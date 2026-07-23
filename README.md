@@ -207,6 +207,13 @@ The deployment floor is **macOS 15**, raised from 13. `Synchronization.Mutex` an
 mutable state is handled here, per [Concurrency](#concurrency-and-isolation). macOS 15 shipped in
 September 2024; requiring it for a developer CLI is not aggressive.
 
+These thirteen resolve as a set on a 6.2 manifest, and to a graph of **33 packages** once transitive
+dependencies are counted — the AsyncHTTPClient tail (NIO, NIO-SSL, NIO-HTTP2, swift-certificates,
+swift-crypto, swift-asn1, service-lifecycle) and swift-syntax 603, pulled by swift-json-schema for its
+macros, account for most of that. swift-syntax is the single largest build-time cost in the graph; if
+clean-build time becomes intolerable, dropping to swift-json-schema's non-macro modules and
+hand-writing the tool schemas removes it.
+
 | Package | License | Why |
 |---|---|---|
 | [apple/swift-argument-parser](https://github.com/apple/swift-argument-parser) | Apache-2.0 | CLI flags, subcommands, shell completions. `from: "1.8.2"`. |
@@ -252,13 +259,16 @@ September 2024; requiring it for a developer CLI is not aggressive.
   pre-1.0 single-maintainer package with a vendored C shim sitting under the key decoder — the same
   bet declined above. Its OSC-query surface is the genuinely non-duplicative part; worth revisiting
   at Phase 4 as a narrow dependency for background detection only, if theming needs it.
-- **swift-collections** — newly reachable at 1.6.0 (the 6.1 floor capped it at 1.2.1). Nothing in the
-  graph pulls it transitively, and it is a per-collection build cost for types not yet needed. Add it
-  if and when scrollback needs a real `Deque`; not speculatively.
-- **swift-async-algorithms** — newly reachable at 1.1.5, the concurrency-clean rewrite. The one thing
-  that would justify it is `AsyncChannel`, since the standard library still has no first-class
-  backpressure — `AsyncStream`'s buffering policies drop rather than apply pressure, which is correct
-  for keyboard input and irrelevant for SSE, where the network is the backpressure.
+- **swift-collections** and **swift-async-algorithms** — not *direct* dependencies, but both are
+  already in the resolved graph and already built: `swift-collections` 1.6.0 arrives via swift-nio,
+  swift-json-schema, and swift-configuration, and `swift-async-algorithms` 1.1.5 via swift-nio-extras
+  and swift-service-lifecycle. So the usual "extra build cost" argument against them does not apply —
+  declaring either directly costs nothing but an import. They stay out only because nothing needs
+  their API yet. Take `swift-collections` when scrollback wants a real `Deque`; take
+  `swift-async-algorithms` for `AsyncChannel` if a bounded queue is ever needed, since the standard
+  library still has no first-class backpressure and `AsyncStream`'s buffering policies drop rather
+  than apply pressure — which is correct for keyboard input and irrelevant for SSE, where the network
+  is the backpressure.
 - **swift-termios** ([minacle/swift-termios](https://github.com/minacle/swift-termios)) — still
   unresolvable. Its only tag declares `swift-tools-version: 6.3`, above this project's floor, and
   there is no older tag. Raw termios comes from `DoMoTermIO`'s own POSIX shim.

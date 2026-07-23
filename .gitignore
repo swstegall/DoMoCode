@@ -60,3 +60,10 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# swiftly
+#
+# Deliberately not committed. The project targets a Swift 6.2 *floor*, not a
+# specific toolchain, and a checked-in .swift-version would switch every
+# contributor to whatever release the file names. CI enforces the floor.
+.swift-version
