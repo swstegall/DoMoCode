@@ -644,3 +644,75 @@ struct RequestShapeTests {
         #expect(transport.recorder.lastRequest?.headerFields[authName] == nil)
     }
 }
+
+// MARK: - Connection-phase retry budget
+
+/// Throws on `execute` for the first `failures` calls, then serves `then`. A
+/// throw models a connection that never produced a response head, which is the
+/// case the client caps separately from a mid-stream drop.
+private final class ThrowingTransport: StreamingTransport {
+    private let remainingFailures: Mutex<Int>
+    private let then: StubResponse
+    let recorder: TransportRecorder
+
+    init(failures: Int, then: StubResponse = StubResponse(status: 200, headers: [], chunks: []), recorder: TransportRecorder = TransportRecorder()) {
+        self.remainingFailures = Mutex(failures)
+        self.then = then
+        self.recorder = recorder
+    }
+
+    func execute(request: HTTPRequest, body: [UInt8]?, timeout: Duration?) async throws -> StreamingResponse {
+        recorder.recordExecute(request, body: body)
+        let shouldFail = remainingFailures.withLock { count -> Bool in
+            if count > 0 { count -= 1; return true }
+            return false
+        }
+        if shouldFail {
+            throw DoMoError(.transport, "connection refused")
+        }
+        let head = HTTPResponse(status: .init(code: then.status))
+        return StreamingResponse(head: head, body: AsyncThrowingStream { $0.finish() })
+    }
+}
+
+@Suite("LiteLLMClient — connection retry budget")
+struct ConnectionRetryTests {
+
+    /// A connection that never establishes is capped at one retry regardless of
+    /// the transient-error budget, so a down gateway is not waited on four times.
+    @Test("An initial-connection failure retries at most once")
+    func initialConnectionCappedAtOne() async {
+        let recorder = TransportRecorder()
+        let transport = ThrowingTransport(failures: .max, recorder: recorder)
+        let (_, error) = await collect(
+            makeClient(transport, maxRetries: 3).streamCompletion(model: "gpt-4o-mini", context: testContext)
+        )
+        #expect(error?.kind == .transport)
+        #expect(recorder.executeCount == 2, "expected 2 attempts (initial + one retry), got \(recorder.executeCount)")
+    }
+
+    /// With retries disabled entirely, the initial connection is tried once.
+    @Test("maxRetries 0 means a single connection attempt")
+    func zeroRetriesSingleAttempt() async {
+        let recorder = TransportRecorder()
+        let transport = ThrowingTransport(failures: .max, recorder: recorder)
+        let (_, error) = await collect(
+            makeClient(transport, maxRetries: 0).streamCompletion(model: "gpt-4o-mini", context: testContext)
+        )
+        #expect(error?.kind == .transport)
+        #expect(recorder.executeCount == 1)
+    }
+
+    /// One transient connection blip before the gateway answers still recovers —
+    /// the cap is one retry, and that is exactly enough for a proxy mid-restart.
+    @Test("A single connection blip recovers")
+    func oneBlipRecovers() async {
+        let recorder = TransportRecorder()
+        let transport = ThrowingTransport(failures: 1, recorder: recorder)
+        let (_, error) = await collect(
+            makeClient(transport, maxRetries: 3).streamCompletion(model: "gpt-4o-mini", context: testContext)
+        )
+        #expect(error == nil, "expected recovery, got \(String(describing: error))")
+        #expect(recorder.executeCount == 2)
+    }
+}

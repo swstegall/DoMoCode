@@ -76,14 +76,36 @@ extension HTTPResponse {
 /// need custom TLS or proxy configuration.
 public struct AsyncHTTPClientTransport: StreamingTransport {
     private let client: HTTPClient
+    private let connectTimeout: Duration
 
     /// The default overall deadline when a caller supplies none. Ten minutes
     /// matches `DOMOCODE_TIMEOUT_MS`'s default; a streamed coding turn with large
     /// tool output legitimately runs for minutes.
     public static let defaultTimeout: Duration = .seconds(600)
 
-    public init(client: HTTPClient = .shared) {
+    /// Bound on time-to-response-head — connect, TLS, request send, and the first
+    /// response byte — separate from the overall streaming deadline above.
+    ///
+    /// This exists because pointing `domocode` at a gateway that is not running is
+    /// the single most common misconfiguration, and `HTTPClient.shared` has no
+    /// connect timeout of its own: its only bound is the overall request deadline,
+    /// which is 600s to accommodate a long streamed turn. Without this a dead
+    /// gateway hangs for ten minutes instead of erroring. On a healthy proxy the
+    /// head arrives in well under a second, so 10s is generous headroom for a slow
+    /// corporate proxy rather than a limit anything real approaches.
+    ///
+    /// It is kept modest on purpose: the client's retry loop multiplies it, so the
+    /// worst case a user waits on a host that silently eats packets is this value
+    /// times the attempt count. The common misconfiguration — nothing listening on
+    /// `localhost` — is refused by the OS immediately and never reaches this bound.
+    public static let defaultConnectTimeout: Duration = .seconds(10)
+
+    public init(
+        client: HTTPClient = .shared,
+        connectTimeout: Duration = AsyncHTTPClientTransport.defaultConnectTimeout
+    ) {
         self.client = client
+        self.connectTimeout = connectTimeout
     }
 
     public func execute(
@@ -109,7 +131,7 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         }
 
         let deadline = timeout ?? Self.defaultTimeout
-        let response = try await client.execute(clientRequest, timeout: .nanoseconds(Self.nanoseconds(deadline)))
+        let response = try await headWithinConnectDeadline(clientRequest, deadline: deadline, host: url.host)
 
         var head = HTTPResponse(status: .init(code: Int(response.status.code)))
         for header in response.headers {
@@ -120,6 +142,55 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         let stream = Self.bridge(response.body)
         return StreamingResponse(head: head, body: stream)
     }
+
+    /// Awaits the response head, but fails with a transport error if it does not
+    /// arrive within ``connectTimeout``.
+    ///
+    /// `client.execute` resolves as soon as the response head is available and
+    /// then streams the body separately, so racing it against a sleep bounds
+    /// exactly the connect-and-headers phase without touching the body budget —
+    /// the returned response's body still streams under `deadline`. The losing
+    /// child is cancelled on exit, which is what tells AsyncHTTPClient to abandon
+    /// a connection attempt that is going nowhere rather than leak it.
+    ///
+    /// A connection the OS refuses outright still errors on its own, faster than
+    /// this deadline; the race only covers the case that actually hangs — a host
+    /// that accepts the SYN, or silently drops it, and then never answers.
+    private func headWithinConnectDeadline(
+        _ request: HTTPClientRequest,
+        deadline: Duration,
+        host: String?
+    ) async throws -> HTTPClientResponse {
+        try await withThrowingTaskGroup(of: HTTPClientResponse.self) { group in
+            group.addTask { [client] in
+                try await client.execute(request, timeout: .nanoseconds(Self.nanoseconds(deadline)))
+            }
+            group.addTask { [connectTimeout] in
+                try await Task.sleep(for: connectTimeout)
+                throw ConnectDeadlineReached()
+            }
+
+            do {
+                guard let response = try await group.next() else {
+                    group.cancelAll()
+                    throw DoMoError(.transport, "The transport produced no response")
+                }
+                group.cancelAll()
+                return response
+            } catch is ConnectDeadlineReached {
+                group.cancelAll()
+                let where_ = host.map { " from \($0)" } ?? ""
+                throw DoMoError(
+                    .transport,
+                    "No response\(where_) within \(connectTimeout) — is the gateway running and reachable?"
+                )
+            }
+        }
+    }
+
+    /// Sentinel thrown by the connect-deadline child so the group can tell a
+    /// timeout apart from a real transport failure the request itself produced.
+    private struct ConnectDeadlineReached: Error {}
 
     /// Bridges the NIO body sequence into the currency stream, wiring
     /// cancellation through so that dropping the consumer aborts the request.

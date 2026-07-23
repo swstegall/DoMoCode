@@ -229,6 +229,7 @@ public struct LiteLLMClient: Sendable {
     ) async {
         let assembly = StreamingAssembly(model: model, rates: rates)
         var attempt = 0
+        var everConnected = false
 
         while true {
             let response: StreamingResponse
@@ -238,12 +239,23 @@ public struct LiteLLMClient: Sendable {
                     body: body,
                     timeout: configuration.timeout
                 )
+                everConnected = true
             } catch let error where DoMoError.isCancellation(error) {
                 finishAborted(assembly, continuation)
                 return
             } catch {
                 let classified = Self.classifyTransport(error)
-                if classified.isRetryable, attempt < configuration.maxRetries {
+                // A failure before we ever reached the gateway is different from a
+                // reconnect after a stream that was working and dropped. The
+                // latter is a transient blip on a proven-good endpoint and earns
+                // the full retry budget. The former usually means the gateway is
+                // down, unreachable, or misconfigured — it rarely clears on
+                // immediate retry, and each attempt costs a whole connect timeout,
+                // so it is capped low. One retry catches a proxy mid-restart; more
+                // just makes the user wait out the transient-error budget before
+                // the actionable "is the gateway running?" message appears.
+                let cap = everConnected ? configuration.maxRetries : min(configuration.maxRetries, 1)
+                if classified.isRetryable, attempt < cap {
                     attempt += 1
                     guard await sleepBeforeRetry(attempt: attempt, retryAfter: classified.retryAfter) else {
                         finishAborted(assembly, continuation)

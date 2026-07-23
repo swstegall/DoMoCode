@@ -160,15 +160,12 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       [Concurrency](#concurrency-and-isolation), CI on macOS and Ubuntu at Swift 6.2 building in both
       debug and `-c release`. `DoMoCore`: `JSONValue`, JSON Schema, the tolerant JSON parser,
       `uuidv7`, error taxonomy, JSONL codec. 234 tests, green in both configurations.
-- [ ] **Phase 1 — Talk to LiteLLM headlessly.** `DoMoLLM` end to end: transport seam, lenient
+- [x] **Phase 1 — Talk to LiteLLM headlessly.** `DoMoLLM` end to end: transport seam, lenient
       `Codable` models, SSE decoding, `[DONE]`, in-stream error sniffing, the tool-call accumulator,
       usage capture, retry/backoff, `GET /v1/models` catalog. Plus `DoMoExec` and headless
-      `DoMoTools`. *Exit:* `domocode -p "list the files here"` runs a real multi-turn tool loop and
-      prints plain text — with zero TUI code, which is exactly why it comes first. `DoMoExec` targets
-      swift-subprocess 0.5+, whose API differs substantially from the 0.4 line: `Execution` is generic
-      over its input/output types, `CollectedResult` / `ExecutionRecord` / `ExecutionOutcome`
-      collapsed into a single `ExecutionResult`, and the 16 `run()` overloads became 6. Write against
-      0.5 directly; do not follow examples written for 0.4.
+      `DoMoTools`. *Exit met:* `domocode -p "..."` runs a real multi-turn tool loop and prints plain
+      text — with zero TUI code, which is exactly why it comes first. The exit-criterion test drives
+      the compiled binary against a loopback mock gateway. 535 tests, green in both configurations.
 - [ ] **Phase 2 — The agent loop.** `DoMoAgent` as a pure, heavily unit-tested function; Phase 1's
       ad-hoc loop is retrofitted onto it.
 - [ ] **Phase 3 — Persistence and harness.** Session tree, JSONL storage, `buildContext`, compaction,
