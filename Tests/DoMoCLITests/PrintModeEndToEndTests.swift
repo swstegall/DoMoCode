@@ -130,6 +130,141 @@ struct PrintModeEndToEndTests {
     }
 
     @Test
+    func jsonModeEmitsEventsInStableOrder() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.toolCallTurn, Self.finalTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+
+        let result = try runDomocode(
+            arguments: [
+                "-p", "list the files here", "--model", "mock-model",
+                "--base-url", gateway.baseURL, "--json",
+            ],
+            workspace: workspace
+        )
+        #expect(result.exitCode == 0, "stderr: \(result.standardError)")
+
+        // The full wire sequence for a two-turn (tool call, then final text) run.
+        // Locking the order down guards the retrofit against silently reshuffling
+        // the stream a script depends on: `turn_start` precedes `response_metadata`
+        // within each turn, tool events sit between the turns, and the run closes
+        // on a single `result`.
+        let types = try Self.parseEventStream(result.standardOutput).compactMap { $0["type"]?.stringValue }
+        #expect(
+            types == [
+                "session_start",
+                "user",
+                "turn_start",
+                "response_metadata",
+                "assistant",
+                "tool_use",
+                "tool_result",
+                "turn_start",
+                "response_metadata",
+                "text_delta",
+                "text_delta",
+                "assistant",
+                "result",
+            ],
+            "actual: \(types)"
+        )
+    }
+
+    @Test
+    func maxTurnsExitsNonZeroWithMessage() async throws {
+        // The model keeps asking to run a tool; with a one-turn budget the run is
+        // cut off before it can produce a final answer.
+        let gateway = try MockGateway(chatCompletionBodies: [Self.toolCallTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+
+        let result = try runDomocode(
+            arguments: [
+                "-p", "list the files here", "--model", "mock-model",
+                "--base-url", gateway.baseURL, "--max-turns", "1",
+            ],
+            workspace: workspace
+        )
+
+        // Hitting the budget is a non-completion: a distinct non-zero exit, a
+        // message on stderr, and nothing on stdout — there is no final answer.
+        #expect(result.exitCode == 2, "stderr: \(result.standardError)")
+        #expect(result.standardOutput.isEmpty)
+        #expect(result.standardError.contains("max-turns"))
+        // The budget stops the run before a second LLM call is made.
+        #expect(gateway.requestCount == 1)
+    }
+
+    /// Turn 1: a `ls` tool call, but finished with an *unrecognized*
+    /// `finish_reason` — a value no version of the API documents, which
+    /// ``StopReason`` keeps verbatim as `.unknown`. Phase 1 treated this as a hard
+    /// terminal error (exit 1) before running the tool.
+    static let unknownFinishWithToolCall = #"""
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_ls_1","type":"function","function":{"name":"ls","arguments":""}}]},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\": \".\"}"}}]},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"flux_capacitor"}]}
+
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":8,"total_tokens":50}}
+
+        data: [DONE]
+
+
+        """#
+
+    @Test
+    func unknownFinishReasonWithToolCallsFailsRatherThanReportingSuccess() async throws {
+        // An unrecognized finish_reason is a provider failure. Phase 1 exited 1 on
+        // it. The retrofit's loop only short-circuits on `.error`/`.aborted`, so a
+        // `.unknown` turn that also carries tool calls would otherwise run those
+        // tools and continue — and if a later turn finished cleanly, the run would
+        // report SUCCESS (exit 0) on that failure. Two scripted turns reproduce
+        // exactly that trap: the unknown turn calls a tool, and a clean final-text
+        // turn is queued behind it. The run must still fail.
+        let gateway = try MockGateway(
+            chatCompletionBodies: [Self.unknownFinishWithToolCall, Self.finalTextTurn]
+        )
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+
+        let result = try runDomocode(
+            arguments: [
+                "-p", "list the files here", "--model", "mock-model",
+                "--base-url", gateway.baseURL, "--json",
+            ],
+            workspace: workspace
+        )
+
+        // The failing stop reason ends the run: exit 1, its verbatim token on
+        // stderr, and no clean `result` on stdout.
+        #expect(result.exitCode == 1, "stderr: \(result.standardError)")
+        #expect(result.standardError.contains("flux_capacitor"))
+
+        // The run stopped at the failing turn — it did not march on to the queued
+        // clean turn, so the second body was never requested.
+        #expect(gateway.requestCount == 1)
+
+        let types = try Self.parseEventStream(result.standardOutput).compactMap { $0["type"]?.stringValue }
+        // No `result` event: the run did not complete successfully.
+        #expect(!types.contains("result"))
+        // It closes on `error`, not `result`.
+        #expect(types.last == "error")
+    }
+
+    @Test
     func missingModelExitsNonZeroWithMessage() throws {
         let workspace = try Workspace()
         defer { workspace.cleanUp() }

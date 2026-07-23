@@ -166,8 +166,11 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       `DoMoTools`. *Exit met:* `domocode -p "..."` runs a real multi-turn tool loop and prints plain
       text — with zero TUI code, which is exactly why it comes first. The exit-criterion test drives
       the compiled binary against a loopback mock gateway. 535 tests, green in both configurations.
-- [ ] **Phase 2 — The agent loop.** `DoMoAgent` as a pure, heavily unit-tested function; Phase 1's
-      ad-hoc loop is retrofitted onto it.
+- [x] **Phase 2 — The agent loop.** `DoMoAgent` as a pure, heavily unit-tested module — the
+      outer follow-up loop and inner turn loop, three-phase tool dispatch, the `.length`
+      truncated-call refusal, steering and follow-up queues, and an awaited `AgentEventSink` (not a
+      fire-and-forget stream). Print mode's ad-hoc loop is gone, retrofitted onto `runAgentLoop`.
+      570 tests, green in both configurations.
 - [ ] **Phase 3 — Persistence and harness.** Session tree, JSONL storage, `buildContext`, compaction,
       branch summarization, hooks. `--continue` / `--resume` / `--fork`, settings with global/project
       merge, project trust. *Exit:* sessions survive restart; `--mode json` is scriptable.
