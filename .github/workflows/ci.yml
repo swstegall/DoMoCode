@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.configuration }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+        # Release is not redundant. `precondition` compiles out under -Onone, so
+        # a debug-only matrix hides exactly the class of bug that kills the
+        # renderer in front of a user. Optimized builds also surface warnings
+        # and concurrency diagnostics that debug builds do not.
+        configuration: [debug, release]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # The project targets a 6.2 *floor*, so CI pins the floor rather than
+      # whatever the runner ships. .swift-version is deliberately gitignored —
+      # see the note there.
+      - name: Install Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build
+        run: swift build --configuration ${{ matrix.configuration }}
+
+      - name: Test
+        run: swift test --configuration ${{ matrix.configuration }}

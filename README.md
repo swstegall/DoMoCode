@@ -155,10 +155,11 @@ swap is mechanical when the floor eventually reaches macOS 26.
 
 Ordered strictly by dependency. Each phase ends with something runnable and tested.
 
-- [ ] **Phase 0 — Skeleton.** `Package.swift` with the pin table, all targets declared, the per-target
-      isolation and safety settings from [Concurrency](#concurrency-and-isolation), CI on macOS and
-      Ubuntu at Swift 6.2 building in both debug and `-c release`. `DoMoCore`: `JSONValue`, JSON
-      Schema, the tolerant JSON parser, `uuidv7`, error taxonomy, JSONL codec.
+- [x] **Phase 0 — Skeleton.** `Package.swift` with the pin table, all eleven targets declared, the
+      per-target isolation and safety settings from
+      [Concurrency](#concurrency-and-isolation), CI on macOS and Ubuntu at Swift 6.2 building in both
+      debug and `-c release`. `DoMoCore`: `JSONValue`, JSON Schema, the tolerant JSON parser,
+      `uuidv7`, error taxonomy, JSONL codec. 234 tests, green in both configurations.
 - [ ] **Phase 1 — Talk to LiteLLM headlessly.** `DoMoLLM` end to end: transport seam, lenient
       `Codable` models, SSE decoding, `[DONE]`, in-stream error sniffing, the tool-call accumulator,
       usage capture, retry/backoff, `GET /v1/models` catalog. Plus `DoMoExec` and headless
