@@ -51,6 +51,27 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+### OpenTUI (via pi-tui `stdin-buffer.ts`)
+
+`packages/tui/src/stdin-buffer.ts`, from which `DoMoTermIO`'s escape-sequence reassembly is ported,
+is itself derived from OpenTUI and carries that project's copyright line upstream.
+
+- **Repository:** https://github.com/anomalyco/opentui
+- **License:** MIT
+- **Copyright:** (c) 2025 opentui
+
+Swift files deriving from that path carry OpenTUI's copyright line in addition to the two below.
+
+### string-width (via pi-tui `utils.ts`)
+
+`packages/tui/src/utils.ts` documents its grapheme-width and character-classification logic as based
+on the `string-width` library. Upstream pi carries no copyright line for it; it is named here rather
+than inheriting that gap.
+
+- **Repository:** https://github.com/sindresorhus/string-width
+- **License:** MIT
+- **Copyright:** Sindre Sorhus
+
 ### Scope of the derivation
 
 DoMoCode is a narrowed port. The table below records which planned modules derive from which
@@ -78,6 +99,14 @@ header naming that file and the commit it was read at, in the following form:
 // SPDX-License-Identifier: MIT
 //
 // Ported to Swift from the Pi Agent Harness.
+```
+
+Files whose upstream source itself derives from a third work carry that work's copyright line as
+well, above the two above — for example, files ported from `stdin-buffer.ts`:
+
+```swift
+// Copyright (c) 2025 opentui. MIT license.
+// https://github.com/anomalyco/opentui
 ```
 
 The following upstream components are **not** ported and are not derived from: `packages/server`,
@@ -157,9 +186,17 @@ Version 2.0.
 
 ### swift-markdown
 
-- **Repository:** https://github.com/apple/swift-markdown
+- **Repository:** https://github.com/swiftlang/swift-markdown
 - **License:** Apache-2.0 WITH Swift-exception
 - **Copyright:** Apple Inc. and the Swift project authors
+
+### swift-cmark
+
+- **Repository:** https://github.com/swiftlang/swift-cmark
+- **License:** Apache-2.0 WITH Swift-exception; bundles cmark under BSD-2-Clause
+- **Copyright:** Apple Inc. and the Swift project authors; cmark Copyright (c) 2014 John MacFarlane
+
+Arrives transitively via swift-markdown.
 
 ### GRDB.swift
 
@@ -173,9 +210,20 @@ Planned for optional SQLite session storage.
 
 - **Repository:** https://github.com/migueldeicaza/SwiftTerm
 - **License:** MIT
-- **Copyright:** Miguel de Icaza
+- **Copyright:** Miguel de Icaza. Its license additionally carries the copyrights of the xterm.js
+  project, SourceLair Private Company, and Christopher Jeffrey, from which SwiftTerm derives.
 
 Used in test targets only, as a headless terminal emulator against which renderer output is asserted.
+
+---
+
+## Distribution
+
+Several dependencies above are licensed under Apache-2.0, whose section 4(d) requires attribution
+notices to travel with redistributed works. A file in this repository does not travel with a release
+tarball or a package-manager bottle, so binary distributions will ship a generated
+`THIRD-PARTY-NOTICES.txt` alongside the executable, and `domocode --licenses` will print the same
+content.
 
 ---
 
