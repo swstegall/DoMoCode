@@ -171,9 +171,13 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       truncated-call refusal, steering and follow-up queues, and an awaited `AgentEventSink` (not a
       fire-and-forget stream). Print mode's ad-hoc loop is gone, retrofitted onto `runAgentLoop`.
       570 tests, green in both configurations.
-- [ ] **Phase 3 — Persistence and harness.** Session tree, JSONL storage, `buildContext`, compaction,
-      branch summarization, hooks. `--continue` / `--resume` / `--fork`, settings with global/project
-      merge, project trust. *Exit:* sessions survive restart; `--mode json` is scriptable.
+- [x] **Phase 3 — Persistence and harness.** `DoMoHarness`: an append-only session tree in JSONL,
+      `buildContext` resolving the leaf-to-root path (or to the nearest compaction boundary),
+      compaction and branch summarization, and the `AgentHarness` actor that persists each message as
+      the loop runs. CLI: persistence by default, `--continue` / `--resume` / `--fork` / `--session`,
+      and a project trust gate. *Exit met:* an end-to-end test resumes a session in a second process
+      and proves the next request carries the prior turn's context. 677 tests, green in both
+      configurations.
 - [ ] **Phase 4 — Terminal.** Ordered so the test oracle exists before the code it judges.
       **4a:** the SwiftTerm-backed screen-state harness — renderer bytes in, assertions against a real
       VT100 cell grid, including a fixture where the transcript exceeds the viewport. A harness that

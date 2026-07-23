@@ -1,24 +1,33 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 //
-// Phase 2: the print-mode CLI is retrofitted onto `DoMoAgent`. The hand-rolled
-// Phase-1 turn loop this file used to carry is gone — the run is now a single
-// call into `runAgentLoop`, with the real `LiteLLMClient.streamCompletion` wired
-// in as the injected `AgentStreamFn` and the `ToolRegistry` wrapped as the loop's
-// `AgentTool` set. This file keeps only the *edges*: the output channel, the
-// translation of `AgentEvent`s into the newline-delimited JSON wire format the
-// mode already emitted, and the mapping of `RunStopReason` to an exit code.
+// Phase 3: print mode now runs THROUGH `AgentHarness`, so every `-p` run persists
+// its transcript to a session file and a later invocation can resume it. Phase 2
+// drove `runAgentLoop` directly; the loop call, the context, and per-message
+// persistence now belong to the harness, and this file keeps only the *edges*:
+// the output channel, the translation of `AgentEvent`s into the newline-delimited
+// JSON wire format the mode already emitted, and the mapping of `RunStopReason`
+// to an exit code.
 //
-// The wire format is preserved: the same event `type`s, the same field shapes,
-// the same exit codes. The `--json` header sequence is reproduced by emitting
-// `turn_start` and `response_metadata` from inside the stream seam (where the
-// response headers become available) rather than from the loop, so their order
-// relative to the streamed deltas is exactly what Phase 1 produced. See the notes
-// on individual events for the two places DoMoAgent's richer event stream widens
-// the old wire.
+// The wire format is preserved byte-for-byte: the harness forwards every loop
+// event to the sink below unchanged, so the same event `type`s, field shapes, and
+// exit codes survive the move. The `--json` header sequence is reproduced by
+// emitting `turn_start` and `response_metadata` from inside the stream seam (where
+// the response headers become available) rather than from the loop, exactly as
+// Phase 1/2 produced them.
+//
+// One Phase-1 behavior the harness cannot express through its `Configuration` is
+// `shouldStopAfterTurn` — the rule that a turn ending on a *failing* stop reason
+// (an unrecognized `finish_reason`, kept as `.unknown`) must end the run at exit
+// 1 before another LLM call, rather than dispatching its tools and marching on to
+// a later clean turn that would falsely report success. `AgentHarness.Configuration`
+// exposes no loop-hook passthrough (see the report's "harness gap"), so this file
+// reconstructs the effect at the one seam it does own: the injected `streamFn`
+// refuses to start a turn once a failing turn has been seen (``RunGuard``).
 
 import DoMoAgent
 import DoMoCore
+import DoMoHarness
 import DoMoLLM
 import DoMoTools
 import Foundation
@@ -138,6 +147,10 @@ struct PrintEventSink: AgentEventSink {
     let sessionModel: String
     let workingDirectory: FilePath
     let toolNames: [String]
+    /// Watches each finished assistant turn so the stream seam can refuse the next
+    /// one when this turn failed. See ``RunGuard`` and this file's header note on
+    /// the harness gap.
+    let runGuard: RunGuard
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
 
@@ -173,6 +186,12 @@ struct PrintEventSink: AgentEventSink {
 
         case .messageEnd(let message):
             if case .assistant(let assistant) = message {
+                // Record a failing (non-`.length`) turn before the loop dispatches
+                // its tools and asks for the next turn: the stream seam reads this
+                // to short-circuit, reproducing Phase 1's `shouldStopAfterTurn`.
+                // Emit ordering makes this safe — `messageEnd` for turn N lands
+                // before turn N+1's `streamFn` call, all on the loop's serial path.
+                runGuard.blockIfFailing(assistant)
                 emitAssistant(assistant)
             }
 
@@ -249,6 +268,60 @@ final class TurnCounter: Sendable {
     var value: Int { count.withLock { $0 } }
 }
 
+// MARK: - Run guard
+
+/// Reproduces Phase 1's `shouldStopAfterTurn` at the CLI, because
+/// ``AgentHarness/Configuration`` exposes no loop-hook passthrough.
+///
+/// Phase 1 short-circuited a run whose assistant turn ended on a failing stop
+/// reason other than `.length` — most importantly an unrecognized `finish_reason`
+/// kept as `.unknown` — *before* another provider request. Without that rule a
+/// `.unknown` turn that also carried tool calls would run its tools and continue,
+/// and a later clean turn would report the whole run as success (exit 0) over a
+/// genuine provider failure.
+///
+/// The harness drives ``runAgentLoop`` itself and does not forward
+/// `shouldStopAfterTurn`, so the only seam left is the injected `streamFn`. The
+/// sink records the first failing turn here (``blockIfFailing(_:)``); the stream
+/// seam consults ``blockingError`` and, once set, refuses to start the next turn
+/// by finishing its stream with that error — which the loop settles as `.errored`
+/// with no further request. A reference type so the sink and the escaping
+/// `streamFn` closure share one instance; `Sendable` because the `Mutex` guards
+/// the only mutable field.
+final class RunGuard: Sendable {
+    private let blocked = Mutex<DoMoError?>(nil)
+
+    /// Records the first failing (non-`.length`) turn. Idempotent: a later failing
+    /// turn does not replace the first, which is the one the run should report.
+    func blockIfFailing(_ assistant: AssistantMessage) {
+        let reason = assistant.stopReason
+        guard reason.isFailure, reason != .length else { return }
+        let error =
+            assistant.failure
+            ?? DoMoError(.provider(status: nil, isRetryable: false), "Turn failed: \(reason.rawValue)")
+        blocked.withLock { if $0 == nil { $0 = error } }
+    }
+
+    /// The recorded failure, or `nil` when no failing turn has been seen. When
+    /// non-`nil`, the stream seam must not start another turn.
+    var blockingError: DoMoError? { blocked.withLock { $0 } }
+}
+
+// MARK: - Session source
+
+/// Where a run's session comes from: a fresh file, a resumed one, or a fork of a
+/// resumed one. The command resolves the flags into one of these; ``PrintMode``
+/// turns it into the matching ``AgentHarness`` lifecycle call.
+public enum SessionSource: Sendable {
+    /// Start a brand-new session under the session directory.
+    case new
+    /// Resume the session at this file, appending to it.
+    case resume(FilePath)
+    /// Resume the session at this file but branch into a new file, leaving the
+    /// original untouched — `--fork`.
+    case fork(FilePath)
+}
+
 // MARK: - Print mode
 
 /// Runs a single prompt to completion and prints the result.
@@ -266,6 +339,10 @@ public struct PrintMode: Sendable {
     let mode: OutputMode
     let maxTurns: Int
     let channel: OutputChannel
+    /// Where this run's session file comes from — new, resumed, or forked.
+    let sessionSource: SessionSource
+    /// The directory a new (or forked) session file is created under.
+    let sessionDirectory: FilePath
 
     public init(
         client: LiteLLMClient,
@@ -276,7 +353,9 @@ public struct PrintMode: Sendable {
         workingDirectory: FilePath,
         mode: OutputMode,
         maxTurns: Int,
-        channel: OutputChannel
+        channel: OutputChannel,
+        sessionSource: SessionSource,
+        sessionDirectory: FilePath
     ) {
         self.client = client
         self.model = model
@@ -287,6 +366,8 @@ public struct PrintMode: Sendable {
         self.mode = mode
         self.maxTurns = maxTurns
         self.channel = channel
+        self.sessionSource = sessionSource
+        self.sessionDirectory = sessionDirectory
     }
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
@@ -302,78 +383,97 @@ public struct PrintMode: Sendable {
 
     /// Runs the prompt and returns the process exit code.
     ///
-    /// Never throws for an ordinary failure: ``DoMoAgent`` settles every run —
+    /// A *conversational* failure never throws: ``DoMoAgent`` settles every run —
     /// provider error, aborted turn, hitting ``maxTurns`` — with a
     /// ``RunStopReason`` rather than an escaping error, and each maps to a
     /// non-zero exit code with a message on stderr, because a headless caller
-    /// scripts against the exit code. The `throws` on the signature is kept for
-    /// the caller's `try`; nothing in the body reaches it today.
+    /// scripts against the exit code. What *does* throw now is an
+    /// infrastructure failure the harness surfaces: a `--resume`/`--session`
+    /// target that is not a session, or a disk write that could not durably
+    /// record the transcript. Those are real ``DoMoError``s the command turns
+    /// into a non-zero exit — a run that could not persist must not report
+    /// success.
     public func run(prompt: String) async throws -> Int32 {
         let tools = agentTools
-        let context = AgentContext(
+
+        // One shared counter across the run's LLM calls, and one guard that lets
+        // the stream seam refuse a turn after a failing one (the harness has no
+        // `shouldStopAfterTurn`). Both are shared by reference into the escaping
+        // `streamFn` and the sink.
+        let turnCounter = TurnCounter()
+        let runGuard = RunGuard()
+
+        let configuration = AgentHarness.Configuration(
             systemPrompt: Self.systemPrompt(workingDirectory: workingDirectory, toolNames: registry.names),
-            messages: [],
-            tools: tools
-        )
-        let config = AgentLoopConfig(
+            tools: tools,
             model: model,
+            streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
             // Sequential to preserve Phase 1's strictly source-ordered tool
             // dispatch: `tool_use`/`tool_result` events, and the tool-result
             // messages fed back to the model, appear in the model's own call
             // order. Parallel would reorder the completion-order `tool_result`s.
             toolExecution: .sequential,
-            maxTurns: maxTurns,
-            // Phase 1 treated any turn whose stop reason was itself a failure as
-            // terminal (exit 1) *before* looking at its tool calls — including an
-            // unrecognized `finish_reason` (`.unknown`). The loop only short-
-            // circuits on `.error`/`.aborted`, so without this a `.unknown` turn
-            // that also carries tool calls would run those tools and continue; if
-            // a later turn then finished cleanly the whole run would report
-            // success (exit 0) on what Phase 1 called a hard failure. Stop the run
-            // at the failing turn so `finish` reports it (exit 1). `.length` is a
-            // failure too but is deliberately recoverable — the batch is refused
-            // and the model retried — so it is excluded, matching Phase 1.
-            shouldStopAfterTurn: { turn in
-                let reason = turn.message.stopReason
-                return reason.isFailure && reason != .length
-            }
+            maxTurns: maxTurns
         )
+
+        let harness = try await makeHarness(configuration: configuration)
+
         let sink = PrintEventSink(
             channel: channel,
             mode: mode,
             sessionModel: model,
             workingDirectory: workingDirectory,
-            toolNames: tools.map(\.definition.name)
+            toolNames: tools.map(\.definition.name),
+            runGuard: runGuard
         )
 
-        // One shared counter across the run's LLM calls. The stream seam is the
-        // only place a turn's request begins, so it is where `turn_start` is
-        // emitted and the counter advances; the terminal `result` reads it back.
-        let turnCounter = TurnCounter()
-
-        let result = await runAgentLoop(
-            prompts: [.user(prompt)],
-            context: context,
-            config: config,
-            sink: sink,
-            streamFn: streamFunction(counter: turnCounter)
-        )
-
+        let result = try await harness.run(prompt: prompt, sink: sink)
         return finish(result: result, turns: turnCounter.value)
+    }
+
+    /// Builds the harness for this run's ``SessionSource``: a new file, an opened
+    /// one (resume), or a fork of an opened one. Resolution errors — a session
+    /// file that is missing or not a session — surface here as a ``DoMoError`` and
+    /// become a non-zero exit, which is what a scripted caller expects of a bad
+    /// `--resume`/`--session` argument.
+    private func makeHarness(configuration: AgentHarness.Configuration) async throws -> AgentHarness {
+        switch sessionSource {
+        case .new:
+            return try AgentHarness.start(
+                cwd: workingDirectory.string,
+                sessionDirectory: sessionDirectory,
+                configuration: configuration
+            )
+        case .resume(let path):
+            return try AgentHarness.open(path: path, configuration: configuration)
+        case .fork(let path):
+            let base = try AgentHarness.open(path: path, configuration: configuration)
+            return try await base.fork(sessionDirectory: sessionDirectory)
+        }
     }
 
     // MARK: Stream seam
 
     /// The injected ``AgentStreamFn``: one LLM call, wrapping
-    /// ``LiteLLMClient/streamCompletion``.
+    /// ``LiteLLMClient/streamCompletion`` — unless a prior turn failed, in which
+    /// case it refuses to start another turn.
     ///
     /// `turn_start` is emitted here, synchronously, before the request is built —
     /// so it precedes the `response_metadata` the header callback emits once the
     /// head arrives, reproducing Phase 1's header ordering (`turn_start`, then
     /// `response_metadata`, then the streamed deltas). The counter advances once
     /// per call, which is once per assistant turn.
-    private func streamFunction(counter: TurnCounter) -> AgentStreamFn {
+    ///
+    /// When ``RunGuard/blockingError`` is set, the seam finishes the stream with
+    /// that error and makes no request: the loop turns a thrown stream into a
+    /// terminal `.error` turn and settles `.errored`, so the run stops at the
+    /// failing turn (exit 1) without a further provider call — the effect Phase 1
+    /// got from `shouldStopAfterTurn`.
+    private func streamFunction(counter: TurnCounter, runGuard: RunGuard) -> AgentStreamFn {
         { context in
+            if let blocking = runGuard.blockingError {
+                return AsyncThrowingStream { $0.finish(throwing: blocking) }
+            }
             let turn = counter.next()
             log.emit("turn_start", ["turn": .int(turn)])
             return client.streamCompletion(

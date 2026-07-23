@@ -226,6 +226,12 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        .testTarget(
+            name: "DoMoHarnessTests",
+            dependencies: ["DoMoHarness", "DoMoAgent", "DoMoLLM", "DoMoExec", "DoMoCore"],
+            swiftSettings: safeSettings
+        ),
+
         // Strict memory safety is off here, matching DoMoTermIO's rationale: the
         // end-to-end test stands up a loopback HTTP gateway with raw POSIX
         // sockets, which is `unsafe` by design and has nothing to audit.
