@@ -1,4 +1,10 @@
-// The executable. Phase 0 declares it so the module graph is complete and the
-// binary links; the ArgumentParser root arrives with DoMoCLI in Phase 1.
+// Copyright (c) 2026 Sam Stegall. MIT license.
+// SPDX-License-Identifier: MIT
+//
+// The executable entry point. Everything of substance lives in DoMoCLI; this is
+// the ArgumentParser root plus the async entry the roadmap's "domocode/: the
+// executable, ArgumentParser root plus DoMoCLI.run()" line describes.
 
-print("domocode: not implemented yet — see README.md, \"Roadmap\".")
+import DoMoCLI
+
+await DoMoCodeCommand.run()
