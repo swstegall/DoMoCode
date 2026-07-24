@@ -215,6 +215,11 @@ public struct WireMessage: Sendable, Hashable {
     /// tools. Encoded explicitly rather than omitted — the field being present
     /// and null is what the reference client sends, and some upstreams reject
     /// an assistant message with neither `content` nor `tool_calls` present.
+    ///
+    /// On an image-bearing input turn the wire carries `content` as an *array*
+    /// of typed parts instead of a string; ``contentParts`` holds those, and when
+    /// it is non-nil the array is what is encoded under `content` — `content`
+    /// itself is then ignored.
     public var content: String?
 
     public var toolCalls: [WireToolCall]?
@@ -228,13 +233,19 @@ public struct WireMessage: Sendable, Hashable {
     /// Replayed reasoning, echoed back under the field name it arrived on.
     public var reasoningContent: String?
 
+    /// A typed content-part array, encoded under `content` in place of the string
+    /// form when present. Only outbound image turns set it — responses always
+    /// arrive as a string, so this stays `nil` after a decode.
+    public var contentParts: [WirePart]?
+
     public init(
         role: WireRole,
         content: String? = nil,
         toolCalls: [WireToolCall]? = nil,
         toolCallID: String? = nil,
         name: String? = nil,
-        reasoningContent: String? = nil
+        reasoningContent: String? = nil,
+        contentParts: [WirePart]? = nil
     ) {
         self.role = role
         self.content = content
@@ -242,6 +253,7 @@ public struct WireMessage: Sendable, Hashable {
         self.toolCallID = toolCallID
         self.name = name
         self.reasoningContent = reasoningContent
+        self.contentParts = contentParts
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -263,16 +275,76 @@ extension WireMessage: Codable {
         toolCallID = try container.decodeIfPresent(String.self, forKey: .toolCallID)
         name = try container.decodeIfPresent(String.self, forKey: .name)
         reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
+        // Responses never send `content` as a parts array, so this is left nil
+        // and the string form above is authoritative on the inbound path.
+        contentParts = nil
     }
 
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(role, forKey: .role)
-        try container.encode(content, forKey: .content)
+        if let contentParts {
+            try container.encode(contentParts, forKey: .content)
+        } else {
+            try container.encode(content, forKey: .content)
+        }
         try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
         try container.encodeIfPresent(toolCallID, forKey: .toolCallID)
         try container.encodeIfPresent(name, forKey: .name)
         try container.encodeIfPresent(reasoningContent, forKey: .reasoningContent)
+    }
+}
+
+/// One element of a Chat Completions `content` parts array.
+///
+/// Only the two kinds an image-bearing input turn needs: a `text` run and an
+/// `image_url` pointing at an inline `data:` URL. This is never decoded off a
+/// response — models answer with `content` as a plain string — so in practice it
+/// is write-only, but `Codable` is kept symmetric so a round-trip test can assert
+/// the exact shape.
+public enum WirePart: Sendable, Hashable {
+    case text(String)
+    case imageURL(url: String)
+}
+
+extension WirePart: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case text
+        case imageURL = "image_url"
+    }
+
+    /// The nested `{"url": ...}` object OpenAI wraps an image reference in.
+    private struct ImageURL: Codable {
+        var url: String
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(String.self, forKey: .type) {
+        case "text":
+            self = .text(try container.decode(String.self, forKey: .text))
+        case "image_url":
+            self = .imageURL(url: try container.decode(ImageURL.self, forKey: .imageURL).url)
+        case let other:
+            throw DecodingError.dataCorruptedError(
+                forKey: .type,
+                in: container,
+                debugDescription: "Unrecognized content part type: \(other)"
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .text(let text):
+            try container.encode("text", forKey: .type)
+            try container.encode(text, forKey: .text)
+        case .imageURL(let url):
+            try container.encode("image_url", forKey: .type)
+            try container.encode(ImageURL(url: url), forKey: .imageURL)
+        }
     }
 }
 
@@ -833,6 +905,12 @@ extension ChatCompletionRequest {
     /// When the transcript mentions tools but no tools are supplied, an empty
     /// `tools` array is sent rather than omitting the field, because Anthropic
     /// behind the gateway rejects the request otherwise.
+    ///
+    /// `includeImageContent: false` strips every image part, collapsing an
+    /// image-bearing user turn back to its text and dropping the hoisted user
+    /// message a tool-result image would produce. It exists as a seam for a
+    /// future text-only-model gate; DoMoCode does not hard-gate on the advisory
+    /// model catalog, so the default keeps images on.
     public init(
         model: String,
         context: Context,
@@ -841,14 +919,21 @@ extension ChatCompletionRequest {
         maxTokens: Int? = nil,
         reasoningEffort: ReasoningEffort? = nil,
         toolChoice: WireToolChoice? = nil,
-        includeToolResultNames: Bool = false
+        includeToolResultNames: Bool = false,
+        includeImageContent: Bool = true
     ) {
         var messages: [WireMessage] = []
         if let systemPrompt = context.systemPrompt, !systemPrompt.isEmpty {
             messages.append(WireMessage(role: .system, content: systemPrompt))
         }
         for message in context.messages {
-            messages.append(contentsOf: WireMessage.encoding(message, includeToolResultName: includeToolResultNames))
+            messages.append(
+                contentsOf: WireMessage.encoding(
+                    message,
+                    includeToolResultName: includeToolResultNames,
+                    includeImageContent: includeImageContent
+                )
+            )
         }
 
         let tools: [WireTool]?
@@ -881,13 +966,26 @@ extension WireMessage {
     /// calls — an aborted turn that produced nothing. Providers reject those
     /// ("either content or tool_calls, but not none"), and replaying one turns a
     /// recoverable abort into a hard failure on the next request.
-    public static func encoding(_ message: Message, includeToolResultName: Bool = false) -> [WireMessage] {
+    public static func encoding(
+        _ message: Message,
+        includeToolResultName: Bool = false,
+        includeImageContent: Bool = true
+    ) -> [WireMessage] {
         switch message {
         case .system(let system):
             return [WireMessage(role: .system, content: system.content)]
 
         case .user(let user):
-            return [WireMessage(role: .user, content: user.text)]
+            // A text-only turn — the common case — stays a plain string. Images
+            // force the typed content-part array; `includeImageContent: false`
+            // strips them, folding the turn back to just its text.
+            let images = user.content.compactMap(\.imageBlock)
+            if images.isEmpty || !includeImageContent {
+                return [WireMessage(role: .user, content: user.text)]
+            }
+            let parts: [WirePart] = (user.text.isEmpty ? [] : [.text(user.text)])
+                + images.map { .imageURL(url: $0.dataURL) }
+            return [WireMessage(role: .user, contentParts: parts)]
 
         case .assistant(let assistant):
             let text = assistant.content.compactMap(\.textBlock?.text).joined()
@@ -923,16 +1021,30 @@ extension WireMessage {
             ]
 
         case .tool(let result):
-            return [
-                WireMessage(
-                    role: .tool,
-                    // An empty tool result is a protocol violation for several
-                    // upstreams, so silence gets a placeholder.
-                    content: result.output.isEmpty ? "(no tool output)" : result.output,
-                    toolCallID: result.toolCallID,
-                    name: includeToolResultName ? result.toolName : nil
-                )
-            ]
+            // The OpenAI `tool` role cannot carry image parts, so any images are
+            // hoisted into a synthetic `user` message that immediately follows —
+            // pi does exactly this. The tool text itself still goes back under the
+            // `tool` role so the call stays addressed by its id.
+            let images = includeImageContent ? result.images : []
+            let toolText = result.output.isEmpty
+                // An empty tool result is a protocol violation for several
+                // upstreams, so silence gets a placeholder — one that points at
+                // the hoisted image when that is all the tool produced.
+                ? (images.isEmpty ? "(no tool output)" : "(see attached image)")
+                : result.output
+            let toolMsg = WireMessage(
+                role: .tool,
+                content: toolText,
+                toolCallID: result.toolCallID,
+                name: includeToolResultName ? result.toolName : nil
+            )
+            if images.isEmpty { return [toolMsg] }
+            let hoist = WireMessage(
+                role: .user,
+                contentParts: [.text("Attached image(s) from tool result:")]
+                    + images.map { .imageURL(url: $0.dataURL) }
+            )
+            return [toolMsg, hoist]
         }
     }
 }

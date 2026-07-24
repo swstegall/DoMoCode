@@ -11,14 +11,14 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 
 ---
 
-## Status: Phases 0–4 shipped; expansion planned
+## Status: Phases 0–4 and 5.5 shipped; rest of the expansion planned
 
-**The runtime and the inline terminal UI are implemented and tested** — Phases 0–4, roughly 28k lines
-of Swift with 1,059 tests green in both debug and `-c release`. Everything tagged **Phase 5 and beyond**
-— the polish pass, the HTTP/SSE server, the full-screen TUI, MCP, and inline images — is a statement of
-intent and a plan of record, tagged with the phase that will deliver it and described in the future
-tense until it lands. Read the [roadmap](#roadmap) for the boundary between what runs today and what is
-planned.
+**The runtime, the inline terminal UI, and image input are implemented and tested** — Phases 0–4 plus
+5.5, with 1,097 tests green in both debug and `-c release`. Everything else tagged **Phase 5 and
+beyond** — the rest of the polish pass, the HTTP/SSE server, the full-screen TUI, MCP, and image
+*display* — is a statement of intent and a plan of record, tagged with the phase that will deliver it
+and described in the future tense until it lands. Read the [roadmap](#roadmap) for the boundary between
+what runs today and what is planned.
 
 DoMoCode began as a deliberately **narrowed** port; the
 [scope expansion](#what-expanded-and-what-did-not) has since widened it in four directions while keeping
@@ -264,13 +264,19 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       menu with an on-demand cheat-sheet printed into scrollback — the flat, remappable subset of
       a command palette that needs no overlay panel. Ships the in-process interactive path to a
       genuinely useful state *before* the architecture pivot begins.
-- [ ] **Phase 5.5 — Inline images, the input half.** `DoMoLLM`'s wire `content` goes from a flat
-      `String?` to a `String`-or-parts array with an image content block; an attach/read-image tool
-      base64s a file for the model (the tool layer already carries `ToolContent.image`); optional
-      `supportsVision` gating on the model catalog. Dependency-free and single-provider-safe — a
-      pasted or attached PNG/JPEG reaches a vision-capable model *through the gateway* and
-      round-trips; text-only models are gated or error gracefully. Pulled early because it is
-      orthogonal to the terminal and useful regardless of the render mode.
+- [x] **Phase 5.5 — Inline images, the input half.** `ContentBlock.image(ImageBlock)` and an
+      `image_url` data-URL wire encoding for image-bearing *user* turns (assistant turns stay
+      plain-string, since some models mirror a content-part array back as garbage). Images a *tool*
+      returns — `read` on a PNG already produces one — are carried through the `RegistryTool` adapter
+      (`AgentToolResult.images`, `ToolResultBlock.images`, both backward-compatibly Codable) and
+      hoisted on the wire into a synthetic user message after the tool message, because the OpenAI
+      `tool` role cannot hold image parts (pi's approach). Attach surfaces: a repeatable
+      `--image <path>` flag in print mode and `@path` auto-attach in the interactive editor (read
+      off the main actor). Dependency-free and single-provider-safe. The model catalog is advisory,
+      so images are sent and a text-only model's error is surfaced rather than hard-gated — an
+      `includeImageContent` seam exists for a future gate. Both the user-attach and tool-image paths
+      are proven end-to-end against the mock gateway, in print mode and the live REPL. 1,097 tests
+      green in debug and release.
 - [ ] **Phase 6 — Headless HTTP/SSE runtime server** (re-scoped from the old "RPC mode"). A new
       `DoMoServer` on Hummingbird 2.x, modeled on opencode's server: `AgentEvent` gains `Codable`;
       a `BroadcastEventSink` fans the existing event stream out over `GET /event` (connected frame

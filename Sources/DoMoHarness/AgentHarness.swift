@@ -245,7 +245,11 @@ public actor AgentHarness {
     /// throw) is surfaced here, so a run that could not durably record its
     /// transcript fails loudly rather than returning a lie.
     @discardableResult
-    public func run(prompt: String, sink: (any AgentEventSink)? = nil) async throws -> AgentRunResult {
+    public func run(
+        prompt: String,
+        attachments: [ImageBlock] = [],
+        sink: (any AgentEventSink)? = nil
+    ) async throws -> AgentRunResult {
         guard !isRunning else {
             throw DoMoError(.configuration, "AgentHarness is already running a turn")
         }
@@ -270,8 +274,13 @@ public actor AgentHarness {
         let errorBox = PersistenceErrorBox()
         let persistenceSink = SessionPersistenceSink(persister: self, forward: sink, errorBox: errorBox)
 
+        // The turn's user message carries the typed prompt plus any image
+        // attachments (Phase 5.5). A text-only turn is byte-for-byte what it was.
+        let promptMessage = Message.user(
+            UserMessage(content: [.text(prompt)] + attachments.map { .image($0) })
+        )
         let result = await runAgentLoop(
-            prompts: [.user(prompt)],
+            prompts: [promptMessage],
             context: context,
             config: config,
             sink: persistenceSink,

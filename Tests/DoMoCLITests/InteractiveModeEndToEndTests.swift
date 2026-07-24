@@ -177,6 +177,63 @@ struct InteractiveModeEndToEndTests {
         try await runTask.value
     }
 
+    /// PHASE 5.5 — a submitted line that `@`-mentions an image file attaches it: the
+    /// gateway request carries the bytes as an OpenAI `image_url` content part. This
+    /// exercises the interactive-only path — token extraction, the sandboxed read,
+    /// and media-type sniffing — that the print-mode `--image` test cannot.
+    @Test
+    func atMentionedImageIsAttachedToTheTurn() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        // A 16-byte PNG the sniffer accepts: signature + IHDR length 13 + "IHDR".
+        let png = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        ])
+        try png.write(to: tree.work.appendingPathComponent("shot.png"))
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path
+        )
+
+        let cols = 60, rows = 20
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        // Trailing non-`@` text leaves the cursor outside the mention token, so no
+        // completion popup is open when Enter submits the line.
+        inputCont.yield(bytes("@shot.png what is this"))
+        inputCont.yield(bytes("\r"))
+
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "the turn never completed")
+        #expect(gateway.requestCount == 1)
+
+        let json = try JSONValue(parsing: Data(gateway.requests[0].body.utf8))
+        let content = json["messages"]?[1]?["content"]
+        #expect(content?[1]?["type"]?.stringValue == "image_url", "body: \(gateway.requests[0].body)")
+        #expect(
+            content?[1]?["image_url"]?["url"]?.stringValue
+                == "data:image/png;base64,\(png.base64EncodedString())",
+            "body: \(gateway.requests[0].body)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
     /// EXIT CRITERION 3 — typing `@` opens a completion popup listing a real temp
     /// directory's contents.
     @Test

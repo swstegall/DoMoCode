@@ -33,8 +33,17 @@ public func calculateContextTokens(_ usage: Usage) -> Int {
     usage.totalTokens
 }
 
+/// A per-image proxy for vision-token cost, in the pre-divide character unit this
+/// estimate accumulates. The real cost is model-dependent (tile-based on OpenAI,
+/// area-based on Anthropic) and unknowable behind the gateway, so one conservative
+/// constant stands in: roughly 1,500 tokens' worth, deliberately high — an image
+/// that counted as zero is exactly how an image-bearing tail slips a request past
+/// the window.
+private let imageEstimatedChars = 6_000
+
 /// A conservative per-message token estimate: characters divided by four, rounded
-/// up, summed over the content this port can carry.
+/// up, summed over the content this port can carry — images included, as a fixed
+/// per-attachment proxy (see ``imageEstimatedChars``).
 ///
 /// It exists for the messages a request has not yet been billed for — the tail
 /// after the last assistant ``Usage`` — where there is no provider number to
@@ -46,8 +55,12 @@ public func estimateTokens(_ message: Message) -> Int {
     case .system(let system):
         chars = system.content.count
     case .user(let user):
-        for block in user.content where block.textBlock != nil {
-            chars += block.textBlock?.text.count ?? 0
+        for block in user.content {
+            if let text = block.textBlock {
+                chars += text.text.count
+            } else if block.imageBlock != nil {
+                chars += imageEstimatedChars
+            }
         }
     case .assistant(let assistant):
         for block in assistant.content {
@@ -56,10 +69,11 @@ public func estimateTokens(_ message: Message) -> Int {
             case .reasoning(let reasoning): chars += reasoning.text.count
             case .toolCall(let call): chars += call.name.count + argumentsJSON(call.arguments).count
             case .toolResult: break
+            case .image: chars += imageEstimatedChars
             }
         }
     case .tool(let result):
-        chars = result.output.count
+        chars = result.output.count + result.images.count * imageEstimatedChars
     }
     // Integer ceil(chars / 4), matching pi's `Math.ceil(chars / 4)` without ever
     // touching floating point.

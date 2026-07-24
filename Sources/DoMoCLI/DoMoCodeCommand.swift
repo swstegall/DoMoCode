@@ -67,6 +67,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     )
     public var prompt: String?
 
+    @Option(
+        name: .customLong("image"),
+        help: "Attach an image file to the -p prompt (PNG, JPEG, GIF, WebP, BMP). Repeatable."
+    )
+    public var images: [String] = []
+
     @Option(name: .customLong("model"), help: "Public model alias as configured on the proxy.")
     public var model: String?
 
@@ -192,6 +198,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionDirectory: configuration.sessionDirectory
         )
 
+        // `--image` attaches to a `-p` prompt; interactive sessions reference
+        // images inline with `@path`, so an image flag with no prompt is a usage
+        // error rather than a silently ignored argument.
+        if !images.isEmpty, prompt?.isEmpty ?? true {
+            throw DoMoError(
+                .configuration,
+                "--image requires -p; in an interactive session, reference an image with @path instead."
+            )
+        }
+
         // No `-p`: run the interactive REPL. The heavy dependencies (tools, the
         // sandboxed context, the harness) are built behind ``InteractiveMode/make``,
         // and the live terminal collaborators are assembled on the main actor so
@@ -230,10 +246,44 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionDirectory: configuration.sessionDirectory
         )
 
-        let code = try await printMode.run(prompt: prompt)
+        let attachments = try Self.loadImageAttachments(images)
+        let code = try await printMode.run(prompt: prompt, attachments: attachments)
         if code != 0 {
             throw ExitCode(code)
         }
+    }
+
+    /// Reads each `--image` path into an ``ImageBlock``, sniffing its media type
+    /// from the leading bytes rather than trusting the extension.
+    ///
+    /// A path that is missing, unreadable, or not a supported image is a hard,
+    /// message-bearing error: a scripted caller that asked to attach an image
+    /// should hear that it could not, not have the attachment silently dropped and
+    /// send the model a prompt that references a picture it never received. Read
+    /// through Foundation rather than the tool sandbox, because a `--image`
+    /// argument is trusted operator input and may name a file outside the project.
+    static func loadImageAttachments(_ paths: [String]) throws(DoMoError) -> [ImageBlock] {
+        var blocks: [ImageBlock] = []
+        for path in paths {
+            let bytes: Data
+            do {
+                bytes = try Data(contentsOf: URL(fileURLWithPath: path))
+            } catch {
+                throw DoMoError(
+                    .file(path: FilePath(path), errno: nil),
+                    "Could not read --image file \"\(path)\"",
+                    cause: error
+                )
+            }
+            guard let mediaType = FileContentProbe.imageMediaType(bytes) else {
+                throw DoMoError(
+                    .configuration,
+                    "--image file \"\(path)\" is not a supported image (PNG, JPEG, GIF, WebP, or BMP)."
+                )
+            }
+            blocks.append(ImageBlock(mediaType: mediaType, data: bytes))
+        }
+        return blocks
     }
 
     /// Assemble the live terminal collaborators on the main actor and run the REPL.

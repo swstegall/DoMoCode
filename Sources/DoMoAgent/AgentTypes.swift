@@ -88,11 +88,23 @@ public struct AgentToolResult: Sendable, Hashable {
     /// Arbitrary structured data for a renderer. Never sent to the model.
     public var details: JSONValue
 
-    public init(output: String, isError: Bool = false, terminate: Bool = false, details: JSONValue = .null) {
+    /// Image attachments the tool produced, carried to the model through
+    /// ``ToolResultBlock/images``. Empty for text-only results — nearly all of
+    /// them — and left untouched by the synthetic results the loop fabricates.
+    public var images: [ImageBlock]
+
+    public init(
+        output: String,
+        isError: Bool = false,
+        terminate: Bool = false,
+        details: JSONValue = .null,
+        images: [ImageBlock] = []
+    ) {
         self.output = output
         self.isError = isError
         self.terminate = terminate
         self.details = details
+        self.images = images
     }
 }
 

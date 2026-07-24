@@ -19,14 +19,19 @@ import Foundation
 /// does not enforce either. One flat enum, with the per-role subsets documented
 /// on the message types, is the trade taken here.
 ///
-/// Image content is deliberately absent. DoMoCode's tool surface is textual, and
-/// a block kind nothing produces is a block kind every renderer and every
-/// serializer still has to handle.
+/// Image content rides here now, but only inbound. An ``ImageBlock`` reaches the
+/// model two ways — a user attachment on a ``UserMessage``, and an image a tool
+/// produced, carried on ``ToolResultBlock/images`` — and nothing on the assistant
+/// side ever emits one, because models behind the gateway answer in text. A
+/// renderer that cannot draw images may ignore the case; what it may not do is
+/// fail to round-trip it, since a persisted session now depends on the block
+/// surviving a decode.
 public enum ContentBlock: Sendable, Hashable {
     case text(TextBlock)
     case reasoning(ReasoningBlock)
     case toolCall(ToolCallBlock)
     case toolResult(ToolResultBlock)
+    case image(ImageBlock)
 }
 
 extension ContentBlock {
@@ -53,6 +58,11 @@ extension ContentBlock {
         if case .toolResult(let block) = self { return block }
         return nil
     }
+
+    public var imageBlock: ImageBlock? {
+        if case .image(let block) = self { return block }
+        return nil
+    }
 }
 
 public struct TextBlock: Sendable, Hashable, Codable {
@@ -60,6 +70,66 @@ public struct TextBlock: Sendable, Hashable, Codable {
 
     public init(text: String) {
         self.text = text
+    }
+}
+
+/// Raw image bytes tagged with their media type, for a vision-capable model
+/// behind the gateway to read.
+///
+/// The bytes are held decoded — not as the `data:` URL the wire wants — because
+/// that URL is a wire detail, reconstructable on demand via ``dataURL``. Storing
+/// it instead would bake base64 padding and the media-type prefix into every
+/// equality check and every persisted line.
+///
+/// `Codable` is written by hand to serialize ``data`` as a base64 *string* under
+/// a stable key, rather than trusting whatever `dataEncodingStrategy` the active
+/// encoder carries. The persistence encoder in DoMoCore's `JSONLines` sets none,
+/// and Foundation's default there is a JSON array of byte integers — bulky and
+/// silently coupled to an encoder setting no reader can see. A self-describing
+/// base64 string is the same shape on disk and on the wire.
+public struct ImageBlock: Sendable, Hashable {
+    /// An IANA media type such as `image/png` or `image/jpeg`.
+    public var mediaType: String
+
+    /// The raw, decoded image bytes.
+    public var data: Data
+
+    public init(mediaType: String, data: Data) {
+        self.mediaType = mediaType
+        self.data = data
+    }
+
+    /// The OpenAI `image_url` data-URL form, `data:<mediaType>;base64,<bytes>`,
+    /// used only when this block is flattened into a wire content-part array.
+    public var dataURL: String {
+        "data:\(mediaType);base64,\(data.base64EncodedString())"
+    }
+}
+
+extension ImageBlock: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case mediaType
+        case data
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mediaType = try container.decode(String.self, forKey: .mediaType)
+        let base64 = try container.decode(String.self, forKey: .data)
+        guard let decoded = Data(base64Encoded: base64) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .data,
+                in: container,
+                debugDescription: "Image data is not valid base64"
+            )
+        }
+        data = decoded
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(mediaType, forKey: .mediaType)
+        try container.encode(data.base64EncodedString(), forKey: .data)
     }
 }
 
@@ -116,11 +186,23 @@ public struct ToolResultBlock: Sendable, Hashable, Codable {
     public var output: String
     public var isError: Bool
 
-    public init(toolCallID: String, toolName: String, output: String, isError: Bool = false) {
+    /// Images the tool produced, threaded to a vision model through a hoisted
+    /// user turn — the `tool` role cannot carry image parts on the wire. Empty
+    /// for the textual results that are the overwhelming norm.
+    public var images: [ImageBlock]
+
+    public init(
+        toolCallID: String,
+        toolName: String,
+        output: String,
+        isError: Bool = false,
+        images: [ImageBlock] = []
+    ) {
         self.toolCallID = toolCallID
         self.toolName = toolName
         self.output = output
         self.isError = isError
+        self.images = images
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -128,6 +210,31 @@ public struct ToolResultBlock: Sendable, Hashable, Codable {
         case toolName
         case output
         case isError
+        case images
+    }
+
+    /// Hand-written so the on-disk shape stays backward-compatible: sessions
+    /// written before images existed have no `images` key (hence
+    /// `decodeIfPresent`), and a result with no images omits the key on encode,
+    /// leaving every existing tool-result line byte-for-byte unchanged.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        toolCallID = try container.decode(String.self, forKey: .toolCallID)
+        toolName = try container.decode(String.self, forKey: .toolName)
+        output = try container.decode(String.self, forKey: .output)
+        isError = try container.decode(Bool.self, forKey: .isError)
+        images = try container.decodeIfPresent([ImageBlock].self, forKey: .images) ?? []
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(toolCallID, forKey: .toolCallID)
+        try container.encode(toolName, forKey: .toolName)
+        try container.encode(output, forKey: .output)
+        try container.encode(isError, forKey: .isError)
+        if !images.isEmpty {
+            try container.encode(images, forKey: .images)
+        }
     }
 }
 
@@ -139,6 +246,7 @@ extension ContentBlock: Codable {
         case reasoning
         case toolCall
         case toolResult
+        case image
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -152,6 +260,7 @@ extension ContentBlock: Codable {
         case .reasoning: self = .reasoning(try ReasoningBlock(from: decoder))
         case .toolCall: self = .toolCall(try ToolCallBlock(from: decoder))
         case .toolResult: self = .toolResult(try ToolResultBlock(from: decoder))
+        case .image: self = .image(try ImageBlock(from: decoder))
         }
     }
 
@@ -169,6 +278,9 @@ extension ContentBlock: Codable {
             try block.encode(to: encoder)
         case .toolResult(let block):
             try container.encode(Kind.toolResult, forKey: .type)
+            try block.encode(to: encoder)
+        case .image(let block):
+            try container.encode(Kind.image, forKey: .type)
             try block.encode(to: encoder)
         }
     }

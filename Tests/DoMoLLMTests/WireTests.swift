@@ -467,6 +467,109 @@ struct RequestTests {
         #expect(message.role == .developer)
         #expect(message.role.rawValue == "developer")
     }
+
+    // The 8-byte PNG signature, reused across the image cases below.
+    private static let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    private static var pngDataURL: String {
+        "data:image/png;base64,\(png.base64EncodedString())"
+    }
+
+    @Test("A user message with an image encodes content as a typed parts array")
+    func userImageContentParts() throws {
+        let context = Context(
+            messages: [
+                .user(
+                    UserMessage(content: [
+                        .text("what is this"),
+                        .image(ImageBlock(mediaType: "image/png", data: Self.png)),
+                    ])
+                )
+            ]
+        )
+        let json = try encoded(ChatCompletionRequest(model: "m", context: context))
+        #expect(json["messages"]?[0]?["role"] == "user")
+        let content = json["messages"]?[0]?["content"]
+        #expect(content?[0]?["type"] == "text")
+        #expect(content?[0]?["text"] == "what is this")
+        let last = content?[1]
+        #expect(last?["type"] == "image_url")
+        #expect(last?["image_url"]?["url"] == .string(Self.pngDataURL))
+    }
+
+    @Test("A user message with no images still encodes content as a plain string")
+    func userNoImagesPlainString() throws {
+        let json = try encoded(
+            ChatCompletionRequest(model: "m", context: Context(messages: [.user("hi")]))
+        )
+        #expect(json["messages"]?[0]?["content"] == "hi")
+    }
+
+    @Test("An assistant text turn still encodes content as a plain string, never an array")
+    func assistantPlainStringInvariant() throws {
+        let context = Context(
+            messages: [
+                .assistant(AssistantMessage(content: [.text("done")], model: "m", stopReason: .stop))
+            ]
+        )
+        let json = try encoded(ChatCompletionRequest(model: "m", context: context))
+        #expect(json["messages"]?[0]?["content"] == "done")
+    }
+
+    @Test("A tool result with images encodes as a tool message plus a hoisted user message")
+    func toolResultImagesHoisted() throws {
+        let wire = WireMessage.encoding(
+            .tool(
+                ToolResultBlock(
+                    toolCallID: "c1",
+                    toolName: "screenshot",
+                    output: "",
+                    images: [ImageBlock(mediaType: "image/png", data: Self.png)]
+                )
+            )
+        )
+        #expect(wire.count == 2)
+        #expect(wire[0].role == .tool)
+        #expect(wire[0].content == "(see attached image)")
+        #expect(wire[0].toolCallID == "c1")
+
+        #expect(wire[1].role == .user)
+        let json = try JSONValue(parsing: try JSONEncoder().encode(wire[1]))
+        #expect(json["content"]?[0]?["type"] == "text")
+        let image = json["content"]?[1]
+        #expect(image?["type"] == "image_url")
+        #expect(image?["image_url"]?["url"] == .string(Self.pngDataURL))
+    }
+
+    @Test("includeImageContent:false strips image parts and drops the tool hoist")
+    func includeImageContentFalse() throws {
+        let userWire = WireMessage.encoding(
+            .user(
+                UserMessage(content: [
+                    .text("hi"),
+                    .image(ImageBlock(mediaType: "image/png", data: Self.png)),
+                ])
+            ),
+            includeImageContent: false
+        )
+        #expect(userWire.count == 1)
+        #expect(userWire[0].contentParts == nil)
+        #expect(userWire[0].content == "hi")
+
+        let toolWire = WireMessage.encoding(
+            .tool(
+                ToolResultBlock(
+                    toolCallID: "c1",
+                    toolName: "screenshot",
+                    output: "text",
+                    images: [ImageBlock(mediaType: "image/png", data: Self.png)]
+                )
+            ),
+            includeImageContent: false
+        )
+        #expect(toolWire.count == 1)
+        #expect(toolWire[0].role == .tool)
+        #expect(toolWire[0].content == "text")
+    }
 }
 
 @Suite("Wire — non-streaming responses")

@@ -311,7 +311,8 @@ struct ToolDispatch: Sendable {
             toolCallID: finalized.toolCall.id,
             toolName: finalized.toolCall.name,
             output: finalized.result.output,
-            isError: finalized.result.isError
+            isError: finalized.result.isError,
+            images: finalized.result.images
         )
         await sink.emit(.messageStart(.tool(block)))
         await sink.emit(.messageEnd(.tool(block)))

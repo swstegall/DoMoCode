@@ -244,6 +244,11 @@ final class InteractiveCoordinator {
     private let idleStatus = "  @ file · / command · enter to send · esc to interrupt"
     private let runningStatus = "  ⋯ working — esc to interrupt"
 
+    /// The sandboxed filesystem, for resolving `@path` image mentions into
+    /// attachments at submit time. `nil` in tests that drive the coordinator
+    /// without a real tool context, which simply attach nothing.
+    private let fileSystem: SandboxedFileSystem?
+
     init(
         tui: TUI,
         driver: TerminalDriver,
@@ -254,6 +259,7 @@ final class InteractiveCoordinator {
         toolTheme: ToolRenderTheme,
         homeDirectory: String?,
         steering: SteeringBox,
+        fileSystem: SandboxedFileSystem? = nil,
         terminalRows: @escaping () -> Int,
         keybindings: Keybindings = Keybindings()
     ) {
@@ -262,6 +268,7 @@ final class InteractiveCoordinator {
         self.quit = quit
         self.harness = harness
         self.steering = steering
+        self.fileSystem = fileSystem
         self.provider = provider
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
@@ -556,10 +563,15 @@ final class InteractiveCoordinator {
         statusLine.text = runningStatus
         render()
 
+        // Resolve any `@path` image mentions into attachments before the turn —
+        // off the main actor (the read is `@concurrent`), so a large image does not
+        // stall the renderer. The `@token` stays in the prompt as the reference.
+        let attachments = await Self.extractImageAttachments(from: prompt, fileSystem: fileSystem)
+
         let sink = InteractiveEventSink(coordinator: self)
         let task = Task { @MainActor () -> RunStopReason in
             do {
-                let result = try await self.harness.run(prompt: prompt, sink: sink)
+                let result = try await self.harness.run(prompt: prompt, attachments: attachments, sink: sink)
                 return result.stopReason
             } catch is CancellationError {
                 return .aborted
@@ -590,6 +602,39 @@ final class InteractiveCoordinator {
             appendInterrupted()
         }
         render()
+    }
+
+    /// Resolve `@path` image mentions in a submitted line into image attachments.
+    ///
+    /// `@path` is the same file affordance the completion popup offers; when a
+    /// mention names a readable image inside the sandbox, its bytes ride along as
+    /// an attachment while the `@token` stays in the text as the model's reference.
+    /// A non-image, a missing path, or a sandbox escape resolves to nothing — an
+    /// `@` mention is a hint, not a promise, and a bad one must never fail the turn.
+    /// Trailing sentence punctuation on a token is stripped so `@shot.png,` still
+    /// resolves; duplicate mentions attach once.
+    ///
+    /// `@concurrent` so the reads run off the main actor: this is called from the
+    /// main-actor run loop and a multi-megabyte image must not stall the renderer.
+    @concurrent
+    static func extractImageAttachments(
+        from text: String,
+        fileSystem: SandboxedFileSystem?
+    ) async -> [ImageBlock] {
+        guard let fileSystem else { return [] }
+        var blocks: [ImageBlock] = []
+        var seen: Set<String> = []
+        for token in text.split(whereSeparator: \.isWhitespace) {
+            guard token.first == "@", token.count > 1 else { continue }
+            var path = String(token.dropFirst())
+            while let last = path.last, ".,;:!?)]}\"'".contains(last) { path.removeLast() }
+            guard !path.isEmpty, seen.insert(path).inserted else { continue }
+            guard let bytes = try? await fileSystem.read(FilePath(path)),
+                let mediaType = FileContentProbe.imageMediaType(bytes)
+            else { continue }
+            blocks.append(ImageBlock(mediaType: mediaType, data: bytes))
+        }
+        return blocks
     }
 
     // MARK: Event handling
@@ -702,6 +747,9 @@ public struct InteractiveMode: Sendable {
     /// whose `getSteeringMessages` drains it, then handed to the coordinator whose
     /// submit-while-running appends to it — one instance bridging both.
     private let steering: SteeringBox
+    /// The sandboxed filesystem behind the tool context, carried through to the
+    /// coordinator so a submitted `@path` image mention can be read and attached.
+    private let fileSystem: SandboxedFileSystem?
 
     private init(
         harness: AgentHarness,
@@ -710,7 +758,8 @@ public struct InteractiveMode: Sendable {
         homeDirectory: String?,
         toolRendererRegistry: ToolRendererRegistry,
         toolTheme: ToolRenderTheme,
-        steering: SteeringBox
+        steering: SteeringBox,
+        fileSystem: SandboxedFileSystem? = nil
     ) {
         self.harness = harness
         self.directoryLister = directoryLister
@@ -719,6 +768,7 @@ public struct InteractiveMode: Sendable {
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
         self.steering = steering
+        self.fileSystem = fileSystem
     }
 
     /// The small, deliberately-minimal slash-command palette. Argument completion
@@ -801,7 +851,8 @@ public struct InteractiveMode: Sendable {
             homeDirectory: homeDirectory,
             toolRendererRegistry: .builtin,
             toolTheme: toolTheme,
-            steering: steering
+            steering: steering,
+            fileSystem: toolContext.fileSystem
         )
     }
 
@@ -865,6 +916,7 @@ public struct InteractiveMode: Sendable {
             toolTheme: toolTheme,
             homeDirectory: homeDirectory,
             steering: steering,
+            fileSystem: fileSystem,
             terminalRows: { target.rows }
         )
         coordinator.install()

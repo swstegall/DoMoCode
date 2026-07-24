@@ -119,7 +119,15 @@ struct RegistryTool: AgentTool {
         // cancellation escapes, and the loop turns that into an aborted result.
         // No built-in tool sets `terminate`; the print run has no early-stop tool.
         let result = try await tool.execute(arguments, in: context)
-        return AgentToolResult(output: result.text, isError: result.isError, details: result.details)
+        // Image attachments a tool produced (e.g. `read` on a PNG) ride through to
+        // the model; the wire layer hoists them into a synthetic user turn, since
+        // the OpenAI `tool` role cannot carry image parts. Phase 5.5.
+        return AgentToolResult(
+            output: result.text,
+            isError: result.isError,
+            details: result.details,
+            images: result.images.map { ImageBlock(mediaType: $0.mediaType, data: $0.data) }
+        )
     }
 }
 
@@ -393,7 +401,7 @@ public struct PrintMode: Sendable {
     /// record the transcript. Those are real ``DoMoError``s the command turns
     /// into a non-zero exit — a run that could not persist must not report
     /// success.
-    public func run(prompt: String) async throws -> Int32 {
+    public func run(prompt: String, attachments: [ImageBlock] = []) async throws -> Int32 {
         let tools = agentTools
 
         // One shared counter across the run's LLM calls, and one guard that lets
@@ -427,7 +435,7 @@ public struct PrintMode: Sendable {
             runGuard: runGuard
         )
 
-        let result = try await harness.run(prompt: prompt, sink: sink)
+        let result = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
         return finish(result: result, turns: turnCounter.value)
     }
 
