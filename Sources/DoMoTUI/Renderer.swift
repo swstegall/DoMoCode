@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT
 //
 // Ported to Swift from the Pi Agent Harness. `RenderCore` ports `TUI.doRender`
-// and its diff bookkeeping verbatim; the Kitty-image handling is dropped (no
-// image pipeline exists yet), which collapses pi's image-reserved-row loops to
-// single-line handling and removes the `previousKittyImageIds` tracking.
+// and its diff bookkeeping verbatim, including pi's Kitty-image handling (Phase
+// 7.5): image lines are opaque, reserve `r=N` rows via cursor motion, and their
+// pixels are cleared with the delete-by-id command rather than a cell erase, so
+// `previousKittyImageIds` is tracked across frames.
 
 import DoMoCore
+import DoMoTermGraphics
 import DoMoTermIO
 import Foundation
 
@@ -94,6 +96,11 @@ public struct RenderCore {
     var maxLinesRendered = 0
     var previousViewportTop = 0
     private(set) var fullRedrawCount = 0
+    /// The Kitty image ids emitted last frame. A cell erase (`\u{1b}[2K`) does not
+    /// touch the graphics layer, so an image's pixels are removed with the
+    /// delete-by-id command; this is the set to delete when the images leave the
+    /// changed range or the screen is cleared.
+    var previousKittyImageIds: Set<UInt32> = []
 
     /// Move the real cursor to the caret (IME) position each frame.
     public var showHardwareCursor: Bool
@@ -142,10 +149,81 @@ public struct RenderCore {
         return nil
     }
 
-    /// Append the per-line reset to every line (after normalization). Ports
-    /// `applyLineResets` sans the image guard, since no line is ever an image.
+    /// Append the per-line reset to every line (after normalization), except image
+    /// lines — normalizing or appending a reset inside an opaque graphics escape
+    /// would corrupt it. Ports `applyLineResets`.
     func applyLineResets(_ lines: [String]) -> [String] {
-        lines.map { normalizeTerminalOutput($0) + RenderCore.segmentReset }
+        lines.map { isImageLine($0) ? $0 : normalizeTerminalOutput($0) + RenderCore.segmentReset }
+    }
+
+    // MARK: Kitty image bookkeeping
+
+    /// Every Kitty image id present across `lines`.
+    func collectKittyImageIds(_ lines: [String]) -> Set<UInt32> {
+        var ids: Set<UInt32> = []
+        for line in lines {
+            if let id = parseKittyImageHeader(line)?.imageId, id > 0 { ids.insert(id) }
+        }
+        return ids
+    }
+
+    /// Emit a delete-by-id for every id — the graphics-layer erase a cell clear
+    /// cannot do.
+    func deleteKittyImages(_ ids: some Sequence<UInt32>) -> String {
+        ids.reduce("") { $0 + deleteKittyImage($1) }
+    }
+
+    /// How many rows the image at `index` reserves: its declared `r=N`, capped by
+    /// the blank rows actually following it (an image occupies its escape line plus
+    /// the blank lines below, up to `maxIndex`). Ports getKittyImageReservedRows.
+    func imageReservedRows(_ lines: [String], _ index: Int, maxIndex: Int) -> Int {
+        guard index >= 0, index < lines.count else { return 1 }
+        let declared = parseKittyImageHeader(lines[index])?.rows ?? 1
+        if declared <= 1 { return 1 }
+        let maxRows = min(declared, maxIndex - index + 1, lines.count - index)
+        var reserved = 1
+        while reserved < maxRows {
+            let line = index + reserved < lines.count ? lines[index + reserved] : ""
+            if isImageLine(line) || visibleWidth(line) > 0 { break }
+            reserved += 1
+        }
+        return reserved
+    }
+
+    /// Grow `[firstChanged, lastChanged]` to fully contain any image block it
+    /// overlaps in the previous OR the new frame — an image can only be re-emitted
+    /// whole, never partially rewritten. Ports expandChangedRangeForKittyImages.
+    func expandChangedRangeForImages(firstChanged: Int, lastChanged: Int, newLines: [String]) -> (first: Int, last: Int) {
+        var first = firstChanged
+        var last = lastChanged
+        func expand(_ lines: [String]) {
+            for i in lines.indices {
+                guard let id = parseKittyImageHeader(lines[i])?.imageId, id > 0 else { continue }
+                let blockEnd = i + imageReservedRows(lines, i, maxIndex: lines.count - 1) - 1
+                if i >= firstChanged || (i <= lastChanged && blockEnd >= firstChanged) {
+                    first = min(first, i)
+                    last = max(last, blockEnd)
+                }
+            }
+        }
+        expand(previousLines)
+        expand(newLines)
+        return (first, last)
+    }
+
+    /// Delete the images that occupied `[firstChanged, lastChanged]` last frame, so
+    /// re-rendering the changed range leaves no stale pixels. Ports
+    /// deleteChangedKittyImages.
+    func deleteChangedKittyImages(firstChanged: Int, lastChanged: Int) -> String {
+        guard firstChanged >= 0, lastChanged >= firstChanged else { return "" }
+        var ids: Set<UInt32> = []
+        let maxLine = min(lastChanged, previousLines.count - 1)
+        if firstChanged <= maxLine {
+            for i in firstChanged...maxLine {
+                if let id = parseKittyImageHeader(previousLines[i])?.imageId, id > 0 { ids.insert(id) }
+            }
+        }
+        return deleteKittyImages(ids)
     }
 
     // MARK: Full render
@@ -160,11 +238,30 @@ public struct RenderCore {
         fullRedrawCount += 1
         var buffer = "\u{1b}[?2026h" // Begin synchronized output
         if clear {
+            // Free the graphics layer before wiping the cells; `\u{1b}[2J` alone
+            // leaves the old Kitty pixels behind.
+            buffer += deleteKittyImages(previousKittyImageIds)
             buffer += "\u{1b}[2J\u{1b}[H\u{1b}[3J" // Clear screen, home, clear scrollback
         }
-        for i in newLines.indices {
+        var i = 0
+        while i < newLines.count {
             if i > 0 { buffer += "\r\n" }
-            buffer += newLines[i]
+            let line = newLines[i]
+            let reserved = isImageLine(line) ? imageReservedRows(newLines, i, maxIndex: newLines.count - 1) : 1
+            if reserved > 1, reserved <= height {
+                // Open up `reserved` rows, move back to the top of them, place the
+                // image (Kitty paints downward), then move to the block's bottom so
+                // the next line lands below the image — keeping cursorRow in logical
+                // rows despite the extra physical rows.
+                for _ in 1..<reserved { buffer += "\r\n" }
+                buffer += "\u{1b}[\(reserved - 1)A"
+                buffer += line
+                buffer += "\u{1b}[\(reserved - 1)B"
+                i += reserved
+                continue
+            }
+            buffer += line
+            i += 1
         }
         buffer += "\u{1b}[?2026l" // End synchronized output
         cursorRow = max(0, newLines.count - 1)
@@ -178,6 +275,7 @@ public struct RenderCore {
         previousViewportTop = max(0, bufferLength - height)
         buffer += positionHardwareCursor(cursorPos, totalLines: newLines.count)
         previousLines = newLines
+        previousKittyImageIds = collectKittyImageIds(newLines)
         previousWidth = width
         previousHeight = height
         return buffer
@@ -234,6 +332,9 @@ public struct RenderCore {
         // shrink) are covered too, so this is the renderer's real safety net
         // against a component that failed to truncate its output.
         for i in newLines.indices {
+            // Image lines are opaque graphics escapes — thousands of bytes that
+            // occupy zero cells on their own line — so the width check skips them.
+            if isImageLine(newLines[i]) { continue }
             let lineWidth = visibleWidth(newLines[i])
             if lineWidth > width {
                 throw DoMoError(
@@ -292,6 +393,13 @@ public struct RenderCore {
             if firstChanged == -1 { firstChanged = previousLines.count }
             lastChanged = newLines.count - 1
         }
+        // Any change touching an image block expands the range to the whole block —
+        // an image is re-emitted whole or not at all.
+        if firstChanged != -1 {
+            let expanded = expandChangedRangeForImages(firstChanged: firstChanged, lastChanged: lastChanged, newLines: newLines)
+            firstChanged = expanded.first
+            lastChanged = expanded.last
+        }
         let appendStart = appendedLines && firstChanged == previousLines.count && firstChanged > 0
 
         // No changes — only the hardware cursor may need repositioning.
@@ -307,6 +415,7 @@ public struct RenderCore {
             var buffer = ""
             if previousLines.count > newLines.count {
                 buffer = "\u{1b}[?2026h"
+                buffer += deleteChangedKittyImages(firstChanged: firstChanged, lastChanged: lastChanged)
                 let targetRow = max(0, newLines.count - 1)
                 if targetRow < prevViewportTop {
                     return fullRender(clear: true, newLines: newLines, width: width, height: height, cursorPos: cursorPos)
@@ -332,6 +441,7 @@ public struct RenderCore {
             }
             buffer += positionHardwareCursor(cursorPos, totalLines: newLines.count)
             previousLines = newLines
+            previousKittyImageIds = collectKittyImageIds(newLines)
             previousWidth = width
             previousHeight = height
             previousViewportTop = prevViewportTop
@@ -346,6 +456,7 @@ public struct RenderCore {
 
         // Strategy 3: normal differential update.
         var buffer = "\u{1b}[?2026h"
+        buffer += deleteChangedKittyImages(firstChanged: firstChanged, lastChanged: lastChanged)
         let prevViewportBottom = prevViewportTop + height - 1
         let moveTargetRow = appendStart ? firstChanged - 1 : firstChanged
         if moveTargetRow > prevViewportBottom {
@@ -367,23 +478,45 @@ public struct RenderCore {
 
         // Rewrite only firstChanged..renderEnd, not everything to the end.
         let renderEnd = min(lastChanged, newLines.count - 1)
-        for i in firstChanged...renderEnd {
+        var i = firstChanged
+        while i <= renderEnd {
             if i > firstChanged { buffer += "\r\n" }
             let line = newLines[i]
+            let isImage = isImageLine(line)
+            let reserved = isImage ? imageReservedRows(newLines, i, maxIndex: renderEnd) : 1
+            if reserved > 1 {
+                // A multi-row image must fit within the viewport, or clearing the
+                // rows below it would scroll and smear the pixels — bail to a full
+                // redraw, exactly as pi does.
+                let imageStartScreenRow = i - viewportTop
+                if imageStartScreenRow < 0 || imageStartScreenRow + reserved > height {
+                    return fullRender(clear: true, newLines: newLines, width: width, height: height, cursorPos: cursorPos)
+                }
+                buffer += "\u{1b}[2K"
+                for _ in 1..<reserved { buffer += "\r\n\u{1b}[2K" }
+                buffer += "\u{1b}[\(reserved - 1)A"
+                buffer += line
+                buffer += "\u{1b}[\(reserved - 1)B"
+                i += reserved
+                continue
+            }
             buffer += "\u{1b}[2K" // Clear current line
-            let lineWidth = visibleWidth(line)
-            if lineWidth > width {
-                // FATAL: an over-wide line shifts every following column. pi dumps
-                // a crash log, stops, and throws; we throw a catchable DoMoError
-                // rather than trapping in release.
-                throw DoMoError(
-                    .malformedResponse,
-                    "Rendered line \(i) exceeds terminal width (\(lineWidth) > \(width)). "
-                        + "A component did not truncate its output; measure with visibleWidth() "
-                        + "and clip with truncateToWidth()."
-                )
+            if !isImage {
+                let lineWidth = visibleWidth(line)
+                if lineWidth > width {
+                    // FATAL: an over-wide line shifts every following column. pi
+                    // dumps a crash log, stops, and throws; we throw a catchable
+                    // DoMoError rather than trapping in release.
+                    throw DoMoError(
+                        .malformedResponse,
+                        "Rendered line \(i) exceeds terminal width (\(lineWidth) > \(width)). "
+                            + "A component did not truncate its output; measure with visibleWidth() "
+                            + "and clip with truncateToWidth()."
+                    )
+                }
             }
             buffer += line
+            i += 1
         }
 
         var finalCursorRow = renderEnd
@@ -409,6 +542,7 @@ public struct RenderCore {
         buffer += positionHardwareCursor(cursorPos, totalLines: newLines.count)
 
         previousLines = newLines
+        previousKittyImageIds = collectKittyImageIds(newLines)
         previousWidth = width
         previousHeight = height
         return buffer

@@ -8,6 +8,7 @@
 // state machine all track `TUI`'s overlay code; the Kitty-image guards are
 // dropped (no line is ever an image in this phase).
 
+import DoMoTermGraphics
 import Foundation
 
 // MARK: - Overlay geometry
@@ -354,6 +355,9 @@ func compositeLineAt(
     overlayWidth: Int,
     totalWidth: Int
 ) -> String {
+    // An image line is an opaque graphics escape; slicing it to splice an overlay
+    // in would corrupt the payload. Leave it whole (pi's compositeLineAt guard).
+    if isImageLine(baseLine) { return baseLine }
     let afterStart = startCol + overlayWidth
     let base = extractSegments(
         baseLine,

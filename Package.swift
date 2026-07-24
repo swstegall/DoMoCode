@@ -105,6 +105,7 @@ let package = Package(
             dependencies: [
                 "DoMoCore",
                 "DoMoTermIO",
+                "DoMoTermGraphics",
                 .product(name: "DisplayWidth", package: "swift-displaywidth"),
                 .product(name: "Markdown", package: "swift-markdown"),
             ],
@@ -307,7 +308,7 @@ let package = Package(
         .testTarget(
             name: "DoMoTUITests",
             dependencies: [
-                "DoMoTUI", "DoMoTermIO", "DoMoCore",
+                "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoCore",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
             swiftSettings: baseSettings
