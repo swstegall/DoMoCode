@@ -111,6 +111,19 @@ let package = Package(
             swiftSettings: safeSettings + [.defaultIsolation(MainActor.self)]
         ),
 
+        // MARK: Terminal graphics
+
+        // Inline terminal image display (Phase 7.5), a faithful port of pi's
+        // terminal-image.ts: capability detection, the Kitty + iTerm2 image
+        // encoders, header-only pixel-dimension parsers, and cell sizing. Pure and
+        // dependency-light (Foundation + Synchronization) — no TUI, no POSIX; the
+        // cell pixel size is injected via setCellDimensions by whoever owns the tty.
+        .target(
+            name: "DoMoTermGraphics",
+            dependencies: ["DoMoCore"],
+            swiftSettings: safeSettings
+        ),
+
         // MARK: Model access
 
         .target(
@@ -247,6 +260,12 @@ let package = Package(
         .testTarget(
             name: "DoMoLLMTests",
             dependencies: ["DoMoLLM", "DoMoCore"],
+            swiftSettings: safeSettings
+        ),
+
+        .testTarget(
+            name: "DoMoTermGraphicsTests",
+            dependencies: ["DoMoTermGraphics", "DoMoCore"],
             swiftSettings: safeSettings
         ),
 
