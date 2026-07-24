@@ -13,7 +13,7 @@ import Foundation
 import Logging
 import SystemPackage
 
-/// The `domocode` command-line root.
+/// The `domo` command-line root.
 ///
 /// Two modes: with `-p` it runs a single non-interactive ``PrintMode`` turn and
 /// exits; with no `-p` it launches the interactive REPL (``InteractiveMode``).
@@ -30,10 +30,10 @@ import SystemPackage
 public struct DoMoCodeCommand: AsyncParsableCommand {
 
     public static let configuration = CommandConfiguration(
-        commandName: "domocode",
+        commandName: "domo",
         abstract: "A terminal coding-agent harness that talks to a LiteLLM gateway.",
         discussion: """
-            Two modes. With no -p, domocode opens an INTERACTIVE session: a live transcript with \
+            Two modes. With no -p, domo opens an INTERACTIVE session: a live transcript with \
             streaming model output, @ file completion, Escape to abort a running turn, and Enter to \
             queue a follow-up. It needs a real terminal. With -p "<prompt>" it runs a single \
             NON-INTERACTIVE turn against the configured LiteLLM proxy and prints the model's final \
@@ -54,7 +54,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             not a session is a hard error (non-zero exit).
 
             PROJECT TRUST. When the current directory carries a .domocode/settings.json — which can \
-            redirect the model, the proxy, and where sessions are written — domocode refuses to run \
+            redirect the model, the proxy, and where sessions are written — domo refuses to run \
             until the directory is trusted. Print mode cannot prompt, so pass --trust once to record \
             trust (in <config-dir>/trust.json, keyed by resolved path; a trusted directory also \
             trusts its subdirectories). A directory with no such project file needs no trust.

@@ -44,14 +44,14 @@ struct ProcessRunResult {
     let standardError: String
 }
 
-/// The directory holding the built products, so the `domocode` executable can be
+/// The directory holding the built products, so the `domo` executable can be
 /// found next to the test bundle.
 ///
 /// `Bundle.allBundles` does not reliably list the running bundle under SwiftPM's
 /// swift-testing helper, so the primary source is the `--test-bundle-path`
 /// argument the helper is launched with — walking it up to the directory that
 /// contains the `.xctest` bundle, which is the same build directory that holds
-/// `domocode`. The `.xctest`/`allBundles`/argv-0 fallbacks cover XCTest and Linux.
+/// `domo`. The `.xctest`/`allBundles`/argv-0 fallbacks cover XCTest and Linux.
 func productsDirectory() -> URL {
     let arguments = CommandLine.arguments
     if let index = arguments.firstIndex(of: "--test-bundle-path"), index + 1 < arguments.count {
@@ -72,19 +72,19 @@ func productsDirectory() -> URL {
     return URL(fileURLWithPath: arguments[0]).deletingLastPathComponent()
 }
 
-func domocodeBinaryURL() -> URL {
-    productsDirectory().appendingPathComponent("domocode")
+func domoBinaryURL() -> URL {
+    productsDirectory().appendingPathComponent("domo")
 }
 
-/// Runs the real `domocode` binary and captures its output.
+/// Runs the real `domo` binary and captures its output.
 ///
 /// The child inherits this process's environment — which is what carries the
 /// toolchain's `DYLD_*` runtime paths `swift test` sets up, without which the
 /// binary cannot load its Swift runtime — and then overrides only the
 /// configuration-relevant variables to isolate the run.
-func runDomocode(arguments: [String], workspace: Workspace) throws -> ProcessRunResult {
+func runDomo(arguments: [String], workspace: Workspace) throws -> ProcessRunResult {
     let process = Process()
-    process.executableURL = domocodeBinaryURL()
+    process.executableURL = domoBinaryURL()
     process.arguments = arguments
     process.currentDirectoryURL = workspace.workDirectory
 

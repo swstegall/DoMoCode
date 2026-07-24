@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // The Phase 3 exit criterion, exercised for real across TWO processes: a first
-// `domocode -p` run persists a session, and a SECOND invocation with `--continue`
+// `domo -p` run persists a session, and a SECOND invocation with `--continue`
 // resumes it against the same mock gateway. The proof is in the wire — the second
 // process's request must carry the first turn's messages — so a unit test of the
 // harness does not substitute. Both invocations spawn the actual compiled binary.
@@ -65,7 +65,7 @@ struct SessionResumeEndToEndTests {
         defer { workspace.cleanUp() }
 
         let firstPrompt = "Please remember the number 4242 for later."
-        let first = try runDomocode(
+        let first = try runDomo(
             arguments: ["-p", firstPrompt, "--model", "mock-model", "--base-url", gateway.baseURL],
             workspace: workspace
         )
@@ -78,7 +78,7 @@ struct SessionResumeEndToEndTests {
         #expect(sessionFiles.count == 1, "expected exactly one session file, found \(sessionFiles)")
 
         let secondPrompt = "What number did I ask you to remember?"
-        let second = try runDomocode(
+        let second = try runDomo(
             arguments: ["--continue", "-p", secondPrompt, "--model", "mock-model", "--base-url", gateway.baseURL],
             workspace: workspace
         )
@@ -114,7 +114,7 @@ struct SessionResumeEndToEndTests {
         defer { workspace.cleanUp() }
 
         let firstPrompt = "Remember 4242."
-        let first = try runDomocode(
+        let first = try runDomo(
             arguments: ["-p", firstPrompt, "--model", "mock-model", "--base-url", gateway.baseURL],
             workspace: workspace
         )
@@ -123,7 +123,7 @@ struct SessionResumeEndToEndTests {
         let sessionsRoot = workspace.configDirectory.appendingPathComponent("sessions")
         #expect(Self.sessionFiles(under: sessionsRoot).count == 1)
 
-        let second = try runDomocode(
+        let second = try runDomo(
             arguments: ["--fork", "-p", "Continue on a branch.", "--model", "mock-model", "--base-url", gateway.baseURL],
             workspace: workspace
         )
@@ -143,7 +143,7 @@ struct SessionResumeEndToEndTests {
         defer { workspace.cleanUp() }
 
         // No gateway needed: resolution fails before any model call.
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: [
                 "--resume", "no-such-session-id", "-p", "hi",
                 "--model", "mock-model", "--base-url", "http://127.0.0.1:1/v1",
@@ -160,7 +160,7 @@ struct SessionResumeEndToEndTests {
         let workspace = try Workspace()
         defer { workspace.cleanUp() }
 
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: ["--continue", "-p", "hi", "--model", "mock-model", "--base-url", "http://127.0.0.1:1/v1"],
             workspace: workspace
         )

@@ -86,7 +86,7 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
     /// Bound on time-to-response-head — connect, TLS, request send, and the first
     /// response byte — separate from the overall streaming deadline above.
     ///
-    /// This exists because pointing `domocode` at a gateway that is not running is
+    /// This exists because pointing `domo` at a gateway that is not running is
     /// the single most common misconfiguration, and `HTTPClient.shared` has no
     /// connect timeout of its own: its only bound is the overall request deadline,
     /// which is 600s to accommodate a long streamed turn. Without this a dead

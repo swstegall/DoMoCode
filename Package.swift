@@ -39,7 +39,7 @@ let package = Package(
         .macOS(.v15)
     ],
     products: [
-        .executable(name: "domocode", targets: ["domocode"]),
+        .executable(name: "domo", targets: ["domo"]),
         .library(name: "DoMoCore", targets: ["DoMoCore"]),
     ],
     dependencies: [
@@ -191,7 +191,7 @@ let package = Package(
         ),
 
         .executableTarget(
-            name: "domocode",
+            name: "domo",
             dependencies: ["DoMoCLI"],
             swiftSettings: safeSettings
         ),

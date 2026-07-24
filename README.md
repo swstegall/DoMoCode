@@ -58,7 +58,7 @@ agent loop means auditing every `await`.
 
 ## Architecture
 
-Package name `DoMoCode`; executable target and installed command `domocode`.
+Package name `DoMoCode`; executable target and installed command `domo`.
 
 ```
 Sources/
@@ -81,7 +81,7 @@ Sources/
   DoMoToolsUI/     Renderers for those tools, reattached at composition time.
   DoMoCLI/         Modes (interactive/print/json), settings, project trust, resource loading,
                    slash commands, wiring.
-  domocode/        The executable. ArgumentParser root plus DoMoCLI.run().
+  domo/            The executable. ArgumentParser root plus DoMoCLI.run().
 ```
 
 ### How this maps to upstream pi
@@ -163,7 +163,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
 - [x] **Phase 1 — Talk to LiteLLM headlessly.** `DoMoLLM` end to end: transport seam, lenient
       `Codable` models, SSE decoding, `[DONE]`, in-stream error sniffing, the tool-call accumulator,
       usage capture, retry/backoff, `GET /v1/models` catalog. Plus `DoMoExec` and headless
-      `DoMoTools`. *Exit met:* `domocode -p "..."` runs a real multi-turn tool loop and prints plain
+      `DoMoTools`. *Exit met:* `domo -p "..."` runs a real multi-turn tool loop and prints plain
       text — with zero TUI code, which is exactly why it comes first. The exit-criterion test drives
       the compiled binary against a loopback mock gateway. 535 tests, green in both configurations.
 - [x] **Phase 2 — The agent loop.** `DoMoAgent` as a pure, heavily unit-tested module — the
@@ -185,7 +185,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       differential renderer (verified against the oracle, proven not to clamp-and-overwrite the
       transcript), overlays, and core components. **4c:** the multi-line Editor (`[[Character]]`
       buffers), Markdown-on-swift-markdown, and autocomplete + fuzzy. **4d:** the live terminal
-      driver, `DoMoToolsUI` tool renderers, and the interactive REPL. *Exit met:* `domocode` with no
+      driver, `DoMoToolsUI` tool renderers, and the interactive REPL. *Exit met:* `domo` with no
       `-p` is an interactive session with streaming output, `@` file completion, Escape-to-abort, and
       Enter to queue a follow-up; three end-to-end tests drive the real REPL headlessly against a mock
       gateway. 1059 tests, green in both configurations.
@@ -358,7 +358,7 @@ Requires a Swift 6.2 or newer toolchain (developed on 6.3.3). Targets macOS 15+ 
 ```bash
 swift build            # build
 swift test             # run tests
-swift run domocode     # run from source
+swift run domo         # run from source
 ```
 
 ## Non-goals and known gaps

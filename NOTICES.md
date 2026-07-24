@@ -222,7 +222,7 @@ Used in test targets only, as a headless terminal emulator against which rendere
 Several dependencies above are licensed under Apache-2.0, whose section 4(d) requires attribution
 notices to travel with redistributed works. A file in this repository does not travel with a release
 tarball or a package-manager bottle, so binary distributions will ship a generated
-`THIRD-PARTY-NOTICES.txt` alongside the executable, and `domocode --licenses` will print the same
+`THIRD-PARTY-NOTICES.txt` alongside the executable, and `domo --licenses` will print the same
 content.
 
 ---

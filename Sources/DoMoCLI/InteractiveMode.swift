@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 //
-// The interactive REPL — what `domocode` becomes when it is run with NO `-p`.
+// The interactive REPL — what `domo` becomes when it is run with NO `-p`.
 //
 // This is original wiring rather than a line-for-line port of a single pi file:
 // it *composes* the pieces the earlier slices ported (the `TUI`/`TerminalDriver`

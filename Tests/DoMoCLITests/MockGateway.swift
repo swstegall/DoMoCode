@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // A minimal OpenAI-compatible HTTP/1.1 + SSE server for driving the real
-// `domocode` binary end to end. Raw POSIX sockets on purpose: it needs a real
+// `domo` binary end to end. Raw POSIX sockets on purpose: it needs a real
 // listening socket the compiled binary connects to over the loopback, and
 // pulling in a full server framework (or NIO, which is only a transitive
 // dependency here) to answer a handful of fixed requests would be a heavier

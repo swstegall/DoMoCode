@@ -43,7 +43,7 @@ struct TrustEndToEndTests {
         try writeProjectSettings(workspace)
 
         // 1) No trust recorded, no --trust: refuse before any model call.
-        let refused = try runDomocode(
+        let refused = try runDomo(
             arguments: ["-p", "hi", "--model", "mock-model", "--base-url", gateway.baseURL],
             workspace: workspace
         )
@@ -53,7 +53,7 @@ struct TrustEndToEndTests {
         #expect(gateway.requestCount == 0, "a refused run must not reach the gateway")
 
         // 2) --trust: the run proceeds and records the decision.
-        let trusted = try runDomocode(
+        let trusted = try runDomo(
             arguments: ["-p", "hi", "--model", "mock-model", "--base-url", gateway.baseURL, "--trust"],
             workspace: workspace
         )
@@ -64,7 +64,7 @@ struct TrustEndToEndTests {
         #expect(FileManager.default.fileExists(atPath: trustFile.path), "trust.json should have been written")
 
         // 3) The recorded decision means a later run needs no flag.
-        let remembered = try runDomocode(
+        let remembered = try runDomo(
             arguments: ["-p", "hi", "--model", "mock-model", "--base-url", gateway.baseURL],
             workspace: workspace
         )

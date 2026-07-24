@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 //
-// The Phase 1 exit criterion, exercised for real: the compiled `domocode` binary
+// The Phase 1 exit criterion, exercised for real: the compiled `domo` binary
 // is driven over a loopback socket against a mock OpenAI-compatible gateway,
 // through a two-turn conversation where turn 1 calls a tool and turn 2 produces
 // the final text. This is deliberately not a unit test of the loop in isolation —
@@ -62,7 +62,7 @@ struct PrintModeEndToEndTests {
         defer { workspace.cleanUp() }
         try workspace.writeFile(named: "hello.txt", contents: "hi\n")
 
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: ["-p", "list the files here", "--model", "mock-model", "--base-url", gateway.baseURL],
             workspace: workspace
         )
@@ -91,7 +91,7 @@ struct PrintModeEndToEndTests {
         defer { workspace.cleanUp() }
         try workspace.writeFile(named: "hello.txt", contents: "hi\n")
 
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: [
                 "-p", "list the files here", "--model", "mock-model",
                 "--base-url", gateway.baseURL, "--json",
@@ -139,7 +139,7 @@ struct PrintModeEndToEndTests {
         defer { workspace.cleanUp() }
         try workspace.writeFile(named: "hello.txt", contents: "hi\n")
 
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: [
                 "-p", "list the files here", "--model", "mock-model",
                 "--base-url", gateway.baseURL, "--json",
@@ -186,7 +186,7 @@ struct PrintModeEndToEndTests {
         defer { workspace.cleanUp() }
         try workspace.writeFile(named: "hello.txt", contents: "hi\n")
 
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: [
                 "-p", "list the files here", "--model", "mock-model",
                 "--base-url", gateway.baseURL, "--max-turns", "1",
@@ -240,7 +240,7 @@ struct PrintModeEndToEndTests {
         defer { workspace.cleanUp() }
         try workspace.writeFile(named: "hello.txt", contents: "hi\n")
 
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: [
                 "-p", "list the files here", "--model", "mock-model",
                 "--base-url", gateway.baseURL, "--json",
@@ -270,7 +270,7 @@ struct PrintModeEndToEndTests {
         defer { workspace.cleanUp() }
 
         // No --model, no DOMOCODE_MODEL, no settings file → a configuration error.
-        let result = try runDomocode(
+        let result = try runDomo(
             arguments: ["-p", "hello", "--base-url", "http://127.0.0.1:1/v1"],
             workspace: workspace
         )
