@@ -25,10 +25,15 @@ import SystemPackage
 /// itself is a stateless value (``JSONLSessionStore``) — everything durable lives
 /// in the file; the only in-memory state here is the tip and the injected config.
 ///
-/// This is the run/persist/compact/resume spine of pi's `AgentHarness`. The
-/// feature surface pi layers on top — steering/follow-up queues, model/tool
-/// mutation entries, hooks, retry policy, thinking level — is deliberately not
-/// ported for Phase 3; the shape below is where those would attach.
+/// This is the run/persist/compact/resume spine of pi's `AgentHarness`. Most of
+/// the feature surface pi layers on top — model/tool mutation entries, retry
+/// policy, thinking level — is deliberately not ported; the shape below is where
+/// those would attach. The loop's turn-boundary hooks (steering, follow-up, and
+/// the stop-after-turn predicate), however, *are* forwarded: ``Configuration``
+/// exposes them and ``run(prompt:sink:)`` threads them into the ``AgentLoopConfig``,
+/// so an embedding can inject a message typed mid-run into the *current* run's
+/// next turn — pi's real steering semantics — rather than deferring it to a fresh
+/// run.
 public actor AgentHarness {
     /// The stateless persistence backend. Re-derives the tree from the file per
     /// read; owns no tip.
@@ -97,6 +102,23 @@ public actor AgentHarness {
 
         public var entryIDFactory: @Sendable () -> String
 
+        /// Polled by the loop at each turn boundary for messages to inject before
+        /// the next assistant response — pi's "steering". A message a caller
+        /// enqueues while a run is in flight reaches the *current* run's next turn.
+        /// Forwarded verbatim into ``AgentLoopConfig/getSteeringMessages``; `nil`
+        /// means "no steering", the print-mode default. Contract: must not throw,
+        /// return `[]` when none.
+        public var getSteeringMessages: (@Sendable () async -> [Message])?
+
+        /// Polled after the agent would otherwise stop; a non-empty return resumes
+        /// the run with another turn. Forwarded into
+        /// ``AgentLoopConfig/getFollowUpMessages``. Contract: must not throw.
+        public var getFollowUpMessages: (@Sendable () async -> [Message])?
+
+        /// Consulted after each turn; returning `true` ends the run early.
+        /// Forwarded into ``AgentLoopConfig/shouldStopAfterTurn``.
+        public var shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)?
+
         public init(
             systemPrompt: String? = nil,
             tools: [any AgentTool] = [],
@@ -108,7 +130,10 @@ public actor AgentHarness {
             compaction: CompactionSettings = .default,
             contextWindow: Int = 200_000,
             now: @escaping @Sendable () -> Date = { Date() },
-            entryIDFactory: @escaping @Sendable () -> String = { UUIDv7.generate().description }
+            entryIDFactory: @escaping @Sendable () -> String = { UUIDv7.generate().description },
+            getSteeringMessages: (@Sendable () async -> [Message])? = nil,
+            getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
+            shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.tools = tools
@@ -121,6 +146,9 @@ public actor AgentHarness {
             self.contextWindow = contextWindow
             self.now = now
             self.entryIDFactory = entryIDFactory
+            self.getSteeringMessages = getSteeringMessages
+            self.getFollowUpMessages = getFollowUpMessages
+            self.shouldStopAfterTurn = shouldStopAfterTurn
         }
     }
 
@@ -234,7 +262,10 @@ public actor AgentHarness {
         let config = AgentLoopConfig(
             model: configuration.model,
             toolExecution: configuration.toolExecution,
-            maxTurns: configuration.maxTurns
+            maxTurns: configuration.maxTurns,
+            getSteeringMessages: configuration.getSteeringMessages,
+            getFollowUpMessages: configuration.getFollowUpMessages,
+            shouldStopAfterTurn: configuration.shouldStopAfterTurn
         )
         let errorBox = PersistenceErrorBox()
         let persistenceSink = SessionPersistenceSink(persister: self, forward: sink, errorBox: errorBox)

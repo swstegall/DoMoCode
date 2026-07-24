@@ -63,6 +63,38 @@ private final class RecordingSink: AgentEventSink {
     var events: [AgentEvent] { storage.withLock { $0 } }
 }
 
+/// A `Sendable`, lock-guarded message queue standing in for the interactive
+/// steering box: a test appends to it from a streamFn (simulating a user typing
+/// mid-run) and the harness's `getSteeringMessages` hook drains it.
+private final class MessageQueue: Sendable {
+    private let storage = Mutex<[Message]>([])
+    func append(_ message: Message) { storage.withLock { $0.append(message) } }
+    func drain() -> [Message] {
+        storage.withLock { queued in
+            let taken = queued
+            queued.removeAll()
+            return taken
+        }
+    }
+}
+
+/// Captures the context message list handed to `streamFn` on each turn, so a test
+/// can assert which turn a steering message first appears in.
+private final class ContextRecorder: Sendable {
+    private let storage = Mutex<[[Message]]>([])
+    func record(_ messages: [Message]) { storage.withLock { $0.append(messages) } }
+    var all: [[Message]] { storage.withLock { $0 } }
+}
+
+/// A terminal-only assembly stream for one canned assistant message.
+private func terminalStream(_ message: AssistantMessage) -> AsyncThrowingStream<AssemblyEvent, any Error> {
+    AsyncThrowingStream { continuation in
+        continuation.yield(.start(AssistantSnapshot(model: message.model)))
+        continuation.yield(message.failure == nil ? .done(message) : .failed(message))
+        continuation.finish()
+    }
+}
+
 /// Deterministic, monotonic entry ids so a whole session file is reproducible.
 private final class SequentialIDs: Sendable {
     private let counter = Mutex<Int>(0)
@@ -204,6 +236,104 @@ struct AgentHarnessTests {
         let kinds = ui.events.map(\.self)
         #expect(kinds.contains { if case .agentStart = $0 { return true } else { return false } })
         #expect(kinds.contains { if case .agentEnd = $0 { return true } else { return false } })
+    }
+
+    // MARK: - Steering passthrough
+
+    @Test("a message queued mid-run is steered into the same run's next turn, not deferred")
+    func steeringInjectsIntoCurrentRun() async throws {
+        // Turn 1 emits a tool call (so the loop takes a second turn within the same
+        // run) and, while it "streams", enqueues a steering message — exactly the
+        // shape of a user typing mid-run. The loop drains the queue at the turn
+        // boundary and must inject it before turn 2's request, so turn 2's context
+        // carries the steering message and turn 1's does not.
+        let queue = MessageQueue()
+        let contexts = ContextRecorder()
+        let turn = Mutex<Int>(0)
+        let streamFn: AgentStreamFn = { context in
+            let i = turn.withLock { value -> Int in
+                let taken = value
+                value += 1
+                return taken
+            }
+            contexts.record(context.messages)
+            if i == 0 {
+                queue.append(.user("also check the tests"))
+                let message = AssistantMessage(
+                    content: [.toolCall(ToolCallBlock(id: "c1", name: "echo"))],
+                    model: "test-model",
+                    stopReason: .toolUse
+                )
+                return terminalStream(message)
+            }
+            return terminalStream(
+                AssistantMessage(content: [.text("done")], model: "test-model", stopReason: .stop)
+            )
+        }
+
+        let ids = SequentialIDs(prefix: "steer")
+        var config = configuration(streamFn: streamFn, tools: [EchoTool()], ids: ids)
+        config.getSteeringMessages = { queue.drain() }
+
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: config
+        )
+        _ = try await harness.run(prompt: "start")
+
+        // Two turns ran inside the single `run` call — the same run, not a new one.
+        let recordedContexts = contexts.all
+        #expect(recordedContexts.count == 2)
+
+        // Turn 1's context predates the steering message; turn 2's includes it.
+        let steer = Message.user("also check the tests")
+        #expect(!recordedContexts[0].contains(steer))
+        #expect(recordedContexts[1].contains(steer))
+
+        // The steered user turn is persisted between the tool result and the final
+        // assistant turn, so a resume replays it in order.
+        let recorded = try entries(of: await harness.sessionFilePath)
+        let roles = recorded.map { entry -> String in
+            if case .message(let message) = entry.payload { return message.role.rawValue }
+            return "?"
+        }
+        // user(start), assistant(tool call), tool result, user(steer), assistant(done)
+        #expect(roles == ["user", "assistant", "tool", "user", "assistant"])
+        guard case .message(.user(let steered)) = recorded[3].payload else {
+            Issue.record("fourth entry is not the steered user message")
+            return
+        }
+        #expect(steered.text == "also check the tests")
+    }
+
+    @Test("shouldStopAfterTurn forwarded from the configuration ends the run early")
+    func shouldStopAfterTurnForwarded() async throws {
+        // The stream would gladly run a second turn (turn 1 calls a tool), but the
+        // configuration's stop hook fires after the first turn, so the run settles
+        // with only one LLM call.
+        let responder = ScriptedResponder([
+            AssistantMessage(
+                content: [.toolCall(ToolCallBlock(id: "c1", name: "echo"))],
+                model: "test-model",
+                stopReason: .toolUse
+            ),
+            assistant("should never be reached"),
+        ])
+        let ids = SequentialIDs(prefix: "stop")
+        var config = configuration(streamFn: responder.fn(), tools: [EchoTool()], ids: ids)
+        config.shouldStopAfterTurn = { _ in true }
+
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: config
+        )
+        let result = try await harness.run(prompt: "start")
+
+        #expect(result.stopReason == .stoppedByHook)
+        // Only the first turn's request was made.
+        #expect(responder.callCount == 1)
     }
 
     // MARK: - Resume correctness (the exit criterion)

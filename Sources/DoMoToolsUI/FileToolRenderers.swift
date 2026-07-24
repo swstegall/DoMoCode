@@ -91,6 +91,17 @@ public struct WriteToolRenderer: ToolRenderer {
 /// exactly as pi does — added lines green, removed lines red, context dim, with
 /// an inverse highlight on the changed tokens of a single-line modification.
 public struct EditToolRenderer: ToolRenderer {
+    /// Diff lines shown before the "N more lines" marker when collapsed. A diff is
+    /// the edit's primary content, so it sits at the roomier end of the module's
+    /// collapsed budgets (read 10, default 15) rather than the terse bash 5.
+    static let previewLines = 20
+
+    /// Absolute ceiling on rendered diff lines even when expanded. Expanded shows
+    /// far more than the collapsed preview, but a pathological full-file replace
+    /// must never flood a live terminal with thousands of rows, so the count is
+    /// still bounded — the trailing marker reports whatever was withheld.
+    static let maxExpandedDiffLines = 500
+
     public init() {}
 
     public func render(_ request: ToolRenderRequest) -> [String] {
@@ -122,7 +133,19 @@ public struct EditToolRenderer: ToolRenderer {
         }
 
         let diff = generateDiffString(oldContent: oldContent, newContent: newContent)
-        let diffLines = renderDiff(diff, width: request.width, theme: theme)
+
+        // Cap the rendered diff the way the other renderers cap their previews.
+        // `renderDiff` emits exactly one row per input diff line, so slicing the
+        // diff string here bounds both the work `renderDiff` does and the rows it
+        // returns; the withheld count is exact. Expanded lifts the budget but not
+        // the ceiling (`maxExpandedDiffLines`).
+        let budget = request.expanded ? Self.maxExpandedDiffLines : Self.previewLines
+        let shownCount = min(budget, diff.count)
+        var diffLines = renderDiff(Array(diff.prefix(shownCount)), width: request.width, theme: theme)
+        let remaining = diff.count - shownCount
+        if remaining > 0 {
+            diffLines.append(clip(theme.muted("... (\(remaining) more lines)"), to: request.width))
+        }
         return [headerLine] + diffLines
     }
 }
@@ -266,6 +289,18 @@ struct DiffPart {
     var lines: [String]
 }
 
+/// Combined line count of the *changed middle* above which the quadratic LCS is
+/// abandoned for a linear removed-then-added block.
+///
+/// `middleDiff` allocates an `(n+1)·(m+1)` `Int` matrix, so cost grows with the
+/// product of the two sides — a full-file replace of a 20k-line file would demand
+/// ~400M ints (well over a gigabyte) and seconds of work. Ordinary edits touch a
+/// few lines of a file, and prefix/suffix trimming (`diffLines`) shrinks even a
+/// large file's changed region to a tiny middle, so this ceiling is only reached
+/// by a genuinely huge rewrite — exactly the case that must degrade rather than
+/// exhaust memory. At the ceiling the matrix is ~1M ints (a few MB), a safe cap.
+let maxDiffLCSLines = 2000
+
 /// Diffs two line arrays into ordered runs, standing in for the `diff` package's
 /// `diffLines`.
 ///
@@ -301,6 +336,14 @@ private nonisolated func middleDiff(_ a: [String], _ b: [String]) -> [DiffPart] 
     if a.isEmpty && b.isEmpty { return [] }
     if a.isEmpty { return [DiffPart(kind: .added, lines: b)] }
     if b.isEmpty { return [DiffPart(kind: .removed, lines: a)] }
+
+    // Oversized middle: skip the quadratic LCS (see `maxDiffLCSLines`) and treat
+    // the whole region as a plain replacement. Linear in time and memory, and for
+    // a large rewrite — where few lines survive anyway — visually close to what
+    // the LCS would have produced (mostly removed-then-added runs).
+    if a.count + b.count > maxDiffLCSLines {
+        return [DiffPart(kind: .removed, lines: a), DiffPart(kind: .added, lines: b)]
+    }
 
     let n = a.count
     let m = b.count

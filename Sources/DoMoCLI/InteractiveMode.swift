@@ -22,16 +22,21 @@
 //     ``AsyncStream`` in, a capturing ``RenderTarget`` out). There is no
 //     "only on a real terminal" path in the wiring.
 //
-//   * **Steering is a CLI-boundary adaptation, not a harness feature.** pi injects a
+//   * **Steering injects into the current run, pi's real semantics.** pi feeds a
 //     message typed mid-run into the *current* turn via the loop's
-//     `getSteeringMessages`. ``AgentHarness`` (Phase 3) does not forward that hook
-//     into its ``AgentLoopConfig`` — see the report's "harness gap" — and this file
-//     must not reach into another module to add it. So "steering" here is a queue at
-//     the CLI: a prompt submitted while the agent is running is appended to a queue
-//     and dispatched as the next ``AgentHarness/run(prompt:sink:)`` the instant the
-//     current one settles. The session persists across those runs, so context still
-//     accumulates; what differs from pi is that the steered text is processed after
-//     the in-flight turn rather than injected into it.
+//     `getSteeringMessages`; ``AgentHarness/Configuration`` now forwards that hook
+//     into its ``AgentLoopConfig``, so the CLI plumbs it rather than faking it. A
+//     ``SteeringBox`` — a `Mutex`-guarded `[Message]` — is the shared seam: the
+//     harness's `getSteeringMessages` closure DRAINS it (called from the loop, off
+//     the main actor), and a submit-while-running APPENDS to it (on the main actor).
+//     A prompt submitted while the agent runs therefore reaches the *current* run's
+//     next turn boundary, not a fresh run. Drain-and-clear is atomic under the lock,
+//     so a message racing the loop's poll is either fully seen by that poll or held
+//     whole for the next — never split, never lost. A message that lands after the
+//     run's *last* poll (between poll and settle) stays in the box and is re-yielded
+//     as the next run's prompt when the run settles, so it still carries forward
+//     exactly as the old next-run queue did rather than vanishing. An idle submit,
+//     as before, simply starts a new run through the submissions stream.
 
 import DoMoAgent
 import DoMoCore
@@ -45,6 +50,39 @@ import DoMoTools
 import Foundation
 import Synchronization
 import SystemPackage
+
+// MARK: - Steering box
+
+/// The `Sendable` seam that carries a mid-run submission into the running agent.
+///
+/// One `Mutex`-guarded queue shared across an isolation boundary: the harness's
+/// ``AgentHarness/Configuration/getSteeringMessages`` closure ``drain()``s it from
+/// the agent loop (which polls at each turn boundary, off the main actor), while a
+/// submit-while-running ``append(_:)``s to it on the main actor. There is no async
+/// work under the lock, so a `Mutex` is the right tool — never a lock across an
+/// `await`.
+///
+/// ``drain()`` reads-and-clears in one critical section, which is what makes the
+/// race benign: a message appended concurrently with a poll is either wholly
+/// returned by that poll (injected into the current turn) or wholly retained for
+/// the next — it can be neither split nor processed twice.
+final class SteeringBox: Sendable {
+    private let messages = Mutex<[Message]>([])
+
+    /// Enqueue a message for the running agent's next turn.
+    func append(_ message: Message) {
+        messages.withLock { $0.append(message) }
+    }
+
+    /// Atomically take everything queued and clear the box.
+    func drain() -> [Message] {
+        messages.withLock { queued in
+            let taken = queued
+            queued.removeAll()
+            return taken
+        }
+    }
+}
 
 // MARK: - Mutable transcript block
 
@@ -169,12 +207,15 @@ final class InteractiveCoordinator {
     private let editor: Editor
     private let prompt: PromptComponent
 
-    // Prompt delivery: idle submissions flow through a stream the agent loop
-    // awaits; submissions made while the agent runs are queued as steering (see
-    // the file header) and drained before the loop next parks on the stream.
+    // Prompt delivery: an idle submission flows through a stream the agent loop
+    // awaits and starts a fresh run. A submission made while the agent runs is
+    // appended to the shared ``SteeringBox`` instead, which the harness's
+    // `getSteeringMessages` hook drains into the *current* run's next turn (see the
+    // file header). The box is the same instance the harness ``Configuration`` was
+    // built with.
     private let submissions: AsyncStream<String>
     private let submissionsContinuation: AsyncStream<String>.Continuation
-    private var steeringQueue: [String] = []
+    private let steering: SteeringBox
 
     // Run state.
     private var running = false
@@ -212,6 +253,7 @@ final class InteractiveCoordinator {
         toolRendererRegistry: ToolRendererRegistry,
         toolTheme: ToolRenderTheme,
         homeDirectory: String?,
+        steering: SteeringBox,
         terminalRows: @escaping () -> Int,
         keybindings: Keybindings = Keybindings()
     ) {
@@ -219,6 +261,7 @@ final class InteractiveCoordinator {
         self.driver = driver
         self.quit = quit
         self.harness = harness
+        self.steering = steering
         self.provider = provider
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
@@ -363,7 +406,12 @@ final class InteractiveCoordinator {
         render()
 
         if running {
-            steeringQueue.append(trimmed)
+            // Steer the in-flight run: the harness's `getSteeringMessages` hook
+            // drains this box at the current run's next turn boundary, so the text
+            // joins the running agent rather than waiting for a fresh run. The user
+            // turn is already echoed above; the loop's own `messageStart(.user)` for
+            // the injected message is ignored by ``handle(_:)``, so it is not doubled.
+            steering.append(.user(trimmed))
         } else {
             submissionsContinuation.yield(trimmed)
         }
@@ -468,20 +516,34 @@ final class InteractiveCoordinator {
     // MARK: Agent loop
 
     /// The concurrent driver of turns, run as the ``TerminalDriver``'s background
-    /// job. It prefers a queued steering message, else parks on the submissions
-    /// stream; a cancelled task (the session ending) breaks the loop.
+    /// job. It parks on the submissions stream and runs each prompt to completion;
+    /// a cancelled task (the session ending) breaks the loop.
+    ///
+    /// Mid-run submissions do not flow through here — they are steered into the
+    /// current run via the ``SteeringBox``. The one thing this loop still owes the
+    /// box is the settle-race tail: a message that landed *after* the just-finished
+    /// run's last steering poll is still sitting in the box, so it is re-queued as
+    /// the next run's prompt rather than being left to wait for an unrelated submit.
     func agentLoop() async {
         var iterator = submissions.makeAsyncIterator()
         while !Task.isCancelled {
-            let prompt: String
-            if !steeringQueue.isEmpty {
-                prompt = steeringQueue.removeFirst()
-            } else if let next = await iterator.next() {
-                prompt = next
-            } else {
-                break
-            }
+            guard let prompt = await iterator.next() else { break }
             await runOne(prompt)
+            drainLeftoverSteering()
+        }
+    }
+
+    /// Re-queue any steering message that arrived between the last run's final poll
+    /// and its settle. The run is fully settled here (``runOne(_:)`` awaited its
+    /// task to completion), so no loop is concurrently draining the box; the read is
+    /// a plain main-actor step. Each leftover was appended as a `.user` message, so
+    /// its text seeds a fresh run — the same "carry to the next run" the old
+    /// next-run queue gave, without the message vanishing or being processed twice.
+    private func drainLeftoverSteering() {
+        for message in steering.drain() {
+            if case .user(let user) = message {
+                submissionsContinuation.yield(user.text)
+            }
         }
     }
 
@@ -636,6 +698,10 @@ public struct InteractiveMode: Sendable {
     private let homeDirectory: String?
     private let toolRendererRegistry: ToolRendererRegistry
     private let toolTheme: ToolRenderTheme
+    /// The steering seam. Built in ``make`` alongside the harness ``Configuration``
+    /// whose `getSteeringMessages` drains it, then handed to the coordinator whose
+    /// submit-while-running appends to it — one instance bridging both.
+    private let steering: SteeringBox
 
     private init(
         harness: AgentHarness,
@@ -643,7 +709,8 @@ public struct InteractiveMode: Sendable {
         slashCommands: [SlashCommand],
         homeDirectory: String?,
         toolRendererRegistry: ToolRendererRegistry,
-        toolTheme: ToolRenderTheme
+        toolTheme: ToolRenderTheme,
+        steering: SteeringBox
     ) {
         self.harness = harness
         self.directoryLister = directoryLister
@@ -651,6 +718,7 @@ public struct InteractiveMode: Sendable {
         self.homeDirectory = homeDirectory
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
+        self.steering = steering
     }
 
     /// The small, deliberately-minimal slash-command palette. Argument completion
@@ -700,6 +768,11 @@ public struct InteractiveMode: Sendable {
             )
         }
 
+        // The steering seam: the loop drains this box for mid-run submissions at
+        // each turn boundary, and the coordinator appends to it. Built here so the
+        // harness Configuration and the coordinator share the one instance.
+        let steering = SteeringBox()
+
         let configuration = AgentHarness.Configuration(
             systemPrompt: PrintMode.systemPrompt(workingDirectory: workDirectory, toolNames: registry.names),
             tools: tools,
@@ -708,7 +781,8 @@ public struct InteractiveMode: Sendable {
             // Sequential keeps tool-start/tool-result transcript order equal to the
             // model's own call order, which is what a reader expects to watch.
             toolExecution: .sequential,
-            maxTurns: maxTurns
+            maxTurns: maxTurns,
+            getSteeringMessages: { steering.drain() }
         )
 
         let harness = try await Self.makeHarness(
@@ -726,7 +800,8 @@ public struct InteractiveMode: Sendable {
             slashCommands: defaultSlashCommands,
             homeDirectory: homeDirectory,
             toolRendererRegistry: .builtin,
-            toolTheme: toolTheme
+            toolTheme: toolTheme,
+            steering: steering
         )
     }
 
@@ -789,6 +864,7 @@ public struct InteractiveMode: Sendable {
             toolRendererRegistry: toolRendererRegistry,
             toolTheme: toolTheme,
             homeDirectory: homeDirectory,
+            steering: steering,
             terminalRows: { target.rows }
         )
         coordinator.install()

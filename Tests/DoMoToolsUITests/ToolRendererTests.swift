@@ -133,6 +133,117 @@ struct ToolRendererTests {
         expectAllFit(lines, width: 40, "edit-multi")
     }
 
+    @Test("A small edit renders the exact same diff as before the cap was added")
+    func editDiffPinned() {
+        // Pins the collapsed, plain-themed rendering of an ordinary one-line
+        // modification: the LCS diff must be byte-for-byte what it was, so the
+        // bounding work never perturbs the common case.
+        let old = "alpha\nbeta\ngamma\n"
+        let new = "alpha\nBETA\ngamma\n"
+        let lines = ToolRendererRegistry.builtin.render(
+            toolName: "edit",
+            arguments: object(["path": .string("file.txt")]),
+            result: ToolResult.text(
+                "ok",
+                details: object(["oldContent": .string(old), "newContent": .string(new)])
+            ),
+            width: 60,
+            theme: .plain
+        )
+        #expect(lines == ["edit file.txt", " 1 alpha", "-2 beta", "+2 BETA", " 3 gamma"])
+    }
+
+    @Test("A 2000x2000-line replace renders bounded output with a more-lines marker")
+    func editOversizedReplaceIsBounded() {
+        // Every line distinct on both sides: no common prefix/suffix to trim, so
+        // the changed middle is the whole 4000-line combined content — over
+        // `maxDiffLCSLines`, forcing the linear fallback rather than a ~400M-int
+        // LCS matrix. Must complete without the huge allocation and stay bounded.
+        let old = (1...2000).map { "old line \($0)" }.joined(separator: "\n") + "\n"
+        let new = (1...2000).map { "new line \($0)" }.joined(separator: "\n") + "\n"
+        let result = ToolResult.text(
+            "ok",
+            details: object(["oldContent": .string(old), "newContent": .string(new)])
+        )
+        let lines = ToolRendererRegistry.builtin.render(
+            toolName: "edit",
+            arguments: object(["path": .string("big.txt")]),
+            result: result,
+            width: 60,
+            theme: .plain
+        )
+        // Header + at most the collapsed budget + one marker: a hard ceiling.
+        #expect(lines.count <= 1 + EditToolRenderer.previewLines + 1)
+        #expect(lines.first == "edit big.txt")
+        #expect(lines.contains { $0.contains("more lines") })
+        expectAllFit(lines, width: 60, "edit-oversized")
+    }
+
+    @Test("An expanded oversized edit is still bounded by the hard ceiling")
+    func editOversizedExpandedIsBounded() {
+        let old = (1...2000).map { "old \($0)" }.joined(separator: "\n") + "\n"
+        let new = (1...2000).map { "new \($0)" }.joined(separator: "\n") + "\n"
+        let lines = ToolRendererRegistry.builtin.render(
+            toolName: "edit",
+            arguments: object(["path": .string("big.txt")]),
+            result: ToolResult.text(
+                "ok",
+                details: object(["oldContent": .string(old), "newContent": .string(new)])
+            ),
+            width: 80,
+            theme: .plain,
+            expanded: true
+        )
+        // Expanded shows more than the collapsed preview but never floods.
+        #expect(lines.count > 1 + EditToolRenderer.previewLines + 1)
+        #expect(lines.count <= 1 + EditToolRenderer.maxExpandedDiffLines + 1)
+        #expect(lines.contains { $0.contains("more lines") })
+        expectAllFit(lines, width: 80, "edit-oversized-expanded")
+    }
+
+    @Test("The oversized fallback collapses interior common lines instead of running LCS")
+    func editOversizedFallbackPathExercised() {
+        // Shared lines sit in the middle, surrounded by change on both ends, so
+        // prefix/suffix trimming cannot reach them. Real LCS would surface them as
+        // an interior `.equal` run; the linear fallback does not — it emits one
+        // removed run then one added run. Asserting that shape proves the
+        // oversized branch, not the quadratic path, produced the diff.
+        let shared = (0..<10).map { "shared \($0)" }
+        let old = (0..<1200).map { "A\($0)" } + shared + (0..<1200).map { "A2_\($0)" }
+        let new = (0..<1200).map { "B\($0)" } + shared + (0..<1200).map { "B2_\($0)" }
+        let parts = diffLines(old, new)
+        #expect(parts.count == 2)
+        #expect(parts.first?.kind == .removed)
+        #expect(parts.last?.kind == .added)
+        // The shared lines were swept into the removed/added runs, not surfaced.
+        #expect(parts.first?.lines.contains("shared 0") == true)
+        #expect(!parts.contains { $0.kind == .equal })
+    }
+
+    @Test("An oversized edit diff stays within width for CJK/emoji/long content")
+    func editOversizedWidthInvariant() {
+        // The fallback and cap must still honour the fatal-width invariant for
+        // wide glyphs and long paths.
+        let longPath = "/deep/" + String(repeating: "日本語ディレクトリ/", count: 12) + "big.txt"
+        let old = (1...2000).map { "旧 \($0) 🎉🚀 ASCII こんにちは世界" }.joined(separator: "\n") + "\n"
+        let new = (1...2000).map { "新 \($0) 🚀🎉 ASCII さようなら世界" }.joined(separator: "\n") + "\n"
+        let result = ToolResult.text(
+            "ok",
+            details: object(["oldContent": .string(old), "newContent": .string(new)])
+        )
+        for width in [7, 12, 21, 40, 80] {
+            let lines = ToolRendererRegistry.builtin.render(
+                toolName: "edit",
+                arguments: object(["path": .string(longPath)]),
+                result: result,
+                width: width,
+                theme: .ansi
+            )
+            #expect(lines.count <= 1 + EditToolRenderer.previewLines + 1)
+            expectAllFit(lines, width: width, "edit-oversized-cjk w=\(width)")
+        }
+    }
+
     // MARK: Read
 
     @Test("A huge read is truncated with a more-lines marker and every line fits")
