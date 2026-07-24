@@ -57,6 +57,14 @@ public struct SessionSummary: Sendable, Codable, Hashable {
 /// method, by design, because the loop and stream already honour cooperative
 /// cancellation. The task is retained so ``abort(sessionID:)`` can reach it, and
 /// cleared when the run settles so the next prompt is admitted.
+///
+/// Three limitations are accepted under the single-client-first posture and would be
+/// revisited for multi-client: ``abort(sessionID:)`` cancels whatever run currently
+/// holds the slot, so a stale abort landing in the brief window after one run ends
+/// and the next begins could stop the wrong turn; a prompt pipelined in that same
+/// window may see a transient `sessionBusy` and succeed on retry; and live sessions
+/// are never evicted from the map, so a client that creates without bound grows
+/// memory and disk (it is only ever throttling itself).
 public actor ServerRuntime {
 
     /// The shared runtime ingredients, assembled once by the `serve` command and
@@ -94,12 +102,19 @@ public actor ServerRuntime {
 
     /// One live session's mutable state. A reference type held only inside the
     /// actor, so its `runTask` mutation is serialized by the actor, not shared.
+    ///
+    /// `token` is a Sendable identity a run can carry into its completion hop, so a
+    /// run that finishes after its session was replaced does not clear the
+    /// replacement's slot (the state object itself is not Sendable and cannot cross
+    /// into the run Task).
     private final class SessionState {
+        let token: Int
         let harness: AgentHarness
         let sink: BroadcastEventSink
         var runTask: Task<Void, Never>?
 
-        init(harness: AgentHarness, sink: BroadcastEventSink) {
+        init(token: Int, harness: AgentHarness, sink: BroadcastEventSink) {
+            self.token = token
             self.harness = harness
             self.sink = sink
         }
@@ -107,9 +122,16 @@ public actor ServerRuntime {
 
     private let config: Config
     private var sessions: [String: SessionState] = [:]
+    private var nextToken = 0
 
     public init(config: Config) {
         self.config = config
+    }
+
+    private func makeState(harness: AgentHarness, sink: BroadcastEventSink) -> SessionState {
+        let token = nextToken
+        nextToken += 1
+        return SessionState(token: token, harness: harness, sink: sink)
     }
 
     private func harnessConfiguration() -> AgentHarness.Configuration {
@@ -133,8 +155,15 @@ public actor ServerRuntime {
         let id: String
         if let resume {
             let path = try resolveResume(resume)
+            let resumedID = try JSONLSessionStore(path: path).readHeader().id
+            // Already live? Return it rather than standing up a second harness over
+            // the same file — that would orphan the running task and leave the
+            // existing SSE subscribers attached to a sink no run feeds.
+            if let existing = sessions[resumedID] {
+                return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
+            }
             harness = try AgentHarness.open(path: path, configuration: configuration)
-            id = try JSONLSessionStore(path: path).readHeader().id
+            id = resumedID
         } else {
             id = UUIDv7.generate().description
             harness = try AgentHarness.start(
@@ -145,7 +174,7 @@ public actor ServerRuntime {
             )
         }
         let path = await harness.sessionFilePath
-        sessions[id] = SessionState(harness: harness, sink: BroadcastEventSink())
+        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink())
         return SessionRef(id: id, path: path.string)
     }
 
@@ -155,7 +184,7 @@ public actor ServerRuntime {
         let forked = try await session.harness.fork(sessionDirectory: config.sessionDirectory)
         let path = await forked.sessionFilePath
         let id = try JSONLSessionStore(path: path).readHeader().id
-        sessions[id] = SessionState(harness: forked, sink: BroadcastEventSink())
+        sessions[id] = makeState(harness: forked, sink: BroadcastEventSink())
         return SessionRef(id: id, path: path.string)
     }
 
@@ -172,16 +201,29 @@ public actor ServerRuntime {
         guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
         let harness = session.harness
         let sink = session.sink
+        let token = session.token
         session.runTask = Task { [weak self] in
-            // A cancellation surfaces as an aborted run; any other error already
-            // reached the client through the event stream, so there is nothing to
-            // do here but let the run settle and free the slot.
-            _ = try? await harness.run(prompt: prompt, attachments: attachments, sink: sink)
-            await self?.finishRun(sessionID)
+            do {
+                _ = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
+            } catch is CancellationError {
+                // Aborted before the loop emitted its own close.
+                sink.broadcast(.agentEnd(reason: "aborted"))
+            } catch {
+                // A failure before agentStart (compaction, context build) or a
+                // persistence error after the loop settled would otherwise leave the
+                // stream with no terminal frame. Guarantee exactly one close per
+                // accepted prompt, so a subscriber never hangs.
+                sink.broadcast(.agentEnd(reason: "errored"))
+            }
+            await self?.finishRun(sessionID, token: token)
         }
     }
 
-    private func finishRun(_ sessionID: String) {
+    /// Clear the run slot, but only if the session is still the one that started the
+    /// run — a session replaced since must not have a completing run nil its
+    /// successor's slot.
+    private func finishRun(_ sessionID: String, token: Int) {
+        guard sessions[sessionID]?.token == token else { return }
         sessions[sessionID]?.runTask = nil
     }
 
@@ -247,8 +289,12 @@ public actor ServerRuntime {
         return match.path
     }
 
+    /// Resolve `resume` strictly as a session id within this cwd's session
+    /// directory — never as a raw filesystem path. A client is loopback-and-token
+    /// trusted, but treating the value as a path would let it open and *append to*
+    /// any JSONL file the process can read, outside the session scope; keeping it an
+    /// id keeps a session contained to the directory `listSessions` exposes.
     private func resolveResume(_ value: String) throws -> FilePath {
-        if FileManager.default.fileExists(atPath: value) { return FilePath(value) }
         let listings = (try? JSONLSessionStore.list(cwd: config.cwd, sessionDirectory: config.sessionDirectory)) ?? []
         guard let match = listings.first(where: { $0.header.id == value }) else {
             throw ServerRuntimeError.sessionNotFound

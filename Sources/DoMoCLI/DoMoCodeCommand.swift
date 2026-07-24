@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 import ArgumentParser
+import DoMoAgent
 import DoMoCore
 import DoMoExec
 import DoMoHarness
 import DoMoLLM
+import DoMoServer
 import DoMoTermIO
 import DoMoTUI
 import DoMoTools
@@ -72,6 +74,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         help: "Attach an image file to the -p prompt (PNG, JPEG, GIF, WebP, BMP). Repeatable."
     )
     public var images: [String] = []
+
+    @Flag(
+        name: .customLong("serve"),
+        help: "Run as a headless HTTP/SSE server (loopback only) instead of an interactive or print session."
+    )
+    public var serve: Bool = false
+
+    @Option(
+        name: .customLong("port"),
+        help: "Port for --serve (default 4100; 0 asks the OS for an ephemeral port)."
+    )
+    public var port: Int = 4100
 
     @Option(name: .customLong("model"), help: "Public model alias as configured on the proxy.")
     public var model: String?
@@ -187,6 +201,14 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             trustFlag: trust
         )
 
+        // `--serve` runs the headless HTTP/SSE server and does not return until the
+        // process is signalled. It manages sessions itself, so it is branched before
+        // the print/interactive session-source resolution below.
+        if serve {
+            try await runServer(configuration: configuration, model: model, workingDirectory: workingDirectory)
+            return
+        }
+
         // Resolve which session this run attaches to before touching the model, so
         // a bad `--resume`/`--session` fails fast with a clear message.
         let sessionSource = try Self.resolveSessionSource(
@@ -300,6 +322,67 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let resize = TerminalSize.resizeStream()
         let lifecycle = TerminalLifecycle()
         try await mode.run(target: target, input: input, resize: resize, lifecycle: lifecycle)
+    }
+
+    // MARK: Serve
+
+    /// Assemble the same runtime ingredients print mode builds — the LiteLLM stream
+    /// function, the sandboxed tool context, the system prompt — and serve them over
+    /// HTTP/SSE until the process is signalled.
+    ///
+    /// The bearer token is minted here and written to stderr (stdout stays clean),
+    /// so a local client can read it. There is no login flow, matching the
+    /// bearer-only posture; loopback-only bind plus the token is the whole gate.
+    private func runServer(
+        configuration: ResolvedConfiguration,
+        model: String,
+        workingDirectory: FilePath
+    ) async throws {
+        let shell = try SubprocessShell()
+        let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
+        let registry = ToolRegistry.builtin
+        let client = LiteLLMClient(configuration: configuration.clientConfiguration)
+        let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) }
+        let systemPrompt = PrintMode.systemPrompt(workingDirectory: workingDirectory, toolNames: registry.names)
+        let reasoningEffort = configuration.reasoningEffort
+        let streamFn: AgentStreamFn = { context in
+            client.streamCompletion(model: model, context: context, reasoningEffort: reasoningEffort)
+        }
+
+        let runtime = ServerRuntime(config: ServerRuntime.Config(
+            systemPrompt: systemPrompt,
+            tools: tools,
+            model: model,
+            streamFn: streamFn,
+            toolExecution: .sequential,
+            maxTurns: maxTurns,
+            sessionDirectory: configuration.sessionDirectory,
+            cwd: workingDirectory.string
+        ))
+        let token = Self.generateToken()
+        let server = DoMoServer(
+            runtime: runtime,
+            options: DoMoServer.Options(host: "127.0.0.1", port: port, token: token)
+        )
+
+        Self.writeStderr("domo serve — listening on http://127.0.0.1:\(port) (loopback only)\n")
+        Self.writeStderr("Authorization: Bearer \(token)\n")
+        try await server.run()
+    }
+
+    /// A 32-byte random bearer token, hex-encoded. Formatted by hand rather than
+    /// with `String(format:)`, whose varargs initializer is `unsafe` under
+    /// `.strictMemorySafety()`.
+    private static func generateToken() -> String {
+        let hexDigits = Array("0123456789abcdef")
+        var token = ""
+        token.reserveCapacity(64)
+        for _ in 0..<32 {
+            let byte = UInt8.random(in: UInt8.min...UInt8.max)
+            token.append(hexDigits[Int(byte >> 4)])
+            token.append(hexDigits[Int(byte & 0x0f)])
+        }
+        return token
     }
 
     // MARK: Project trust

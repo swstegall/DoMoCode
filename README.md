@@ -11,14 +11,14 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 
 ---
 
-## Status: Phases 0–4 and 5.5 shipped; rest of the expansion planned
+## Status: Phases 0–4, 5.5, and 6 shipped; rest of the expansion planned
 
-**The runtime, the inline terminal UI, and image input are implemented and tested** — Phases 0–4 plus
-5.5, with 1,097 tests green in both debug and `-c release`. Everything else tagged **Phase 5 and
-beyond** — the rest of the polish pass, the HTTP/SSE server, the full-screen TUI, MCP, and image
-*display* — is a statement of intent and a plan of record, tagged with the phase that will deliver it
-and described in the future tense until it lands. Read the [roadmap](#roadmap) for the boundary between
-what runs today and what is planned.
+**The runtime, the inline terminal UI, image input, and the headless HTTP/SSE server are implemented
+and tested** — Phases 0–4 plus 5.5 and 6, with 1,116 tests green in both debug and `-c release`.
+Everything else tagged **Phase 5 and beyond** — the rest of the polish pass, the full-screen TUI, MCP,
+and image *display* — is a statement of intent and a plan of record, tagged with the phase that will
+deliver it and described in the future tense until it lands. Read the [roadmap](#roadmap) for the
+boundary between what runs today and what is planned.
 
 DoMoCode began as a deliberately **narrowed** port; the
 [scope expansion](#what-expanded-and-what-did-not) has since widened it in four directions while keeping
@@ -277,16 +277,23 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       `includeImageContent` seam exists for a future gate. Both the user-attach and tool-image paths
       are proven end-to-end against the mock gateway, in print mode and the live REPL. 1,097 tests
       green in debug and release.
-- [ ] **Phase 6 — Headless HTTP/SSE runtime server** (re-scoped from the old "RPC mode"). A new
-      `DoMoServer` on Hummingbird 2.x, modeled on opencode's server: `AgentEvent` gains `Codable`;
-      a `BroadcastEventSink` fans the existing event stream out over `GET /event` (connected frame
-      + per-event frames + heartbeat); REST wrappers over `AgentHarness`/`JSONLSessionStore`
-      (`POST /session/:id/prompt`, list/get/messages/children/fork/abort); loopback-only bind with a
-      per-session token; `domo serve`; the awaited-emit sink split (durable-awaited vs
-      fan-out-buffered). *Exit:* `domo serve` runs the runtime headless, a scriptable client streams
-      events over SSE, abort/fork/resume work over REST, the JSON protocol carries a version field
-      with round-trip tests — **single loopback client only**; local interactive/`-p` stays
-      in-process. The hub is built broadcast-*capable*; multi-client mirroring waits on Phase 7.
+- [x] **Phase 6 — Headless HTTP/SSE runtime server** (re-scoped from the old "RPC mode"). A new
+      `DoMoServer` on Hummingbird 2.25.1 (resolves and builds sharing one swift-nio with
+      async-http-client), modeled on opencode's server. The wire vocabulary is a versioned
+      `ServerEvent` DTO *projected* from `AgentEvent` (streaming deltas flattened; `AssemblyEvent`
+      kept off the wire; `DoMoAgent` left untouched) rather than encoding the event enum. A
+      `BroadcastEventSink` fans it out over `GET /session/{id}/events` (connected frame + per-event
+      frames + heartbeat) with the awaited-emit split honoured (durable-awaited vs
+      fan-out-buffered, drop-oldest, so one stuck client cannot stall the loop); REST over
+      `AgentHarness`/`JSONLSessionStore` (`POST /session/{id}/prompt` → 202, list / messages /
+      children / abort / fork, resume by id); loopback-only bind + a constant-time bearer token;
+      `domo serve`. *Exit met:* an in-process end-to-end test stands the server up and drives it with
+      a real HTTP client — create → SSE subscribe → prompt → assert the event frames → transcript
+      persisted and read back → fork → 401/404 — and a three-lens adversarial review's findings
+      (unbounded SSE buffer, error-swallowing that dropped the terminal frame, live-session
+      overwrite, arbitrary-path resume) were fixed. **Single loopback client only**; local
+      interactive/`-p` stays in-process; multi-client mirroring waits on Phase 7. 1,116 tests green
+      in debug and release.
 - [ ] **Phase 7 — Full-screen widget TUI** (built in-house — there is no OpenTUI-equivalent in
       Swift). `DoMoTermIO` gains alternate-screen enter/exit (`CSI ?1049h/l`) with crash-safe
       restore; a new `DoMoTUIKit` module adds a box/flexbox-lite layout solver above the existing

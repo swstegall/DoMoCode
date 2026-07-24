@@ -41,10 +41,27 @@ struct TokenAuthMiddleware: RouterMiddleware {
         context: BasicRequestContext,
         next: @concurrent (Request, BasicRequestContext) async throws -> Response
     ) async throws -> Response {
-        guard request.headers[.authorization] == "Bearer \(token)" else {
+        guard let provided = request.headers[.authorization],
+            Self.constantTimeEqual(provided, "Bearer \(token)")
+        else {
             throw HTTPError(.unauthorized)
         }
         return try await next(request, context)
+    }
+
+    /// Compare in constant time over the byte length, so response timing does not
+    /// leak the token position-by-position. The length is allowed to short-circuit
+    /// (it reveals nothing about a high-entropy secret's content), matching the
+    /// stated posture that every local process is untrusted.
+    private static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let lhs = Array(a.utf8)
+        let rhs = Array(b.utf8)
+        guard lhs.count == rhs.count else { return false }
+        var difference: UInt8 = 0
+        for index in lhs.indices {
+            difference |= lhs[index] ^ rhs[index]
+        }
+        return difference == 0
     }
 }
 
@@ -189,7 +206,14 @@ public struct DoMoServer: Sendable {
             // One ordered stream of run events plus heartbeats. Two producers feed
             // it: the subscription forwarder and the heartbeat ticker. The consumer
             // is this single writer loop, so there is no contention on the writer.
-            let (merged, continuation) = AsyncStream<ServerEvent>.makeStream()
+            //
+            // Bounded (drop-oldest): a client that stops reading the socket suspends
+            // `writer.write`, but the forwarder keeps draining the per-subscriber
+            // stream into here — so this hop must carry the same cap, or the memory
+            // bound BroadcastEventSink promises would be defeated by this buffer.
+            let (merged, continuation) = AsyncStream<ServerEvent>.makeStream(
+                bufferingPolicy: .bufferingNewest(512)
+            )
             let forward = Task {
                 for await event in subscription.events { continuation.yield(event) }
                 continuation.finish()
