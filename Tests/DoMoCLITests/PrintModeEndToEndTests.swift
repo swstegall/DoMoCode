@@ -264,6 +264,85 @@ struct PrintModeEndToEndTests {
         #expect(types.last == "error")
     }
 
+    /// Turn 1: the assistant calls `bash` with `echo permitted` — a tool that, under
+    /// the Phase-8 baseline, needs approval (bash resolves to `ask`).
+    static let bashToolTurn = #"""
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_bash_1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\": \"echo permitted\"}"}}]},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":8,"total_tokens":50}}
+
+        data: [DONE]
+
+
+        """#
+
+    @Test
+    func headlessRefusesAToolNeedingApprovalWithAModelVisibleReason() async throws {
+        // Phase 8: bash needs approval and there is no human to prompt in -p, so the
+        // gate rejects it with a reason the model reads (not a silent allow, not a
+        // crash). The echo never runs, and the model still gets its turn to react.
+        let gateway = try MockGateway(chatCompletionBodies: [Self.bashToolTurn, Self.finalTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+
+        let result = try runDomo(
+            arguments: ["-p", "run echo", "--model", "mock-model", "--base-url", gateway.baseURL, "--json"],
+            workspace: workspace
+        )
+
+        #expect(result.exitCode == 0, "stderr: \(result.standardError)")
+        #expect(gateway.requestCount == 2)
+        // The tool_result fed back to the model carries the refusal — not the echo
+        // output. (Check the tool-role message's CONTENT specifically: the string
+        // "permitted" also appears in the replayed tool-call arguments regardless.)
+        let content = Self.toolResultContent(gateway.requests[1].body)
+        #expect(content.contains("interactive approval"), "tool result: \(content)")
+        #expect(!content.contains("permitted"), "the echo must NOT have run: \(content)")
+    }
+
+    @Test
+    func yoloAutoApprovesTheToolInHeadlessMode() async throws {
+        // With --yolo, the same bash call is auto-approved and actually runs.
+        let gateway = try MockGateway(chatCompletionBodies: [Self.bashToolTurn, Self.finalTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+
+        let result = try runDomo(
+            arguments: ["-p", "run echo", "--model", "mock-model", "--base-url", gateway.baseURL, "--json", "--yolo"],
+            workspace: workspace
+        )
+
+        #expect(result.exitCode == 0, "stderr: \(result.standardError)")
+        #expect(gateway.requestCount == 2)
+        // The echo actually ran: its output rides back in the tool RESULT content.
+        let content = Self.toolResultContent(gateway.requests[1].body)
+        #expect(content.contains("permitted"), "tool result: \(content)")
+        #expect(!content.contains("interactive approval"), "tool result: \(content)")
+    }
+
+    /// The content of the (first) tool-role message in a chat-completions request
+    /// body — the actual tool result fed back to the model, distinct from the
+    /// tool-call arguments echoed in the assistant message.
+    private static func toolResultContent(_ body: String) -> String {
+        guard let json = try? JSONValue(parsing: body),
+              let messages = json["messages"]?.arrayValue
+        else { return "" }
+        for message in messages where message["role"]?.stringValue == "tool" {
+            return message["content"]?.stringValue ?? ""
+        }
+        return ""
+    }
+
     @Test
     func missingModelExitsNonZeroWithMessage() throws {
         let workspace = try Workspace()

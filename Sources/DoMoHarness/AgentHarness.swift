@@ -119,6 +119,13 @@ public actor AgentHarness {
         /// Forwarded into ``AgentLoopConfig/shouldStopAfterTurn``.
         public var shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)?
 
+        /// Runs before each tool executes and may reject or rewrite the call. The
+        /// permission engine's gate (Phase 8) is injected here; the loop already
+        /// awaits it in `ToolDispatch.prepare` strictly before any side effect, but
+        /// `AgentLoopConfig`'s field was previously never populated from the harness.
+        /// `nil` means "no gate" — every tool runs. Contract: must honor cancellation.
+        public var beforeToolCall: BeforeToolCallHook?
+
         public init(
             systemPrompt: String? = nil,
             tools: [any AgentTool] = [],
@@ -133,7 +140,8 @@ public actor AgentHarness {
             entryIDFactory: @escaping @Sendable () -> String = { UUIDv7.generate().description },
             getSteeringMessages: (@Sendable () async -> [Message])? = nil,
             getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
-            shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil
+            shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil,
+            beforeToolCall: BeforeToolCallHook? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.tools = tools
@@ -149,6 +157,7 @@ public actor AgentHarness {
             self.getSteeringMessages = getSteeringMessages
             self.getFollowUpMessages = getFollowUpMessages
             self.shouldStopAfterTurn = shouldStopAfterTurn
+            self.beforeToolCall = beforeToolCall
         }
     }
 
@@ -267,6 +276,7 @@ public actor AgentHarness {
             model: configuration.model,
             toolExecution: configuration.toolExecution,
             maxTurns: configuration.maxTurns,
+            beforeToolCall: configuration.beforeToolCall,
             getSteeringMessages: configuration.getSteeringMessages,
             getFollowUpMessages: configuration.getFollowUpMessages,
             shouldStopAfterTurn: configuration.shouldStopAfterTurn

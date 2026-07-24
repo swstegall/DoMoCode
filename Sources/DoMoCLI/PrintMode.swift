@@ -392,6 +392,9 @@ public struct PrintMode: Sendable {
     let sessionSource: SessionSource
     /// The directory a new (or forked) session file is created under.
     let sessionDirectory: FilePath
+    /// The permission gate (Phase 8). `nil` runs every tool ungated; the headless
+    /// gate rejects any tool needing approval unless `--yolo` is set.
+    let beforeToolCall: BeforeToolCallHook?
 
     public init(
         client: LiteLLMClient,
@@ -404,7 +407,8 @@ public struct PrintMode: Sendable {
         maxTurns: Int,
         channel: OutputChannel,
         sessionSource: SessionSource,
-        sessionDirectory: FilePath
+        sessionDirectory: FilePath,
+        beforeToolCall: BeforeToolCallHook? = nil
     ) {
         self.client = client
         self.model = model
@@ -417,6 +421,7 @@ public struct PrintMode: Sendable {
         self.channel = channel
         self.sessionSource = sessionSource
         self.sessionDirectory = sessionDirectory
+        self.beforeToolCall = beforeToolCall
     }
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
@@ -462,7 +467,8 @@ public struct PrintMode: Sendable {
             // messages fed back to the model, appear in the model's own call
             // order. Parallel would reorder the completion-order `tool_result`s.
             toolExecution: .sequential,
-            maxTurns: maxTurns
+            maxTurns: maxTurns,
+            beforeToolCall: beforeToolCall
         )
 
         let harness = try await makeHarness(configuration: configuration)

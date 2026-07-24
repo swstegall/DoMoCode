@@ -133,6 +133,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     )
     public var inline: Bool = false
 
+    @Flag(
+        name: [.customLong("yolo"), .customLong("dangerously-allow-all")],
+        help: "Headless (-p) only: auto-approve every tool call that would otherwise need interactive approval. Without this, a tool needing approval is refused with a message the model can act on."
+    )
+    public var yolo: Bool = false
+
     @Option(
         name: .customLong("url"),
         help: "Attach the full-screen client to an existing `domo serve` at this base URL (e.g. http://127.0.0.1:4100) instead of spawning a local server."
@@ -286,6 +292,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let registry = ToolRegistry.builtin
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
 
+        // The permission gate (Phase 8). Headless has no human to prompt, so a tool
+        // that resolves to `ask` is refused with a model-visible reason unless
+        // `--yolo` auto-approves it. Read-only tools run silently under the baseline.
+        let permissionHook = PermissionSetup.headlessHook(
+            workingDirectory: workingDirectory.string,
+            configDirectory: configuration.configDirectory.string,
+            homeDirectory: environment["HOME"] ?? NSHomeDirectory(),
+            yolo: yolo
+        )
+
         let printMode = PrintMode(
             client: client,
             model: model,
@@ -297,7 +313,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             maxTurns: maxTurns,
             channel: OutputChannel(),
             sessionSource: sessionSource,
-            sessionDirectory: configuration.sessionDirectory
+            sessionDirectory: configuration.sessionDirectory,
+            beforeToolCall: permissionHook
         )
 
         let attachments = try Self.loadImageAttachments(images)

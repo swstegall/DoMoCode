@@ -195,6 +195,17 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        // The granular permission engine (Phase 8a). A pure policy core faithfully
+        // ported from opencode/kilocode (wildcard, evaluate, config, bash arity,
+        // .env guard) plus the actor + request factory + before-tool-call hook
+        // adapter that gate the pure agent loop. Depends on DoMoCore (JSONValue) and
+        // DoMoAgent (the BeforeToolCallHook type) only.
+        .target(
+            name: "DoMoPermissions",
+            dependencies: ["DoMoCore", "DoMoAgent"],
+            swiftSettings: safeSettings
+        ),
+
         // MARK: Server
 
         // The headless HTTP/SSE runtime server (Phase 6). Wraps the existing
@@ -237,7 +248,7 @@ let package = Package(
             name: "DoMoCLI",
             dependencies: [
                 "DoMoCore", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoLLM", "DoMoAgent",
-                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoServer", "DoMoClient",
+                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoServer", "DoMoClient",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -285,6 +296,12 @@ let package = Package(
         .testTarget(
             name: "DoMoAgentTests",
             dependencies: ["DoMoAgent", "DoMoLLM", "DoMoTools", "DoMoCore"],
+            swiftSettings: safeSettings
+        ),
+
+        .testTarget(
+            name: "DoMoPermissionsTests",
+            dependencies: ["DoMoPermissions", "DoMoCore"],
             swiftSettings: safeSettings
         ),
 
