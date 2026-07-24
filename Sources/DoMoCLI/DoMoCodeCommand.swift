@@ -6,6 +6,8 @@ import DoMoCore
 import DoMoExec
 import DoMoHarness
 import DoMoLLM
+import DoMoTermIO
+import DoMoTUI
 import DoMoTools
 import Foundation
 import Logging
@@ -13,25 +15,30 @@ import SystemPackage
 
 /// The `domocode` command-line root.
 ///
-/// Phase 1 ships exactly one mode: non-interactive print (`-p`). The interactive
-/// TUI, sessions, and the rest of the flag surface arrive in later phases; this
-/// command is intentionally the thin wiring that turns resolved configuration
-/// into a single ``PrintMode`` run.
+/// Two modes: with `-p` it runs a single non-interactive ``PrintMode`` turn and
+/// exits; with no `-p` it launches the interactive REPL (``InteractiveMode``).
+/// Session selection and project trust are resolved once, up front, and shared by
+/// both paths; the command itself is the thin wiring that turns resolved
+/// configuration into whichever run the flags asked for.
 ///
-/// Isolation note: nothing here is `@MainActor`. `AsyncParsableCommand.main()`
-/// runs `run()` on the global executor, and the streaming client, tool dispatch,
-/// and filesystem seams are all `@concurrent`, so the work stays off any actor —
-/// which is what the README's concurrency rules ask of a headless entry point.
+/// Isolation note: the parse-and-dispatch surface stays off any actor —
+/// `AsyncParsableCommand.main()` runs `run()` on the global executor, and the
+/// streaming client, tool dispatch, and filesystem seams are all `@concurrent`.
+/// The one exception is ``runInteractive(_:)``, which is `@MainActor`: the live
+/// terminal target is not `Sendable`, so the REPL's collaborators are assembled
+/// and driven on the main actor rather than crossing an isolation boundary.
 public struct DoMoCodeCommand: AsyncParsableCommand {
 
     public static let configuration = CommandConfiguration(
         commandName: "domocode",
         abstract: "A terminal coding-agent harness that talks to a LiteLLM gateway.",
         discussion: """
-            Non-interactive print mode. Give a prompt with -p and domocode runs a multi-turn tool \
-            loop against the configured LiteLLM proxy and prints the model's final text. \
-            Diagnostics go to stderr; stdout carries only the result (or, with --json, the event \
-            stream).
+            Two modes. With no -p, domocode opens an INTERACTIVE session: a live transcript with \
+            streaming model output, @ file completion, Escape to abort a running turn, and Enter to \
+            queue a follow-up. It needs a real terminal. With -p "<prompt>" it runs a single \
+            NON-INTERACTIVE turn against the configured LiteLLM proxy and prints the model's final \
+            text; diagnostics go to stderr, stdout carries only the result (or, with --json, the \
+            event stream).
 
             SESSIONS. Every run persists its transcript to a session file under the session \
             directory (DOMOCODE_SESSION_DIR, or <config-dir>/sessions). Resume a session to carry \
@@ -155,9 +162,6 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // channel; routing it to stderr is what keeps stdout clean.
         Self.bootstrapLogging(level: configuration.logLevel)
 
-        guard let prompt, !prompt.isEmpty else {
-            throw DoMoError(.configuration, "No prompt given. Use -p \"<prompt>\" to run non-interactively.")
-        }
         guard let model = configuration.model, !model.isEmpty else {
             throw DoMoError(
                 .configuration,
@@ -188,6 +192,25 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionDirectory: configuration.sessionDirectory
         )
 
+        // No `-p`: run the interactive REPL. The heavy dependencies (tools, the
+        // sandboxed context, the harness) are built behind ``InteractiveMode/make``,
+        // and the live terminal collaborators are assembled on the main actor so
+        // the non-`Sendable` output target never crosses an isolation boundary.
+        guard let prompt, !prompt.isEmpty else {
+            let mode = try await InteractiveMode.make(
+                clientConfiguration: configuration.clientConfiguration,
+                model: model,
+                workingDirectory: workingDirectory.string,
+                sessionDirectory: configuration.sessionDirectory.string,
+                homeDirectory: environment["HOME"],
+                reasoningEffort: configuration.reasoningEffort,
+                maxTurns: maxTurns,
+                sessionSource: sessionSource
+            )
+            try await Self.runInteractive(mode)
+            return
+        }
+
         let shell = try SubprocessShell()
         let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
         let registry = ToolRegistry.builtin
@@ -211,6 +234,22 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         if code != 0 {
             throw ExitCode(code)
         }
+    }
+
+    /// Assemble the live terminal collaborators on the main actor and run the REPL.
+    ///
+    /// ``TerminalOutputTarget`` is not `Sendable` (it wraps a process descriptor),
+    /// so it is created here — inside the main-actor context that will use it —
+    /// rather than passed across an isolation boundary. The input, resize and
+    /// lifecycle seams are the live producers the injectable ``InteractiveMode/run``
+    /// consumes; a test substitutes scripted ones.
+    @MainActor
+    private static func runInteractive(_ mode: InteractiveMode) async throws {
+        let target = TerminalOutputTarget()
+        let input = TerminalDriver.standardInputStream()
+        let resize = TerminalSize.resizeStream()
+        let lifecycle = TerminalLifecycle()
+        try await mode.run(target: target, input: input, resize: resize, lifecycle: lifecycle)
     }
 
     // MARK: Project trust

@@ -178,18 +178,17 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       and a project trust gate. *Exit met:* an end-to-end test resumes a session in a second process
       and proves the next request carries the prior turn's context. 677 tests, green in both
       configurations.
-- [ ] **Phase 4 — Terminal.** Ordered so the test oracle exists before the code it judges.
-      **4a:** the SwiftTerm-backed screen-state harness — renderer bytes in, assertions against a real
-      VT100 cell grid, including a fixture where the transcript exceeds the viewport. A harness that
-      records writes instead of emulating a screen cannot catch the bug class this phase exists to
-      avoid. **4b:** `DoMoTermIO` — raw mode, restore-on-crash, SIGWINCH, and the stdin framing layer
-      with an explicit complete/incomplete/not-escape state machine plus an ESC-disambiguation
-      timeout, tested before any decoding is written. **4c:** the key decoder as a public pure
-      function, the `KeyId` grammar and matcher, then the keybindings layer — this ordering is
-      load-bearing, since the app layer resolves keybindings at roughly forty call sites. **4d:**
-      `DoMoTUI` — width engine → components → diff renderer (with viewport, height-change, shrink and
-      append-past-viewport bookkeeping) → overlays → Editor → Markdown. *Exit:* interactive mode with
-      streaming output, `@` file completion, Escape-to-abort, Enter-steering.
+- [x] **Phase 4 — Terminal.** Built oracle-first, across four workflows. **4a:** the SwiftTerm
+      screen-state oracle (renderer bytes in, cell-grid assertions), the `DoMoTermIO` POSIX seam (raw
+      mode with panic-safe restore, SIGWINCH, the stdin framing state machine, key decoding,
+      keybindings), and the `DoMoTUI` width engine. **4b:** the Component model and the inline
+      differential renderer (verified against the oracle, proven not to clamp-and-overwrite the
+      transcript), overlays, and core components. **4c:** the multi-line Editor (`[[Character]]`
+      buffers), Markdown-on-swift-markdown, and autocomplete + fuzzy. **4d:** the live terminal
+      driver, `DoMoToolsUI` tool renderers, and the interactive REPL. *Exit met:* `domocode` with no
+      `-p` is an interactive session with streaming output, `@` file completion, Escape-to-abort, and
+      Enter to queue a follow-up; three end-to-end tests drive the real REPL headlessly against a mock
+      gateway. 1059 tests, green in both configurations.
 - [ ] **Phase 5 — Polish.** Slash commands, `!` shell commands, skills, prompt templates,
       `AGENTS.md` loading, themes, external editor, session tree navigation, model cycling.
 - [ ] **Phase 6 — Deferred.** SQLite storage behind the existing protocol; RPC mode; anything
