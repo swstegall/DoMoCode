@@ -196,13 +196,34 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        // MARK: Client
+
+        // The remote full-screen TUI client (Phase 7d). Consumes the DoMoServer
+        // wire — `ServerEvent` over SSE + the REST endpoints — through
+        // AsyncHTTPClient, folds the delta-only stream into a normalized transcript,
+        // and drives a two-pane full-screen `ScreenSurface`. It imports DoMoServer
+        // only for the wire DTOs (not the Hummingbird server), and never touches
+        // POSIX directly. The transport is `Sendable`/off-main; the UI layer marks
+        // `@MainActor` explicitly (DoMoTUI sets `.defaultIsolation` on itself, not on
+        // dependents), so this target keeps the default nonisolated settings.
+        .target(
+            name: "DoMoClient",
+            dependencies: [
+                "DoMoCore", "DoMoServer", "DoMoLLM", "DoMoHarness",
+                "DoMoTUI", "DoMoTermIO", "DoMoToolsUI",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
+            swiftSettings: safeSettings
+        ),
+
         // MARK: CLI
 
         .target(
             name: "DoMoCLI",
             dependencies: [
                 "DoMoCore", "DoMoTUI", "DoMoLLM", "DoMoAgent",
-                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoServer",
+                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoServer", "DoMoClient",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -301,6 +322,20 @@ let package = Package(
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
             ],
             swiftSettings: safeSettings
+        ),
+
+        // baseSettings: the client's two-pane UI is asserted through the same
+        // SwiftTerm cell-grid oracle the TUI tests use, and the transport is proven
+        // against a real in-process DoMoServer over AsyncHTTPClient.
+        .testTarget(
+            name: "DoMoClientTests",
+            dependencies: [
+                "DoMoClient", "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent",
+                "DoMoHarness", "DoMoTUI", "DoMoTermIO",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
+            ],
+            swiftSettings: baseSettings
         ),
     ]
 )

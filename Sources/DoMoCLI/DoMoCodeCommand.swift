@@ -3,6 +3,7 @@
 
 import ArgumentParser
 import DoMoAgent
+import DoMoClient
 import DoMoCore
 import DoMoExec
 import DoMoHarness
@@ -126,6 +127,24 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     )
     public var trust: Bool = false
 
+    @Flag(
+        name: .customLong("inline"),
+        help: "Use the classic inline REPL instead of the full-screen client (the default interactive mode)."
+    )
+    public var inline: Bool = false
+
+    @Option(
+        name: .customLong("url"),
+        help: "Attach the full-screen client to an existing `domo serve` at this base URL (e.g. http://127.0.0.1:4100) instead of spawning a local server."
+    )
+    public var serverURL: String?
+
+    @Option(
+        name: .customLong("token"),
+        help: "Bearer token for --url (from the server's stderr `Authorization: Bearer` line)."
+    )
+    public var serverToken: String?
+
     public init() {}
 
     /// The executable's entry point.
@@ -230,22 +249,35 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             )
         }
 
-        // No `-p`: run the interactive REPL. The heavy dependencies (tools, the
-        // sandboxed context, the harness) are built behind ``InteractiveMode/make``,
-        // and the live terminal collaborators are assembled on the main actor so
-        // the non-`Sendable` output target never crosses an isolation boundary.
+        // No `-p`: run interactively. The full-screen two-pane client is the
+        // default (it drives a loopback runtime over the same HTTP/SSE surface a
+        // remote one would); `--inline` selects the classic inline REPL, and
+        // `--url` attaches the client to an already-running `domo serve`. The live
+        // terminal collaborators are assembled on the main actor so the
+        // non-`Sendable` output target never crosses an isolation boundary.
         guard let prompt, !prompt.isEmpty else {
-            let mode = try await InteractiveMode.make(
-                clientConfiguration: configuration.clientConfiguration,
-                model: model,
-                workingDirectory: workingDirectory.string,
-                sessionDirectory: configuration.sessionDirectory.string,
-                homeDirectory: environment["HOME"],
-                reasoningEffort: configuration.reasoningEffort,
-                maxTurns: maxTurns,
-                sessionSource: sessionSource
-            )
-            try await Self.runInteractive(mode)
+            if inline {
+                let mode = try await InteractiveMode.make(
+                    clientConfiguration: configuration.clientConfiguration,
+                    model: model,
+                    workingDirectory: workingDirectory.string,
+                    sessionDirectory: configuration.sessionDirectory.string,
+                    homeDirectory: environment["HOME"],
+                    reasoningEffort: configuration.reasoningEffort,
+                    maxTurns: maxTurns,
+                    sessionSource: sessionSource
+                )
+                try await Self.runInteractive(mode)
+            } else {
+                try await Self.runClient(
+                    configuration: configuration,
+                    model: model,
+                    workingDirectory: workingDirectory,
+                    maxTurns: maxTurns,
+                    serverURL: serverURL,
+                    serverToken: serverToken
+                )
+            }
             return
         }
 
@@ -338,6 +370,35 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         model: String,
         workingDirectory: FilePath
     ) async throws {
+        let runtime = try await Self.buildServerRuntime(
+            configuration: configuration,
+            model: model,
+            workingDirectory: workingDirectory,
+            maxTurns: maxTurns
+        )
+        let token = Self.generateToken()
+        let server = DoMoServer(
+            runtime: runtime,
+            options: DoMoServer.Options(host: "127.0.0.1", port: port, token: token)
+        )
+
+        Self.writeStderr("Authorization: Bearer \(token)\n")
+        // Print the ACTUAL bound port from onReady, so `--serve --port 0` (ephemeral)
+        // advertises the real port the OS assigned rather than the literal 0.
+        try await server.run(onReady: { boundPort in
+            Self.writeStderr("domo serve — listening on http://127.0.0.1:\(boundPort) (loopback only)\n")
+        })
+    }
+
+    /// Assemble the shared runtime ingredients — the sandboxed tool context, the
+    /// system prompt, and the LiteLLM stream function — that both `--serve` and the
+    /// in-process client spawn behind. The same wiring print mode builds.
+    private static func buildServerRuntime(
+        configuration: ResolvedConfiguration,
+        model: String,
+        workingDirectory: FilePath,
+        maxTurns: Int
+    ) async throws -> ServerRuntime {
         let shell = try SubprocessShell()
         let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
         let registry = ToolRegistry.builtin
@@ -348,8 +409,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let streamFn: AgentStreamFn = { context in
             client.streamCompletion(model: model, context: context, reasoningEffort: reasoningEffort)
         }
-
-        let runtime = ServerRuntime(config: ServerRuntime.Config(
+        return ServerRuntime(config: ServerRuntime.Config(
             systemPrompt: systemPrompt,
             tools: tools,
             model: model,
@@ -359,15 +419,81 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionDirectory: configuration.sessionDirectory,
             cwd: workingDirectory.string
         ))
-        let token = Self.generateToken()
-        let server = DoMoServer(
-            runtime: runtime,
-            options: DoMoServer.Options(host: "127.0.0.1", port: port, token: token)
-        )
+    }
 
-        Self.writeStderr("domo serve — listening on http://127.0.0.1:\(port) (loopback only)\n")
-        Self.writeStderr("Authorization: Bearer \(token)\n")
-        try await server.run()
+    // MARK: Full-screen client
+
+    /// Run the default interactive experience — the two-pane full-screen client.
+    ///
+    /// Remote transport either way: with `--url` it attaches to an already-running
+    /// `domo serve`; otherwise it spawns a loopback ``DoMoServer`` on an ephemeral
+    /// port (the real port comes back through `onReady`, so no port guessing) and
+    /// drives that. The spawned server is torn down when the client returns. The
+    /// terminal collaborators are assembled here on the main actor, exactly as the
+    /// inline REPL's are.
+    @MainActor
+    private static func runClient(
+        configuration: ResolvedConfiguration,
+        model: String,
+        workingDirectory: FilePath,
+        maxTurns: Int,
+        serverURL: String?,
+        serverToken: String?
+    ) async throws {
+        let baseURL: String
+        let token: String
+        var serverTask: Task<Void, Never>?
+
+        if let url = serverURL {
+            baseURL = url
+            token = serverToken ?? ""
+        } else {
+            let runtime = try await Self.buildServerRuntime(
+                configuration: configuration,
+                model: model,
+                workingDirectory: workingDirectory,
+                maxTurns: maxTurns
+            )
+            let generated = Self.generateToken()
+            let server = DoMoServer(
+                runtime: runtime,
+                options: DoMoServer.Options(host: "127.0.0.1", port: 0, token: generated)
+            )
+            let (ports, portContinuation) = AsyncStream.makeStream(of: Int.self)
+            serverTask = Task {
+                try? await server.run(onReady: { boundPort in
+                    portContinuation.yield(boundPort)
+                    portContinuation.finish()
+                })
+            }
+            var boundPort = 0
+            for await value in ports { boundPort = value; break }
+            guard boundPort != 0 else {
+                serverTask?.cancel()
+                throw DoMoError(.configuration, "The local runtime server did not bind a port.")
+            }
+            baseURL = "http://127.0.0.1:\(boundPort)"
+            token = generated
+        }
+
+        let target = TerminalOutputTarget()
+        let input = TerminalDriver.standardInputStream()
+        let resize = TerminalSize.resizeStream()
+        let lifecycle = TerminalLifecycle()
+        do {
+            try await runFullScreenClient(
+                baseURL: baseURL,
+                token: token,
+                target: target,
+                input: input,
+                resize: resize,
+                lifecycle: lifecycle
+            )
+        } catch {
+            serverTask?.cancel()
+            throw error
+        }
+        serverTask?.cancel()
     }
 
     /// A 32-byte random bearer token, hex-encoded. Formatted by hand rather than
