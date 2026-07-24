@@ -224,7 +224,7 @@ let package = Package(
             name: "DoMoClient",
             dependencies: [
                 "DoMoCore", "DoMoServer", "DoMoLLM", "DoMoHarness",
-                "DoMoTUI", "DoMoTermIO", "DoMoToolsUI",
+                "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoToolsUI",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -236,7 +236,7 @@ let package = Package(
         .target(
             name: "DoMoCLI",
             dependencies: [
-                "DoMoCore", "DoMoTUI", "DoMoLLM", "DoMoAgent",
+                "DoMoCore", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoLLM", "DoMoAgent",
                 "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoServer", "DoMoClient",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
@@ -326,7 +326,7 @@ let package = Package(
         .testTarget(
             name: "DoMoCLITests",
             dependencies: [
-                "DoMoCLI", "DoMoCore", "DoMoLLM", "DoMoTUI", "DoMoTermIO",
+                "DoMoCLI", "DoMoCore", "DoMoLLM", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics",
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
             swiftSettings: baseSettings
@@ -351,7 +351,7 @@ let package = Package(
             name: "DoMoClientTests",
             dependencies: [
                 "DoMoClient", "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent",
-                "DoMoHarness", "DoMoTUI", "DoMoTermIO",
+                "DoMoHarness", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],

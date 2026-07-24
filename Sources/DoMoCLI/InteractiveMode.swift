@@ -43,6 +43,7 @@ import DoMoCore
 import DoMoExec
 import DoMoHarness
 import DoMoLLM
+import DoMoTermGraphics
 import DoMoTermIO
 import DoMoToolsUI
 import DoMoTUI
@@ -201,6 +202,12 @@ final class InteractiveCoordinator {
     private let homeDirectory: String?
     private let keybindings: Keybindings
 
+    /// The terminal's inline-image capability and cell pixel size, detected once by
+    /// `run` (the REPL owns the tty). A tool result's image blocks render through
+    /// these; with no image protocol they degrade to a `[Image: …]` text marker.
+    private let imageCapabilities: TerminalCapabilities
+    private let cell: CellDimensions
+
     // Owned UI.
     private let transcript = Container()
     private let statusLine = StatusLine()
@@ -261,7 +268,9 @@ final class InteractiveCoordinator {
         steering: SteeringBox,
         fileSystem: SandboxedFileSystem? = nil,
         terminalRows: @escaping () -> Int,
-        keybindings: Keybindings = Keybindings()
+        keybindings: Keybindings = Keybindings(),
+        imageCapabilities: TerminalCapabilities = TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false),
+        cell: CellDimensions = .default
     ) {
         self.tui = tui
         self.driver = driver
@@ -274,6 +283,8 @@ final class InteractiveCoordinator {
         self.toolTheme = toolTheme
         self.homeDirectory = homeDirectory
         self.keybindings = keybindings
+        self.imageCapabilities = imageCapabilities
+        self.cell = cell
 
         self.editor = Editor(
             keybindings: keybindings,
@@ -723,6 +734,22 @@ final class InteractiveCoordinator {
         } else {
             transcript.addChild(MutableBlock(view))
         }
+
+        // The text renderers never see the tool's image blocks (they carry the
+        // one-row width contract); an image is a separate row whose escape the
+        // differential renderer paints opaquely. Append one image view per block,
+        // right after the tool result, mirroring the full-screen client's transcript.
+        // Sequential tool execution keeps these ordered under their own tool.
+        for image in result.images {
+            transcript.addChild(
+                ImageBlockView(
+                    block: image,
+                    imageId: allocateImageId(),
+                    capabilities: imageCapabilities,
+                    cell: cell
+                )
+            )
+        }
     }
 }
 
@@ -890,12 +917,20 @@ public struct InteractiveMode: Sendable {
     /// A render error (an over-wide line escaped a component) or a startup error
     /// (the descriptor was not a terminal) recorded by the driver is surfaced here
     /// as a throw, so a caller can report *why* a session ended abnormally.
+    ///
+    /// `imageCapabilities`/`cell` default to `nil`, meaning "detect from the tty" —
+    /// the production path. They are injectable because detection reads the
+    /// process's real environment and stdout, which a headless test drives an
+    /// injected `target` around but cannot itself control; a test forces them to
+    /// keep image rendering deterministic.
     @MainActor
     public func run(
         target: any RenderTarget,
         input: AsyncStream<[UInt8]>,
         resize: AsyncStream<TerminalSize>,
-        lifecycle: any TerminalLifecycleControl
+        lifecycle: any TerminalLifecycleControl,
+        imageCapabilities: TerminalCapabilities? = nil,
+        cell: CellDimensions? = nil
     ) async throws {
         let quit = QuitSignal()
         let tui = TUI(target: target, showHardwareCursor: true)
@@ -905,6 +940,16 @@ public struct InteractiveMode: Sendable {
             SlashCommandProvider(commands: slashCommands),
             FileCompletionProvider(lister: directoryLister),
         ])
+
+        // Detect the tty's inline-image capability and cell pixel size once, up
+        // front — the REPL owns the terminal, so this is the place that can query
+        // it. With no image protocol every image degrades to a text marker. An
+        // injected override (tests) short-circuits detection.
+        let resolvedCapabilities = imageCapabilities ?? detectCapabilities()
+        var resolvedCell = cell ?? .default
+        if cell == nil, let pixel = TerminalSize.cellPixelSize() {
+            resolvedCell = CellDimensions(widthPx: pixel.widthPx, heightPx: pixel.heightPx)
+        }
 
         let coordinator = InteractiveCoordinator(
             tui: tui,
@@ -917,7 +962,9 @@ public struct InteractiveMode: Sendable {
             homeDirectory: homeDirectory,
             steering: steering,
             fileSystem: fileSystem,
-            terminalRows: { target.rows }
+            terminalRows: { target.rows },
+            imageCapabilities: resolvedCapabilities,
+            cell: resolvedCell
         )
         coordinator.install()
 

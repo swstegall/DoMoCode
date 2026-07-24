@@ -6,6 +6,8 @@
 // history it seeds from — into this flat, renderable transcript. One item per
 // visible block, in arrival order, is all the two-pane main view needs.
 
+import DoMoLLM
+
 // MARK: - Transcript item
 
 /// One rendered block in a session transcript.
@@ -25,4 +27,8 @@ public enum TranscriptItem: Sendable, Hashable {
     /// A tool invocation and its result. `output` is empty while the tool runs
     /// (between `tool_start` and `tool_end`).
     case tool(name: String, output: String, isError: Bool, imageCount: Int)
+    /// An image to display inline — a user attachment or a tool-produced image.
+    /// The `imageId` is a stable Kitty id, allocated once when the item is created,
+    /// so the differential renderer can track and delete the image across frames.
+    case image(ImageBlock, imageId: UInt32)
 }

@@ -29,6 +29,8 @@ import DoMoAgent
 import DoMoCore
 import DoMoHarness
 import DoMoLLM
+import DoMoTermGraphics
+import DoMoTermIO
 import DoMoTools
 import Foundation
 import Synchronization
@@ -160,6 +162,13 @@ struct PrintEventSink: AgentEventSink {
     /// the harness gap.
     let runGuard: RunGuard
 
+    /// The tty's inline-image capability, cell pixel size, and column budget, for
+    /// text mode. Detected only when stdout is a terminal (else `images` is `nil`),
+    /// so a piped `-p` run stays byte-clean and JSON mode never carries pixels.
+    let imageCapabilities: TerminalCapabilities
+    let cell: CellDimensions
+    let imageMaxWidth: Int
+
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
 
     func emit(_ event: AgentEvent) async {
@@ -223,9 +232,41 @@ struct PrintEventSink: AgentEventSink {
                     "output": .string(result.output),
                 ]
             )
+            emitImages(result.images)
 
         case .turnStart, .turnEnd, .agentEnd:
             break
+        }
+    }
+
+    /// In text mode on a real tty, print a tool's image blocks inline as they are
+    /// produced (the final assistant text still follows). JSON mode keeps the
+    /// scriptable stream free of pixels, and a non-tty stdout carries `images: nil`
+    /// so nothing is emitted. Unlike the inline REPL — where a differential renderer
+    /// owns the cursor — print mode streams raw bytes, so the escape moves the cursor
+    /// itself and a trailing newline separates it from what follows.
+    private func emitImages(_ images: [ImageBlock]) {
+        guard mode == .text, imageCapabilities.images != nil else { return }
+        for image in images {
+            let dimensions = imageDimensions(image.data, mediaType: image.mediaType)
+            if let dimensions,
+               let rendered = renderImage(
+                   base64Data: image.data.base64EncodedString(),
+                   dimensions: dimensions,
+                   mediaType: image.mediaType,
+                   capabilities: imageCapabilities,
+                   cell: cell,
+                   maxWidthCells: imageMaxWidth,
+                   imageId: allocateImageId(),
+                   moveCursor: true
+               ) {
+                channel.writeOut(rendered.sequence + "\n")
+            } else {
+                // Unreadable, or a format this protocol can't display (e.g. a JPEG
+                // on Kitty, whose `f=100` is PNG-only): show the text marker rather
+                // than nothing — the terminal is a real tty here.
+                channel.writeOut(imageFallback(mediaType: image.mediaType, dimensions: dimensions) + "\n")
+            }
         }
     }
 
@@ -426,13 +467,17 @@ public struct PrintMode: Sendable {
 
         let harness = try await makeHarness(configuration: configuration)
 
+        let graphics = detectImageGraphics()
         let sink = PrintEventSink(
             channel: channel,
             mode: mode,
             sessionModel: model,
             workingDirectory: workingDirectory,
             toolNames: tools.map(\.definition.name),
-            runGuard: runGuard
+            runGuard: runGuard,
+            imageCapabilities: graphics.capabilities,
+            cell: graphics.cell,
+            imageMaxWidth: graphics.maxWidth
         )
 
         let result = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
@@ -458,6 +503,21 @@ public struct PrintMode: Sendable {
             let base = try AgentHarness.open(path: path, configuration: configuration)
             return try await base.fork(sessionDirectory: sessionDirectory)
         }
+    }
+
+    /// The tty's image capability, cell size, and column budget for text-mode image
+    /// display. Gated on `stdout` being a real terminal in text mode: a piped or
+    /// redirected stdout (or JSON mode) reports no image protocol, so `emitImages`
+    /// writes nothing and the byte stream stays clean and scriptable.
+    private func detectImageGraphics() -> (capabilities: TerminalCapabilities, cell: CellDimensions, maxWidth: Int) {
+        let none = TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false)
+        guard mode == .text, TerminalSize.isTerminal() else { return (none, .default, 80) }
+        let capabilities = detectCapabilities()
+        var cell = CellDimensions.default
+        if let pixel = TerminalSize.cellPixelSize() {
+            cell = CellDimensions(widthPx: pixel.widthPx, heightPx: pixel.heightPx)
+        }
+        return (capabilities, cell, TerminalSize.current().columns)
     }
 
     // MARK: Stream seam

@@ -94,20 +94,27 @@ struct ImageDimensionsTests {
         let dims = ImageDimensions(widthPx: 900, heightPx: 450)
 
         // No protocol -> nil (caller shows the text fallback).
-        #expect(renderImage(base64Data: "QUJD", dimensions: dims,
+        #expect(renderImage(base64Data: "QUJD", dimensions: dims, mediaType: "image/png",
                             capabilities: TerminalCapabilities(images: nil, trueColor: true, hyperlinks: true),
                             cell: cell) == nil)
 
         // Kitty: sequence carries c=/r=/i=, rows reported, id echoed.
-        let kitty = renderImage(base64Data: "QUJD", dimensions: dims,
+        let kitty = renderImage(base64Data: "QUJD", dimensions: dims, mediaType: "image/png",
                                 capabilities: TerminalCapabilities(images: .kitty, trueColor: true, hyperlinks: true),
                                 cell: cell, maxWidthCells: 80, imageId: 99, moveCursor: false)
         #expect(kitty?.rows == 20)
         #expect(kitty?.imageId == 99)
         #expect(kitty?.sequence.contains("c=80,r=20,i=99") == true)
 
-        // iTerm2: width=<cols>;height=auto, no id.
-        let iterm = renderImage(base64Data: "QUJD", dimensions: dims,
+        // Kitty's f=100 is PNG-only: a non-PNG returns nil so the caller can show
+        // the text fallback instead of a silently-rejected escape.
+        #expect(renderImage(base64Data: "QUJD", dimensions: dims, mediaType: "image/jpeg",
+                            capabilities: TerminalCapabilities(images: .kitty, trueColor: true, hyperlinks: true),
+                            cell: cell, maxWidthCells: 80) == nil)
+
+        // iTerm2: width=<cols>;height=auto, no id — and it auto-detects the format,
+        // so a non-PNG still renders.
+        let iterm = renderImage(base64Data: "QUJD", dimensions: dims, mediaType: "image/jpeg",
                                 capabilities: TerminalCapabilities(images: .iterm2, trueColor: true, hyperlinks: true),
                                 cell: cell, maxWidthCells: 80)
         #expect(iterm?.rows == 20)

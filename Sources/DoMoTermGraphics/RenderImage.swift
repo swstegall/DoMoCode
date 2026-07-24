@@ -16,6 +16,8 @@ import DoMoCore
 public struct RenderedImage: Sendable, Hashable {
     /// The full escape sequence to write at the image's position.
     public var sequence: String
+    /// Terminal columns the image occupies.
+    public var columns: Int
     /// Terminal rows the image occupies (authoritative for Kitty via `r=`, an
     /// estimate for iTerm2, which sizes itself from `height=auto`).
     public var rows: Int
@@ -23,8 +25,9 @@ public struct RenderedImage: Sendable, Hashable {
     /// for iTerm2, which has no image lifecycle.
     public var imageId: UInt32?
 
-    public init(sequence: String, rows: Int, imageId: UInt32?) {
+    public init(sequence: String, columns: Int, rows: Int, imageId: UInt32?) {
         self.sequence = sequence
+        self.columns = columns
         self.rows = rows
         self.imageId = imageId
     }
@@ -36,6 +39,11 @@ public struct RenderedImage: Sendable, Hashable {
 /// - Parameters:
 ///   - base64Data: the base64-encoded image bytes (PNG for Kitty's `f=100`).
 ///   - dimensions: the image's intrinsic pixel size (from ``imageDimensions(_:mediaType:)``).
+///   - mediaType: the image's IANA media type (e.g. `image/png`). Kitty's `f=100`
+///     transmission format is PNG only — a JPEG/GIF/WebP/BMP would be silently
+///     rejected by the terminal — so a non-PNG on Kitty returns `nil` here, letting
+///     the caller show ``imageFallback(mediaType:dimensions:filename:)`` instead of
+///     emitting a broken escape. iTerm2 auto-detects the format, so any type works.
 ///   - capabilities: the detected terminal capabilities (usually ``getCapabilities()``).
 ///   - cell: the terminal cell pixel size (usually ``getCellDimensions()``).
 ///   - imageId: a stable Kitty id (allocate once per logical image and reuse it
@@ -45,6 +53,7 @@ public struct RenderedImage: Sendable, Hashable {
 public func renderImage(
     base64Data: String,
     dimensions: ImageDimensions,
+    mediaType: String,
     capabilities: TerminalCapabilities,
     cell: CellDimensions,
     maxWidthCells: Int = 80,
@@ -58,6 +67,9 @@ public func renderImage(
 
     switch imageProtocol {
     case .kitty:
+        // Kitty's `f=100` payload must be PNG; other formats decode-fail silently
+        // (`q=2` suppresses the error), so degrade to the text marker instead.
+        guard mediaType == "image/png" else { return nil }
         let sequence = encodeKitty(
             base64Data,
             columns: size.columns,
@@ -65,7 +77,7 @@ public func renderImage(
             imageId: imageId,
             moveCursor: moveCursor
         )
-        return RenderedImage(sequence: sequence, rows: size.rows, imageId: imageId)
+        return RenderedImage(sequence: sequence, columns: size.columns, rows: size.rows, imageId: imageId)
     case .iterm2:
         let sequence = encodeITerm2(
             base64Data,
@@ -73,7 +85,7 @@ public func renderImage(
             height: "auto",
             preserveAspectRatio: preserveAspectRatio
         )
-        return RenderedImage(sequence: sequence, rows: size.rows, imageId: nil)
+        return RenderedImage(sequence: sequence, columns: size.columns, rows: size.rows, imageId: nil)
     }
 }
 

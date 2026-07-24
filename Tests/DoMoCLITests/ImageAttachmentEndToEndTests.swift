@@ -127,6 +127,38 @@ struct ImageAttachmentEndToEndTests {
     }
 
     @Test
+    func printModeToPipedStdoutEmitsNoImageEscapes() async throws {
+        // Phase 7.5d: text mode displays a tool's images inline only on a real tty.
+        // `runDomo` pipes stdout, so this run's stdout must stay byte-clean — a
+        // base64 graphics escape written into a pipe (or a redirect to a file) would
+        // corrupt scripted output. The read-on-PNG turn produces an image; the run
+        // must still print only the final text, with no ESC/graphics bytes.
+        let gateway = try MockGateway(chatCompletionBodies: [Self.readImageToolTurn, Self.finalTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        try Data(Self.pngBytes).write(to: workspace.workDirectory.appendingPathComponent("shot.png"))
+
+        let result = try runDomo(
+            arguments: [
+                "-p", "read shot.png and describe it", "--model", "mock-model",
+                "--base-url", gateway.baseURL,
+            ],
+            workspace: workspace
+        )
+
+        #expect(result.exitCode == 0, "stderr: \(result.standardError)")
+        // Only the final assistant text — no image escape, no reserved rows.
+        #expect(result.standardOutput == "I see it.\n", "stdout: \(result.standardOutput.debugDescription)")
+        #expect(!result.standardOutput.contains("\u{1b}"), "stdout carried an escape byte")
+        // Neither protocol's opening marker leaks into the piped stream.
+        #expect(!result.standardOutput.contains("_G"), "stdout carried a Kitty graphics header")
+        #expect(!result.standardOutput.contains("]1337"), "stdout carried an iTerm2 graphics header")
+    }
+
+    @Test
     func imageWithoutPromptIsAUsageError() async throws {
         let workspace = try Workspace()
         defer { workspace.cleanUp() }

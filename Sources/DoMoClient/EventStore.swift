@@ -12,6 +12,7 @@
 
 import DoMoLLM
 import DoMoServer
+import DoMoTermGraphics
 
 // MARK: - Event store
 
@@ -78,7 +79,8 @@ public final class EventStore {
             case .system:
                 continue
             case .user(let user):
-                transcript.append(.user(user.text))
+                if !user.text.isEmpty { transcript.append(.user(user.text)) }
+                appendImages(user.content.compactMap(\.imageBlock))
             case .assistant(let assistant):
                 if !assistant.text.isEmpty {
                     transcript.append(.assistant(assistant.text))
@@ -90,6 +92,7 @@ public final class EventStore {
                     isError: result.isError,
                     imageCount: result.images.count
                 ))
+                appendImages(result.images)
             }
         }
         onChange?()
@@ -117,7 +120,8 @@ public final class EventStore {
         case .messageStart(let message):
             switch message {
             case .user(let user):
-                transcript.append(.user(user.text))
+                if !user.text.isEmpty { transcript.append(.user(user.text)) }
+                appendImages(user.content.compactMap(\.imageBlock))
             case .assistant:
                 // Don't reserve a row yet: the first non-empty delta (or a
                 // non-empty message_end) creates it. A tool-call-only or aborted
@@ -134,15 +138,23 @@ public final class EventStore {
             if let reasoning, !reasoning.isEmpty { appendReasoningDelta(reasoning) }
 
         case .messageEnd(let message):
-            // Only an assistant turn with actual text produces a row; a tool-call-
-            // only turn (empty text) leaves nothing. Replace the streamed buffer
-            // with the authoritative final text when a row was streamed, else append.
-            if case .assistant(let assistant) = message, !assistant.text.isEmpty {
+            switch message {
+            case .assistant(let assistant) where !assistant.text.isEmpty:
+                // Replace the streamed buffer with the authoritative final text when
+                // a row was streamed, else append. A tool-call-only turn (empty text)
+                // leaves nothing.
                 if let index = streamingAssistantIndex, transcript.indices.contains(index) {
                     transcript[index] = .assistant(assistant.text)
                 } else {
                     transcript.append(.assistant(assistant.text))
                 }
+            case .tool(let result):
+                // The tool row itself came from tool_start/tool_end (which carry only
+                // a count); the actual image bytes ride the tool-role message frame,
+                // so display them here, after the tool row.
+                appendImages(result.images)
+            default:
+                break
             }
             streamingAssistantIndex = nil
             streamingReasoningIndex = nil
@@ -164,6 +176,14 @@ public final class EventStore {
     }
 
     // MARK: Streaming helpers
+
+    /// Append one image item per block, each with a freshly-allocated stable Kitty
+    /// id so the differential renderer can track and delete it across frames.
+    private func appendImages(_ images: [ImageBlock]) {
+        for image in images {
+            transcript.append(.image(image, imageId: allocateImageId()))
+        }
+    }
 
     private func appendAssistantDelta(_ delta: String) {
         if let index = streamingAssistantIndex,

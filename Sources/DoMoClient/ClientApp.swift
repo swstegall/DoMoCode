@@ -11,6 +11,7 @@
 import DoMoCore
 import DoMoServer
 import DoMoTUI
+import DoMoTermGraphics
 import DoMoTermIO
 
 /// The remote full-screen client application.
@@ -24,6 +25,11 @@ public final class ClientApp {
     private let statusBar = StatusBar()
     private let focus = FocusRing()
     private let quit = QuitSignal()
+
+    /// The terminal's inline-image capability and cell pixel size, detected once at
+    /// startup (the client owns the tty; the remote runtime has none).
+    private var graphicsCapabilities = TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false)
+    private var cellSize: CellDimensions = .default
 
     private var surface: ScreenSurface?
     private var eventTask: Task<Void, Never>?
@@ -48,6 +54,7 @@ public final class ClientApp {
     ) async throws {
         focus.register(sidebar)
         focus.register(promptInput)
+        detectGraphics()
 
         let surface = ScreenSurface(target: target, focus: focus) { [weak self] in
             self?.buildTree(width: target.columns, height: target.rows) ?? Column([])
@@ -78,6 +85,16 @@ public final class ClientApp {
 
     // MARK: Layout
 
+    /// Detect the terminal's image protocol (env sniffing) and cell pixel size
+    /// (kernel ioctl, else the 9×18 default). Runs in the client process, which
+    /// owns the tty — the remote runtime has no terminal to query.
+    private func detectGraphics() {
+        graphicsCapabilities = detectCapabilities()
+        if let pixel = TerminalSize.cellPixelSize() {
+            cellSize = CellDimensions(widthPx: pixel.widthPx, heightPx: pixel.heightPx)
+        }
+    }
+
     private func buildTree(width: Int, height: Int) -> any LayoutNode {
         // Refresh the views from the current store state.
         sidebar.sessions = store.sessions
@@ -88,7 +105,7 @@ public final class ClientApp {
 
         let sidebarWidth = min(32, max(16, width / 4))
         let main = Column([
-            Flexible(1, TailBox(transcriptView)),
+            Flexible(1, TranscriptNode(view: transcriptView, capabilities: graphicsCapabilities, cell: cellSize)),
             Fixed(.absolute(1), statusBar.layout),
             Fixed(.absolute(1), promptInput.layout),
         ])

@@ -22,6 +22,7 @@ import Glibc
 import DoMoCLI
 import DoMoCore
 import DoMoLLM
+import DoMoTermGraphics
 import DoMoTermIO
 import DoMoTUI
 import Foundation
@@ -229,6 +230,98 @@ struct InteractiveModeEndToEndTests {
                 == "data:image/png;base64,\(png.base64EncodedString())",
             "body: \(gateway.requests[0].body)"
         )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// Turn 1: the assistant calls `read` on a PNG, then finishes with `tool_calls`
+    /// so the loop dispatches the read (which returns the image block) before turn 2.
+    static let readImageToolTurn = #"""
+        data: {"id":"r1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_read_1","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}
+
+        data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\": \"shot.png\"}"}}]},"finish_reason":null}]}
+
+        data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+        data: {"id":"r1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":8,"total_tokens":50}}
+
+        data: [DONE]
+
+
+        """#
+
+    /// Turn 2: a plain-text final answer with a distinct marker.
+    static let describedImageTurn = #"""
+        data: {"id":"r2","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":"described-the-image."},"finish_reason":null}]}
+
+        data: {"id":"r2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+        data: {"id":"r2","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":60,"completion_tokens":5,"total_tokens":65}}
+
+        data: [DONE]
+
+
+        """#
+
+    /// PHASE 7.5d — a tool that returns an image adds an image row to the inline
+    /// transcript. The captured target is not a graphics tty (the test process's
+    /// stdout is a pipe), so capability detection reports no image protocol and the
+    /// row degrades to a `[Image: …]` text marker — which is exactly what proves the
+    /// `endTool → ImageBlockView` wiring runs: the image survived the `RegistryTool`
+    /// adapter into `AgentToolResult.images` and was rendered as its own transcript
+    /// row rather than dropped.
+    @Test
+    func toolReturnedImageAddsAnImageRowToTheTranscript() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.readImageToolTurn, Self.describedImageTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        // A 24-byte PNG the sniffer accepts AND the dimension parser reads as 40×20,
+        // so the fallback marker carries the size.
+        let png = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x14,
+        ])
+        try png.write(to: tree.work.appendingPathComponent("shot.png"))
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path
+        )
+
+        let cols = 60, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        // Force "no image protocol" so the assertion is hermetic: real capability
+        // detection reads the test process's own env/stdout (which may carry a
+        // graphics terminal's markers), and an actual escape would be swallowed by
+        // the VT100 oracle rather than shown as text. With no protocol the image row
+        // is the `[Image: …]` fallback, which the oracle renders and we can assert.
+        let runTask = Task { @MainActor in
+            try await mode.run(
+                target: target, input: input, resize: resize, lifecycle: NoopLifecycle(),
+                imageCapabilities: TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false)
+            )
+        }
+
+        inputCont.yield(bytes("read shot.png and describe it"))
+        inputCont.yield(bytes("\r"))
+
+        // The run reaches its final turn, and the image row is on the grid — the
+        // capitalized `[Image:` marker is distinct from the read tool's own text.
+        let described = await waitUntil { screenContains(target, rows: rows, cols: cols, "described-the-image") }
+        #expect(described, "the two-turn read-image run never completed")
+        let imageRow = await waitUntil { screenContains(target, rows: rows, cols: cols, "[Image:") }
+        #expect(imageRow, "the tool-returned image did not become a transcript row")
+        #expect(gateway.requestCount == 2)
 
         inputCont.finish()
         try await runTask.value

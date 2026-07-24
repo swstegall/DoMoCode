@@ -1,15 +1,25 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 //
-// The main pane: renders the event store's transcript to lines. Each item gets a
-// role marker and wraps to the pane width; reasoning is dimmed; a tool call is a
-// header line plus a capped, indented slice of its output. The app refreshes
-// `items` from the store before each frame; scrolling to the newest content is
-// the `TailBox` wrapper's job, not this view's.
+// The main pane's transcript renderer. Text items wrap to the pane width (role
+// marker, dimmed reasoning, capped tool output); an image item becomes an image
+// visual row (the graphics escape + the blank rows it reserves) when the terminal
+// supports images, else a `[Image: …]` fallback line. `visualRows` is the mixed
+// text/image output the layout node places; `render` flattens it to text only for
+// the Component protocol and the pure-text tests.
 
+import DoMoLLM
+import DoMoTermGraphics
 import DoMoTUI
 
-/// Renders `[TranscriptItem]` to width-fitted lines for the main pane.
+/// One row of rendered transcript: a text line, or an image (its escape plus the
+/// cell footprint the renderer paints text around).
+enum TranscriptVisualRow: Sendable, Hashable {
+    case text(String)
+    case image(escape: String, imageId: UInt32?, cellWidth: Int, cellRows: Int)
+}
+
+/// Renders `[TranscriptItem]` to visual rows (text + images) for the main pane.
 @MainActor
 final class TranscriptView: Component {
     /// The transcript to render; set from `EventStore.transcript` each frame.
@@ -17,46 +27,80 @@ final class TranscriptView: Component {
     /// Whether the selected session has a turn in flight (shows a streaming hint).
     var running = false
 
-    /// How many lines of a tool's output to show before eliding the rest.
     private let toolOutputCap = 8
-    /// Never wrap more tool-output characters than could fill the cap — the rest is
-    /// never shown, so wrapping it would be pure wasted (and unbounded) work.
     private let toolOutputCharCap = 4000
 
-    /// Memoize the wrapped lines: the transcript is re-rendered every frame (e.g.
-    /// on every keystroke in the input pane), but only actually changes when a new
-    /// event lands, so an unchanged transcript must not re-wrap. Keyed on the
-    /// content, the width, and the streaming flag.
-    private var cache: (items: [TranscriptItem], running: Bool, width: Int, lines: [String])?
+    /// Memoize the rendered rows: the transcript is re-rendered every frame (e.g.
+    /// on every keystroke), but only changes when an event lands — and re-encoding
+    /// an image (base64 + escape) every frame would be very expensive. Keyed on the
+    /// content, width, streaming flag, and the graphics context.
+    private var cache: (items: [TranscriptItem], running: Bool, width: Int, capabilities: TerminalCapabilities, cell: CellDimensions, rows: [TranscriptVisualRow])?
 
-    func render(width: Int) -> [String] {
+    /// The mixed text/image rows for the main pane, given the terminal's image
+    /// capability and cell size.
+    func visualRows(width: Int, capabilities: TerminalCapabilities, cell: CellDimensions) -> [TranscriptVisualRow] {
         guard width > 0 else { return [] }
-        if let cache, cache.width == width, cache.running == running, cache.items == items {
-            return cache.lines
+        if let cache, cache.width == width, cache.running == running,
+           cache.capabilities == capabilities, cache.cell == cell, cache.items == items {
+            return cache.rows
         }
-        let lines = renderLines(width: width)
-        cache = (items, running, width, lines)
-        return lines
+        let rows = buildVisualRows(width: width, capabilities: capabilities, cell: cell)
+        cache = (items, running, width, capabilities, cell, rows)
+        return rows
     }
 
-    private func renderLines(width: Int) -> [String] {
-        var lines: [String] = []
+    /// Text-only rendering for the Component protocol: with no image protocol,
+    /// images become their `[Image: …]` fallback line.
+    func render(width: Int) -> [String] {
+        visualRows(width: width, capabilities: TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false), cell: .default)
+            .compactMap { if case .text(let line) = $0 { line } else { nil } }
+    }
+
+    private func buildVisualRows(width: Int, capabilities: TerminalCapabilities, cell: CellDimensions) -> [TranscriptVisualRow] {
+        var rows: [TranscriptVisualRow] = []
         for item in items {
             switch item {
             case .user(let text):
-                lines += labeledWrap("› ", text, width: width)
+                rows += labeledWrap("› ", text, width: width).map(TranscriptVisualRow.text)
             case .assistant(let text):
-                lines += wrapToWidth(text, width: width)
+                rows += wrapToWidth(text, width: width).map(TranscriptVisualRow.text)
             case .reasoning(let text):
-                lines += wrapToWidth(text, width: width).map(dim)
+                rows += wrapToWidth(text, width: width).map { TranscriptVisualRow.text(dim($0)) }
             case .tool(let name, let output, let isError, let imageCount):
-                lines.append(toolHeader(name: name, isError: isError, imageCount: imageCount, width: width))
-                lines += toolBody(output, width: width)
+                rows.append(.text(toolHeader(name: name, isError: isError, imageCount: imageCount, width: width)))
+                rows += toolBody(output, width: width).map(TranscriptVisualRow.text)
+            case .image(let block, let imageId):
+                rows += imageRows(block, imageId: imageId, width: width, capabilities: capabilities, cell: cell)
             }
-            lines.append("")   // a blank spacer between items
+            rows.append(.text(""))   // a blank spacer between items
         }
-        if running { lines.append(dim("…")) }
-        return lines
+        if running { rows.append(.text(dim("…"))) }
+        return rows
+    }
+
+    private func imageRows(_ block: ImageBlock, imageId: UInt32, width: Int, capabilities: TerminalCapabilities, cell: CellDimensions) -> [TranscriptVisualRow] {
+        let dimensions = imageDimensions(block.data, mediaType: block.mediaType)
+        if let dimensions,
+           let rendered = renderImage(
+               base64Data: block.data.base64EncodedString(),
+               dimensions: dimensions,
+               mediaType: block.mediaType,
+               capabilities: capabilities,
+               cell: cell,
+               maxWidthCells: width,
+               imageId: imageId,
+               moveCursor: false
+           ) {
+            var rows: [TranscriptVisualRow] = [
+                .image(escape: rendered.sequence, imageId: rendered.imageId, cellWidth: rendered.columns, cellRows: rendered.rows)
+            ]
+            // Reserve the blank rows the image also occupies (the renderer paints
+            // text around them; they stay blank in the text grid).
+            for _ in 1..<max(1, rendered.rows) { rows.append(.text("")) }
+            return rows
+        }
+        // No image protocol, or an unreadable format: fall back to a text marker.
+        return [.text(truncateToWidth(imageFallback(mediaType: block.mediaType, dimensions: dimensions), width))]
     }
 
     private func toolHeader(name: String, isError: Bool, imageCount: Int, width: Int) -> String {
@@ -68,8 +112,6 @@ final class TranscriptView: Component {
 
     private func toolBody(_ output: String, width: Int) -> [String] {
         guard !output.isEmpty else { return [] }
-        // Bound the work: only the first `toolOutputCap` lines are ever shown, so
-        // never wrap more than a capped slice of the raw output.
         let overCharCap = output.count > toolOutputCharCap
         let bounded = overCharCap ? String(output.prefix(toolOutputCharCap)) : output
         var wrapped = wrapToWidth(bounded, width: max(1, width - 2)).map { "  " + $0 }

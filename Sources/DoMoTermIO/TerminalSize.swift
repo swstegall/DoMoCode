@@ -128,6 +128,14 @@ extension TerminalSize {
         return CellPixelSize(widthPx: pixelWidth / columns, heightPx: pixelHeight / rows)
     }
 
+    /// Whether `fileDescriptor` is an interactive terminal. Print mode consults this
+    /// before emitting inline-image escapes: a piped or redirected stdout must stay
+    /// byte-clean (a base64 graphics escape written into a file would corrupt it),
+    /// so images render only to a real tty.
+    public static func isTerminal(fileDescriptor: Int32 = STDOUT_FILENO) -> Bool {
+        isatty(fileDescriptor) == 1
+    }
+
     private static func positiveInt(_ value: String?) -> Int? {
         guard let value, let parsed = Int(value), parsed > 0 else { return nil }
         return parsed
