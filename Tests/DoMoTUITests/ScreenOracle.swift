@@ -99,6 +99,15 @@ final class ScreenOracle {
     var rows: Int { terminal.rows }
     var cols: Int { terminal.cols }
 
+    /// Whether the emulator is currently showing the DEC alternate screen buffer.
+    ///
+    /// SwiftTerm models `?1049h`/`?1049l` natively (activate/deactivate alt
+    /// buffer), so feeding the lifecycle's enter/exit sequences flips this exactly
+    /// as a real terminal would. The full-screen tests assert it to prove the
+    /// alt-screen switch actually happened — and, on exit, that the normal buffer
+    /// (with its untouched transcript) came back.
+    var isCurrentBufferAlternate: Bool { terminal.isCurrentBufferAlternate }
+
     /// Cursor position as `(col, row)`, both zero-based and viewport-relative.
     var cursor: (col: Int, row: Int) {
         let location = terminal.getCursorLocation()

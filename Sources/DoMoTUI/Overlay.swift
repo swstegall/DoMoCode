@@ -167,6 +167,10 @@ enum OverlayFocusRestorePolicy {
 /// left edge (tracked as escapes stream past), so styling opened before the
 /// overlay still colours the content the overlay does not cover. `strictAfter`
 /// drops a wide cluster that would straddle the after-window's right edge.
+///
+/// A file-scope free function (not a `TUI` method), so it — and its lifted caller
+/// ``compositeLineAt(_:_:startCol:overlayWidth:totalWidth:)`` — can run from a
+/// value type (``CellBuffer``) that holds no `TUI`.
 func extractSegments(
     _ line: String,
     beforeEnd: Int,
@@ -232,6 +236,61 @@ func extractSegments(
     }
 
     return (before, beforeWidth, after, afterWidth)
+}
+
+/// Splice `overlayLine` into `baseLine` at `startCol`, single pass. Ports
+/// `compositeLineAt`.
+///
+/// Lifted out of the `@MainActor extension TUI` into a file-scope free function:
+/// it holds no `TUI` state — only ``extractSegments``, slicing, and padding — so
+/// both overlay compositing and the full-screen ``CellBuffer`` can splice a span
+/// into a line without an owning renderer. The SGR-carry and the wide-cluster
+/// `strictAfter` handling are preserved byte-for-byte. (It stays within the
+/// module's default `MainActor` isolation, alongside ``RenderCore``, because its
+/// helpers `AnsiCodeTracker` and ``RenderCore/segmentReset`` are themselves
+/// MainActor-isolated.)
+///
+/// The composed line's width is re-verified against `totalWidth` and, only as a
+/// last-resort safeguard, truncated — not trapped. Width tracking can drift on
+/// complex ANSI/OSC runs or a wide cluster at a boundary, and one stray column
+/// would corrupt the frame, so the belt-and-suspenders truncate stays.
+func compositeLineAt(
+    _ baseLine: String,
+    _ overlayLine: String,
+    startCol: Int,
+    overlayWidth: Int,
+    totalWidth: Int
+) -> String {
+    let afterStart = startCol + overlayWidth
+    let base = extractSegments(
+        baseLine,
+        beforeEnd: startCol,
+        afterStart: afterStart,
+        afterLen: totalWidth - afterStart,
+        strictAfter: true
+    )
+    let overlay = sliceWithWidth(overlayLine, from: 0, to: overlayWidth, strict: true)
+
+    let beforePad = max(0, startCol - base.beforeWidth)
+    let overlayPad = max(0, overlayWidth - overlay.width)
+    let actualBeforeWidth = max(startCol, base.beforeWidth)
+    let actualOverlayWidth = max(overlayWidth, overlay.width)
+    let afterTarget = max(0, totalWidth - actualBeforeWidth - actualOverlayWidth)
+    let afterPad = max(0, afterTarget - base.afterWidth)
+
+    let r = RenderCore.segmentReset
+    let result = base.before
+        + String(repeating: " ", count: beforePad)
+        + r
+        + overlay.text
+        + String(repeating: " ", count: overlayPad)
+        + r
+        + base.after
+        + String(repeating: " ", count: afterPad)
+
+    let resultWidth = visibleWidth(result)
+    if resultWidth <= totalWidth { return result }
+    return sliceByColumn(result, from: 0, to: totalWidth, strict: true)
 }
 
 // MARK: - TUI overlay methods
@@ -442,52 +501,6 @@ public extension TUI {
         }
 
         return result
-    }
-
-    /// Splice `overlayLine` into `baseLine` at `startCol`, single pass. Ports
-    /// `compositeLineAt`.
-    ///
-    /// The composed line's width is re-verified against `totalWidth` and, only as
-    /// a last-resort safeguard, truncated — not trapped. Width tracking can drift
-    /// on complex ANSI/OSC runs or a wide cluster at a boundary, and one stray
-    /// column would corrupt the frame, so the belt-and-suspenders truncate stays.
-    internal func compositeLineAt(
-        _ baseLine: String,
-        _ overlayLine: String,
-        startCol: Int,
-        overlayWidth: Int,
-        totalWidth: Int
-    ) -> String {
-        let afterStart = startCol + overlayWidth
-        let base = extractSegments(
-            baseLine,
-            beforeEnd: startCol,
-            afterStart: afterStart,
-            afterLen: totalWidth - afterStart,
-            strictAfter: true
-        )
-        let overlay = sliceWithWidth(overlayLine, from: 0, to: overlayWidth, strict: true)
-
-        let beforePad = max(0, startCol - base.beforeWidth)
-        let overlayPad = max(0, overlayWidth - overlay.width)
-        let actualBeforeWidth = max(startCol, base.beforeWidth)
-        let actualOverlayWidth = max(overlayWidth, overlay.width)
-        let afterTarget = max(0, totalWidth - actualBeforeWidth - actualOverlayWidth)
-        let afterPad = max(0, afterTarget - base.afterWidth)
-
-        let r = RenderCore.segmentReset
-        let result = base.before
-            + String(repeating: " ", count: beforePad)
-            + r
-            + overlay.text
-            + String(repeating: " ", count: overlayPad)
-            + r
-            + base.after
-            + String(repeating: " ", count: afterPad)
-
-        let resultWidth = visibleWidth(result)
-        if resultWidth <= totalWidth { return result }
-        return sliceByColumn(result, from: 0, to: totalWidth, strict: true)
     }
 
     // MARK: Visibility helpers
