@@ -62,8 +62,12 @@ let package = Package(
         // A headless VT100 emulator used as a test oracle: renderer bytes go in,
         // assertions run against the resulting cell grid. Test targets only.
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.15.0"),
+        // Phase 6 — the headless HTTP/SSE server. Resolves at 2.25.1 sharing one
+        // swift-nio (2.101.x) with async-http-client, so it adds only itself plus
+        // the already-present swift-service-lifecycle / NIO tail. Apache-2.0.
+        .package(url: "https://github.com/hummingbird-project/hummingbird", from: "2.25.1"),
         // Arriving later, already validated against this graph:
-        //   groue/GRDB.swift         from: "7.11.1"   — Phase 6, optional storage
+        //   groue/GRDB.swift         from: "7.11.1"   — SQLite session storage (Later)
     ],
     targets: [
         // MARK: Core
@@ -177,13 +181,28 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        // MARK: Server
+
+        // The headless HTTP/SSE runtime server (Phase 6). Wraps the existing
+        // runtime — DoMoHarness / DoMoAgent / DoMoLLM — behind Hummingbird;
+        // loopback-only, single-client-first, broadcast-capable. No TUI import.
+        .target(
+            name: "DoMoServer",
+            dependencies: [
+                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness",
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
+            swiftSettings: safeSettings
+        ),
+
         // MARK: CLI
 
         .target(
             name: "DoMoCLI",
             dependencies: [
                 "DoMoCore", "DoMoTUI", "DoMoLLM", "DoMoAgent",
-                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI",
+                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoServer",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -270,6 +289,18 @@ let package = Package(
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
             swiftSettings: baseSettings
+        ),
+
+        // The server e2e stands up DoMoServer on a loopback port and drives it with
+        // a real AsyncHTTPClient, with a scripted stream function in place of the
+        // LiteLLM client, so no mock LLM gateway is needed.
+        .testTarget(
+            name: "DoMoServerTests",
+            dependencies: [
+                "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent", "DoMoHarness",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+            ],
+            swiftSettings: safeSettings
         ),
     ]
 )

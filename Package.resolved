@@ -1,5 +1,5 @@
 {
-  "originHash" : "fb04e50cbd48f7f99b9e0af70b5a18f4b17b6d5ce29519a672080c2d881b05a9",
+  "originHash" : "e2cb669a6a7aa5dd8f88d87fbb60bf71009f59c32f912ee2187b0ad43b2cbbad",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -17,6 +17,15 @@
       "state" : {
         "revision" : "a3a85a85214caf642abaa96ae664e4c772a59f6e",
         "version" : "1.4.1"
+      }
+    },
+    {
+      "identity" : "hummingbird",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/hummingbird-project/hummingbird",
+      "state" : {
+        "revision" : "db50d7b5da7709d245120ccc25e094cbf9365260",
+        "version" : "2.25.1"
       }
     },
     {
@@ -170,6 +179,15 @@
       "state" : {
         "revision" : "3c6f9523da3a1ec2fd829673e472d95b8097a3b8",
         "version" : "0.8.0"
+      }
+    },
+    {
+      "identity" : "swift-metrics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-metrics.git",
+      "state" : {
+        "revision" : "087e8074afa97040c3b870c8664fe5482fb87cc4",
+        "version" : "2.11.0"
       }
     },
     {
