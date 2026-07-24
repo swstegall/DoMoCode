@@ -99,6 +99,24 @@ struct AltScreenCoreImageTests {
         #expect(out.contains("\u{1b}[1;11H"))   // right segment CUP at (0,10)
     }
 
+    @Test("A colored covered-row segment does not bleed into the row painted after it")
+    func noSgrBleed() throws {
+        var core = AltScreenCore()
+        let img = placement(row: 0, col: 3, cols: 4, rows: 1, id: 5)
+        // Row 0: "AB " (cols 0-2), image cols 3-6 (blank in the text grid), then a
+        // red-background "XYZ" (cols 7-9) whose SGR is left open by the slice.
+        let text = grid(["AB     \u{1b}[41mXYZ", "hello"], height: 4)
+        let oracle = ScreenOracle(rows: 4, cols: 10)
+        oracle.feed("\u{1b}[?1049h")
+        let target = CaptureTarget(columns: 10, rows: 4)
+        target.write(try core.frame(lines: text, width: 10, height: 4, images: [img]))
+        oracle.feed(target.drain())
+        // The red background must NOT leak onto the next row.
+        #expect(oracle.cell(col: 0, row: 1)?.style.background == .default)
+        #expect(oracle.cell(col: 4, row: 1)?.style.background == .default)
+        #expect(oracle.cell(col: 0, row: 0)?.character == "A")   // sidebar text intact
+    }
+
     @Test("An image-only change (text grid unchanged) still updates the image layer")
     func imageOnlyChange() throws {
         var core = AltScreenCore()

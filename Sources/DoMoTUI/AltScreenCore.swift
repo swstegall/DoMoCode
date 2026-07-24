@@ -146,18 +146,23 @@ public struct AltScreenCore {
         if covered.isEmpty {
             return cursorTo(row: row, col: 0) + "\u{1b}[2K" + line
         }
+        // Each segment is a SLICE of the row, which cuts before the line's trailing
+        // reset — so a segment whose content leaves an SGR open (a background that
+        // reaches the segment's right edge) must be closed with its own reset, or the
+        // style bleeds into every row painted after it. The non-covered path gets this
+        // for free from `line` (which ends in the reset via applyLineResets).
         var buffer = ""
         var segmentStart = 0
         for (rangeStart, rangeEnd) in mergeColumnRanges(covered) {
             if segmentStart < rangeStart {
                 let segment = sliceByColumn(line, from: segmentStart, to: rangeStart, strict: true)
-                buffer += cursorTo(row: row, col: segmentStart) + padToWidth(segment, rangeStart - segmentStart)
+                buffer += cursorTo(row: row, col: segmentStart) + padToWidth(segment, rangeStart - segmentStart) + AltScreenCore.segmentReset
             }
             segmentStart = max(segmentStart, rangeEnd)
         }
         if segmentStart < width {
             let segment = sliceByColumn(line, from: segmentStart, to: width, strict: true)
-            buffer += cursorTo(row: row, col: segmentStart) + padToWidth(segment, width - segmentStart)
+            buffer += cursorTo(row: row, col: segmentStart) + padToWidth(segment, width - segmentStart) + AltScreenCore.segmentReset
         }
         return buffer
     }

@@ -82,9 +82,14 @@ func mergeColumnRanges(_ ranges: [(Int, Int)]) -> [(Int, Int)] {
 
 /// The delete-by-id sequence for images that left or changed since last frame, and
 /// the images to (re-)emit this frame — everything not byte-identically stable.
-/// An unchanged Kitty image is neither deleted nor re-emitted (no flicker, no
-/// re-transmit); an iTerm2 image (no id) is always re-emitted since it cannot be
-/// tracked or deleted.
+///
+/// A byte-identical placement (Kitty or iTerm2) is stable: neither deleted nor
+/// re-emitted, so no flicker and no re-transmit. A Kitty image that left or changed
+/// is deleted by id (its pixels are a separate graphics layer a cell clear cannot
+/// touch). An iTerm2 image has no id and cannot be deleted, but its pixels live in
+/// the cell buffer — so when it moves or leaves, the now-uncovered row's own
+/// `\u{1b}[2K` clears the stale pixels, and a full redraw's `\u{1b}[2J` clears any
+/// that remain.
 func diffImageLayer(previous: [ImagePlacement], current: [ImagePlacement]) -> (deletes: String, emits: String) {
     let currentSet = Set(current)
     let previousSet = Set(previous)
