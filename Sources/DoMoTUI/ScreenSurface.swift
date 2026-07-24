@@ -106,11 +106,20 @@ public final class ScreenSurface: TerminalApp {
         guard !stopped else { return }
         let width = target.columns
         let height = target.rows
-        var lines = layoutLines(build(), width: width, height: height)
+        // Solve to a buffer (not just lines) so the image layer travels with the
+        // text grid to the renderer, which paints text around the images.
+        let buffer = layoutBuffer(build(), width: width, height: height)
+        var lines = buffer.flatten()
         if !overlayStack.isEmpty {
             lines = compositeOverlays(lines, termWidth: width, termHeight: height)
         }
-        let bytes = try core.frame(lines: lines, width: width, height: height, hasOverlays: !overlayStack.isEmpty)
+        let bytes = try core.frame(
+            lines: lines,
+            width: width,
+            height: height,
+            hasOverlays: !overlayStack.isEmpty,
+            images: buffer.images
+        )
         target.write(bytes)
         lastRenderAt = Date()
     }

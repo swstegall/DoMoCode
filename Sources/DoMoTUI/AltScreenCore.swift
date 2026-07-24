@@ -16,6 +16,7 @@
 // scrolls.
 
 import DoMoCore
+import DoMoTermGraphics
 
 // MARK: - AltScreenCore
 
@@ -58,6 +59,10 @@ public struct AltScreenCore {
     var previousWidth = 0
     var previousHeight = 0
     private(set) var fullRedrawCount = 0
+    /// The image layer emitted last frame. Images are tracked apart from the text
+    /// grid so a shared row can be repainted without erasing the image's pixels,
+    /// and a Kitty image is re-transmitted only when it actually changes.
+    var previousImages: [ImagePlacement] = []
 
     /// Move the real cursor to the caret (IME) position each frame.
     public var showHardwareCursor: Bool
@@ -130,29 +135,66 @@ public struct AltScreenCore {
         return buffer
     }
 
+    // MARK: Text row painting (image-aware)
+
+    /// Paint one text row, clearing/rewriting only the columns NOT covered by an
+    /// image. With no coverage this is the plain `CUP + \u{1b}[2K + line`. With
+    /// coverage, each uncovered column segment is CUP-addressed and painted padded
+    /// to its exact width (so it clears stale content), and the covered ranges are
+    /// jumped over — a `\u{1b}[2K` there would erase the image's pixels.
+    private func paintTextRow(_ row: Int, _ line: String, covered: [(Int, Int)], width: Int) -> String {
+        if covered.isEmpty {
+            return cursorTo(row: row, col: 0) + "\u{1b}[2K" + line
+        }
+        var buffer = ""
+        var segmentStart = 0
+        for (rangeStart, rangeEnd) in mergeColumnRanges(covered) {
+            if segmentStart < rangeStart {
+                let segment = sliceByColumn(line, from: segmentStart, to: rangeStart, strict: true)
+                buffer += cursorTo(row: row, col: segmentStart) + padToWidth(segment, rangeStart - segmentStart)
+            }
+            segmentStart = max(segmentStart, rangeEnd)
+        }
+        if segmentStart < width {
+            let segment = sliceByColumn(line, from: segmentStart, to: width, strict: true)
+            buffer += cursorTo(row: row, col: segmentStart) + padToWidth(segment, width - segmentStart)
+        }
+        return buffer
+    }
+
     // MARK: Full render
 
-    /// Place every row by CUP. `clear` emits `\x1b[2J` first (screen only — never
-    /// `\x1b[3J`, which would clobber scrollback the alt buffer does not own).
+    /// Place every text row by CUP (painting around image coverage), then emit the
+    /// image layer. `clear` deletes the previous frame's images and emits `\x1b[2J`
+    /// first (screen only — never `\x1b[3J`, which would clobber scrollback the alt
+    /// buffer does not own; a Kitty delete-by-id, unlike a cell clear, frees pixels).
     private mutating func fullRender(
         clear: Bool,
         newLines: [String],
         width: Int,
         height: Int,
-        cursorPos: (row: Int, col: Int)?
+        cursorPos: (row: Int, col: Int)?,
+        images: [ImagePlacement]
     ) -> String {
         fullRedrawCount += 1
+        let coverage = imageCoverageByRow(images, width: width, height: height)
         var buffer = "\u{1b}[?2026h" // Begin synchronized output
         if clear {
+            for previous in previousImages {
+                if let id = previous.imageId, id > 0 { buffer += deleteKittyImage(id) }
+            }
             buffer += "\u{1b}[2J" // Clear the alt-screen page (no scrollback clear)
         }
         for i in newLines.indices {
-            buffer += cursorTo(row: i, col: 0)
-            buffer += newLines[i]
+            buffer += paintTextRow(i, newLines[i], covered: coverage[i] ?? [], width: width)
+        }
+        for image in images {
+            buffer += cursorTo(row: image.row, col: image.col) + image.escape
         }
         buffer += "\u{1b}[?2026l" // End synchronized output
         buffer += positionHardwareCursor(cursorPos, totalLines: newLines.count)
         previousLines = newLines
+        previousImages = images
         previousWidth = width
         previousHeight = height
         return buffer
@@ -176,7 +218,8 @@ public struct AltScreenCore {
         lines rawLines: [String],
         width: Int,
         height: Int,
-        hasOverlays: Bool = false
+        hasOverlays: Bool = false,
+        images: [ImagePlacement] = []
     ) throws(DoMoError) -> String {
         _ = hasOverlays
         var newLines = rawLines
@@ -199,15 +242,15 @@ public struct AltScreenCore {
 
         // Strategy 1: first render — place everything, the alt buffer is clean.
         if previousLines.isEmpty, !widthChanged, !heightChanged {
-            return fullRender(clear: false, newLines: newLines, width: width, height: height, cursorPos: cursorPos)
+            return fullRender(clear: false, newLines: newLines, width: width, height: height, cursorPos: cursorPos, images: images)
         }
         // Strategy 2a: width change — wrapping changes, repaint all rows.
         if widthChanged {
-            return fullRender(clear: true, newLines: newLines, width: width, height: height, cursorPos: cursorPos)
+            return fullRender(clear: true, newLines: newLines, width: width, height: height, cursorPos: cursorPos, images: images)
         }
         // Strategy 2b: height change — repaint all rows at the new height.
         if heightChanged {
-            return fullRender(clear: true, newLines: newLines, width: width, height: height, cursorPos: cursorPos)
+            return fullRender(clear: true, newLines: newLines, width: width, height: height, cursorPos: cursorPos, images: images)
         }
 
         // Find the first and last changed rows. The row count is constant
@@ -224,34 +267,40 @@ public struct AltScreenCore {
             }
         }
 
-        // No changes — only the hardware cursor may need repositioning.
-        if firstChanged == -1 {
+        // No text change AND no image change — only the hardware cursor may move.
+        if firstChanged == -1, images == previousImages {
             let buffer = positionHardwareCursor(cursorPos, totalLines: newLines.count)
             previousWidth = width
             previousHeight = height
             return buffer
         }
 
-        // Strategy 3: normal differential update. Rewrite the contiguous changed
-        // span, each row re-addressed with an absolute CUP + `\x1b[2K` clear, so no
-        // relative motion is ever emitted and no unchanged row is touched outside
-        // the span.
+        // Strategy 3: normal differential update. Delete images that left or
+        // changed, repaint the changed text span (painting around image coverage so
+        // an image's pixels are never cleared), then (re-)emit the images that are
+        // new or changed. Each row re-addressed with absolute CUP — no relative
+        // motion, and no unchanged row is touched outside the span.
+        let coverage = imageCoverageByRow(images, width: width, height: height)
+        let (deletes, emits) = diffImageLayer(previous: previousImages, current: images)
         var buffer = "\u{1b}[?2026h"
-        let renderEnd = min(lastChanged, newLines.count - 1)
-        for i in firstChanged...renderEnd {
-            let line = newLines[i]
-            let lineWidth = visibleWidth(line)
-            if lineWidth > width {
-                throw AltScreenCore.overWide(row: i, measured: lineWidth, width: width)
+        buffer += deletes
+        if firstChanged != -1 {
+            let renderEnd = min(lastChanged, newLines.count - 1)
+            for i in firstChanged...renderEnd {
+                let line = newLines[i]
+                let lineWidth = visibleWidth(line)
+                if lineWidth > width {
+                    throw AltScreenCore.overWide(row: i, measured: lineWidth, width: width)
+                }
+                buffer += paintTextRow(i, line, covered: coverage[i] ?? [], width: width)
             }
-            buffer += cursorTo(row: i, col: 0)
-            buffer += "\u{1b}[2K" // Clear the row before rewriting it
-            buffer += line
         }
+        buffer += emits
         buffer += "\u{1b}[?2026l"
         buffer += positionHardwareCursor(cursorPos, totalLines: newLines.count)
 
         previousLines = newLines
+        previousImages = images
         previousWidth = width
         previousHeight = height
         return buffer

@@ -10,6 +10,7 @@
 // so a `CellBuffer` can place a span without an owning `TUI`.
 
 import DoMoCore
+import DoMoTermGraphics
 
 // MARK: - Rect
 
@@ -56,6 +57,12 @@ public struct CellBuffer {
     /// shorter or (transiently, mid-splice) wider than `width`.
     private var rows: [String]
 
+    /// Images placed on this buffer, tracked apart from the text rows (an image
+    /// shares its rows with other content, and its opaque escape cannot live in the
+    /// `[String]` grid without being sliced). The renderer paints text around these
+    /// and emits them as a separate layer.
+    public private(set) var images: [ImagePlacement] = []
+
     /// An empty buffer of the given size: every row blank.
     public init(width: Int, height: Int) {
         self.width = max(0, width)
@@ -93,6 +100,21 @@ public struct CellBuffer {
                 totalWidth: width
             )
         }
+    }
+
+    /// Register an image on the page: its escape is emitted at `(row, col)` as a
+    /// separate layer, and the `cellWidth × cellRows` rectangle it occupies is left
+    /// to the renderer to paint text around. The text grid at those cells stays
+    /// blank (the caller leaves it so), so nothing overwrites the pixels.
+    public mutating func placeImage(
+        _ escape: String,
+        imageId: UInt32?,
+        row: Int,
+        col: Int,
+        cellWidth: Int,
+        cellRows: Int
+    ) {
+        images.append(ImagePlacement(row: row, col: col, cellWidth: cellWidth, cellRows: cellRows, escape: escape, imageId: imageId))
     }
 
     // MARK: Reading
