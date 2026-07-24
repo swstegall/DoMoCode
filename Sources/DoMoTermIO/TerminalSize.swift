@@ -36,6 +36,19 @@ public struct TerminalSize: Sendable, Hashable {
     public static let fallback = TerminalSize(columns: 80, rows: 24)
 }
 
+/// The pixel size of one terminal cell — what inline image display needs to turn
+/// an image's pixel dimensions into a cell footprint. Reported by the kernel
+/// (`ws_xpixel`/`ws_ypixel` ÷ the grid) or by a terminal cell-size query; many
+/// terminals report neither, so a consumer keeps a sane default (9×18).
+public struct CellPixelSize: Sendable, Hashable {
+    public var widthPx: Int
+    public var heightPx: Int
+    public init(widthPx: Int, heightPx: Int) {
+        self.widthPx = widthPx
+        self.heightPx = heightPx
+    }
+}
+
 // MARK: - Platform constant
 
 #if canImport(Darwin)
@@ -98,6 +111,21 @@ extension TerminalSize {
             ioctl: query(fileDescriptor: fileDescriptor),
             environment: ProcessInfo.processInfo.environment
         )
+    }
+
+    /// One cell's pixel size from the kernel: `ws_xpixel`/`ws_ypixel` divided by
+    /// the grid. Returns nil when the terminal reports no pixel size (common — many
+    /// terminals leave `ws_xpixel`/`ws_ypixel` zero) or has no window at all, in
+    /// which case a caller falls back to a cell-size query or a fixed default.
+    public static func cellPixelSize(fileDescriptor: Int32 = STDOUT_FILENO) -> CellPixelSize? {
+        var window = winsize()
+        guard ioctl(fileDescriptor, requestTIOCGWINSZ, &window) == 0 else { return nil }
+        let columns = Int(window.ws_col)
+        let rows = Int(window.ws_row)
+        let pixelWidth = Int(window.ws_xpixel)
+        let pixelHeight = Int(window.ws_ypixel)
+        guard columns > 0, rows > 0, pixelWidth > 0, pixelHeight > 0 else { return nil }
+        return CellPixelSize(widthPx: pixelWidth / columns, heightPx: pixelHeight / rows)
     }
 
     private static func positiveInt(_ value: String?) -> Int? {
