@@ -172,10 +172,11 @@ public final class TerminalDriver {
     /// The armed ESC-disambiguation flush, cancelled the instant more bytes land.
     private var flushTask: Task<Void, Never>?
 
-    /// The session's TUI and quit handle, held for the duration of `run` so
+    /// The session's app and quit handle, held for the duration of `run` so
     /// ``render()`` and the render-error path can reach them without threading
-    /// them through every call.
-    private weak var activeTUI: TUI?
+    /// them through every call. Typed as ``TerminalApp`` so the one driver serves
+    /// both the inline ``TUI`` and the full-screen ``ScreenSurface``.
+    private weak var activeApp: (any TerminalApp)?
     private var activeQuit: QuitSignal?
 
     /// The last render error, if a frame overflowed the terminal width. Surfaced
@@ -207,7 +208,8 @@ public final class TerminalDriver {
     /// Run the interactive session until quit, input EOF, or cancellation.
     ///
     /// - Parameters:
-    ///   - tui: the renderer to drive. Its ``TUI/target`` is where frames land.
+    ///   - app: the coordinator to drive — an inline ``TUI`` or a full-screen
+    ///     ``ScreenSurface``. Its ``TerminalApp/target`` is where frames land.
     ///   - quit: the shared shutdown handle a component pulls to end the session.
     ///   - background: optional work (the agent) run concurrently with input.
     ///     It shares the main actor for UI mutation and should honour
@@ -218,25 +220,25 @@ public final class TerminalDriver {
     /// outside cancellation alike — the one guarantee pi spreads across three
     /// separate teardown call sites.
     public func run(
-        _ tui: TUI,
+        _ app: any TerminalApp,
         quit: QuitSignal,
         background: (@Sendable () async -> Void)? = nil
     ) async {
-        activeTUI = tui
+        activeApp = app
         activeQuit = quit
         framer.reset()
         renderError = nil
         startupError = nil
 
-        // The restore MUST run however the body exits. `tui.stop()` first so no
+        // The restore MUST run however the body exits. `app.stop()` first so no
         // late scheduled frame writes after the descriptor is handed back, then
         // the lifecycle puts raw mode / cursor / bracketed paste back.
         defer {
             flushTask?.cancel()
             flushTask = nil
-            tui.stop()
+            app.stop()
             lifecycle.stop()
-            activeTUI = nil
+            activeApp = nil
             activeQuit = nil
         }
 
@@ -257,13 +259,13 @@ public final class TerminalDriver {
         await withTaskGroup(of: RunOutcome.self) { group in
             group.addTask { [input] in
                 for await chunk in input {
-                    await self.ingest(chunk, tui: tui)
+                    await self.ingest(chunk, app: app)
                 }
                 return .inputEnded
             }
             group.addTask { [resize] in
                 for await size in resize {
-                    await self.handleResize(size, tui: tui)
+                    await self.handleResize(size, app: app)
                 }
                 return .resizeEnded
             }
@@ -305,12 +307,12 @@ public final class TerminalDriver {
     /// how ``Editor`` recognises a paste as one atomic segment; the framer stripped
     /// the guards to keep paste content out of the keystroke path, and this puts
     /// them back for exactly the one consumer that needs them.
-    private func ingest(_ chunk: [UInt8], tui: TUI) {
+    private func ingest(_ chunk: [UInt8], app: any TerminalApp) {
         flushTask?.cancel()
         flushTask = nil
 
         let events = framer.process(chunk)
-        dispatch(events, to: tui)
+        dispatch(events, to: app)
 
         // A held tail (a lone ESC, a split CSI) is neither a keypress nor noise
         // until the disambiguation window closes. Arm the flush the framer's I/O
@@ -320,7 +322,7 @@ public final class TerminalDriver {
                 try? await Task.sleep(for: StdinFramer.disambiguationTimeout)
                 guard let self, !Task.isCancelled else { return }
                 let flushed = self.framer.flush()
-                self.dispatch(flushed, to: tui)
+                self.dispatch(flushed, to: app)
                 self.render()
             }
         }
@@ -328,16 +330,16 @@ public final class TerminalDriver {
         render()
     }
 
-    private func dispatch(_ events: [StdinEvent], to tui: TUI) {
+    private func dispatch(_ events: [StdinEvent], to app: any TerminalApp) {
         for event in events {
             switch event {
             case .sequence(let bytes):
-                tui.handleInput(bytes)
+                app.handleInput(bytes)
             case .paste(let content):
                 var wrapped = Array("\u{1b}[200~".utf8)
                 wrapped.append(contentsOf: content)
                 wrapped.append(contentsOf: Array("\u{1b}[201~".utf8))
-                tui.handleInput(wrapped)
+                app.handleInput(wrapped)
             }
         }
     }
@@ -351,8 +353,8 @@ public final class TerminalDriver {
     /// "tell the target its new size, then render". The live target reads size from
     /// the kernel and ignores ``ResizableRenderTarget/setSize(_:)``; a headless
     /// target adopts it so the injected resize is visible to the very next frame.
-    private func handleResize(_ size: TerminalSize, tui: TUI) {
-        if let resizable = tui.target as? any ResizableRenderTarget {
+    private func handleResize(_ size: TerminalSize, app: any TerminalApp) {
+        if let resizable = app.target as? any ResizableRenderTarget {
             resizable.setSize(size)
         }
         render()
@@ -369,9 +371,9 @@ public final class TerminalDriver {
     /// terminal — unrecoverable for this frame — so the session is ended cleanly
     /// with the error recorded, rather than trapping.
     public func render() {
-        guard let tui = activeTUI else { return }
+        guard let app = activeApp else { return }
         do {
-            try tui.renderSync()
+            try app.renderSync()
         } catch {
             // Typed throw: `error` is a DoMoError (an over-wide line).
             renderError = error

@@ -442,7 +442,9 @@ public protocol RenderTarget: AnyObject {
 /// coalescing throttle.
 @MainActor
 public final class TUI: Container {
-    let target: any RenderTarget
+    /// Where frames are written. `public` so ``TUI`` can witness
+    /// ``TerminalApp/target`` — the driver reads it to apply a resize.
+    public let target: any RenderTarget
     var core: RenderCore
 
     // Overlay + focus state (methods live in Overlay.swift).

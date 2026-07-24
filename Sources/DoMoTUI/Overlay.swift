@@ -104,6 +104,99 @@ private func parseSizeValue(_ value: SizeValue?, reference: Int) -> Int? {
     }
 }
 
+// MARK: - Overlay geometry (shared by the inline TUI and full-screen ScreenSurface)
+
+/// Resolve an overlay's `(width, row, col, maxHeight)` from its options and the
+/// terminal size. Called twice per overlay: first with `overlayHeight: 0`
+/// (width/maxHeight are height-independent), then with the real height for the
+/// final row/col. Ports `resolveOverlayLayout`.
+///
+/// A file-scope free function — pure math on the options and the terminal size,
+/// no renderer state — so the inline ``TUI/compositeOverlays(_:termWidth:termHeight:)``
+/// and the full-screen ``ScreenSurface`` place overlays with byte-identical
+/// geometry instead of each carrying its own solver.
+func resolveOverlayGeometry(
+    _ options: OverlayOptions?,
+    overlayHeight: Int,
+    termWidth: Int,
+    termHeight: Int
+) -> (width: Int, row: Int, col: Int, maxHeight: Int?) {
+    let opt = options ?? OverlayOptions()
+
+    let marginTop = max(0, opt.margin?.top ?? 0)
+    let marginRight = max(0, opt.margin?.right ?? 0)
+    let marginBottom = max(0, opt.margin?.bottom ?? 0)
+    let marginLeft = max(0, opt.margin?.left ?? 0)
+
+    let availWidth = max(1, termWidth - marginLeft - marginRight)
+    let availHeight = max(1, termHeight - marginTop - marginBottom)
+
+    // Width
+    var width = parseSizeValue(opt.width, reference: termWidth) ?? min(80, availWidth)
+    if let minWidth = opt.minWidth { width = max(width, minWidth) }
+    width = max(1, min(width, availWidth))
+
+    // maxHeight
+    var maxHeight = parseSizeValue(opt.maxHeight, reference: termHeight)
+    if let mh = maxHeight { maxHeight = max(1, min(mh, availHeight)) }
+
+    let effectiveHeight = maxHeight != nil ? min(overlayHeight, maxHeight!) : overlayHeight
+
+    // Row
+    var row: Int
+    switch opt.row {
+    case .percent(let p):
+        let maxRow = max(0, availHeight - effectiveHeight)
+        row = marginTop + Int(floor(Double(maxRow) * (p / 100)))
+    case .absolute(let n):
+        row = n
+    case nil:
+        row = resolveOverlayAnchorRow(opt.anchor ?? .center, height: effectiveHeight, availHeight: availHeight, marginTop: marginTop)
+    }
+
+    // Col
+    var col: Int
+    switch opt.col {
+    case .percent(let p):
+        let maxCol = max(0, availWidth - width)
+        col = marginLeft + Int(floor(Double(maxCol) * (p / 100)))
+    case .absolute(let n):
+        col = n
+    case nil:
+        col = resolveOverlayAnchorCol(opt.anchor ?? .center, width: width, availWidth: availWidth, marginLeft: marginLeft)
+    }
+
+    if let offsetY = opt.offsetY { row += offsetY }
+    if let offsetX = opt.offsetX { col += offsetX }
+
+    row = max(marginTop, min(row, termHeight - marginBottom - effectiveHeight))
+    col = max(marginLeft, min(col, termWidth - marginRight - width))
+
+    return (width, row, col, maxHeight)
+}
+
+private func resolveOverlayAnchorRow(_ anchor: OverlayAnchor, height: Int, availHeight: Int, marginTop: Int) -> Int {
+    switch anchor {
+    case .topLeft, .topCenter, .topRight:
+        return marginTop
+    case .bottomLeft, .bottomCenter, .bottomRight:
+        return marginTop + availHeight - height
+    case .leftCenter, .center, .rightCenter:
+        return marginTop + (availHeight - height) / 2
+    }
+}
+
+private func resolveOverlayAnchorCol(_ anchor: OverlayAnchor, width: Int, availWidth: Int, marginLeft: Int) -> Int {
+    switch anchor {
+    case .topLeft, .leftCenter, .bottomLeft:
+        return marginLeft
+    case .topRight, .rightCenter, .bottomRight:
+        return marginLeft + availWidth - width
+    case .topCenter, .center, .bottomCenter:
+        return marginLeft + (availWidth - width) / 2
+    }
+}
+
 // MARK: - Overlay stack entry & focus state
 
 /// One overlay on the stack. A reference type: the renderer mutates `hidden`,
@@ -347,90 +440,16 @@ public extension TUI {
 
     // MARK: Layout
 
-    /// Resolve an overlay's `(width, row, col, maxHeight)` from its options and
-    /// the terminal size. Called twice per overlay: first with `overlayHeight: 0`
-    /// (width/maxHeight are height-independent), then with the real height for the
-    /// final row/col. Ports `resolveOverlayLayout`.
+    /// Resolve an overlay's `(width, row, col, maxHeight)`. Delegates to the shared
+    /// file-scope ``resolveOverlayGeometry(_:overlayHeight:termWidth:termHeight:)``
+    /// so the inline and full-screen overlay paths solve geometry identically.
     internal func resolveOverlayLayout(
         _ options: OverlayOptions?,
         overlayHeight: Int,
         termWidth: Int,
         termHeight: Int
     ) -> (width: Int, row: Int, col: Int, maxHeight: Int?) {
-        let opt = options ?? OverlayOptions()
-
-        let marginTop = max(0, opt.margin?.top ?? 0)
-        let marginRight = max(0, opt.margin?.right ?? 0)
-        let marginBottom = max(0, opt.margin?.bottom ?? 0)
-        let marginLeft = max(0, opt.margin?.left ?? 0)
-
-        let availWidth = max(1, termWidth - marginLeft - marginRight)
-        let availHeight = max(1, termHeight - marginTop - marginBottom)
-
-        // Width
-        var width = parseSizeValue(opt.width, reference: termWidth) ?? min(80, availWidth)
-        if let minWidth = opt.minWidth { width = max(width, minWidth) }
-        width = max(1, min(width, availWidth))
-
-        // maxHeight
-        var maxHeight = parseSizeValue(opt.maxHeight, reference: termHeight)
-        if let mh = maxHeight { maxHeight = max(1, min(mh, availHeight)) }
-
-        let effectiveHeight = maxHeight != nil ? min(overlayHeight, maxHeight!) : overlayHeight
-
-        // Row
-        var row: Int
-        switch opt.row {
-        case .percent(let p):
-            let maxRow = max(0, availHeight - effectiveHeight)
-            row = marginTop + Int(floor(Double(maxRow) * (p / 100)))
-        case .absolute(let n):
-            row = n
-        case nil:
-            row = resolveAnchorRow(opt.anchor ?? .center, height: effectiveHeight, availHeight: availHeight, marginTop: marginTop)
-        }
-
-        // Col
-        var col: Int
-        switch opt.col {
-        case .percent(let p):
-            let maxCol = max(0, availWidth - width)
-            col = marginLeft + Int(floor(Double(maxCol) * (p / 100)))
-        case .absolute(let n):
-            col = n
-        case nil:
-            col = resolveAnchorCol(opt.anchor ?? .center, width: width, availWidth: availWidth, marginLeft: marginLeft)
-        }
-
-        if let offsetY = opt.offsetY { row += offsetY }
-        if let offsetX = opt.offsetX { col += offsetX }
-
-        row = max(marginTop, min(row, termHeight - marginBottom - effectiveHeight))
-        col = max(marginLeft, min(col, termWidth - marginRight - width))
-
-        return (width, row, col, maxHeight)
-    }
-
-    private func resolveAnchorRow(_ anchor: OverlayAnchor, height: Int, availHeight: Int, marginTop: Int) -> Int {
-        switch anchor {
-        case .topLeft, .topCenter, .topRight:
-            return marginTop
-        case .bottomLeft, .bottomCenter, .bottomRight:
-            return marginTop + availHeight - height
-        case .leftCenter, .center, .rightCenter:
-            return marginTop + (availHeight - height) / 2
-        }
-    }
-
-    private func resolveAnchorCol(_ anchor: OverlayAnchor, width: Int, availWidth: Int, marginLeft: Int) -> Int {
-        switch anchor {
-        case .topLeft, .leftCenter, .bottomLeft:
-            return marginLeft
-        case .topRight, .rightCenter, .bottomRight:
-            return marginLeft + availWidth - width
-        case .topCenter, .center, .bottomCenter:
-            return marginLeft + (availWidth - width) / 2
-        }
+        resolveOverlayGeometry(options, overlayHeight: overlayHeight, termWidth: termWidth, termHeight: termHeight)
     }
 
     // MARK: Compositing
