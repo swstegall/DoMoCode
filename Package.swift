@@ -59,8 +59,10 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-markdown", .upToNextMinor(from: "0.8.0")),
         .package(url: "https://github.com/jpsim/Yams", from: "6.2.2"),
         .package(url: "https://github.com/ajevans99/swift-json-schema", .upToNextMinor(from: "0.13.1")),
+        // A headless VT100 emulator used as a test oracle: renderer bytes go in,
+        // assertions run against the resulting cell grid. Test targets only.
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.15.0"),
         // Arriving later, already validated against this graph:
-        //   migueldeicaza/SwiftTerm  from: "1.15.0"   — Phase 4, test target only
         //   groue/GRDB.swift         from: "7.11.1"   — Phase 6, optional storage
     ],
     targets: [
@@ -230,6 +232,26 @@ let package = Package(
             name: "DoMoHarnessTests",
             dependencies: ["DoMoHarness", "DoMoAgent", "DoMoLLM", "DoMoExec", "DoMoCore"],
             swiftSettings: safeSettings
+        ),
+
+        // baseSettings (strict memory safety off): terminal tests open PTYs and
+        // touch termios/ioctl directly, which is `unsafe` by design.
+        .testTarget(
+            name: "DoMoTermIOTests",
+            dependencies: ["DoMoTermIO", "DoMoCore"],
+            swiftSettings: baseSettings
+        ),
+
+        // baseSettings: the SwiftTerm-backed screen-state oracle bridges a Swift-5
+        // language-mode dependency, and strict memory safety on the test bridge
+        // buys nothing.
+        .testTarget(
+            name: "DoMoTUITests",
+            dependencies: [
+                "DoMoTUI", "DoMoTermIO", "DoMoCore",
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
+            ],
+            swiftSettings: baseSettings
         ),
 
         // Strict memory safety is off here, matching DoMoTermIO's rationale: the
