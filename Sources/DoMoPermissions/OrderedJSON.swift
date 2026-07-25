@@ -199,6 +199,57 @@ private struct OrderedJSONParser {
     }
 }
 
+/// Serialize an ``OrderedJSONValue`` back to pretty-printed JSON text (2-space
+/// indent), preserving object key order. Used to write a settings.json back after
+/// its `permission` block is updated, leaving every other key untouched.
+public func serializeOrderedJSON(_ value: OrderedJSONValue, indent: Int = 0) -> String {
+    let pad = String(repeating: " ", count: indent)
+    let childPad = String(repeating: " ", count: indent + 2)
+    switch value {
+    case .string(let s): return encodeJSONString(s)
+    case .number(let n):
+        if n == n.rounded(), abs(n) < 1e15 { return String(Int(n)) }
+        return String(n)
+    case .bool(let b): return b ? "true" : "false"
+    case .null: return "null"
+    case .array(let items):
+        if items.isEmpty { return "[]" }
+        let body = items.map { childPad + serializeOrderedJSON($0, indent: indent + 2) }.joined(separator: ",\n")
+        return "[\n" + body + "\n" + pad + "]"
+    case .object(let pairs):
+        if pairs.isEmpty { return "{}" }
+        let body = pairs
+            .map { childPad + encodeJSONString($0.key) + ": " + serializeOrderedJSON($0.value, indent: indent + 2) }
+            .joined(separator: ",\n")
+        return "{\n" + body + "\n" + pad + "}"
+    }
+}
+
+/// A JSON string literal with the standard escapes.
+private func encodeJSONString(_ string: String) -> String {
+    var result = "\""
+    for scalar in string.unicodeScalars {
+        switch scalar {
+        case "\"": result += "\\\""
+        case "\\": result += "\\\\"
+        case "\n": result += "\\n"
+        case "\t": result += "\\t"
+        case "\r": result += "\\r"
+        case "\u{08}": result += "\\b"
+        case "\u{0C}": result += "\\f"
+        default:
+            if scalar.value < 0x20 {
+                let hex = String(scalar.value, radix: 16)
+                result += "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
+            } else {
+                result.unicodeScalars.append(scalar)
+            }
+        }
+    }
+    result += "\""
+    return result
+}
+
 extension Unicode.Scalar {
     fileprivate var hexDigitValue: Int? {
         switch self {

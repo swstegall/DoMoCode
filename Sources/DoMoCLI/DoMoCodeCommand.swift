@@ -268,6 +268,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     model: model,
                     workingDirectory: workingDirectory.string,
                     sessionDirectory: configuration.sessionDirectory.string,
+                    configDirectory: configuration.configDirectory.string,
                     homeDirectory: environment["HOME"],
                     reasoningEffort: configuration.reasoningEffort,
                     maxTurns: maxTurns,

@@ -63,6 +63,35 @@ enum PermissionSetup {
         )
     }
 
+    /// A persister that writes "allow always" grants into the GLOBAL user
+    /// settings.json (so a grant survives restarts and applies across projects,
+    /// matching kilocode). Best-effort: a failed write must never crash the session,
+    /// and the in-memory grant still holds for the rest of it.
+    static func persister(configDirectory: String) -> @Sendable (Ruleset) async -> Void {
+        let path = userSettingsPath(configDirectory)
+        return { grants in
+            guard !grants.isEmpty else { return }
+            let existing = (try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)) ?? "{}"
+            let updated = settingsText(existing, mergingGrants: grants)
+            try? FileManager.default.createDirectory(atPath: configDirectory, withIntermediateDirectories: true)
+            try? updated.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// The pieces a surface needs to build its own gated engine: the resolved
+    /// ruleset, the tool-aware factory, and the config persister.
+    static func runtime(
+        workingDirectory: String,
+        configDirectory: String,
+        homeDirectory: String
+    ) -> (ruleset: Ruleset, factory: PermissionRequestFactory, persist: @Sendable (Ruleset) async -> Void) {
+        (
+            resolvedRuleset(workingDirectory: workingDirectory, configDirectory: configDirectory, homeDirectory: homeDirectory),
+            factory(workingDirectory: workingDirectory, configDirectory: configDirectory),
+            persister(configDirectory: configDirectory)
+        )
+    }
+
     /// The headless prompter: never blocks. A tool that resolves to `ask` is rejected
     /// with a model-visible reason unless `--yolo` auto-approves it for this call.
     static func headlessPrompter(yolo: Bool) -> PermissionPrompter {

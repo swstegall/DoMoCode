@@ -155,7 +155,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 20
@@ -201,7 +202,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 20
@@ -292,7 +294,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 24
@@ -327,6 +330,115 @@ struct InteractiveModeEndToEndTests {
         try await runTask.value
     }
 
+    /// Turn 1: the assistant calls `bash echo permitted` — under the Phase-8 baseline
+    /// this needs interactive approval.
+    static let bashApprovalTurn = #"""
+        data: {"id":"b1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_bash_1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}
+
+        data: {"id":"b1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\": \"echo permitted\"}"}}]},"finish_reason":null}]}
+
+        data: {"id":"b1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+        data: {"id":"b1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":8,"total_tokens":50}}
+
+        data: [DONE]
+
+
+        """#
+
+    /// The content of the first tool-role message in a chat-completions body — the
+    /// tool result fed back to the model.
+    private static func toolResult(_ body: String) -> String {
+        guard let json = try? JSONValue(parsing: body), let messages = json["messages"]?.arrayValue else { return "" }
+        for message in messages where message["role"]?.stringValue == "tool" {
+            return message["content"]?.stringValue ?? ""
+        }
+        return ""
+    }
+
+    /// PHASE 8 — a bash tool needing approval raises the modal; Enter ("Allow once")
+    /// runs it. The gate suspends the tool on a continuation and the render loop keeps
+    /// going (the modal is visible), then the keypress resumes it.
+    @Test
+    func permissionModalAllowOnceRunsTheTool() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.bashApprovalTurn, Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 70, rows = 22
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("run echo"))
+        inputCont.yield(bytes("\r"))
+        let modalUp = await waitUntil { screenContains(target, rows: rows, cols: cols, "Allow bash") }
+        #expect(modalUp, "the approval modal never appeared")
+
+        inputCont.yield(bytes("\r"))   // confirm the highlighted "Allow once"
+        let finished = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(finished, "the run never completed after approval")
+        #expect(gateway.requestCount == 2)
+        #expect(Self.toolResult(gateway.requests[1].body).contains("permitted"), "the echo should have run")
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// PHASE 8 — Escape on the modal rejects the tool; the model gets the refusal and
+    /// the run still completes (no leaked tool fiber).
+    @Test
+    func permissionModalEscapeRejectsTheTool() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.bashApprovalTurn, Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 70, rows = 22
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("run echo"))
+        inputCont.yield(bytes("\r"))
+        let modalUp = await waitUntil { screenContains(target, rows: rows, cols: cols, "Allow bash") }
+        #expect(modalUp, "the approval modal never appeared")
+
+        inputCont.yield(bytes("\u{1b}"))   // Escape -> reject
+        let finished = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(finished, "the run never completed after rejection")
+        #expect(gateway.requestCount == 2)
+        #expect(Self.toolResult(gateway.requests[1].body).contains("rejected"), "the tool should have been refused")
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
     /// EXIT CRITERION 3 — typing `@` opens a completion popup listing a real temp
     /// directory's contents.
     @Test
@@ -341,7 +453,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: "http://127.0.0.1:1/v1", apiKey: nil),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 20
@@ -379,7 +492,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 20
@@ -428,7 +542,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 20
@@ -494,7 +609,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 20
@@ -551,7 +667,8 @@ struct InteractiveModeEndToEndTests {
             clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
             model: "mock-model",
             workingDirectory: tree.work.path,
-            sessionDirectory: tree.sessions.path
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
         )
 
         let cols = 60, rows = 20

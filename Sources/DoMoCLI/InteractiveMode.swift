@@ -43,6 +43,7 @@ import DoMoCore
 import DoMoExec
 import DoMoHarness
 import DoMoLLM
+import DoMoPermissions
 import DoMoTermGraphics
 import DoMoTermIO
 import DoMoToolsUI
@@ -242,6 +243,12 @@ final class InteractiveCoordinator {
     private var popupList: SelectList?
     private var popupItems: [AutocompleteItem] = []
     private var popupPrefix = ""
+
+    // Permission approval modal (Phase 8). One at a time — the loop prepares tool
+    // calls sequentially, so a second prompt is never requested while one is up.
+    private var permissionHandle: OverlayHandle?
+    private var permissionList: SelectList?
+    private var pendingPermission: CheckedContinuation<PermissionReply, Never>?
     /// Monotonic token so a superseded async suggestion lookup abandons its result
     /// rather than clobbering a newer keystroke's popup. A ``Mutex`` because the
     /// cancellation signal reads it from the (`Sendable`) provider closure that may
@@ -331,6 +338,23 @@ final class InteractiveCoordinator {
     private func handleKey(_ data: [UInt8]) {
         let kb = keybindings
 
+        // A permission prompt captures ALL input: arrows move the choice, Enter
+        // confirms it, Escape rejects; every other key is swallowed so the editor
+        // cannot change while a tool waits on a decision.
+        if let list = permissionList {
+            if kb.matches(data, .selectUp) || kb.matches(data, .selectDown) {
+                list.handleInput(data)
+                render()
+            } else if kb.matches(data, .selectConfirm) {
+                resolvePermission(Self.reply(for: list.getSelectedItem()?.value))
+                render()
+            } else if kb.matches(data, .selectCancel) {
+                resolvePermission(.reject(message: nil))
+                render()
+            }
+            return
+        }
+
         if popupList != nil {
             if kb.matches(data, .selectUp) || kb.matches(data, .selectDown) {
                 popupList?.handleInput(data)
@@ -370,6 +394,12 @@ final class InteractiveCoordinator {
     /// Ctrl+C, layered like pi's: dismiss a popup, else interrupt a run, else clear
     /// a non-empty editor, else quit.
     private func handleInterrupt() {
+        // Ctrl+C with a permission prompt up rejects it (and dismisses the modal).
+        if permissionList != nil {
+            resolvePermission(.reject(message: nil))
+            render()
+            return
+        }
         if popupList != nil {
             closePopup()
             render()
@@ -529,6 +559,92 @@ final class InteractiveCoordinator {
         popupHandle?.hide()
         popupHandle = nil
         popupList = nil
+    }
+
+    // MARK: Permission approval
+
+    /// Show the approval modal and suspend until the user answers. This is the
+    /// engine's prompter for the REPL. It runs on the main actor (the harness run is
+    /// a `@MainActor` task), so it MUST NOT block: the `CheckedContinuation` frees the
+    /// actor while the modal is up, and a keypress (or a cancellation) resumes it. A
+    /// cancelled run — Escape while running from another path, EOF, quit — resumes it
+    /// with a reject so the tool fiber never leaks.
+    func showPermissionPrompt(_ request: PermissionRequest) async -> PermissionReply {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<PermissionReply, Never>) in
+                pendingPermission = continuation
+                presentPermissionOverlay(request)
+                render()
+            }
+        } onCancel: {
+            Task { @MainActor in self.resolvePermission(.reject(message: nil)) }
+        }
+    }
+
+    /// Resume the pending prompt with `reply` and tear down the modal. Idempotent —
+    /// a keypress and a concurrent cancellation both call it, but only the first
+    /// resumes the (single) continuation.
+    private func resolvePermission(_ reply: PermissionReply) {
+        guard let continuation = pendingPermission else { return }
+        pendingPermission = nil
+        permissionHandle?.hide()
+        permissionHandle = nil
+        permissionList = nil
+        continuation.resume(returning: reply)
+    }
+
+    private static func reply(for value: String?) -> PermissionReply {
+        switch value {
+        case "once": return .once
+        case "always": return .always
+        default: return .reject(message: nil)
+        }
+    }
+
+    private func presentPermissionOverlay(_ request: PermissionRequest) {
+        var items = [SelectItem(value: "once", label: "Allow once", description: nil)]
+        if !request.disableAlways {
+            items.append(SelectItem(value: "always", label: "Allow always", description: Self.alwaysHint(request)))
+        }
+        items.append(SelectItem(value: "reject", label: "Reject", description: nil))
+
+        let list = SelectList(items: items, maxVisible: items.count, keybindings: keybindings)
+        permissionList = list
+
+        let header = Self.permissionHeader(request)
+        let container = Container()
+        for line in header { container.addChild(Text(line, wrap: false)) }
+        container.addChild(list)
+
+        permissionHandle = tui.showOverlay(
+            container,
+            options: OverlayOptions(
+                width: .absolute(64),
+                minWidth: 30,
+                maxHeight: .absolute(header.count + items.count + 1),
+                anchor: .center,
+                nonCapturing: true
+            )
+        )
+    }
+
+    /// The modal's descriptive lines: what tool wants to run and on what.
+    private static func permissionHeader(_ request: PermissionRequest) -> [String] {
+        var lines = ["⚠ Allow \(request.permission)?"]
+        if let command = request.metadata["command"]?.stringValue, !command.isEmpty {
+            lines.append("  " + truncateToWidth(command, 60))
+        } else if let filepath = request.metadata["filepath"]?.stringValue, !filepath.isEmpty {
+            lines.append("  " + truncateToWidth(filepath, 60))
+        } else if let first = request.patterns.first, first != "*" {
+            lines.append("  " + truncateToWidth(first, 60))
+        }
+        return lines
+    }
+
+    /// The "allow always" hint: the broader glob that would be granted.
+    private static func alwaysHint(_ request: PermissionRequest) -> String? {
+        guard let glob = request.always.first else { return nil }
+        return "grants \(glob)"
     }
 
     // MARK: Agent loop
@@ -777,6 +893,10 @@ public struct InteractiveMode: Sendable {
     /// The sandboxed filesystem behind the tool context, carried through to the
     /// coordinator so a submitted `@path` image mention can be read and attached.
     private let fileSystem: SandboxedFileSystem?
+    /// The permission engine's late-bound prompter (Phase 8). Built in ``make``
+    /// alongside the harness whose `beforeToolCall` gate the engine drives, then set
+    /// in ``run`` to the coordinator's approval overlay once the UI exists.
+    private let prompterBox: PrompterBox
 
     private init(
         harness: AgentHarness,
@@ -786,6 +906,7 @@ public struct InteractiveMode: Sendable {
         toolRendererRegistry: ToolRendererRegistry,
         toolTheme: ToolRenderTheme,
         steering: SteeringBox,
+        prompterBox: PrompterBox,
         fileSystem: SandboxedFileSystem? = nil
     ) {
         self.harness = harness
@@ -795,6 +916,7 @@ public struct InteractiveMode: Sendable {
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
         self.steering = steering
+        self.prompterBox = prompterBox
         self.fileSystem = fileSystem
     }
 
@@ -821,6 +943,7 @@ public struct InteractiveMode: Sendable {
         model: String,
         workingDirectory: String,
         sessionDirectory: String,
+        configDirectory: String,
         homeDirectory: String? = nil,
         reasoningEffort: ReasoningEffort? = nil,
         maxTurns: Int = 100,
@@ -850,6 +973,23 @@ public struct InteractiveMode: Sendable {
         // harness Configuration and the coordinator share the one instance.
         let steering = SteeringBox()
 
+        // The permission gate (Phase 8). The harness is built here but the approval
+        // overlay only exists once `run` builds the coordinator, so the engine drives
+        // a late-bound prompter box the coordinator fills in. "Allow always" grants
+        // persist to the user settings.json.
+        let permission = PermissionSetup.runtime(
+            workingDirectory: workingDirectory,
+            configDirectory: configDirectory,
+            homeDirectory: homeDirectory ?? ""
+        )
+        let prompterBox = PrompterBox()
+        let engine = PermissionEngine(
+            ruleset: permission.ruleset,
+            prompt: { await prompterBox.prompt($0) },
+            persist: permission.persist
+        )
+        let gate = permissionHook(engine: engine, factory: permission.factory, sessionID: "interactive")
+
         let configuration = AgentHarness.Configuration(
             systemPrompt: PrintMode.systemPrompt(workingDirectory: workDirectory, toolNames: registry.names),
             tools: tools,
@@ -859,7 +999,8 @@ public struct InteractiveMode: Sendable {
             // model's own call order, which is what a reader expects to watch.
             toolExecution: .sequential,
             maxTurns: maxTurns,
-            getSteeringMessages: { steering.drain() }
+            getSteeringMessages: { steering.drain() },
+            beforeToolCall: gate
         )
 
         let harness = try await Self.makeHarness(
@@ -879,6 +1020,7 @@ public struct InteractiveMode: Sendable {
             toolRendererRegistry: .builtin,
             toolTheme: toolTheme,
             steering: steering,
+            prompterBox: prompterBox,
             fileSystem: toolContext.fileSystem
         )
     }
@@ -967,6 +1109,9 @@ public struct InteractiveMode: Sendable {
             cell: resolvedCell
         )
         coordinator.install()
+        // Now that the approval UI exists, point the engine's prompter at it. Until
+        // this runs (it cannot fire before the first frame), the box refuses.
+        prompterBox.set { await coordinator.showPermissionPrompt($0) }
 
         await driver.run(tui, quit: quit, background: {
             await coordinator.agentLoop()
