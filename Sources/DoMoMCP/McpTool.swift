@@ -22,14 +22,24 @@ struct McpTool: AgentTool {
 
     /// `nameOverride` lets the manager substitute a de-collided name when two servers'
     /// tools namespace to the same string (otherwise the default `namespaced` name is used).
-    init(client: MCPClient, serverName: String, info: MCPClient.ToolInfo, nameOverride: String? = nil) {
+    /// `parameters` is the pre-validated schema (see ``makeParameters``) — the manager
+    /// builds it first so it can DROP a tool whose schema won't convert rather than
+    /// advertise a misleading parameterless tool.
+    init(client: MCPClient, serverName: String, info: MCPClient.ToolInfo, nameOverride: String? = nil, parameters: JSONSchema) {
         self.client = client
         self.rawName = info.name
         self.namespacedName = nameOverride ?? McpTool.namespaced(server: serverName, tool: info.name)
         self.toolDescription = info.description
-        // MCP schemas are untrusted; the conversion can throw on excessive nesting —
-        // fall back to an empty object schema rather than dropping the tool.
-        self.parameters = (try? JSONSchema(jsonValue: McpTool.normalizeSchema(info.inputSchema))) ?? .object()
+        self.parameters = parameters
+    }
+
+    /// Convert an MCP tool's (untrusted) input schema into a `JSONSchema`. Throws when the
+    /// schema can't convert (an unknown type keyword, nesting past the depth cap, etc.) so
+    /// the manager can skip the tool with a log line instead of the old silent fallback to
+    /// an empty object schema — which advertised a real tool as taking no arguments and
+    /// guaranteed the model would call it wrong.
+    static func makeParameters(_ inputSchema: JSONValue) throws -> JSONSchema {
+        try JSONSchema(jsonValue: normalizeSchema(inputSchema))
     }
 
     var definition: ToolDefinition {

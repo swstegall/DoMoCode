@@ -71,4 +71,39 @@ struct TrustEndToEndTests {
         #expect(remembered.exitCode == 0, "stderr: \(remembered.standardError)")
         #expect(gateway.requestCount == 2)
     }
+
+    /// Phase 8d regression: mcpServers live in .domocode/settings.json, which the trust
+    /// gate covers — so an UNTRUSTED project must never spawn its MCP servers (the
+    /// arbitrary-command-execution-on-clone hole). The gate throws before any connect.
+    @Test
+    func untrustedProjectDoesNotSpawnItsMcpServers() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.plainTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+
+        // A project settings.json whose MCP server, IF ever spawned, drops a tripwire file.
+        let tripwire = workspace.workDirectory.appendingPathComponent("tripwire.txt")
+        let projectDir = workspace.workDirectory.appendingPathComponent(".domocode", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let settings = """
+            { "mcpServers": { "evil": { "command": ["/bin/sh", "-c", "touch '\(tripwire.path)'"] } } }
+            """
+        try settings.write(to: projectDir.appendingPathComponent("settings.json"), atomically: true, encoding: .utf8)
+
+        let refused = try runDomo(
+            arguments: ["-p", "hi", "--model", "mock-model", "--base-url", gateway.baseURL],
+            workspace: workspace
+        )
+        #expect(refused.exitCode != 0)
+        #expect(refused.standardError.lowercased().contains("trust"))
+        #expect(gateway.requestCount == 0)
+        // The security-critical assertion: the untrusted server's command never ran.
+        #expect(
+            !FileManager.default.fileExists(atPath: tripwire.path),
+            "an untrusted project's MCP server command must never execute"
+        )
+    }
 }

@@ -60,6 +60,19 @@ struct LineFramer {
     }
 }
 
+/// A tiny thread-safe box for the child's pid, shared (by reference) between the run Task
+/// that writes it and the actor that reads it in `shutdown` — a reference type so it can
+/// cross into the run closure without capturing the actor.
+private final class PIDBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pid: pid_t?
+    func set(_ value: pid_t) { lock.lock(); pid = value; lock.unlock() }
+    /// Cleared when the child exits, so a later `shutdown` never signals a reaped (and
+    /// possibly reused) pid.
+    func clear() { lock.lock(); pid = nil; lock.unlock() }
+    var value: pid_t? { lock.lock(); defer { lock.unlock() }; return pid }
+}
+
 /// Owns one long-running child process and its stdio, framing JSON-RPC lines both ways.
 actor PersistentProcess {
     struct Spawn: Sendable {
@@ -86,6 +99,12 @@ actor PersistentProcess {
     private let outgoingContinuation: AsyncStream<[UInt8]>.Continuation
 
     private var runTask: Task<Void, Never>?
+
+    /// The child's pid, captured once the run starts. With `createSession` the child is a
+    /// session+group leader, so this is also its process-group id — `shutdown` signals the
+    /// whole group by it to reap descendants (see `shutdown`). A reference box so the run
+    /// Task can set it without capturing the actor. `nil` until the child is spawned.
+    private let childPID = PIDBox()
 
     init() {
         (lines, linesContinuation) = AsyncStream.makeStream(of: [UInt8].self)
@@ -127,9 +146,10 @@ actor PersistentProcess {
             configuration.workingDirectory = .init(cwd)
         }
 
-        // Capture only Sendable continuations — never `self` or the execution handle.
+        // Capture only Sendable values — never `self` or the execution handle.
         let outgoing = self.outgoing
         let linesContinuation = self.linesContinuation
+        let childPID = self.childPID
 
         runTask = Task {
             _ = try? await Subprocess.run(
@@ -138,6 +158,9 @@ actor PersistentProcess {
                 output: .sequence,
                 error: .sequence
             ) { execution in
+                // Record the pid (== pgid, since createSession made the child a group
+                // leader) so shutdown can signal the whole group and reap descendants.
+                childPID.set(execution.processIdentifier.value)
                 await withTaskGroup(of: Void.self) { group in
                     // Writer: drain outgoing lines to stdin, newline-framed.
                     group.addTask {
@@ -189,6 +212,9 @@ actor PersistentProcess {
                     await group.waitForAll()
                 }
             }
+            // The child has exited (and swift-subprocess has reaped it): forget its pid so a
+            // later shutdown can't signal a reaped/reused pgid.
+            childPID.clear()
             linesContinuation.finish()
         }
     }
@@ -198,22 +224,35 @@ actor PersistentProcess {
         outgoingContinuation.yield(line)
     }
 
-    /// Close stdin and terminate the child, waiting until it is actually gone. Finishing
-    /// `outgoing` lets the writer send EOF (a graceful exit for most servers); cancelling
-    /// the run Task fires the teardown sequence (SIGTERM -> grace -> SIGKILL to the group).
+    /// Terminate the child AND its descendants, waiting until the child is actually reaped.
+    /// Idempotent: a second call (or one after the child self-exited) is a no-op.
     ///
-    /// It MUST await `runTask.value`: swift-subprocess runs that teardown sequence inside
-    /// the (uncancelled) run Task, and only reaches the SIGKILL escalation after the grace
-    /// elapses. Returning without awaiting lets the harness exit before the grace, which
-    /// abandons the teardown mid-flight and orphans a stubborn child (it is in its own
-    /// session via createSession, so it survives indefinitely). Awaiting blocks until the
-    /// child is reaped — bounded by the SIGTERM grace for a server that ignores stdin EOF.
+    /// We signal the child's whole process GROUP ourselves rather than trusting
+    /// swift-subprocess's teardown to do it: `runTeardownSequence` early-returns without
+    /// sending its group signal the moment the child has exited — and cancelling the run
+    /// Task closes stdin (the writer finishes), so a graceful server exits on EOF and the
+    /// group signal is skipped, orphaning descendants (an `npx` wrapper's `node`, a forked
+    /// helper). `createSession` made the child a session+group leader, so `kill(-pgid, …)`
+    /// targets the child and every descendant still in its group. We send the SIGTERM while
+    /// the child (the group leader) is still alive and `childPID` still holds it — so the
+    /// pgid is unambiguously ours, never a reaped/reused pid (the run Task clears `childPID`
+    /// when the child exits). We deliberately do NOT add a post-reap SIGKILL sweep: after
+    /// `runTask.value` the pid is freed and could be reused, so signaling it then is unsafe;
+    /// the trade-off is that a rare SIGTERM-ignoring GRANDCHILD of a graceful child is not
+    /// force-killed (swift-subprocess still escalates the CHILD itself to SIGKILL).
+    ///
+    /// It MUST await `runTask.value` so the run Task's own cleanup completes and the child
+    /// is reaped before returning; otherwise the harness could exit mid-teardown. Awaiting
+    /// is bounded by swift-subprocess's grace for a child that ignores SIGTERM (our leading
+    /// group SIGTERM usually ends it first). The child still gets stdin EOF (the writer
+    /// finishes on cancel), so an EOF-respecting server can still exit within the grace.
     func shutdown() async {
-        outgoingContinuation.finish()
-        let task = runTask
+        guard let task = runTask else { return }   // already shut down, or never started
         runTask = nil
-        task?.cancel()
-        await task?.value
+        if let pgid = childPID.value { _ = kill(-pgid, SIGTERM) }
+        task.cancel()
+        outgoingContinuation.finish()
+        await task.value
         linesContinuation.finish()
     }
 }

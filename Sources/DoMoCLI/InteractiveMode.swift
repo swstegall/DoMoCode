@@ -979,11 +979,27 @@ public struct InteractiveMode: Sendable {
                 workspaceDirectory: workingDirectory,
                 // Scrub the LLM-gateway credential variables from each MCP child's env.
                 sensitiveEnvKeys: Set(EnvName.apiKeyFallbacks),
+                // Reserve the built-in tool names so an MCP tool can't shadow one.
+                reservedNames: Set(ToolRegistry.builtin.names),
                 log: mcpLog ?? { _ in }
             )
             mcpManager = manager
         }
-        let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + mcpTools
+
+        // The permission gate (Phase 8). Built before the tool set so a `deny` rule can
+        // hide the MCP tool from the model (Phase 8d visibility), not just block the call.
+        // The harness is built here but the approval overlay only exists once `run` builds
+        // the coordinator, so the engine drives a late-bound prompter box the coordinator
+        // fills in. "Allow always" grants persist to the user settings.json.
+        let permission = PermissionSetup.runtime(
+            workingDirectory: workingDirectory,
+            configDirectory: configDirectory,
+            // Fall back to the real home, never "": a `~`/`$HOME` deny rule must not
+            // expand to a bogus root and fail open when $HOME is unset.
+            homeDirectory: homeDirectory ?? NSHomeDirectory()
+        )
+        let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
+        let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
 
         let streamFn: AgentStreamFn = { context in
             client.streamCompletion(
@@ -999,17 +1015,6 @@ public struct InteractiveMode: Sendable {
         // harness Configuration and the coordinator share the one instance.
         let steering = SteeringBox()
 
-        // The permission gate (Phase 8). The harness is built here but the approval
-        // overlay only exists once `run` builds the coordinator, so the engine drives
-        // a late-bound prompter box the coordinator fills in. "Allow always" grants
-        // persist to the user settings.json.
-        let permission = PermissionSetup.runtime(
-            workingDirectory: workingDirectory,
-            configDirectory: configDirectory,
-            // Fall back to the real home, never "": a `~`/`$HOME` deny rule must not
-            // expand to a bogus root and fail open when $HOME is unset.
-            homeDirectory: homeDirectory ?? NSHomeDirectory()
-        )
         let prompterBox = PrompterBox()
         let engine = PermissionEngine(
             ruleset: permission.ruleset,
@@ -1021,7 +1026,7 @@ public struct InteractiveMode: Sendable {
         let configuration = AgentHarness.Configuration(
             systemPrompt: PrintMode.systemPrompt(
                 workingDirectory: workDirectory,
-                toolNames: registry.names + mcpTools.map(\.definition.name)
+                toolNames: registry.names + visibleMcp.map(\.definition.name)
             ),
             tools: tools,
             model: model,

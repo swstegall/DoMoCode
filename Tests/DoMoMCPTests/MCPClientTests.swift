@@ -18,7 +18,14 @@ struct MCPClientTests {
     /// A minimal MCP stdio server: initialize, tools/list (echo/boom/slow), tools/call,
     /// ping. `slow` never responds (to exercise the per-request timeout).
     static let fixture = #"""
-        import sys, json, os
+        import sys, json, os, subprocess
+        # Optionally spawn a grandchild in this server's own process group, to prove the
+        # teardown signal reaches descendants (its pid is written for the test to check).
+        pidfile = os.environ.get("GRANDCHILD_PIDFILE")
+        if pidfile:
+            gc = subprocess.Popen(["sleep", "300"])
+            open(pidfile, "w").write(str(gc.pid))
+        pv = os.environ.get("FIXTURE_PROTOCOL_VERSION", "2025-06-18")
         def send(o):
             sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
         for line in sys.stdin:
@@ -26,7 +33,7 @@ struct MCPClientTests {
             if not line: continue
             m = json.loads(line); method = m.get("method"); mid = m.get("id")
             if method == "initialize":
-                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":False}},"serverInfo":{"name":"fixture","version":"1.0"}}})
+                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":pv,"capabilities":{"tools":{"listChanged":False}},"serverInfo":{"name":"fixture","version":"1.0"}}})
             elif method == "tools/list":
                 send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
                     {"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
@@ -193,6 +200,125 @@ struct MCPClientTests {
         let elapsed = Date().timeIntervalSince(start)
         #expect(result.isError)          // transport gone -> error result
         #expect(elapsed < 4.0)           // fast-failed, nowhere near the 8s timeout
+    }
+
+    // MARK: - Phase 8d hardening
+
+    /// A thread-safe collector for the `log` closure (called from actor context).
+    private final class LogSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _lines: [String] = []
+        func append(_ s: String) { lock.lock(); _lines.append(s); lock.unlock() }
+        var lines: [String] { lock.lock(); defer { lock.unlock() }; return _lines }
+    }
+
+    @Test("A tool whose input schema won't convert is dropped, not advertised with empty params")
+    func malformedSchemaToolDropped() async throws {
+        guard FileManager.default.fileExists(atPath: "/usr/bin/python3") else { return }
+        // A server advertising one good tool and one whose NESTED schema has an invalid
+        // type keyword (normalizeSchema forces the TOP-level type to object, so the bad
+        // part must be nested to survive to JSONSchema conversion and throw there).
+        let script = #"""
+            import sys, json
+            def send(o):
+                sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+            for line in sys.stdin:
+                line=line.strip()
+                if not line: continue
+                m=json.loads(line); method=m.get("method"); mid=m.get("id")
+                if method=="initialize":
+                    send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":False}},"serverInfo":{"name":"f","version":"1"}}})
+                elif method=="tools/list":
+                    send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
+                        {"name":"good","description":"ok","inputSchema":{"type":"object","properties":{"x":{"type":"string"}}}},
+                        {"name":"bad","description":"broken","inputSchema":{"type":"object","properties":{"y":{"type":"not-a-real-json-schema-type"}}}}]}})
+            """#
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("domo-mcp-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("server.py")
+        try script.write(to: path, atomically: true, encoding: .utf8)
+
+        let sink = LogSink()
+        let manager = MCPManager()
+        let tools = await manager.connect(
+            servers: ["srv": MCPServerConfig(command: ["/usr/bin/python3", path.path], timeout: 4000)],
+            workspaceDirectory: dir.path,
+            log: { sink.append($0) }
+        )
+        defer { Task { await manager.shutdown() } }
+
+        #expect(self.tool(tools, "srv_good") != nil)   // valid schema kept
+        #expect(self.tool(tools, "srv_bad") == nil)    // malformed schema dropped
+        #expect(sink.lines.contains { $0.contains("unusable input schema") })
+    }
+
+    @Test("An MCP tool cannot shadow a built-in: a reserved name forces a rename")
+    func builtinNameCollisionRenamed() async throws {
+        guard let (dir, config) = try fixtureConfig() else { return }
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manager = MCPManager()
+        // Reserve the name the fixture's echo tool would take, as a built-in would.
+        let tools = await manager.connect(
+            servers: ["srv": config], workspaceDirectory: dir.path,
+            reservedNames: ["srv_echo"]
+        )
+        defer { Task { await manager.shutdown() } }
+        // The reserved name is untouched (no MCP tool claims it) and echo is renamed.
+        #expect(self.tool(tools, "srv_echo") == nil)
+        #expect(self.tool(tools, "srv_echo_2") != nil)
+    }
+
+    @Test("An unrecognized negotiated protocol version is warned, not fatal")
+    func unknownProtocolVersionWarns() async throws {
+        guard let (dir, base) = try fixtureConfig() else { return }
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var config = base
+        config.environment = ["FIXTURE_PROTOCOL_VERSION": "1999-01-01"]
+        let sink = LogSink()
+        let manager = MCPManager()
+        let tools = await manager.connect(servers: ["srv": config], workspaceDirectory: dir.path, log: { sink.append($0) })
+        defer { Task { await manager.shutdown() } }
+        // Proceeds (tools still discovered) but logs a warning naming the odd version.
+        #expect(!tools.isEmpty)
+        #expect(sink.lines.contains { $0.contains("unrecognized protocol version") && $0.contains("1999-01-01") })
+    }
+
+    @Test("Shutdown reaps a server's grandchild via the process-group teardown")
+    func grandchildReapedOnShutdown() async throws {
+        guard let (dir, base) = try fixtureConfig() else { return }
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let pidfile = dir.appendingPathComponent("gc.pid")
+        var config = base
+        config.environment = ["GRANDCHILD_PIDFILE": pidfile.path]
+
+        let manager = MCPManager()
+        _ = await manager.connect(servers: ["srv": config], workspaceDirectory: dir.path)
+
+        // The server writes its grandchild's pid at startup; give it a moment to appear.
+        var gcPid: Int32 = 0
+        for _ in 0..<40 {
+            if let text = try? String(contentsOf: pidfile, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                gcPid = pid; break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        try #require(gcPid != 0)
+        #expect(kill(gcPid, 0) == 0)   // grandchild alive before shutdown
+
+        await manager.shutdown()
+
+        // After teardown (SIGTERM to the child's process group), the grandchild is
+        // signaled and exits. It then becomes a zombie reparented to launchd — kill(pid,0)
+        // keeps returning 0 until launchd reaps it, which can lag under heavy parallel
+        // test load — so poll generously. On the happy path this exits the instant it is
+        // reaped; only a genuine leak (a still-live grandchild) runs out the window.
+        var alive = true
+        for _ in 0..<300 {   // up to ~15s
+            if kill(gcPid, 0) != 0 { alive = false; break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(!alive)
     }
 }
 

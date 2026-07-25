@@ -299,10 +299,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // The permission gate (Phase 8). Headless has no human to prompt, so a tool
         // that resolves to `ask` is refused with a model-visible reason unless
         // `--yolo` auto-approves it. Read-only tools run silently under the baseline.
+        let homeDirectory = environment["HOME"] ?? NSHomeDirectory()
         let permissionHook = PermissionSetup.headlessHook(
             workingDirectory: workingDirectory.string,
             configDirectory: configuration.configDirectory.string,
-            homeDirectory: environment["HOME"] ?? NSHomeDirectory(),
+            homeDirectory: homeDirectory,
             yolo: yolo
         )
 
@@ -315,6 +316,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // tools. Torn down after the run — the servers run in their own process group,
         // so an un-shut-down server would be orphaned.
         let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
+
+        // Hide any MCP tool a `deny` rule blocks (Phase 8d visibility). The ruleset is the
+        // same one headlessHook resolves internally (resolvedRuleset is pure over the same
+        // settings files), so what is hidden matches what would be denied at call time.
+        let visibleMcp = PermissionSetup.visibleMCPTools(
+            mcpTools,
+            ruleset: PermissionSetup.resolvedRuleset(
+                workingDirectory: workingDirectory.string,
+                configDirectory: configuration.configDirectory.string,
+                homeDirectory: homeDirectory
+            )
+        )
 
         let printMode = PrintMode(
             client: client,
@@ -329,7 +342,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionSource: sessionSource,
             sessionDirectory: configuration.sessionDirectory,
             beforeToolCall: permissionHook,
-            mcpTools: mcpTools
+            mcpTools: visibleMcp
         )
 
         let code: Int32
@@ -360,6 +373,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // Scrub the LLM-gateway credential variables from each MCP child's
             // environment — an untrusted server has no business reading them.
             sensitiveEnvKeys: Set(EnvName.apiKeyFallbacks),
+            // Reserve the built-in tool names so an MCP tool can never shadow one.
+            reservedNames: Set(ToolRegistry.builtin.names),
             log: { Self.writeStderr($0 + "\n") }
         )
         return (tools, manager)
@@ -467,28 +482,31 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
         let registry = ToolRegistry.builtin
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
-        // MCP tools (Phase 8c): the manager is returned so the caller tears the servers
-        // down (they spawn in their own process group and would otherwise be orphaned).
-        let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
-        let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + mcpTools
-        let systemPrompt = PrintMode.systemPrompt(
-            workingDirectory: workingDirectory,
-            toolNames: registry.names + mcpTools.map(\.definition.name)
-        )
-        let reasoningEffort = configuration.reasoningEffort
-        let streamFn: AgentStreamFn = { context in
-            client.streamCompletion(model: model, context: context, reasoningEffort: reasoningEffort)
-        }
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
         // persist the local surfaces use. This gates BOTH `--serve` and the loopback
         // client (both spawn through here); a tool needing approval prompts the client
-        // over SSE and waits for the REST answer.
+        // over SSE and waits for the REST answer. Built BEFORE the tool assembly so the
+        // ruleset can hide deny'd MCP tools (Phase 8d visibility).
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
         let permission = PermissionSetup.runtime(
             workingDirectory: workingDirectory.string,
             configDirectory: configuration.configDirectory.string,
             homeDirectory: home
         )
+        // MCP tools (Phase 8c): the manager is returned so the caller tears the servers
+        // down (they spawn in their own process group and would otherwise be orphaned).
+        // Deny'd MCP tools are hidden from both the tool set and the system prompt.
+        let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
+        let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
+        let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
+        let systemPrompt = PrintMode.systemPrompt(
+            workingDirectory: workingDirectory,
+            toolNames: registry.names + visibleMcp.map(\.definition.name)
+        )
+        let reasoningEffort = configuration.reasoningEffort
+        let streamFn: AgentStreamFn = { context in
+            client.streamCompletion(model: model, context: context, reasoningEffort: reasoningEffort)
+        }
         let runtime = ServerRuntime(config: ServerRuntime.Config(
             systemPrompt: systemPrompt,
             tools: tools,

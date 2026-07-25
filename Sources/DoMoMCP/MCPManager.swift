@@ -8,6 +8,7 @@
 // child). The tools it returns are appended to the built-in tool set at the build sites.
 
 import DoMoAgent
+import DoMoCore
 import Foundation
 
 /// Connects and owns the run's stdio MCP servers.
@@ -22,16 +23,22 @@ public actor MCPManager {
     ///
     /// `sensitiveEnvKeys` are removed from each child's inherited environment (the caller
     /// passes the harness's LLM-credential variable names so an untrusted server can't
-    /// read them). Tool names are de-collided across servers so two servers can never
-    /// ship the same function name.
+    /// read them). Tool names are de-collided across servers so two servers can never ship
+    /// the same function name. `reservedNames` (the built-in tool names) seeds that set as
+    /// FORWARD-LOOKING defense: today a namespaced MCP name is `sanitize(server)_sanitize(tool)`
+    /// (always contains `_`) and no built-in name does, so no MCP name can currently collide
+    /// with a built-in — but seeding guards a future built-in whose name contains an `_`.
     public func connect(
         servers: [String: MCPServerConfig],
         workspaceDirectory: String,
         clientVersion: String = "0.1.0",
         sensitiveEnvKeys: Set<String> = [],
+        reservedNames: Set<String> = [],
         log: (@Sendable (String) -> Void)? = nil
     ) async -> [any AgentTool] {
-        var usedNames: Set<String> = []
+        // Seed with the built-in names (forward-looking; see the doc-comment) so a
+        // namespaced MCP name that ever collided with one would be renamed, not shadow it.
+        var usedNames = reservedNames
         for (name, config) in servers.sorted(by: { $0.key < $1.key }) {
             if config.enabled == false { continue }
             // An empty command would trap on `command[0]` at spawn (an uncatchable index
@@ -43,15 +50,25 @@ public actor MCPManager {
             let client = MCPClient(
                 serverName: name, config: config,
                 workspaceDirectory: workspaceDirectory, clientVersion: clientVersion,
-                sensitiveEnvKeys: sensitiveEnvKeys
+                sensitiveEnvKeys: sensitiveEnvKeys, log: log
             )
             do {
                 try await client.connect()
                 clients.append(client)
                 var count = 0
                 for info in await client.tools() {
+                    // Validate the (untrusted) schema BEFORE reserving a name: a tool whose
+                    // schema can't convert is dropped with a log line rather than advertised
+                    // with an empty (misleading) parameter list.
+                    let parameters: JSONSchema
+                    do {
+                        parameters = try McpTool.makeParameters(info.inputSchema)
+                    } catch {
+                        log?("MCP server '\(name)' tool '\(info.name)' has an unusable input schema; skipping it.")
+                        continue
+                    }
                     let unique = dedupedName(server: name, tool: info.name, used: &usedNames, log: log)
-                    mcpTools.append(McpTool(client: client, serverName: name, info: info, nameOverride: unique))
+                    mcpTools.append(McpTool(client: client, serverName: name, info: info, nameOverride: unique, parameters: parameters))
                     count += 1
                 }
                 log?("MCP server '\(name)' connected with \(count) tool(s).")

@@ -44,6 +44,18 @@ enum PermissionSetup {
         return merge(baseline, user, project)
     }
 
+    /// The MCP tools the model should actually SEE, given the resolved ruleset: a tool
+    /// whose permission resolves to a broad `deny` is hidden from both the advertised tool
+    /// set and the system-prompt tool list (Phase 8d visibility), not merely blocked at
+    /// call time. Only MCP tool names are candidates — built-ins are never hidden by this
+    /// path (a broad `*: deny` still gates them at the call, but they stay visible).
+    static func visibleMCPTools(_ mcpTools: [any AgentTool], ruleset: Ruleset) -> [any AgentTool] {
+        guard !mcpTools.isEmpty else { return mcpTools }
+        let hidden = disabledTools(mcpTools.map(\.definition.name), ruleset)
+        guard !hidden.isEmpty else { return mcpTools }
+        return mcpTools.filter { !hidden.contains($0.definition.name) }
+    }
+
     /// The config files a `write`/`edit` must never silently overwrite (the model
     /// widening its own permissions). Absolute, standardized for the factory's check.
     static func protectedPaths(workingDirectory: String, configDirectory: String) -> Set<String> {

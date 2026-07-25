@@ -13,6 +13,10 @@ import Foundation
 
 /// The MCP protocol version this client speaks.
 let mcpProtocolVersion = "2025-06-18"
+/// Protocol revisions this client is known to interoperate with. A server that echoes
+/// a version outside this set gets a warning (not a disconnect — tools/list and
+/// tools/call are stable across these revisions, so proceeding is more compatible).
+let knownProtocolVersions: Set<String> = ["2024-11-05", "2025-03-26", "2025-06-18"]
 /// Cap on `tools/list` pages, a guard against a looping/malicious server.
 private let maxToolListPages = 1000
 
@@ -44,6 +48,7 @@ public actor MCPClient {
     private let workspaceDirectory: String
     private let clientVersion: String
     private let sensitiveEnvKeys: Set<String>
+    private let log: (@Sendable (String) -> Void)?
 
     private let process = PersistentProcess()
     private var readerTask: Task<Void, Never>?
@@ -66,13 +71,15 @@ public actor MCPClient {
         config: MCPServerConfig,
         workspaceDirectory: String,
         clientVersion: String = "0.1.0",
-        sensitiveEnvKeys: Set<String> = []
+        sensitiveEnvKeys: Set<String> = [],
+        log: (@Sendable (String) -> Void)? = nil
     ) {
         self.serverName = serverName
         self.config = config
         self.workspaceDirectory = workspaceDirectory
         self.clientVersion = clientVersion
         self.sensitiveEnvKeys = sensitiveEnvKeys
+        self.log = log
     }
 
     // MARK: Connect / discover
@@ -96,8 +103,11 @@ public actor MCPClient {
         ])
         let initResult = try await request("initialize", params: initParams)
         // Version is accepted leniently: tools/list + tools/call are stable across the
-        // known versions, so proceeding is more compatible than disconnecting.
-        _ = initResult["protocolVersion"]?.stringValue
+        // known versions, so proceeding is more compatible than disconnecting. But an
+        // UNKNOWN version is worth a warning — it may mean tools behave unexpectedly.
+        if let version = initResult["protocolVersion"]?.stringValue, !knownProtocolVersions.contains(version) {
+            log?("MCP server '\(serverName)' negotiated an unrecognized protocol version '\(version)'; proceeding anyway.")
+        }
 
         try await notify("notifications/initialized", params: nil)
 
