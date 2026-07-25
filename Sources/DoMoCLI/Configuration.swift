@@ -3,6 +3,7 @@
 
 import DoMoCore
 import DoMoLLM
+import DoMoMCP
 import Foundation
 import Logging
 import SystemPackage
@@ -60,6 +61,10 @@ public struct Settings: Sendable, Hashable, Codable {
     /// The *name* of the environment variable holding the API key. Never the key.
     public var apiKeyEnv: String?
 
+    /// Stdio-local MCP servers, keyed by a namespacing prefix (Phase 8c). Rides
+    /// settings.json, so a project's servers are trust-gated by the existing gate.
+    public var mcpServers: [String: MCPServerConfig]?
+
     public init(
         baseURL: String? = nil,
         model: String? = nil,
@@ -73,7 +78,8 @@ public struct Settings: Sendable, Hashable, Codable {
         logLevel: String? = nil,
         offline: Bool? = nil,
         sessionDir: String? = nil,
-        apiKeyEnv: String? = nil
+        apiKeyEnv: String? = nil,
+        mcpServers: [String: MCPServerConfig]? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -88,6 +94,7 @@ public struct Settings: Sendable, Hashable, Codable {
         self.offline = offline
         self.sessionDir = sessionDir
         self.apiKeyEnv = apiKeyEnv
+        self.mcpServers = mcpServers
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -104,6 +111,7 @@ public struct Settings: Sendable, Hashable, Codable {
         case offline
         case sessionDir
         case apiKeyEnv
+        case mcpServers
     }
 
     /// Loads a settings file, returning `nil` when it is absent and throwing
@@ -174,6 +182,8 @@ public struct ResolvedConfiguration: Sendable {
     public var sessionDirectory: FilePath
     public var logLevel: Logger.Level
     public var offline: Bool
+    /// The enabled stdio MCP servers, project merged over user (Phase 8c).
+    public var mcpServers: [String: MCPServerConfig]
 
     public init(
         baseURL: String,
@@ -189,7 +199,8 @@ public struct ResolvedConfiguration: Sendable {
         configDirectory: FilePath,
         sessionDirectory: FilePath,
         logLevel: Logger.Level,
-        offline: Bool
+        offline: Bool,
+        mcpServers: [String: MCPServerConfig] = [:]
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -205,6 +216,7 @@ public struct ResolvedConfiguration: Sendable {
         self.sessionDirectory = sessionDirectory
         self.logLevel = logLevel
         self.offline = offline
+        self.mcpServers = mcpServers
     }
 
     // MARK: Defaults
@@ -304,6 +316,12 @@ extension ResolvedConfiguration {
             apiKeyEnvName: project?.apiKeyEnv ?? user?.apiKeyEnv
         )
 
+        // MCP servers: project merged over user (project wins on a key collision,
+        // matching every other setting), then disabled entries dropped so the build
+        // sites never spawn them.
+        let mergedMCP = (user?.mcpServers ?? [:]).merging(project?.mcpServers ?? [:]) { _, projectValue in projectValue }
+        let mcpServers = mergedMCP.filter { $0.value.enabled != false }
+
         return ResolvedConfiguration(
             baseURL: baseURL,
             apiKey: apiKey,
@@ -318,7 +336,8 @@ extension ResolvedConfiguration {
             configDirectory: configDirectory,
             sessionDirectory: sessionDirectory,
             logLevel: logLevel,
-            offline: offline
+            offline: offline,
+            mcpServers: mcpServers
         )
     }
 

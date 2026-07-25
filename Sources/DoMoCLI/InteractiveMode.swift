@@ -43,6 +43,7 @@ import DoMoCore
 import DoMoExec
 import DoMoHarness
 import DoMoLLM
+import DoMoMCP
 import DoMoPermissions
 import DoMoTermGraphics
 import DoMoTermIO
@@ -897,6 +898,10 @@ public struct InteractiveMode: Sendable {
     /// alongside the harness whose `beforeToolCall` gate the engine drives, then set
     /// in ``run`` to the coordinator's approval overlay once the UI exists.
     private let prompterBox: PrompterBox
+    /// The MCP servers backing this session's MCP tools (Phase 8c), held so ``run``
+    /// can tear them down on exit — they spawn in their own process group and would
+    /// otherwise be orphaned. `nil` when no MCP servers are configured.
+    private let mcpManager: MCPManager?
 
     private init(
         harness: AgentHarness,
@@ -907,7 +912,8 @@ public struct InteractiveMode: Sendable {
         toolTheme: ToolRenderTheme,
         steering: SteeringBox,
         prompterBox: PrompterBox,
-        fileSystem: SandboxedFileSystem? = nil
+        fileSystem: SandboxedFileSystem? = nil,
+        mcpManager: MCPManager? = nil
     ) {
         self.harness = harness
         self.directoryLister = directoryLister
@@ -918,6 +924,7 @@ public struct InteractiveMode: Sendable {
         self.steering = steering
         self.prompterBox = prompterBox
         self.fileSystem = fileSystem
+        self.mcpManager = mcpManager
     }
 
     /// The small, deliberately-minimal slash-command palette. Argument completion
@@ -948,7 +955,9 @@ public struct InteractiveMode: Sendable {
         reasoningEffort: ReasoningEffort? = nil,
         maxTurns: Int = 100,
         sessionSource: SessionSource = .new,
-        toolTheme: ToolRenderTheme = .ansi
+        toolTheme: ToolRenderTheme = .ansi,
+        mcpServers: [String: MCPServerConfig] = [:],
+        mcpLog: (@Sendable (String) -> Void)? = nil
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
@@ -957,7 +966,24 @@ public struct InteractiveMode: Sendable {
         let shell = try SubprocessShell()
         let toolContext = try await ToolContext.rooted(at: workDirectory, shell: shell)
         let registry = ToolRegistry.builtin
-        let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) }
+        // MCP tools (Phase 8c): connect the configured stdio servers and append their
+        // tools to the built-ins. The manager is held on the session and torn down in
+        // ``run`` — the servers spawn in their own process group and would otherwise be
+        // orphaned. `nil` manager when nothing is configured, so `run` has nothing to do.
+        var mcpManager: MCPManager?
+        var mcpTools: [any AgentTool] = []
+        if !mcpServers.isEmpty {
+            let manager = MCPManager()
+            mcpTools = await manager.connect(
+                servers: mcpServers,
+                workspaceDirectory: workingDirectory,
+                // Scrub the LLM-gateway credential variables from each MCP child's env.
+                sensitiveEnvKeys: Set(EnvName.apiKeyFallbacks),
+                log: mcpLog ?? { _ in }
+            )
+            mcpManager = manager
+        }
+        let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + mcpTools
 
         let streamFn: AgentStreamFn = { context in
             client.streamCompletion(
@@ -993,7 +1019,10 @@ public struct InteractiveMode: Sendable {
         let gate = permissionHook(engine: engine, factory: permission.factory, sessionID: "interactive")
 
         let configuration = AgentHarness.Configuration(
-            systemPrompt: PrintMode.systemPrompt(workingDirectory: workDirectory, toolNames: registry.names),
+            systemPrompt: PrintMode.systemPrompt(
+                workingDirectory: workDirectory,
+                toolNames: registry.names + mcpTools.map(\.definition.name)
+            ),
             tools: tools,
             model: model,
             streamFn: streamFn,
@@ -1005,12 +1034,22 @@ public struct InteractiveMode: Sendable {
             beforeToolCall: gate
         )
 
-        let harness = try await Self.makeHarness(
-            sessionSource: sessionSource,
-            workingDirectory: workDirectory,
-            sessionDirectory: sessionDir,
-            configuration: configuration
-        )
+        // MCP is already connected by here; if harness construction fails, tear the
+        // servers down before rethrowing — this is the one throwing call between the
+        // connect above and the returned InteractiveMode (whose run() owns shutdown),
+        // so a leak here would orphan the just-spawned children.
+        let harness: AgentHarness
+        do {
+            harness = try await Self.makeHarness(
+                sessionSource: sessionSource,
+                workingDirectory: workDirectory,
+                sessionDirectory: sessionDir,
+                configuration: configuration
+            )
+        } catch {
+            await mcpManager?.shutdown()
+            throw error
+        }
 
         let lister = Self.directoryLister(fileSystem: toolContext.fileSystem)
 
@@ -1023,7 +1062,8 @@ public struct InteractiveMode: Sendable {
             toolTheme: toolTheme,
             steering: steering,
             prompterBox: prompterBox,
-            fileSystem: toolContext.fileSystem
+            fileSystem: toolContext.fileSystem,
+            mcpManager: mcpManager
         )
     }
 
@@ -1118,6 +1158,10 @@ public struct InteractiveMode: Sendable {
         await driver.run(tui, quit: quit, background: {
             await coordinator.agentLoop()
         })
+
+        // Tear the MCP servers down before reporting any terminal error — they run in
+        // their own process group, so leaving them up would orphan them.
+        await mcpManager?.shutdown()
 
         if let error = driver.startupError { throw error }
         if let error = driver.renderError { throw error }

@@ -395,6 +395,9 @@ public struct PrintMode: Sendable {
     /// The permission gate (Phase 8). `nil` runs every tool ungated; the headless
     /// gate rejects any tool needing approval unless `--yolo` is set.
     let beforeToolCall: BeforeToolCallHook?
+    /// Tools discovered from configured MCP servers (Phase 8c), appended after the
+    /// built-ins. Already connected by the caller, which owns their teardown.
+    let mcpTools: [any AgentTool]
 
     public init(
         client: LiteLLMClient,
@@ -408,7 +411,8 @@ public struct PrintMode: Sendable {
         channel: OutputChannel,
         sessionSource: SessionSource,
         sessionDirectory: FilePath,
-        beforeToolCall: BeforeToolCallHook? = nil
+        beforeToolCall: BeforeToolCallHook? = nil,
+        mcpTools: [any AgentTool] = []
     ) {
         self.client = client
         self.model = model
@@ -422,15 +426,17 @@ public struct PrintMode: Sendable {
         self.sessionSource = sessionSource
         self.sessionDirectory = sessionDirectory
         self.beforeToolCall = beforeToolCall
+        self.mcpTools = mcpTools
     }
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
 
     /// The registered tools bound to this run's context, in registration order so
     /// the wire tool list the model sees is stable across runs (prompt-cache
-    /// friendly). Their ``AgentTool/definition``s are what the loop advertises.
+    /// friendly), plus any MCP tools. Their ``AgentTool/definition``s are what the
+    /// loop advertises.
     private var agentTools: [any AgentTool] {
-        registry.all.map { RegistryTool(tool: $0, context: toolContext) }
+        registry.all.map { RegistryTool(tool: $0, context: toolContext) } + mcpTools
     }
 
     // MARK: The run
@@ -458,7 +464,7 @@ public struct PrintMode: Sendable {
         let runGuard = RunGuard()
 
         let configuration = AgentHarness.Configuration(
-            systemPrompt: Self.systemPrompt(workingDirectory: workingDirectory, toolNames: registry.names),
+            systemPrompt: Self.systemPrompt(workingDirectory: workingDirectory, toolNames: registry.names + mcpTools.map(\.definition.name)),
             tools: tools,
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),

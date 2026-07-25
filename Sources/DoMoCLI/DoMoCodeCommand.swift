@@ -8,6 +8,7 @@ import DoMoCore
 import DoMoExec
 import DoMoHarness
 import DoMoLLM
+import DoMoMCP
 import DoMoServer
 import DoMoTermIO
 import DoMoTUI
@@ -272,7 +273,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     homeDirectory: environment["HOME"],
                     reasoningEffort: configuration.reasoningEffort,
                     maxTurns: maxTurns,
-                    sessionSource: sessionSource
+                    sessionSource: sessionSource,
+                    mcpServers: configuration.mcpServers,
+                    mcpLog: { Self.writeStderr($0 + "\n") }
                 )
                 try await Self.runInteractive(mode)
             } else {
@@ -303,6 +306,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             yolo: yolo
         )
 
+        // Load image attachments BEFORE connecting MCP: loadImageAttachments can throw on
+        // a bad `--image` path, and a throw here must not have spawned MCP servers that
+        // nothing then tears down.
+        let attachments = try Self.loadImageAttachments(images)
+
+        // MCP tools (Phase 8c): connect the configured stdio servers and append their
+        // tools. Torn down after the run — the servers run in their own process group,
+        // so an un-shut-down server would be orphaned.
+        let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
+
         let printMode = PrintMode(
             client: client,
             model: model,
@@ -315,14 +328,41 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             channel: OutputChannel(),
             sessionSource: sessionSource,
             sessionDirectory: configuration.sessionDirectory,
-            beforeToolCall: permissionHook
+            beforeToolCall: permissionHook,
+            mcpTools: mcpTools
         )
 
-        let attachments = try Self.loadImageAttachments(images)
-        let code = try await printMode.run(prompt: prompt, attachments: attachments)
+        let code: Int32
+        do {
+            code = try await printMode.run(prompt: prompt, attachments: attachments)
+        } catch {
+            await mcpManager.shutdown()
+            throw error
+        }
+        await mcpManager.shutdown()
         if code != 0 {
             throw ExitCode(code)
         }
+    }
+
+    /// Connect the configured stdio MCP servers and collect their tools. Returns the
+    /// tools plus the manager the caller must `shutdown()` after the run (the servers
+    /// spawn in their own process group and would otherwise be orphaned).
+    static func connectMCP(
+        _ configuration: ResolvedConfiguration,
+        workingDirectory: FilePath
+    ) async -> (tools: [any AgentTool], manager: MCPManager) {
+        let manager = MCPManager()
+        guard !configuration.mcpServers.isEmpty else { return ([], manager) }
+        let tools = await manager.connect(
+            servers: configuration.mcpServers,
+            workspaceDirectory: workingDirectory.string,
+            // Scrub the LLM-gateway credential variables from each MCP child's
+            // environment — an untrusted server has no business reading them.
+            sensitiveEnvKeys: Set(EnvName.apiKeyFallbacks),
+            log: { Self.writeStderr($0 + "\n") }
+        )
+        return (tools, manager)
     }
 
     /// Reads each `--image` path into an ``ImageBlock``, sniffing its media type
@@ -388,7 +428,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         model: String,
         workingDirectory: FilePath
     ) async throws {
-        let runtime = try await Self.buildServerRuntime(
+        let (runtime, mcpManager) = try await Self.buildServerRuntime(
             configuration: configuration,
             model: model,
             workingDirectory: workingDirectory,
@@ -403,9 +443,15 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         Self.writeStderr("Authorization: Bearer \(token)\n")
         // Print the ACTUAL bound port from onReady, so `--serve --port 0` (ephemeral)
         // advertises the real port the OS assigned rather than the literal 0.
-        try await server.run(onReady: { boundPort in
-            Self.writeStderr("domo serve — listening on http://127.0.0.1:\(boundPort) (loopback only)\n")
-        })
+        do {
+            try await server.run(onReady: { boundPort in
+                Self.writeStderr("domo serve — listening on http://127.0.0.1:\(boundPort) (loopback only)\n")
+            })
+        } catch {
+            await mcpManager.shutdown()
+            throw error
+        }
+        await mcpManager.shutdown()
     }
 
     /// Assemble the shared runtime ingredients — the sandboxed tool context, the
@@ -416,13 +462,19 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         model: String,
         workingDirectory: FilePath,
         maxTurns: Int
-    ) async throws -> ServerRuntime {
+    ) async throws -> (runtime: ServerRuntime, mcpManager: MCPManager) {
         let shell = try SubprocessShell()
         let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
         let registry = ToolRegistry.builtin
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
-        let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) }
-        let systemPrompt = PrintMode.systemPrompt(workingDirectory: workingDirectory, toolNames: registry.names)
+        // MCP tools (Phase 8c): the manager is returned so the caller tears the servers
+        // down (they spawn in their own process group and would otherwise be orphaned).
+        let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
+        let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + mcpTools
+        let systemPrompt = PrintMode.systemPrompt(
+            workingDirectory: workingDirectory,
+            toolNames: registry.names + mcpTools.map(\.definition.name)
+        )
         let reasoningEffort = configuration.reasoningEffort
         let streamFn: AgentStreamFn = { context in
             client.streamCompletion(model: model, context: context, reasoningEffort: reasoningEffort)
@@ -437,7 +489,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             configDirectory: configuration.configDirectory.string,
             homeDirectory: home
         )
-        return ServerRuntime(config: ServerRuntime.Config(
+        let runtime = ServerRuntime(config: ServerRuntime.Config(
             systemPrompt: systemPrompt,
             tools: tools,
             model: model,
@@ -452,6 +504,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 persist: permission.persist
             )
         ))
+        return (runtime, mcpManager)
     }
 
     // MARK: Full-screen client
@@ -476,17 +529,21 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let baseURL: String
         let token: String
         var serverTask: Task<Void, Never>?
+        // The MCP manager for the locally-spawned server (nil under `--url`, where the
+        // remote host owns its own MCP servers). Torn down when the client returns.
+        var mcpManager: MCPManager?
 
         if let url = serverURL {
             baseURL = url
             token = serverToken ?? ""
         } else {
-            let runtime = try await Self.buildServerRuntime(
+            let (runtime, manager) = try await Self.buildServerRuntime(
                 configuration: configuration,
                 model: model,
                 workingDirectory: workingDirectory,
                 maxTurns: maxTurns
             )
+            mcpManager = manager
             let generated = Self.generateToken()
             let server = DoMoServer(
                 runtime: runtime,
@@ -503,6 +560,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             for await value in ports { boundPort = value; break }
             guard boundPort != 0 else {
                 serverTask?.cancel()
+                await mcpManager?.shutdown()
                 throw DoMoError(.configuration, "The local runtime server did not bind a port.")
             }
             baseURL = "http://127.0.0.1:\(boundPort)"
@@ -524,9 +582,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             )
         } catch {
             serverTask?.cancel()
+            await mcpManager?.shutdown()
             throw error
         }
         serverTask?.cancel()
+        await mcpManager?.shutdown()
     }
 
     /// A 32-byte random bearer token, hex-encoded. Formatted by hand rather than

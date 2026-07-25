@@ -206,6 +206,23 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        // The MCP client (Phase 8c). A hand-rolled, stdio-local, tools-only Model
+        // Context Protocol client: spawns each configured server as a subprocess,
+        // speaks newline-delimited JSON-RPC 2.0 over its stdin/stdout, discovers tools
+        // and bridges each as an `AgentTool`. No SDK (the official one doesn't spawn
+        // the subprocess and drags a branch-pinned docc plugin). Reuses swift-subprocess
+        // (as DoMoExec does) + DoMoCore's JSONValue/JSONSchema for framing.
+        .target(
+            name: "DoMoMCP",
+            dependencies: [
+                "DoMoCore", "DoMoAgent", "DoMoLLM",
+                .product(name: "Subprocess", package: "swift-subprocess"),
+                .product(name: "SystemPackage", package: "swift-system"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
+            swiftSettings: safeSettings
+        ),
+
         // MARK: Server
 
         // The headless HTTP/SSE runtime server (Phase 6). Wraps the existing
@@ -248,7 +265,7 @@ let package = Package(
             name: "DoMoCLI",
             dependencies: [
                 "DoMoCore", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoLLM", "DoMoAgent",
-                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoServer", "DoMoClient",
+                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoMCP", "DoMoServer", "DoMoClient",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -302,6 +319,12 @@ let package = Package(
         .testTarget(
             name: "DoMoPermissionsTests",
             dependencies: ["DoMoPermissions", "DoMoCore"],
+            swiftSettings: safeSettings
+        ),
+
+        .testTarget(
+            name: "DoMoMCPTests",
+            dependencies: ["DoMoMCP", "DoMoCore", "DoMoAgent", "DoMoLLM"],
             swiftSettings: safeSettings
         ),
 
