@@ -427,6 +427,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let streamFn: AgentStreamFn = { context in
             client.streamCompletion(model: model, context: context, reasoningEffort: reasoningEffort)
         }
+        // The permission gate (Phase 8b) for the server — the same ruleset/factory/
+        // persist the local surfaces use. This gates BOTH `--serve` and the loopback
+        // client (both spawn through here); a tool needing approval prompts the client
+        // over SSE and waits for the REST answer.
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let permission = PermissionSetup.runtime(
+            workingDirectory: workingDirectory.string,
+            configDirectory: configuration.configDirectory.string,
+            homeDirectory: home
+        )
         return ServerRuntime(config: ServerRuntime.Config(
             systemPrompt: systemPrompt,
             tools: tools,
@@ -435,7 +445,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             toolExecution: .sequential,
             maxTurns: maxTurns,
             sessionDirectory: configuration.sessionDirectory,
-            cwd: workingDirectory.string
+            cwd: workingDirectory.string,
+            permissions: ServerRuntime.PermissionRuntime(
+                ruleset: permission.ruleset,
+                factory: permission.factory,
+                persist: permission.persist
+            )
         ))
     }
 

@@ -8,6 +8,7 @@
 import DoMoClient
 import DoMoCore
 import DoMoLLM
+import DoMoPermissions
 import DoMoServer
 import Testing
 
@@ -48,6 +49,53 @@ struct EventStoreTests {
         #expect(store.transcript == [.assistant("Hello")])
         #expect(store.runState == .idle)
         #expect(store.lastStopReason == "completed")
+    }
+
+    // MARK: Permission fold (Phase 8b)
+
+    private func askEvent(id: String = "per_1", session: String = "s") -> ServerEvent {
+        .permissionRequest(
+            id: id, sessionID: session, permission: "bash",
+            patterns: ["rm -rf /"], always: ["rm *"],
+            metadata: ["command": .string("rm -rf /")], disableAlways: false
+        )
+    }
+
+    @Test("A permission_request becomes the pending prompt; permission_resolved clears it")
+    func permissionFold() {
+        let store = EventStore()
+        store.apply(askEvent())
+        #expect(store.pendingPermission?.id == "per_1")
+        #expect(store.pendingPermission?.permission == "bash")
+        #expect(store.pendingPermission?.metadata["command"]?.stringValue == "rm -rf /")
+        // A resolve for a different id does not clear it.
+        store.apply(.permissionResolved(id: "per_other"))
+        #expect(store.pendingPermission?.id == "per_1")
+        // The matching resolve clears it.
+        store.apply(.permissionResolved(id: "per_1"))
+        #expect(store.pendingPermission == nil)
+    }
+
+    @Test("agent_end and clearPendingPermission both drop a dangling prompt")
+    func permissionClears() {
+        let store = EventStore()
+        store.apply(askEvent())
+        store.apply(.agentEnd(reason: "aborted"))
+        #expect(store.pendingPermission == nil)   // a finished turn can't still be waiting
+
+        store.apply(askEvent(id: "per_2"))
+        store.clearPendingPermission()
+        #expect(store.pendingPermission == nil)
+    }
+
+    @Test("Switching sessions drops a prompt belonging to the session being left")
+    func permissionPerSession() {
+        let store = EventStore()
+        store.select("a")
+        store.apply(askEvent(session: "a"))
+        #expect(store.pendingPermission != nil)
+        store.select("b")   // clearTranscript nils the pending prompt
+        #expect(store.pendingPermission == nil)
     }
 
     @Test("A tool call fills its result in place, not as a duplicate row")

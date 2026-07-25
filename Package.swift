@@ -214,7 +214,7 @@ let package = Package(
         .target(
             name: "DoMoServer",
             dependencies: [
-                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness",
+                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness", "DoMoPermissions",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -234,7 +234,7 @@ let package = Package(
         .target(
             name: "DoMoClient",
             dependencies: [
-                "DoMoCore", "DoMoServer", "DoMoLLM", "DoMoHarness",
+                "DoMoCore", "DoMoServer", "DoMoLLM", "DoMoHarness", "DoMoPermissions",
                 "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoToolsUI",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Logging", package: "swift-log"),
@@ -355,8 +355,9 @@ let package = Package(
         .testTarget(
             name: "DoMoServerTests",
             dependencies: [
-                "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent", "DoMoHarness",
+                "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent", "DoMoHarness", "DoMoPermissions",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "JSONSchema", package: "swift-json-schema"),
             ],
             swiftSettings: safeSettings
         ),
@@ -367,7 +368,7 @@ let package = Package(
         .testTarget(
             name: "DoMoClientTests",
             dependencies: [
-                "DoMoClient", "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent",
+                "DoMoClient", "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent", "DoMoPermissions",
                 "DoMoHarness", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "SwiftTerm", package: "SwiftTerm"),

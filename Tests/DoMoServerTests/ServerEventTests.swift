@@ -87,6 +87,12 @@ struct ServerEventTests {
             .messageEnd(msg),
             .toolStart(id: "t", name: "read", arguments: .object(["path": .string("f")])),
             .toolEnd(id: "t", name: "read", output: "o", isError: true, imageCount: 2),
+            .permissionRequest(
+                id: "per_1", sessionID: "s-1", permission: "bash",
+                patterns: ["rm -rf /"], always: ["rm *"],
+                metadata: ["command": .string("rm -rf /")], disableAlways: false
+            ),
+            .permissionResolved(id: "per_1"),
         ]
         for event in cases {
             #expect(try roundTrip(event) == event, "did not round-trip: \(event)")
@@ -108,5 +114,17 @@ struct ServerEventTests {
             ServerEvent.toolEnd(id: "t", name: "read", output: "o", isError: false, imageCount: 0)))
         #expect(toolEnd["type"]?.stringValue == "tool_end")
         #expect(toolEnd["isError"]?.boolValue == false)
+
+        let ask = try JSONValue(parsing: try JSONEncoder().encode(
+            ServerEvent.permissionRequest(
+                id: "per_1", sessionID: "s-1", permission: "bash",
+                patterns: ["ls"], always: ["ls *"], metadata: [:], disableAlways: true)))
+        #expect(ask["type"]?.stringValue == "permission_request")
+        #expect(ask["permission"]?.stringValue == "bash")
+        #expect(ask["disableAlways"]?.boolValue == true)
+
+        let resolved = try JSONValue(parsing: try JSONEncoder().encode(ServerEvent.permissionResolved(id: "per_1")))
+        #expect(resolved["type"]?.stringValue == "permission_resolved")
+        #expect(resolved["id"]?.stringValue == "per_1")
     }
 }

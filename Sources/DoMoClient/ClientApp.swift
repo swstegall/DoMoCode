@@ -9,6 +9,7 @@
 // The same `TerminalDriver` that runs the inline `TUI` runs this.
 
 import DoMoCore
+import DoMoPermissions
 import DoMoServer
 import DoMoTUI
 import DoMoTermGraphics
@@ -33,6 +34,12 @@ public final class ClientApp {
 
     private var surface: ScreenSurface?
     private var eventTask: Task<Void, Never>?
+
+    // Permission approval modal (Phase 8b). Driven off `store.pendingPermission` via
+    // `reconcilePermissionOverlay`, so every show/dismiss path funnels through one place.
+    private let keybindings = Keybindings()
+    private var permissionHandle: ScreenOverlayHandle?
+    private var permissionList: SelectList?
 
     private static let ctrlC: [UInt8] = [0x03]
     private static let escape: [UInt8] = [0x1b]
@@ -61,7 +68,10 @@ public final class ClientApp {
         }
         self.surface = surface
 
-        store.onChange = { [weak self] in self?.surface?.requestRender() }
+        store.onChange = { [weak self] in
+            self?.reconcilePermissionOverlay()
+            self?.surface?.requestRender()
+        }
         promptInput.onSubmit = { [weak self] text in self?.submit(text) }
         sidebar.onSelect = { [weak self] id in self?.openSession(id) }
         sidebar.onNew = { [weak self] in self?.newSession() }
@@ -158,6 +168,13 @@ public final class ClientApp {
         guard store.selectedSessionID == sessionID else { return }
         store.seed(history)
         attachEvents(sessionID)
+        // Reconcile a prompt that was asked while this session was detached — the
+        // drop-oldest SSE stream may never re-send it, so the run would hang with no
+        // one to answer. Guarded by the same stale-selection check.
+        if let pending = try? await client.pendingPermissions(sessionID: sessionID),
+           store.selectedSessionID == sessionID {
+            for event in pending { store.apply(event) }
+        }
     }
 
     private func attachEvents(_ sessionID: String) {
@@ -198,6 +215,85 @@ public final class ClientApp {
             try? await self?.client.abort(sessionID: id)
         }
     }
+
+    // MARK: Permission approval
+
+    /// Show or hide the approval modal to match `store.pendingPermission`. Called from
+    /// `onChange`, so every trigger — the ask event, an answer, a server-side resolve,
+    /// a session switch — funnels through here instead of being hand-tracked.
+    private func reconcilePermissionOverlay() {
+        if let request = store.pendingPermission {
+            if permissionHandle == nil { presentPermissionOverlay(request) }
+        } else if permissionHandle != nil {
+            dismissPermissionOverlay()
+        }
+    }
+
+    private func presentPermissionOverlay(_ request: PermissionRequest) {
+        var items = [SelectItem(value: "once", label: "Allow once", description: nil)]
+        if !request.disableAlways {
+            items.append(SelectItem(value: "always", label: "Allow always", description: request.always.first.map { "grants \($0)" }))
+        }
+        items.append(SelectItem(value: "reject", label: "Reject", description: nil))
+
+        let list = SelectList(items: items, maxVisible: items.count, keybindings: keybindings)
+        permissionList = list
+
+        let header = Self.permissionHeader(request)
+        let container = Container()
+        for line in header { container.addChild(Text(line, wrap: false)) }
+        container.addChild(list)
+
+        permissionHandle = surface?.showOverlay(
+            container,
+            options: OverlayOptions(
+                width: .absolute(64),
+                minWidth: 30,
+                maxHeight: .absolute(header.count + items.count + 1),
+                anchor: .center,
+                nonCapturing: true
+            )
+        )
+    }
+
+    private func dismissPermissionOverlay() {
+        permissionHandle?.hide()
+        permissionHandle = nil
+        permissionList = nil
+    }
+
+    /// Answer the pending prompt: dismiss the modal, clear the store optimistically
+    /// (so reconcile does not re-show it before the server's echo), and POST the reply.
+    private func answer(_ reply: PermissionReply) {
+        guard let request = store.pendingPermission else { dismissPermissionOverlay(); return }
+        dismissPermissionOverlay()
+        store.clearPendingPermission()
+        let sessionID = request.sessionID
+        let requestID = request.id
+        Task { @MainActor [weak self] in
+            try? await self?.client.resolvePermission(sessionID: sessionID, requestID: requestID, reply: reply)
+        }
+    }
+
+    private static func reply(for value: String?) -> PermissionReply {
+        switch value {
+        case "once": return .once
+        case "always": return .always
+        default: return .reject(message: nil)
+        }
+    }
+
+    private static func permissionHeader(_ request: PermissionRequest) -> [String] {
+        var lines = ["⚠ Allow \(request.permission)?"]
+        if let command = request.metadata["command"]?.stringValue, !command.isEmpty {
+            lines.append("  " + truncateToWidth(command, 60))
+        } else if let filepath = request.metadata["filepath"]?.stringValue, !filepath.isEmpty {
+            lines.append("  " + truncateToWidth(filepath, 60))
+        } else if let first = request.patterns.first, first != "*" {
+            lines.append("  " + truncateToWidth(first, 60))
+        }
+        return lines
+    }
 }
 
 // MARK: - TerminalApp
@@ -214,6 +310,19 @@ extension ClientApp: TerminalApp {
     }
 
     public func handleInput(_ data: [UInt8]) {
+        // A permission prompt captures all input: arrows move, Enter confirms,
+        // Escape/Ctrl-C reject; everything else is swallowed while a tool waits.
+        if let list = permissionList {
+            if keybindings.matches(data, .selectUp) || keybindings.matches(data, .selectDown) {
+                list.handleInput(data)
+                surface?.requestRender()
+            } else if keybindings.matches(data, .selectConfirm) {
+                answer(Self.reply(for: list.getSelectedItem()?.value))
+            } else if keybindings.matches(data, .selectCancel) || data == Self.ctrlC {
+                answer(.reject(message: nil))
+            }
+            return
+        }
         if data == Self.ctrlC { quit.quit(); return }
         if data == Self.escape { abort(); return }
         surface?.handleInput(data)

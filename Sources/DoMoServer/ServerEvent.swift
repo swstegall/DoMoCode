@@ -50,6 +50,24 @@ public enum ServerEvent: Sendable, Hashable {
     case toolStart(id: String, name: String, arguments: JSONValue)
     case toolEnd(id: String, name: String, output: String, isError: Bool, imageCount: Int)
 
+    /// A tool call the permission engine could not resolve on policy alone: the
+    /// server is asking a client to approve it. Answered out-of-band over
+    /// `POST /session/{id}/permission`, correlated by `(sessionID, id)`.
+    /// Server-originated like ``connected`` — it has no `AgentEvent` source and is
+    /// broadcast directly by the runtime, never projected.
+    case permissionRequest(
+        id: String,
+        sessionID: String,
+        permission: String,
+        patterns: [String],
+        always: [String],
+        metadata: [String: JSONValue],
+        disableAlways: Bool
+    )
+    /// The pending prompt with this id was answered (by a client, or torn down when
+    /// the run ended). A subscriber still showing it should dismiss it.
+    case permissionResolved(id: String)
+
     /// Projects one runtime event onto the wire, or `nil` when the event carries
     /// nothing a client needs (an assembly frame that is neither a text nor a
     /// reasoning delta — a snapshot boundary the client reconstructs from the
@@ -120,6 +138,8 @@ extension ServerEvent: Codable {
         case messageEnd = "message_end"
         case toolStart = "tool_start"
         case toolEnd = "tool_end"
+        case permissionRequest = "permission_request"
+        case permissionResolved = "permission_resolved"
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -136,6 +156,11 @@ extension ServerEvent: Codable {
         case output
         case isError
         case imageCount
+        case permission
+        case patterns
+        case always
+        case metadata
+        case disableAlways
     }
 
     public init(from decoder: any Decoder) throws {
@@ -179,6 +204,18 @@ extension ServerEvent: Codable {
                 isError: try container.decode(Bool.self, forKey: .isError),
                 imageCount: try container.decode(Int.self, forKey: .imageCount)
             )
+        case .permissionRequest:
+            self = .permissionRequest(
+                id: try container.decode(String.self, forKey: .id),
+                sessionID: try container.decode(String.self, forKey: .sessionID),
+                permission: try container.decode(String.self, forKey: .permission),
+                patterns: try container.decode([String].self, forKey: .patterns),
+                always: try container.decode([String].self, forKey: .always),
+                metadata: try container.decode([String: JSONValue].self, forKey: .metadata),
+                disableAlways: try container.decode(Bool.self, forKey: .disableAlways)
+            )
+        case .permissionResolved:
+            self = .permissionResolved(id: try container.decode(String.self, forKey: .id))
         }
     }
 
@@ -222,6 +259,18 @@ extension ServerEvent: Codable {
             try container.encode(output, forKey: .output)
             try container.encode(isError, forKey: .isError)
             try container.encode(imageCount, forKey: .imageCount)
+        case .permissionRequest(let id, let sessionID, let permission, let patterns, let always, let metadata, let disableAlways):
+            try container.encode(Kind.permissionRequest, forKey: .type)
+            try container.encode(id, forKey: .id)
+            try container.encode(sessionID, forKey: .sessionID)
+            try container.encode(permission, forKey: .permission)
+            try container.encode(patterns, forKey: .patterns)
+            try container.encode(always, forKey: .always)
+            try container.encode(metadata, forKey: .metadata)
+            try container.encode(disableAlways, forKey: .disableAlways)
+        case .permissionResolved(let id):
+            try container.encode(Kind.permissionResolved, forKey: .type)
+            try container.encode(id, forKey: .id)
         }
     }
 }

@@ -5,6 +5,7 @@ import DoMoAgent
 import DoMoCore
 import DoMoHarness
 import DoMoLLM
+import DoMoPermissions
 import Foundation
 import SystemPackage
 
@@ -69,6 +70,25 @@ public actor ServerRuntime {
 
     /// The shared runtime ingredients, assembled once by the `serve` command and
     /// reused to build a fresh ``AgentHarness/Configuration`` per session.
+    /// The permission engine's ingredients (Phase 8b). The runtime builds a fresh
+    /// engine PER SESSION (each needs its own `sessionID`, which the `PermissionRequest`
+    /// carries to route the round-trip back), so `Config` holds the ingredients, not a
+    /// prebuilt hook. `nil` runs every tool ungated (tests, back-compat).
+    public struct PermissionRuntime: Sendable {
+        public let ruleset: Ruleset
+        public let factory: PermissionRequestFactory
+        public let persist: @Sendable (Ruleset) async -> Void
+        public init(
+            ruleset: Ruleset,
+            factory: PermissionRequestFactory,
+            persist: @escaping @Sendable (Ruleset) async -> Void
+        ) {
+            self.ruleset = ruleset
+            self.factory = factory
+            self.persist = persist
+        }
+    }
+
     public struct Config: Sendable {
         public var systemPrompt: String
         public var tools: [any AgentTool]
@@ -78,6 +98,7 @@ public actor ServerRuntime {
         public var maxTurns: Int?
         public var sessionDirectory: FilePath
         public var cwd: String
+        public var permissions: PermissionRuntime?
 
         public init(
             systemPrompt: String,
@@ -87,7 +108,8 @@ public actor ServerRuntime {
             toolExecution: ToolExecutionMode = .sequential,
             maxTurns: Int? = nil,
             sessionDirectory: FilePath,
-            cwd: String
+            cwd: String,
+            permissions: PermissionRuntime? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.tools = tools
@@ -97,6 +119,7 @@ public actor ServerRuntime {
             self.maxTurns = maxTurns
             self.sessionDirectory = sessionDirectory
             self.cwd = cwd
+            self.permissions = permissions
         }
     }
 
@@ -112,12 +135,23 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let sink: BroadcastEventSink
         var runTask: Task<Void, Never>?
+        /// Permission prompts awaiting a client answer, keyed by request id. The
+        /// engine's prompter suspends on the continuation; a REST answer (or an
+        /// abort/shutdown) resumes it. Held only inside the actor, never shared.
+        var pending: [String: PendingApproval] = [:]
 
         init(token: Int, harness: AgentHarness, sink: BroadcastEventSink) {
             self.token = token
             self.harness = harness
             self.sink = sink
         }
+    }
+
+    /// A suspended permission prompt: the original request (so a re-attaching client
+    /// can be told about it) and the continuation to resume with the answer.
+    private struct PendingApproval {
+        let request: PermissionRequest
+        let continuation: CheckedContinuation<PermissionReply, Never>
     }
 
     private let config: Config
@@ -134,14 +168,80 @@ public actor ServerRuntime {
         return SessionState(token: token, harness: harness, sink: sink)
     }
 
-    private func harnessConfiguration() -> AgentHarness.Configuration {
-        AgentHarness.Configuration(
+    /// Build the harness configuration for one session, wiring the permission gate
+    /// bound to THIS session's id (so a prompt routes its answer back to this
+    /// session's pending map). The prompter is `self.awaitPermission` — the runtime
+    /// that owns the pending map already exists, so no `PrompterBox` is needed.
+    private func harnessConfiguration(sessionID: String) -> AgentHarness.Configuration {
+        var beforeToolCall: BeforeToolCallHook?
+        if let permissions = config.permissions {
+            let engine = PermissionEngine(
+                ruleset: permissions.ruleset,
+                prompt: { [weak self] request in
+                    guard let self else { return .reject(message: "The server is shutting down.") }
+                    return await self.awaitPermission(request)
+                },
+                persist: permissions.persist
+            )
+            beforeToolCall = permissionHook(engine: engine, factory: permissions.factory, sessionID: sessionID)
+        }
+        return AgentHarness.Configuration(
             systemPrompt: config.systemPrompt,
             tools: config.tools,
             model: config.model,
             streamFn: config.streamFn,
             toolExecution: config.toolExecution,
-            maxTurns: config.maxTurns
+            maxTurns: config.maxTurns,
+            beforeToolCall: beforeToolCall
+        )
+    }
+
+    // MARK: Permission round-trip
+
+    /// The engine's prompter for a server session: store the continuation, broadcast
+    /// the ask to the SSE subscribers, and suspend. A client answers over REST via
+    /// ``resolvePermission(sessionID:requestID:reply:)``; abort/shutdown resume it as
+    /// a reject. Runs on this actor, so `withCheckedContinuation` stores + broadcasts
+    /// synchronously and then releases the actor while the run parks.
+    func awaitPermission(_ request: PermissionRequest) async -> PermissionReply {
+        // Already being aborted → reject without suspending (closes the store race).
+        if Task.isCancelled { return .reject(message: "The tool call was aborted.") }
+        guard let session = sessions[request.sessionID] else {
+            return .reject(message: "No session is available to approve this tool call.")
+        }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<PermissionReply, Never>) in
+            session.pending[request.id] = PendingApproval(request: request, continuation: continuation)
+            session.sink.broadcast(permissionEvent(request))
+        }
+    }
+
+    /// Answer a pending prompt (REST-driven). Idempotent: a stale/duplicate answer for
+    /// an already-resolved id is a no-op (abort/shutdown may have drained it), so a
+    /// double POST is not a 500.
+    public func resolvePermission(sessionID: String, requestID: String, reply: PermissionReply) throws {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard let approval = session.pending.removeValue(forKey: requestID) else { return }
+        approval.continuation.resume(returning: reply)
+        session.sink.broadcast(.permissionResolved(id: requestID))
+    }
+
+    /// The still-open prompts for a session, as wire events — so a (re)connecting or
+    /// session-switching client can reconcile a prompt it missed on the drop-oldest
+    /// SSE stream (otherwise the run would hang forever with no one to answer).
+    public func pendingPermissions(sessionID: String) throws -> [ServerEvent] {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        return session.pending.values.map { permissionEvent($0.request) }
+    }
+
+    private func permissionEvent(_ request: PermissionRequest) -> ServerEvent {
+        .permissionRequest(
+            id: request.id,
+            sessionID: request.sessionID,
+            permission: request.permission,
+            patterns: request.patterns,
+            always: request.always,
+            metadata: request.metadata,
+            disableAlways: request.disableAlways
         )
     }
 
@@ -150,7 +250,8 @@ public actor ServerRuntime {
     /// Create a fresh session, or open an existing one when `resume` names a
     /// session file path or a session id.
     public func createSession(resume: String? = nil) async throws -> SessionRef {
-        let configuration = harnessConfiguration()
+        // The session id must be known BEFORE building the harness config, so the
+        // permission hook can be bound to it (a prompt routes its answer by sessionID).
         let harness: AgentHarness
         let id: String
         if let resume {
@@ -162,14 +263,14 @@ public actor ServerRuntime {
             if let existing = sessions[resumedID] {
                 return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
             }
-            harness = try AgentHarness.open(path: path, configuration: configuration)
+            harness = try AgentHarness.open(path: path, configuration: harnessConfiguration(sessionID: resumedID))
             id = resumedID
         } else {
             id = UUIDv7.generate().description
             harness = try AgentHarness.start(
                 cwd: config.cwd,
                 sessionDirectory: config.sessionDirectory,
-                configuration: configuration,
+                configuration: harnessConfiguration(sessionID: id),
                 sessionID: id
             )
         }
@@ -184,7 +285,17 @@ public actor ServerRuntime {
         let forked = try await session.harness.fork(sessionDirectory: config.sessionDirectory)
         let path = await forked.sessionFilePath
         let id = try JSONLSessionStore(path: path).readHeader().id
-        sessions[id] = makeState(harness: forked, sink: BroadcastEventSink())
+        // `fork` reuses the PARENT's configuration, whose permission hook is bound to
+        // the parent's sessionID — a prompt from the forked run would route to the
+        // wrong session and hang. Re-open the forked file with a correctly-bound
+        // config (only when gating is on; ungated forks keep the cheap path).
+        let harness: AgentHarness
+        if config.permissions != nil {
+            harness = try AgentHarness.open(path: path, configuration: harnessConfiguration(sessionID: id))
+        } else {
+            harness = forked
+        }
+        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink())
         return SessionRef(id: id, path: path.string)
     }
 
@@ -228,9 +339,23 @@ public actor ServerRuntime {
     }
 
     /// Cancel a running turn. The run settles cooperatively and clears its own slot.
+    /// A run suspended on a permission prompt is NOT resumed by cancelling its task,
+    /// so drain any pending prompts as rejects (else the tool fiber leaks forever).
     public func abort(sessionID: String) throws {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         session.runTask?.cancel()
+        drainPending(session, reason: "The tool call was aborted.")
+    }
+
+    /// Resume every pending prompt on `session` with a reject, and tell subscribers to
+    /// dismiss each modal. Idempotent (empties the map).
+    private func drainPending(_ session: SessionState, reason: String) {
+        let approvals = session.pending
+        session.pending.removeAll()
+        for (id, approval) in approvals {
+            approval.continuation.resume(returning: .reject(message: reason))
+            session.sink.broadcast(.permissionResolved(id: id))
+        }
     }
 
     /// The broadcast sink for a live session, for the SSE handler to subscribe to.
@@ -273,6 +398,7 @@ public actor ServerRuntime {
     public func shutdown() {
         for session in sessions.values {
             session.runTask?.cancel()
+            drainPending(session, reason: "The server is shutting down.")
             session.sink.closeAll()
         }
         sessions.removeAll()

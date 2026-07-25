@@ -11,6 +11,7 @@
 // here to mutate it, so a frame never observes a half-applied event.
 
 import DoMoLLM
+import DoMoPermissions
 import DoMoServer
 import DoMoTermGraphics
 
@@ -39,6 +40,10 @@ public final class EventStore {
     /// The last `agent_end` reason (e.g. `completed`, `aborted`, `errored`), for a
     /// status line. Cleared when a new turn starts.
     public private(set) var lastStopReason: String?
+    /// A pending permission prompt for the selected session (Phase 8b): the server
+    /// asked over SSE and the run is parked until a client answers. `nil` when nothing
+    /// is awaiting approval. Per-session, so it is cleared on a session switch.
+    public private(set) var pendingPermission: PermissionRequest?
 
     /// Fired after any mutation, so the UI can request a render. Set by the app.
     public var onChange: (() -> Void)?
@@ -116,6 +121,17 @@ public final class EventStore {
             runState = .idle
             lastStopReason = reason
             endStreaming()
+            // A turn that ended cannot still be waiting on approval.
+            pendingPermission = nil
+
+        case .permissionRequest(let id, let sessionID, let permission, let patterns, let always, let metadata, let disableAlways):
+            pendingPermission = PermissionRequest(
+                id: id, sessionID: sessionID, permission: permission,
+                patterns: patterns, always: always, metadata: metadata, disableAlways: disableAlways
+            )
+
+        case .permissionResolved(let id):
+            if pendingPermission?.id == id { pendingPermission = nil }
 
         case .messageStart(let message):
             switch message {
@@ -207,6 +223,14 @@ public final class EventStore {
         }
     }
 
+    /// Clear the pending prompt after the client answers it (optimistic — the
+    /// server's `permission_resolved` echo also clears it, idempotently), so the
+    /// overlay-reconcile does not re-present the request it just answered.
+    public func clearPendingPermission() {
+        pendingPermission = nil
+        onChange?()
+    }
+
     private func endStreaming() {
         streamingAssistantIndex = nil
         streamingReasoningIndex = nil
@@ -219,5 +243,8 @@ public final class EventStore {
         toolIndexByID = [:]
         runState = .idle
         lastStopReason = nil
+        // A pending prompt belongs to the session being left; a switch back re-fetches
+        // it (GET /permissions), so it must not linger and show against the wrong one.
+        pendingPermission = nil
     }
 }

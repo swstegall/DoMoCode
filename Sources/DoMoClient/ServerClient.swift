@@ -14,6 +14,7 @@
 import AsyncHTTPClient
 import DoMoHarness
 import DoMoLLM
+import DoMoPermissions
 import DoMoServer
 import Foundation
 
@@ -49,6 +50,7 @@ public struct ServerClient: Sendable {
 
     private struct CreateBody: Encodable { let resume: String? }
     private struct PromptBody: Encodable { let prompt: String; let images: [ImageBlock]? }
+    private struct PermissionReplyBody: Encodable { let requestID: String; let reply: String; let message: String? }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -112,6 +114,33 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.post, path)
         try expect(status, 201, path)
         return try JSONDecoder().decode(SessionRef.self, from: data)
+    }
+
+    /// Answer a pending permission prompt the server asked over SSE. `POST
+    /// /session/{id}/permission` → 200. The reply serializes to "once"/"always"/
+    /// "reject" plus, on reject, the optional model-visible correction message.
+    public func resolvePermission(sessionID: String, requestID: String, reply: PermissionReply) async throws {
+        let path = "/session/\(sessionID)/permission"
+        let replyString: String
+        let message: String?
+        switch reply {
+        case .once: replyString = "once"; message = nil
+        case .always: replyString = "always"; message = nil
+        case .reject(let text): replyString = "reject"; message = text
+        }
+        let body = try JSONEncoder().encode(PermissionReplyBody(requestID: requestID, reply: replyString, message: message))
+        let (status, _) = try await send(.post, path, body: body)
+        try expect(status, 200, path)
+    }
+
+    /// The still-open permission prompts for a session, so a (re)connecting client
+    /// reconciles one it missed on the SSE stream. `GET /session/{id}/permissions` →
+    /// 200. Each is a `ServerEvent.permissionRequest`.
+    public func pendingPermissions(sessionID: String) async throws -> [ServerEvent] {
+        let path = "/session/\(sessionID)/permissions"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path)
+        return try JSONDecoder().decode([ServerEvent].self, from: data)
     }
 
     // MARK: SSE

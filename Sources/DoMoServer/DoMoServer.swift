@@ -4,6 +4,7 @@
 import DoMoAgent
 import DoMoCore
 import DoMoLLM
+import DoMoPermissions
 import Foundation
 import Hummingbird
 import Logging
@@ -20,6 +21,14 @@ private struct CreateBody: Decodable {
 private struct PromptBody: Decodable {
     var prompt: String
     var images: [ImageBlock]?
+}
+
+/// `POST /session/{id}/permission` body (Phase 8b). `reply` is "once" / "always" /
+/// "reject"; `message` is the optional model-visible reason carried only on reject.
+private struct PermissionReplyBody: Decodable {
+    var requestID: String
+    var reply: String
+    var message: String?
 }
 
 // MARK: - Auth middleware
@@ -171,6 +180,32 @@ public struct DoMoServer: Sendable {
                 let id = try context.parameters.require("id")
                 try await self.runtime.abort(sessionID: id)
                 return Response(status: .ok)
+            }
+        }
+
+        // Phase 8b: answer a pending permission prompt the server asked over SSE.
+        router.post("/session/:id/permission") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(PermissionReplyBody.self, request)
+                let reply: PermissionReply
+                switch body.reply {
+                case "once": reply = .once
+                case "always": reply = .always
+                case "reject": reply = .reject(message: body.message)
+                default: throw HTTPError(.badRequest)
+                }
+                try await self.runtime.resolvePermission(sessionID: id, requestID: body.requestID, reply: reply)
+                return Response(status: .ok)
+            }
+        }
+
+        // The still-open prompts for a session, so a (re)connecting client reconciles
+        // a prompt it missed on the drop-oldest SSE stream.
+        router.get("/session/:id/permissions") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.pendingPermissions(sessionID: id))
             }
         }
 
