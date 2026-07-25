@@ -3,25 +3,34 @@
 // SPDX-License-Identifier: MIT
 //
 // Turns a raw tool call into a ``PermissionRequestSpec``. Tool-aware: bash is split
-// per sub-command with an arity-prefix "always" glob; read/write/edit key on the file
-// path (so the `.env` guard sees a real path and the config self-edit guard can fire);
-// an unknown name (an MCP tool) defaults to `*` so it is treated like any untrusted
-// call. Reads arguments defensively (the `file_path`/`path` alias, string values).
+// per sub-command (including nested substitutions) with an arity-prefix "always" glob;
+// read/write/edit key on the file path (so the `.env` guard sees a real path and the
+// config self-edit guard can fire); an unknown name (an MCP tool) defaults to `*` so it
+// is treated like any untrusted call. Reads arguments defensively (the `file_path`/
+// `path` alias, string values).
 
 import DoMoCore
 import Foundation
 
 /// Builds permission specs from tool calls. Holds the workspace root (to resolve
-/// relative paths) and the absolute config-file paths the self-edit guard protects.
+/// relative paths) and the config-file paths the self-edit guard protects.
 public struct PermissionRequestFactory: Sendable {
     private let workingDirectory: String
-    /// Absolute paths of the permission/settings/trust files the model must not
-    /// silently overwrite via `write`/`edit` (Phase 8a self-edit guard).
+    /// Absolute, canonicalized paths of the permission/settings/trust files the model
+    /// must not silently overwrite (Phase 8a self-edit guard).
     private let protectedPaths: Set<String>
+    /// Lowercased basenames + `.domocode` used to config-protect a bash command that
+    /// mentions a config file (bash can write via a redirect, bypassing write/edit).
+    private let protectedMarkers: [String]
 
     public init(workingDirectory: String, protectedPaths: Set<String> = []) {
         self.workingDirectory = workingDirectory
-        self.protectedPaths = protectedPaths
+        self.protectedPaths = Set(protectedPaths.map { Self.canonical($0) })
+        var markers = Set<String>([".domocode"])
+        for path in protectedPaths {
+            markers.insert((path as NSString).lastPathComponent.lowercased())
+        }
+        self.protectedMarkers = Array(markers)
     }
 
     public func make(toolName: String, arguments: JSONValue) -> PermissionRequestSpec {
@@ -56,19 +65,26 @@ public struct PermissionRequestFactory: Sendable {
         let command = arguments["command"]?.stringValue ?? ""
         let subcommands = ShellCommand.split(command)
         // Each sub-command is checked separately, so a `rm *` deny catches a chained
-        // `echo hi && rm -rf /` that a single whole-string pattern would miss.
+        // or substituted `rm -rf /` that a single whole-string pattern would miss.
         let patterns = subcommands.isEmpty ? [command] : subcommands
         var always: [String] = []
         var seen: Set<String> = []
         for pattern in patterns {
-            let glob = bashAlwaysGlob(ShellCommand.tokenize(pattern))
+            // Drop leading `NAME=value` assignments so `FOO=bar rm x` grants `rm *`.
+            let tokens = ShellCommand.stripEnvAssignments(ShellCommand.tokenize(pattern))
+            let glob = bashAlwaysGlob(tokens)
             if seen.insert(glob).inserted { always.append(glob) }
         }
+        // bash can write a config file via a redirect (`echo … > settings.json`),
+        // which no write/edit guard sees; treat a command that names a protected file
+        // as config-protected (force a prompt, no "always").
+        let protectedBash = mentionsProtected(command)
         return PermissionRequestSpec(
             permission: "bash",
             patterns: patterns,
-            always: always,
-            metadata: ["command": .string(command)]
+            always: protectedBash ? [] : always,
+            metadata: ["command": .string(command)],
+            configProtected: protectedBash
         )
     }
 
@@ -78,13 +94,30 @@ public struct PermissionRequestFactory: Sendable {
     }
 
     /// Whether a write/edit target is a protected config file. Resolves a relative
-    /// path against the workspace and collapses `.`/`..` before the membership check.
-    /// (Symlinks are not resolved — a deliberate v1 limitation.)
+    /// path against the workspace, follows symlinks in existing components, and
+    /// compares case-/unicode-insensitively (macOS's default filesystem is
+    /// case-insensitive, so `Settings.json` must not slip past `settings.json`).
     private func isProtected(_ path: String) -> Bool {
         guard !path.isEmpty else { return false }
         let base = URL(fileURLWithPath: workingDirectory, isDirectory: true)
-        let resolved = URL(fileURLWithPath: path, relativeTo: base).standardizedFileURL.path
-        return protectedPaths.contains(resolved)
+        let url = URL(fileURLWithPath: path, relativeTo: base)
+        // Check both the lexical and the symlink-resolved forms.
+        let candidates = [url.standardizedFileURL.path, url.resolvingSymlinksInPath().standardizedFileURL.path]
+        return candidates.contains { protectedPaths.contains(Self.canonical($0)) }
+    }
+
+    /// Whether a bash command text names any protected config file (over-approximate).
+    private func mentionsProtected(_ command: String) -> Bool {
+        let lower = command.lowercased()
+        return protectedMarkers.contains { lower.contains($0) }
+    }
+
+    /// A path normalized for the case-insensitive membership test: symlink-resolved,
+    /// case-folded, and unicode-precomposed.
+    private static func canonical(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+            .precomposedStringWithCanonicalMapping
+            .lowercased()
     }
 }
 

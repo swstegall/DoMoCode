@@ -71,8 +71,16 @@ enum PermissionSetup {
         let path = userSettingsPath(configDirectory)
         return { grants in
             guard !grants.isEmpty else { return }
-            let existing = (try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)) ?? "{}"
-            let updated = settingsText(existing, mergingGrants: grants)
+            let existing: String
+            if FileManager.default.fileExists(atPath: path) {
+                // Present but unreadable — skip, rather than clobber it with "{}".
+                guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else { return }
+                existing = text
+            } else {
+                existing = "{}"
+            }
+            // Unparseable existing content aborts the write (settingsText -> nil).
+            guard let updated = settingsText(existing, mergingGrants: grants) else { return }
             try? FileManager.default.createDirectory(atPath: configDirectory, withIntermediateDirectories: true)
             try? updated.write(toFile: path, atomically: true, encoding: .utf8)
         }

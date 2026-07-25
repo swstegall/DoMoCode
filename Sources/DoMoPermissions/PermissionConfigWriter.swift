@@ -9,13 +9,23 @@
 // intact. Merging happens at the CONFIG level (not through `fromConfig`) so a `~`/
 // `$HOME` in an existing pattern is NOT expanded to an absolute path on disk.
 
-/// Return the settings.json text with `grants` merged into its `permission` block.
-/// Preserves all other keys and order; creates the block if absent. A grant for an
-/// existing `(permission, pattern)` overrides its action; a new pattern is appended
-/// (so it wins under last-match-wins); a new permission key is appended.
-public func settingsText(_ existingText: String, mergingGrants grants: Ruleset) -> String {
-    var root = parseOrderedJSON(existingText) ?? .object([])
-    if case .object = root {} else { root = .object([]) }
+/// Return the settings.json text with `grants` merged into its `permission` block, or
+/// `nil` to ABORT — the caller must then leave the file untouched. Aborting protects
+/// the user's other settings: an existing file that is non-empty but does not parse as
+/// a JSON object is never overwritten (a clobber would silently destroy hand-authored
+/// settings). Otherwise all other keys and the block's authored order are preserved; a
+/// grant for an existing `(permission, pattern)` overrides its action, a new pattern is
+/// appended (so it wins under last-match-wins), and a new permission key is appended.
+public func settingsText(_ existingText: String, mergingGrants grants: Ruleset) -> String? {
+    let trimmed = existingText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let root: OrderedJSONValue
+    if trimmed.isEmpty {
+        root = .object([])
+    } else if let parsed = parseOrderedJSON(existingText), case .object = parsed {
+        root = parsed
+    } else {
+        return nil  // present but unparseable / not an object — do NOT clobber it
+    }
 
     let existingConfig = root["permission"].map { permissionConfig(from: $0) } ?? []
     let merged = mergeGrants(into: existingConfig, grants: grants)

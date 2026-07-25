@@ -12,7 +12,10 @@
 /// A JSON value whose objects preserve key insertion order.
 public indirect enum OrderedJSONValue: Sendable, Equatable {
     case string(String)
-    case number(Double)
+    /// The raw number TOKEN as written, serialized back verbatim — so a round-trip
+    /// (read → write a grant → save) never reformats a large integer, an exponent, or
+    /// a trailing-zero float in some OTHER settings key.
+    case number(String)
     case bool(Bool)
     case null
     case array([OrderedJSONValue])
@@ -195,7 +198,8 @@ private struct OrderedJSONParser {
         }
         guard start < index else { return nil }
         let string = String(String.UnicodeScalarView(scalars[start..<index]))
-        return Double(string).map(OrderedJSONValue.number)
+        guard Double(string) != nil else { return nil }  // validate, but keep the raw token
+        return .number(string)
     }
 }
 
@@ -207,9 +211,7 @@ public func serializeOrderedJSON(_ value: OrderedJSONValue, indent: Int = 0) -> 
     let childPad = String(repeating: " ", count: indent + 2)
     switch value {
     case .string(let s): return encodeJSONString(s)
-    case .number(let n):
-        if n == n.rounded(), abs(n) < 1e15 { return String(Int(n)) }
-        return String(n)
+    case .number(let raw): return raw  // verbatim — no reformatting
     case .bool(let b): return b ? "true" : "false"
     case .null: return "null"
     case .array(let items):

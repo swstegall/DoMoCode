@@ -980,7 +980,9 @@ public struct InteractiveMode: Sendable {
         let permission = PermissionSetup.runtime(
             workingDirectory: workingDirectory,
             configDirectory: configDirectory,
-            homeDirectory: homeDirectory ?? ""
+            // Fall back to the real home, never "": a `~`/`$HOME` deny rule must not
+            // expand to a bogus root and fail open when $HOME is unset.
+            homeDirectory: homeDirectory ?? NSHomeDirectory()
         )
         let prompterBox = PrompterBox()
         let engine = PermissionEngine(

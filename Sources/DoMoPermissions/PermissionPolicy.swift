@@ -7,11 +7,12 @@
 // permission-dim AND pattern-dim both glob-match wins; default `ask`); `merge` is an
 // order-preserving concat; `readHarden` ports kilocode's `.env`-secret guard (a broad
 // `read` allow is downgraded to `ask` for `*.env`/`*.env.*`, except `*.env.example`);
-// `disabled` ports opencode's tool-visibility filter. DoMoCode omits kilocode's full
-// `resolve` (base-vs-saved layering for agent modes / external_directory) — with no
-// agent modes, `evaluate(config + approved)` then `readHarden` is provably equivalent
-// for every case DoMoCode has: a broad saved allow is caught by `readHarden` on the
-// merged result exactly as it is caught on kilocode's `base`.
+// `disabled` ports opencode's tool-visibility filter; `resolvePermission` ports
+// kilocode's base-vs-saved `resolve` layering (dropping only the agent-mode /
+// external_directory / hardRuleset pieces DoMoCode has no equivalent for). The
+// layering is load-bearing: a config `deny` must beat any broad in-session "allow
+// always" grant, which a flat `evaluate(merge(config, saved))` does NOT guarantee
+// (last-match-wins would let the appended grant win).
 
 /// A permission decision. Runtime literal order is `allow, deny, ask` (opencode).
 public enum PermissionAction: String, Sendable, Hashable, Codable {
@@ -69,6 +70,31 @@ public func merge(_ rulesets: Ruleset...) -> Ruleset {
 /// kilocode's `PermissionRule.broad`.
 public func isBroad(_ rule: PermissionRule) -> Bool {
     rule.permission == "*" || rule.pattern == "*"
+}
+
+/// Resolve `(permission, pattern)` against the CONFIG ruleset (`base`) and the
+/// in-session grants (`saved`), giving config precedence. Ports kilocode's `resolve`:
+/// `base` is `evaluate` over config with the `.env` guard applied; `saved` is
+/// `evaluate` over the session grants. Precedence:
+///   1. a config `deny` is final (checked before `saved` is even consulted),
+///   2. then a saved `deny` is final,
+///   3. a config `ask` is promoted to a saved `allow` ONLY if the saved rule's
+///      pattern falls within the config rule's pattern (`wildcardMatch(saved, base)`)
+///      — so a blanket `*` grant cannot lift a targeted `.env`/`deny`-adjacent ask,
+///   4. otherwise a saved `allow` wins over a config `allow`.
+/// This is why an "allow always" grant cannot silently override a `deny` the user (or
+/// the baseline) configured — the flaw a flat merge has.
+public func resolvePermission(_ permission: String, _ pattern: String, config: Ruleset, saved: Ruleset) -> PermissionRule {
+    let base = readHarden(permission, pattern, evaluate(permission, pattern, config))
+    let savedRule = evaluate(permission, pattern, saved)
+    if base.action == .deny { return base }
+    if savedRule.action == .deny { return savedRule }
+    if base.action == .ask {
+        if savedRule.action == .allow, wildcardMatch(savedRule.pattern, base.pattern) { return savedRule }
+        return base
+    }
+    if savedRule.action == .allow { return savedRule }
+    return base
 }
 
 /// The `.env`-secret read guard. Ports kilocode's `ReadPermission.harden`: a BROAD

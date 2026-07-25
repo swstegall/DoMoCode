@@ -59,7 +59,7 @@ struct OrderedConfigTests {
     func escapes() {
         let root = parseOrderedJSON(#"{ "a": "line\none\ttab\"q", "b": [1, 2.5, true, null] }"#)
         #expect(root?["a"] == .string("line\none\ttab\"q"))
-        #expect(root?["b"] == .array([.number(1), .number(2.5), .bool(true), .null]))
+        #expect(root?["b"] == .array([.number("1"), .number("2.5"), .bool(true), .null]))
     }
 }
 
@@ -93,13 +93,54 @@ struct FactoryTests {
         #expect(spec.always == ["*"])
     }
 
-    @Test("write to a protected config file is flagged configProtected")
+    @Test("write to a protected config file is flagged configProtected (incl. case variants)")
     func selfEditGuard() {
         let guarded = PermissionRequestFactory(workingDirectory: "/work", protectedPaths: ["/work/.domocode/settings.json"])
-        let danger = guarded.make(toolName: "write", arguments: .object(["path": .string(".domocode/settings.json")]))
+        #expect(guarded.make(toolName: "write", arguments: .object(["path": .string(".domocode/settings.json")])).configProtected)
+        // macOS is case-insensitive: `Settings.json` overwrites the real file.
+        #expect(guarded.make(toolName: "edit", arguments: .object(["path": .string(".domocode/Settings.json")])).configProtected)
+        #expect(!guarded.make(toolName: "write", arguments: .object(["path": .string("src/main.swift")])).configProtected)
+    }
+
+    @Test("bash that names a config file is config-protected (redirect self-edit guard)")
+    func bashRedirectGuard() {
+        let guarded = PermissionRequestFactory(workingDirectory: "/work", protectedPaths: ["/work/.domocode/settings.json"])
+        let danger = guarded.make(toolName: "bash", arguments: .object(["command": .string("echo bad > .domocode/settings.json")]))
         #expect(danger.configProtected)
-        let safe = guarded.make(toolName: "write", arguments: .object(["path": .string("src/main.swift")]))
-        #expect(!safe.configProtected)
+        #expect(danger.always.isEmpty)  // a protected command offers no "always"
+        #expect(!guarded.make(toolName: "bash", arguments: .object(["command": .string("echo hi")])).configProtected)
+    }
+
+    @Test("bash env-assignment prefixes are stripped from the arity glob")
+    func bashEnvStrip() {
+        let factory = PermissionRequestFactory(workingDirectory: "/work")
+        let spec = factory.make(toolName: "bash", arguments: .object(["command": .string("FOO=bar rm x")]))
+        #expect(spec.always == ["rm *"])
+    }
+}
+
+@Suite("Shell command decomposition")
+struct ShellSplitTests {
+    @Test("chained, substituted, and subshell commands each become a checked fragment")
+    func decomposes() {
+        #expect(ShellCommand.split("echo hi && rm -rf /") == ["echo hi", "rm -rf /"])
+        #expect(ShellCommand.split("echo $(rm -rf /)").contains("rm -rf /"))
+        #expect(ShellCommand.split("echo `rm -rf /`").contains("rm -rf /"))
+        #expect(ShellCommand.split("( rm -rf / )").contains("rm -rf /"))
+        // Command substitution is active INSIDE double quotes too.
+        #expect(ShellCommand.split(#"echo "$(rm -rf /)""#).contains { $0.hasPrefix("rm -rf /") })
+    }
+
+    @Test("a backslash-escaped separator does not desync the scanner")
+    func backslashEscape() {
+        #expect(ShellCommand.split(#"echo a\;b"#) == [#"echo a\;b"#])   // \; is escaped, not a separator
+        #expect(ShellCommand.split("'a; b'") == ["'a; b'"])            // single quotes suppress the ;
+    }
+
+    @Test("env-assignment stripping")
+    func envStrip() {
+        #expect(ShellCommand.stripEnvAssignments(["FOO=bar", "BAZ=qux", "rm", "x"]) == ["rm", "x"])
+        #expect(ShellCommand.stripEnvAssignments(["rm", "FOO=bar"]) == ["rm", "FOO=bar"])  // only LEADING
     }
 }
 
@@ -179,6 +220,25 @@ struct EngineTests {
         #expect(decision == .allow)            // the user allowed it once
         #expect(lastRequest.withLock { $0 }?.disableAlways == true)
         #expect(await persisted.all.isEmpty)   // but "always" did not persist a self-widening grant
+    }
+
+    @Test("a config deny beats a broad in-session allow-always grant (resolve, not flat merge)")
+    func configDenyBeatsSavedGrant() async {
+        // User config denies writing lockfiles.
+        let ruleset = merge(baseline(), fromConfig(permissionConfig(fromSettingsText:
+            #"{ "permission": { "write": { "*.lock": "deny" } } }"#), homeDirectory: HOME))
+        // The model earlier obtained a broad `write *` allow-always grant.
+        let engine = PermissionEngine(
+            ruleset: ruleset,
+            approved: [PermissionRule(permission: "write", pattern: "*", action: .allow)],
+            prompt: { _ in .reject(message: nil) }
+        )
+        // The lockfile write must still be DENIED — the grant cannot override the deny.
+        let denied = await engine.ask(PermissionRequestSpec(permission: "write", patterns: ["yarn.lock"], always: ["*"]), sessionID: "s")
+        if case .deny = denied {} else { Issue.record("config deny must beat the saved grant, got \(denied)") }
+        // A non-denied write is still covered silently by the grant.
+        let allowed = await engine.ask(PermissionRequestSpec(permission: "write", patterns: ["README.md"], always: ["*"]), sessionID: "s")
+        #expect(allowed == .allow)
     }
 
     @Test("reject with a message denies with that message as the reason")

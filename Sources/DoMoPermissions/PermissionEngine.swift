@@ -38,9 +38,10 @@ public actor PermissionEngine {
     /// runs with no prompt, and any `ask` prompts the surface once for the whole call.
     public func ask(_ spec: PermissionRequestSpec, sessionID: String) async -> PermissionDecision {
         var needsAsk = false
-        let ruleset = merge(baseRuleset, sessionApproved)
         for pattern in spec.patterns {
-            var rule = readHarden(spec.permission, pattern, evaluate(spec.permission, pattern, ruleset))
+            // Base-vs-saved resolve, NOT a flat merge: a config `deny` beats a broad
+            // in-session "allow always" grant (which last-match-wins would not).
+            var rule = resolvePermission(spec.permission, pattern, config: baseRuleset, saved: sessionApproved)
             // Config-protection: a broad allow must not silently cover the agent's own
             // permission/settings files — force a prompt.
             if spec.configProtected, rule.action == .allow { rule.action = .ask }
