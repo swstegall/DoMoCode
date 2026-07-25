@@ -168,13 +168,6 @@ public final class ClientApp {
         guard store.selectedSessionID == sessionID else { return }
         store.seed(history)
         attachEvents(sessionID)
-        // Reconcile a prompt that was asked while this session was detached — the
-        // drop-oldest SSE stream may never re-send it, so the run would hang with no
-        // one to answer. Guarded by the same stale-selection check.
-        if let pending = try? await client.pendingPermissions(sessionID: sessionID),
-           store.selectedSessionID == sessionID {
-            for event in pending { store.apply(event) }
-        }
     }
 
     private func attachEvents(_ sessionID: String) {
@@ -184,12 +177,29 @@ public final class ClientApp {
             do {
                 for try await event in self.client.events(sessionID: sessionID) {
                     self.store.apply(event)
+                    // Reconcile pending prompts only AFTER the SSE is live (the server
+                    // sends `connected` first). Doing the GET before subscribing would
+                    // lose a prompt asked in the gap — the run would hang with no one
+                    // to answer. Now anything asked pre-subscribe is caught by the GET
+                    // and anything after arrives live.
+                    if case .connected = event { await self.reconcilePendingPermissions(sessionID) }
                 }
             } catch {
                 // The stream ended or errored; the next selection re-attaches. The
                 // transcript stays as last seen rather than clearing under the user.
             }
         }
+    }
+
+    /// Fetch and fold any still-open prompts for `sessionID` (a prompt the client
+    /// missed on the drop-oldest SSE stream, or one left over on reconnect). The store
+    /// drops events for the wrong session and already-resolved ids, so this is safe.
+    private func reconcilePendingPermissions(_ sessionID: String) async {
+        guard store.selectedSessionID == sessionID,
+              let pending = try? await client.pendingPermissions(sessionID: sessionID),
+              store.selectedSessionID == sessionID
+        else { return }
+        for event in pending { store.apply(event) }
     }
 
     // MARK: Actions (called from the render actor via component callbacks)
@@ -271,7 +281,15 @@ public final class ClientApp {
         let sessionID = request.sessionID
         let requestID = request.id
         Task { @MainActor [weak self] in
-            try? await self?.client.resolvePermission(sessionID: sessionID, requestID: requestID, reply: reply)
+            guard let self else { return }
+            do {
+                try await self.client.resolvePermission(sessionID: sessionID, requestID: requestID, reply: reply)
+            } catch {
+                // The answer never landed, so the server run is still parked with no
+                // modal. Re-fetch the pending prompt so it returns and can be
+                // re-answered, rather than leaving the run hung.
+                await self.reconcilePendingPermissions(sessionID)
+            }
         }
     }
 

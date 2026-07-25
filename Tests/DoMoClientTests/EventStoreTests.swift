@@ -64,6 +64,7 @@ struct EventStoreTests {
     @Test("A permission_request becomes the pending prompt; permission_resolved clears it")
     func permissionFold() {
         let store = EventStore()
+        store.select("s")
         store.apply(askEvent())
         #expect(store.pendingPermission?.id == "per_1")
         #expect(store.pendingPermission?.permission == "bash")
@@ -79,6 +80,7 @@ struct EventStoreTests {
     @Test("agent_end and clearPendingPermission both drop a dangling prompt")
     func permissionClears() {
         let store = EventStore()
+        store.select("s")
         store.apply(askEvent())
         store.apply(.agentEnd(reason: "aborted"))
         #expect(store.pendingPermission == nil)   // a finished turn can't still be waiting
@@ -96,6 +98,28 @@ struct EventStoreTests {
         #expect(store.pendingPermission != nil)
         store.select("b")   // clearTranscript nils the pending prompt
         #expect(store.pendingPermission == nil)
+    }
+
+    @Test("A prompt for a non-selected session is dropped (no cross-session modal)")
+    func permissionSessionGuard() {
+        let store = EventStore()
+        store.select("a")
+        store.apply(askEvent(session: "b"))   // a late frame from a session being left
+        #expect(store.pendingPermission == nil)
+        store.apply(askEvent(session: "a"))   // the selected session's prompt does show
+        #expect(store.pendingPermission?.id == "per_1")
+    }
+
+    @Test("A prompt whose id was already resolved this session is not resurrected by the GET reconcile")
+    func permissionResolvedSuppression() {
+        let store = EventStore()
+        store.select("a")
+        store.apply(.permissionResolved(id: "per_1"))    // resolve raced ahead of the GET
+        store.apply(askEvent(id: "per_1", session: "a")) // the stale GET-reconciled request
+        #expect(store.pendingPermission == nil)          // suppressed, not resurrected
+        // A fresh id in the same session still works.
+        store.apply(askEvent(id: "per_2", session: "a"))
+        #expect(store.pendingPermission?.id == "per_2")
     }
 
     @Test("A tool call fills its result in place, not as a duplicate row")

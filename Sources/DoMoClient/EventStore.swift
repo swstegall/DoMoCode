@@ -44,6 +44,10 @@ public final class EventStore {
     /// asked over SSE and the run is parked until a client answers. `nil` when nothing
     /// is awaiting approval. Per-session, so it is cleared on a session switch.
     public private(set) var pendingPermission: PermissionRequest?
+    /// Ids of prompts already resolved (or whose run ended) THIS session, so the
+    /// `GET /permissions` reconcile can't resurrect a dead one that a `permission_resolved`
+    /// raced ahead of. Cleared on a session switch (ids reset per session).
+    private var resolvedRequestIDs: Set<String> = []
 
     /// Fired after any mutation, so the UI can request a render. Set by the app.
     public var onChange: (() -> Void)?
@@ -122,15 +126,22 @@ public final class EventStore {
             lastStopReason = reason
             endStreaming()
             // A turn that ended cannot still be waiting on approval.
+            if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
             pendingPermission = nil
 
         case .permissionRequest(let id, let sessionID, let permission, let patterns, let always, let metadata, let disableAlways):
+            // Drop a prompt that is NOT for the selected session (a late frame from a
+            // session being switched away from would otherwise pop a modal here and
+            // silently decide the WRONG session's tool call), and one whose id was
+            // already resolved this session (a resolve that raced the GET reconcile).
+            guard sessionID == selectedSessionID, !resolvedRequestIDs.contains(id) else { return }
             pendingPermission = PermissionRequest(
                 id: id, sessionID: sessionID, permission: permission,
                 patterns: patterns, always: always, metadata: metadata, disableAlways: disableAlways
             )
 
         case .permissionResolved(let id):
+            resolvedRequestIDs.insert(id)
             if pendingPermission?.id == id { pendingPermission = nil }
 
         case .messageStart(let message):
@@ -246,5 +257,6 @@ public final class EventStore {
         // A pending prompt belongs to the session being left; a switch back re-fetches
         // it (GET /permissions), so it must not linger and show against the wrong one.
         pendingPermission = nil
+        resolvedRequestIDs = []
     }
 }
