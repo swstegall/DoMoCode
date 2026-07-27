@@ -321,9 +321,9 @@ public final class TerminalDriver {
         // and re-frame its remainder as keystrokes. Either way a following chunk
         // cancels the timer above, so these only fire after real silence.
         let timeout: Duration? =
-            framer.hasPendingBytes
-            ? StdinFramer.disambiguationTimeout
-            : (framer.hasPendingPaste ? StdinFramer.pasteTimeout : nil)
+            (framer.hasPendingPaste || framer.hasPendingPasteStart)
+            ? StdinFramer.pasteTimeout
+            : (framer.hasPendingBytes ? StdinFramer.disambiguationTimeout : nil)
         if let timeout {
             armFlush(after: timeout, app: app)
         }
@@ -347,7 +347,7 @@ public final class TerminalDriver {
             let flushed = self.framer.flush()
             self.dispatch(flushed, to: app)
             self.render()
-            if self.framer.hasPendingPaste {
+            if self.framer.hasPendingPaste || self.framer.hasPendingPasteStart {
                 self.armFlush(after: StdinFramer.pasteTimeout, app: app)
             }
         }

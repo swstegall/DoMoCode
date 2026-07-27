@@ -357,6 +357,22 @@ struct ScrollAndToolStateTests {
         #expect(input.text.contains("older") && input.text.contains("new"))
     }
 
+    @Test("An abort the server reports as a no-op self-corrects a stale run state")
+    func markIdleClearsStaleRunState() {
+        // The client's run state can be stale (it is reset on every selection). When
+        // the server answers that there was nothing to abort, that is authoritative —
+        // adopting it stops the prompt box refusing input over a turn that is not
+        // actually running.
+        let store = EventStore()
+        store.select("s1")
+        store.apply(.agentStart)
+        store.apply(.toolStart(id: "t1", name: "bash", arguments: .object([:])))
+        #expect(store.runState == .running)
+        store.markIdle()
+        #expect(store.runState == .idle)
+        #expect(store.activeToolCall == nil, "no spinner may outlive the turn")
+    }
+
     // MARK: Untrusted text
 
     @Test("Control characters in model/tool text are neutralised")

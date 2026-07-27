@@ -334,6 +334,7 @@ public final class ClientApp {
         eventTask?.cancel()
         eventTask = Task { @MainActor [weak self] in
             var backoffMS = 125
+            var isReconnect = false
             while !Task.isCancelled {
                 guard let self, self.store.selectedSessionID == sessionID else { return }
                 do {
@@ -345,6 +346,19 @@ public final class ClientApp {
                             // subscribing would lose a prompt asked in the gap.
                             backoffMS = 125
                             self.setStreamConnected(true)
+                            // Re-seed after an OUTAGE: the stream is delta-only, so
+                            // everything that streamed while we were away is simply
+                            // missing from the pane, with nothing to say so. Not on the
+                            // first connect — `open()` has just fetched the same
+                            // history, and re-seeding a mid-turn attach would discard
+                            // partial streamed text. Before `apply`, because `seed`
+                            // clears the transcript (and the run state with it), which
+                            // would wipe the `running` this very frame carries.
+                            if isReconnect, let history = try? await self.client.messages(sessionID: sessionID) {
+                                guard self.store.selectedSessionID == sessionID else { return }
+                                self.store.seed(history)
+                            }
+                            isReconnect = false
                             self.store.apply(event)
                             await self.reconcilePendingPermissions(sessionID)
                             continue
@@ -358,6 +372,7 @@ public final class ClientApp {
                 // The stream is down. Say so — a silent disconnect is exactly what made
                 // this look like a freeze — then retry with bounded backoff.
                 self.setStreamConnected(false)
+                isReconnect = true
                 try? await Task.sleep(for: .milliseconds(backoffMS))
                 backoffMS = min(backoffMS * 2, 4000)
             }
@@ -439,7 +454,19 @@ public final class ClientApp {
         // map. Refusing to try was how "Esc does nothing" happened.
         guard let id = store.selectedSessionID else { return }
         Task { @MainActor [weak self] in
-            try? await self?.client.abort(sessionID: id)
+            guard let self else { return }
+            do {
+                // The server answers whether anything was actually in flight. `false`
+                // means our own run state was stale — self-correct it, so the prompt
+                // box stops refusing input, instead of leaving the user pressing a key
+                // that appears to do nothing.
+                if try await self.client.abort(sessionID: id) == false {
+                    self.store.markIdle()
+                    self.post(notice: "nothing to abort")
+                }
+            } catch {
+                self.post(notice: "could not abort — the run may still be going")
+            }
         }
     }
 

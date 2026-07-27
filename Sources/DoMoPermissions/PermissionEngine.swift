@@ -38,14 +38,16 @@ public actor PermissionEngine {
     /// runs with no prompt, and any `ask` prompts the surface once for the whole call.
     public func ask(_ spec: PermissionRequestSpec, sessionID: String) async -> PermissionDecision {
         var needsAsk = false
-        for pattern in spec.patterns {
-            // Base-vs-saved resolve, NOT a flat merge: a config `deny` beats a broad
-            // in-session "allow always" grant (which last-match-wins would not).
-            var rule = resolvePermission(spec.permission, pattern, config: baseRuleset, saved: sessionApproved)
+        for (index, pattern) in spec.patterns.enumerated() {
+            // Every spelling of the resource is checked, not just the one the model
+            // used — see `PermissionRequestSpec.patternAliases`. Aliases describe the
+            // FIRST pattern only; a multi-pattern spec (bash) has none.
+            let spellings = index == 0 ? [pattern] + spec.patternAliases : [pattern]
+            var action = resolvedAction(spec.permission, spellings)
             // Config-protection: a broad allow must not silently cover the agent's own
             // permission/settings files — force a prompt.
-            if spec.configProtected, rule.action == .allow { rule.action = .ask }
-            switch rule.action {
+            if spec.configProtected, action == .allow { action = .ask }
+            switch action {
             case .deny:
                 return .deny(reason: Self.deniedReason(permission: spec.permission, pattern: pattern))
             case .ask:
@@ -85,6 +87,28 @@ public actor PermissionEngine {
         case .reject(let message):
             return .deny(reason: message ?? "The user rejected this tool call.")
         }
+    }
+
+    /// Fold the verdicts for every spelling of one resource.
+    ///
+    /// Deny-first, then allow: a deny on ANY spelling denies (so a rule cannot be
+    /// side-stepped by renaming the same file), and an allow on any spelling allows
+    /// (so a grant is spelling-independent). Only if no spelling says anything does
+    /// it fall through to a prompt.
+    ///
+    /// Each spelling goes through the base-vs-saved resolve, NOT a flat merge: a
+    /// config `deny` beats a broad in-session "allow always" grant, which
+    /// last-match-wins would not.
+    private func resolvedAction(_ permission: String, _ spellings: [String]) -> PermissionAction {
+        var sawAllow = false
+        for spelling in spellings {
+            switch resolvePermission(permission, spelling, config: baseRuleset, saved: sessionApproved).action {
+            case .deny: return .deny
+            case .allow: sawAllow = true
+            case .ask: continue
+            }
+        }
+        return sawAllow ? .allow : .ask
     }
 
     /// A model-visible denial reason. The model reads this as the tool's error result

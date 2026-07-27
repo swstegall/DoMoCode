@@ -137,6 +137,22 @@ public struct StdinFramer: Sendable {
     /// even Ctrl-C, could ever reach it again.
     public var hasPendingPaste: Bool { pasteMode }
 
+    /// Whether the held tail is a committed CSI that can only be growing into the
+    /// bracketed-paste START marker (`ESC[2`, `ESC[20`, `ESC[200`).
+    ///
+    /// Such a tail needs the PASTE deadline, not the 10 ms escape one: a paste marker
+    /// split across a `read()` boundary was otherwise emitted as garbage after 10 ms
+    /// and the entire paste that followed was framed as KEYSTROKES. The `>= 3` floor
+    /// is load-bearing — `ESC` alone and `ESC[` are indistinguishable from a real
+    /// Escape or Alt-`[` keypress, and stalling those for three quarters of a second
+    /// would make the abort key feel broken. From three bytes on, the tail cannot be
+    /// any keypress, so waiting costs nothing: if it never completes it was garbage
+    /// either way, and it is emitted as the same garbage, later.
+    public var hasPendingPasteStart: Bool {
+        buffer.count >= 3 && buffer.count < bracketedPasteStart.count
+            && bracketedPasteStart.starts(with: buffer)
+    }
+
     /// Feed a chunk of raw bytes; returns every sequence and paste it completed.
     public mutating func process(_ incoming: [UInt8]) -> [StdinEvent] {
         var events: [StdinEvent] = []

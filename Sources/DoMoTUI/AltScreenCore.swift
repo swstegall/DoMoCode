@@ -291,8 +291,23 @@ public struct AltScreenCore {
         buffer += deletes
         if firstChanged != -1 {
             let renderEnd = min(lastChanged, newLines.count - 1)
+            let previousCoverage = imageCoverageByRow(previousImages, width: width, height: height)
             for i in firstChanged...renderEnd {
                 let line = newLines[i]
+                // Skip rows inside the span that did not actually change.
+                //
+                // The span is only a bounding box: one row changing near the top and
+                // another near the bottom repainted everything between them. That is
+                // most of the page every time an animated status line ticks, which is
+                // how a spinner came to cost ~110 KB/s of terminal traffic. Skipping
+                // is safe because every row here is independent: `paintTextRow` emits
+                // absolute `CUP + erase-line + content` (there is no relative cursor
+                // motion anywhere on the alt-screen path) and `applyLineResets`
+                // terminates each line's SGR, so nothing carries between rows. A row
+                // that image coverage touched in EITHER frame is still repainted — a
+                // Kitty delete can clear cells belonging to an unchanged text row.
+                let oldLine = i < previousLines.count ? previousLines[i] : ""
+                if line == oldLine, coverage[i] == nil, previousCoverage[i] == nil { continue }
                 let lineWidth = visibleWidth(line)
                 if lineWidth > width {
                     throw AltScreenCore.overWide(row: i, measured: lineWidth, width: width)

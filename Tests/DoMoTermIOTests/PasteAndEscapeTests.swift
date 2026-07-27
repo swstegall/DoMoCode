@@ -109,6 +109,37 @@ struct PasteAndEscapeTests {
         #expect(String(decoding: content, as: UTF8.self) == "one\rtwo\u{03}")
     }
 
+    @Test("A committed paste-start prefix waits on the PASTE deadline, not the escape one")
+    func splitPasteStartMarker() {
+        // `ESC[200~` split across a read() boundary was emitted as garbage after 10 ms
+        // and the whole paste that followed was framed as KEYSTROKES.
+        var framer = StdinFramer()
+        _ = framer.process(Array("\u{1b}[2".utf8))
+        #expect(framer.hasPendingPasteStart, "a 3-byte committed CSI can only be growing into the marker")
+        #expect(framer.hasPendingBytes)
+
+        // The two genuinely ambiguous prefixes must NOT wait: they are indistinguishable
+        // from a real Escape / Alt-[ keypress, and stalling them would make the abort
+        // key feel broken.
+        var short = StdinFramer()
+        _ = short.process([0x1b])
+        #expect(!short.hasPendingPasteStart)
+        var alt = StdinFramer()
+        _ = alt.process(Array("\u{1b}[".utf8))
+        #expect(!alt.hasPendingPasteStart)
+
+        // A CSI that is NOT growing into the marker is unaffected.
+        var other = StdinFramer()
+        _ = other.process(Array("\u{1b}[3".utf8))
+        #expect(!other.hasPendingPasteStart)
+
+        // And the split marker still completes into a real paste.
+        let events = framer.process(Array("00~pasted".utf8) + pasteEnd)
+        #expect(events.count == 1)
+        guard case .paste(let content) = events.first else { Issue.record("expected a paste"); return }
+        #expect(String(decoding: content, as: UTF8.self) == "pasted")
+    }
+
     @Test("The paste deadline is much longer than the escape deadline")
     func timeoutsAreDistinct() {
         #expect(StdinFramer.pasteTimeout > StdinFramer.disambiguationTimeout * 10)

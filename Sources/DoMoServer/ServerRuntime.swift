@@ -341,10 +341,17 @@ public actor ServerRuntime {
     /// Cancel a running turn. The run settles cooperatively and clears its own slot.
     /// A run suspended on a permission prompt is NOT resumed by cancelling its task,
     /// so drain any pending prompts as rejects (else the tool fiber leaks forever).
-    public func abort(sessionID: String) throws {
+    /// - Returns: whether a run was actually in flight. A client uses this to tell
+    ///   "aborted" from "there was nothing to abort" — the latter means its own view
+    ///   of the run state is stale, which it can then self-correct rather than leave
+    ///   the user pressing a key that appears to do nothing.
+    @discardableResult
+    public func abort(sessionID: String) throws -> Bool {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        let wasRunning = session.runTask != nil
         session.runTask?.cancel()
         drainPending(session, reason: "The tool call was aborted.")
+        return wasRunning
     }
 
     /// Resume every pending prompt on `session` with a reject, and tell subscribers to

@@ -12,6 +12,13 @@ import Logging
 // MARK: - Request bodies
 
 /// `POST /session` body. Absent (empty body) means a fresh session.
+/// The `POST /session/{id}/abort` result: whether a run was actually in flight.
+/// A client that gets `false` knows its own run state was stale.
+public struct AbortResult: Codable, Sendable, Hashable {
+    public var aborted: Bool
+    public init(aborted: Bool) { self.aborted = aborted }
+}
+
 private struct CreateBody: Decodable {
     var resume: String?
 }
@@ -178,8 +185,8 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/abort") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
-                try await self.runtime.abort(sessionID: id)
-                return Response(status: .ok)
+                let aborted = try await self.runtime.abort(sessionID: id)
+                return try Self.json(AbortResult(aborted: aborted), status: .ok)
             }
         }
 

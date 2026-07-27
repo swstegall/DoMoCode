@@ -102,10 +102,18 @@ public struct ServerClient: Sendable {
 
     /// Abort the running turn. `POST /session/{id}/abort` → 200. Cooperative —
     /// the runtime cancels the run task.
-    public func abort(sessionID: String) async throws {
+    ///
+    /// - Returns: whether a run was actually in flight. `false` means there was
+    ///   nothing to abort, which tells the caller its own run state is stale. An
+    ///   older server that answers with no body reads as `true`, preserving the
+    ///   previous fire-and-forget behaviour.
+    @discardableResult
+    public func abort(sessionID: String) async throws -> Bool {
         let path = "/session/\(sessionID)/abort"
-        let (status, _) = try await send(.post, path)
+        let (status, data) = try await send(.post, path)
         try expect(status, 200, path)
+        guard let result = try? JSONDecoder().decode(AbortResult.self, from: data) else { return true }
+        return result.aborted
     }
 
     /// Fork the session into a new branch/file. `POST /session/{id}/fork` → 201.

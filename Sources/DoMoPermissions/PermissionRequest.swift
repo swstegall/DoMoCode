@@ -17,6 +17,20 @@ import DoMoCore
 public struct PermissionRequestSpec: Sendable, Hashable {
     public var permission: String
     public var patterns: [String]
+    /// Other spellings of the SAME resource as `patterns[0]` — for a path-keyed tool,
+    /// the workspace-anchored absolute form of the path the model wrote.
+    ///
+    /// A rule matches text, and one file has many names: `a.txt`, `./a.txt` and
+    /// `/work/a.txt` are the same file but three different pattern strings. Checking
+    /// only the model's spelling meant a saved grant on one form did not cover
+    /// another (so "Allow always" re-prompted), and — worse — a deny written for one
+    /// form could be side-stepped by asking for another. Checking every spelling,
+    /// deny-first, closes both without changing what any existing rule means: the
+    /// model's own spelling is still in the set.
+    ///
+    /// Only produced for tools with exactly one resource; `bash` decomposes into
+    /// several patterns and carries none.
+    public var patternAliases: [String]
     public var always: [String]
     public var metadata: [String: JSONValue]
     public var configProtected: Bool
@@ -24,12 +38,14 @@ public struct PermissionRequestSpec: Sendable, Hashable {
     public init(
         permission: String,
         patterns: [String],
+        patternAliases: [String] = [],
         always: [String],
         metadata: [String: JSONValue] = [:],
         configProtected: Bool = false
     ) {
         self.permission = permission
         self.patterns = patterns
+        self.patternAliases = patternAliases
         self.always = always
         self.metadata = metadata
         self.configProtected = configProtected

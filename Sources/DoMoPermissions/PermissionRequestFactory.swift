@@ -42,7 +42,8 @@ public struct PermissionRequestFactory: Sendable {
             return PermissionRequestSpec(
                 permission: toolName,
                 patterns: [path],
-                always: Self.pathGrant(path),
+                patternAliases: aliases(for: path),
+                always: pathGrant(path),
                 metadata: ["filepath": .string(path)],
                 configProtected: isProtected(path)
             )
@@ -52,12 +53,18 @@ public struct PermissionRequestFactory: Sendable {
             return PermissionRequestSpec(
                 permission: "read",
                 patterns: [path],
-                always: Self.pathGrant(path),
+                patternAliases: aliases(for: path),
+                always: pathGrant(path),
                 metadata: ["filepath": .string(path)]
             )
         case "ls":
             let path = arguments["path"]?.stringValue ?? "."
-            return PermissionRequestSpec(permission: "ls", patterns: [path], always: Self.pathGrant(path))
+            return PermissionRequestSpec(
+                permission: "ls",
+                patterns: [path],
+                patternAliases: aliases(for: path),
+                always: pathGrant(path)
+            )
         default:
             // find/grep/todo/etc. and every MCP tool: a coarse `*` resource. Known
             // read-only tools are auto-allowed by the baseline; an unknown MCP name is
@@ -99,9 +106,38 @@ public struct PermissionRequestFactory: Sendable {
     ///
     /// Only path-keyed tools come through here. `bash` grants are *deliberately*
     /// globs (`git *`), which is why this cannot live at the persistence boundary.
-    private static func pathGrant(_ path: String) -> [String] {
-        guard !path.isEmpty, !path.contains("*"), !path.contains("?") else { return [] }
-        return [path]
+    private func pathGrant(_ path: String) -> [String] {
+        // Anchored to the workspace, so the grant is PROJECT-LOCAL by construction.
+        //
+        // Grants are persisted to the user's GLOBAL settings.json, so a bare relative
+        // pattern authorised the same relative path in every other project on the
+        // machine — "Always allow src/index.js" in one repo silently covered
+        // `src/index.js` in all of them. An absolute pattern cannot travel. It matches
+        // because the engine also checks the absolute spelling of every request (see
+        // `aliases(for:)`), and it does not weaken the `.env` guard: `wildcardMatch`
+        // compiles `*` to `.*` with no path-separator special case, so `*.env` still
+        // matches `/abs/project/.env`.
+        let anchored = absolutePath(path)
+        guard !anchored.isEmpty, !anchored.contains("*"), !anchored.contains("?") else { return [] }
+        return [anchored]
+    }
+
+    /// The other spellings of `path` that name the same file, for the engine to check
+    /// alongside the model's own spelling.
+    private func aliases(for path: String) -> [String] {
+        guard !path.isEmpty else { return [] }
+        let anchored = absolutePath(path)
+        return anchored.isEmpty || anchored == path ? [] : [anchored]
+    }
+
+    /// `path` resolved against the workspace and lexically standardised (`.` and `..`
+    /// folded, a leading `./` dropped). Deliberately NOT symlink-resolved: a grant
+    /// must not change meaning because a symlink was re-pointed, and on macOS that
+    /// would also rewrite `/tmp` to `/private/tmp` inconsistently.
+    private func absolutePath(_ path: String) -> String {
+        guard !path.isEmpty else { return "" }
+        let base = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        return URL(fileURLWithPath: path, relativeTo: base).standardizedFileURL.path
     }
 
     private func bashSpec(_ arguments: JSONValue) -> PermissionRequestSpec {

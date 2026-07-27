@@ -16,20 +16,65 @@ import Testing
 @Suite("Allow-always grant scope")
 struct GrantScopeTests {
 
-    private let factory = PermissionRequestFactory(workingDirectory: "/work")
+    private let workspace = "/work"
+    private var factory: PermissionRequestFactory { PermissionRequestFactory(workingDirectory: workspace) }
 
     private func spec(_ tool: String, path: String) -> PermissionRequestSpec {
         factory.make(toolName: tool, arguments: .object(["path": .string(path)]))
     }
 
-    @Test("An edit grant covers that file, not every file")
+    @Test("An edit grant covers that file, not every file — and not other projects")
     func editGrantIsScopedToTheFile() {
         // It used to be ["*"]: approving "Allow always" on a prompt reading
         // `edit  a.txt` wrote `edit: {"*": "allow"}` to the GLOBAL settings.json —
-        // every edit, every file, every project, permanently.
-        #expect(spec("edit", path: "a.txt").always == ["a.txt"])
-        #expect(spec("write", path: "src/Foo.swift").always == ["src/Foo.swift"])
+        // every edit, every file, every project, permanently. Scoping it to the path
+        // alone was still not enough: grants live in the GLOBAL config, so a bare
+        // relative pattern authorised the same relative path in every other repo.
+        #expect(spec("edit", path: "a.txt").always == ["/work/a.txt"])
+        #expect(spec("write", path: "src/Foo.swift").always == ["/work/src/Foo.swift"])
         #expect(!spec("edit", path: "a.txt").always.contains("*"))
+    }
+
+    @Test("A grant made in one project does not authorise the same relative path in another")
+    func grantsDoNotTravelBetweenProjects() {
+        let granted = spec("edit", path: "src/index.js").always
+        #expect(granted == ["/work/src/index.js"])
+        let elsewhere = PermissionRequestFactory(workingDirectory: "/other")
+            .make(toolName: "edit", arguments: .object(["path": .string("src/index.js")]))
+        // The other project's request resolves to a different absolute spelling, so
+        // the saved rule cannot match it.
+        #expect(!elsewhere.patternAliases.contains("/work/src/index.js"))
+        #expect(elsewhere.patternAliases == ["/other/src/index.js"])
+    }
+
+    @Test("Every spelling of the same file is checked, so a grant is spelling-independent")
+    func spellingsAreEquivalent() async {
+        let ruleset = fromConfig(defaultBaselinePermissionConfig(), homeDirectory: "/home")
+        let engine = PermissionEngine(
+            ruleset: ruleset,
+            approved: [PermissionRule(permission: "edit", pattern: "/work/a.txt", action: .allow)],
+            prompt: { _ in Issue.record("a granted file must not re-prompt under another spelling"); return .reject(message: nil) }
+        )
+        for spelling in ["a.txt", "./a.txt", "/work/a.txt", "sub/../a.txt"] {
+            #expect(await engine.ask(spec("edit", path: spelling), sessionID: "s") == .allow, "spelling: \(spelling)")
+        }
+    }
+
+    @Test("A deny cannot be side-stepped by re-spelling the path")
+    func denyCannotBeDodgedByRespelling() async {
+        let config: PermissionConfig = [
+            PermissionConfigEntry(permission: "*", value: .action(.ask)),
+            PermissionConfigEntry(permission: "edit", value: .map([PatternRule(pattern: "secrets.txt", action: .deny)])),
+        ]
+        let engine = PermissionEngine(
+            ruleset: fromConfig(config, homeDirectory: "/home"),
+            prompt: { _ in .once }
+        )
+        // The raw spelling is still in the checked set, so the hand-written relative
+        // rule keeps working; the fold is deny-first, so no alias can lift it.
+        if case .allow = await engine.ask(spec("edit", path: "secrets.txt"), sessionID: "s") {
+            Issue.record("the hand-written deny must still apply")
+        }
     }
 
     @Test("A read grant cannot disable the .env guard everywhere")
@@ -37,7 +82,7 @@ struct GrantScopeTests {
         // Worse than edit: a blanket `read: {"*": "allow"}` overrides the baseline's
         // `*.env: ask` rule, so one "always" on any file silently turned off the
         // secret guard for every project.
-        #expect(spec("read", path: "notes.md").always == ["notes.md"])
+        #expect(spec("read", path: "notes.md").always == ["/work/notes.md"])
         #expect(!spec("read", path: "notes.md").always.contains("*"))
     }
 
@@ -48,7 +93,7 @@ struct GrantScopeTests {
         let ruleset = fromConfig(defaultBaselinePermissionConfig(), homeDirectory: "/home")
         let engine = PermissionEngine(
             ruleset: ruleset,
-            approved: [PermissionRule(permission: "edit", pattern: "a.txt", action: .allow)],
+            approved: [PermissionRule(permission: "edit", pattern: "/work/a.txt", action: .allow)],
             prompt: { _ in Issue.record("must not prompt for an already-granted path"); return .reject(message: nil) }
         )
         #expect(await engine.ask(spec("edit", path: "a.txt"), sessionID: "s") == .allow)
@@ -60,7 +105,7 @@ struct GrantScopeTests {
         let prompted = Prompted()
         let engine = PermissionEngine(
             ruleset: ruleset,
-            approved: [PermissionRule(permission: "edit", pattern: "a.txt", action: .allow)],
+            approved: [PermissionRule(permission: "edit", pattern: "/work/a.txt", action: .allow)],
             prompt: { _ in prompted.record(); return .reject(message: nil) }
         )
         _ = await engine.ask(spec("edit", path: "b.txt"), sessionID: "s")
@@ -95,11 +140,11 @@ struct GrantScopeTests {
         #expect(spec("edit", path: "a?.txt").always.isEmpty)
         #expect(spec("ls", path: "src/*").always.isEmpty)
         // An ordinary path is unaffected.
-        #expect(spec("edit", path: "src/Foo.swift").always == ["src/Foo.swift"])
+        #expect(spec("edit", path: "src/Foo.swift").always == ["/work/src/Foo.swift"])
         // Characters wildcardMatch already escapes are NOT glob-active, so they stay
         // grantable — refusing them would be needless.
-        #expect(spec("edit", path: "a[1].txt").always == ["a[1].txt"])
-        #expect(spec("edit", path: "a+b(c).txt").always == ["a+b(c).txt"])
+        #expect(spec("edit", path: "a[1].txt").always == ["/work/a[1].txt"])
+        #expect(spec("edit", path: "a+b(c).txt").always == ["/work/a+b(c).txt"])
     }
 
     @Test("bash grants stay globs — the restriction is for path-keyed tools only")

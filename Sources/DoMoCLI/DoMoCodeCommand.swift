@@ -58,9 +58,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             not a session is a hard error (non-zero exit).
 
             PROJECT TRUST. When the current directory carries a .domocode/settings.json — which can \
-            redirect the model, the proxy, and where sessions are written — domo refuses to run \
-            until the directory is trusted. Print mode cannot prompt, so pass --trust once to record \
-            trust (in <config-dir>/trust.json, keyed by resolved path; a trusted directory also \
+            redirect the model, the proxy, and where sessions are written — domo will not use it \
+            until the directory is trusted. An interactive session asks once, on the terminal, and \
+            records the answer. Print mode and --serve cannot ask, so pass --trust to record trust \
+            up front (in <config-dir>/trust.json, keyed by resolved path; a trusted directory also \
             trusts its subdirectories). A directory with no such project file needs no trust.
             """
     )
@@ -221,10 +222,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // Refuse to run an untrusted project's local settings before any tool is
         // built — the point of the gate is that untrusted input never reaches a
         // run. A directory with no `.domocode/settings.json` needs no trust.
+        // An interactive run (no `-p`) can ASK; print mode and `--serve` cannot.
         try Self.ensureProjectTrust(
             workingDirectory: workingDirectory,
             configDirectory: configuration.configDirectory,
-            trustFlag: trust
+            trustFlag: trust,
+            canPrompt: prompt == nil && !serve && isatty(STDIN_FILENO) == 1
         )
 
         // `--serve` runs the headless HTTP/SSE server and does not return until the
@@ -640,7 +643,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     static func ensureProjectTrust(
         workingDirectory: FilePath,
         configDirectory: FilePath,
-        trustFlag: Bool
+        trustFlag: Bool,
+        canPrompt: Bool = false
     ) throws(DoMoError) {
         guard projectRequiresTrust(directory: workingDirectory) else { return }
         let store = TrustStore(configDirectory: configDirectory)
@@ -660,17 +664,44 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     + ".domocode/settings.json will not be used. Pass --trust to override and re-trust it."
             )
         case .none:
-            // The message must not blame "print mode": this gate runs for EVERY
-            // surface, so an interactive user opening the TUI in a project that
-            // happens to have a .domocode/settings.json was told their problem was a
-            // mode they had not asked for. Name the actual remedy instead.
+            // Ask, when there is a human on a terminal to ask. Refusing outright made
+            // every interactive session in any project holding a
+            // .domocode/settings.json a hard stop that could only be cleared by
+            // re-running with a flag — for a question the user is standing right there
+            // to answer. This is before raw mode and before any TUI, so a plain
+            // line-read is the whole mechanism.
+            if canPrompt, try Self.askToTrust(workingDirectory, store: store) {
+                try store.setDecision(true, for: workingDirectory)
+                return
+            }
+            // Deliberately does NOT record a refusal: a mistyped answer should not
+            // lock the directory out permanently.
             throw DoMoError(
                 .configuration,
                 "Project \(workingDirectory.string) has a .domocode/settings.json, which can change how tools "
-                    + "and permissions behave, and this directory is not trusted yet. Re-run with --trust to "
+                    + "and permissions behave, and this directory is not trusted. Re-run with --trust to "
                     + "trust it (recorded in \(store.path.string)), or remove the file to run without it."
             )
         }
+    }
+
+    /// Ask on the terminal whether to trust this project. Anything but an explicit
+    /// yes is a no, and EOF (stdin closed under us) is a no.
+    private static func askToTrust(_ workingDirectory: FilePath, store: TrustStore) throws(DoMoError) -> Bool {
+        writeStderr(
+            "\nProject \(workingDirectory.string) has a .domocode/settings.json.\n"
+                + "It can change how tools and permissions behave, so it is only used in directories you trust.\n"
+                + "Trust this directory? [y/N] "
+        )
+        guard let answer = readLine(strippingNewline: true)?
+            .trimmingCharacters(in: .whitespaces)
+            .lowercased()
+        else {
+            writeStderr("\n")
+            return false
+        }
+        writeStderr("\n")
+        return answer == "y" || answer == "yes"
     }
 
     // MARK: Session resolution

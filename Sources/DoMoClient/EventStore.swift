@@ -332,6 +332,16 @@ public final class EventStore {
         }
     }
 
+    /// Force the run state to idle, for a caller that learned authoritatively that
+    /// nothing is running (an abort the server reports as a no-op). Settles any tool
+    /// row still in flight, so a spinner cannot outlive the turn it belongs to.
+    public func markIdle() {
+        guard runState != .idle else { return }
+        runState = .idle
+        settleActiveToolCalls()
+        onChange?()
+    }
+
     /// Clear the pending prompt after the client answers it (optimistic — the
     /// server's `permission_resolved` echo also clears it, idempotently), so the
     /// overlay-reconcile does not re-present the request it just answered.
