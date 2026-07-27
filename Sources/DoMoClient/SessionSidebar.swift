@@ -26,8 +26,24 @@ final class SessionSidebar: @MainActor Focusable {
 
     private var cursor = 0
 
+    /// How many session rows are scrolled off the top. The list is clipped to the
+    /// pane height by ``ComponentBox``, so without this a long session list simply
+    /// has no way to reach its tail.
+    private(set) var scrollOffset = 0
+
     private static let arrowUp: [UInt8] = [0x1b, 0x5b, 0x41]
     private static let arrowDown: [UInt8] = [0x1b, 0x5b, 0x42]
+
+    /// The two header rows (title + rule) that are not session rows.
+    private static let headerRows = 2
+
+    /// Scroll the list by `delta` rows, clamped to the content. `viewportHeight` is
+    /// the pane height the app knows and the component does not.
+    func scroll(by delta: Int, viewportHeight: Int) {
+        let visibleRows = max(1, viewportHeight - Self.headerRows)
+        let maxOffset = max(0, sessions.count - visibleRows)
+        scrollOffset = min(max(0, scrollOffset + delta), maxOffset)
+    }
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [] }
@@ -40,7 +56,9 @@ final class SessionSidebar: @MainActor Focusable {
             return lines
         }
         let clampedCursor = min(cursor, sessions.count - 1)
-        for (index, session) in sessions.enumerated() {
+        // Clamp here too: `sessions` can shrink between a scroll and a render.
+        let offset = min(max(0, scrollOffset), max(0, sessions.count - 1))
+        for (index, session) in sessions.enumerated().dropFirst(offset) {
             let marker = session.id == openID ? "• " : "  "
             let label = padToWidth(truncateToWidth(marker + sessionLabel(session), width), width)
             lines.append(index == clampedCursor && focused ? inverse(label) : label)

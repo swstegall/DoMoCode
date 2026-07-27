@@ -11,6 +11,30 @@ import DoMoCore
 import DoMoTUI
 import DoMoTermIO
 
+/// The terminal state the full-screen client requires, as one named thing.
+///
+/// It exists because the alternative — the caller passing the right flags — is
+/// what actually went wrong: the client shipped addressing absolute rows on the
+/// NORMAL screen buffer, because the CLI constructed a default
+/// ``TerminalLifecycle`` and no test could see the difference. The two flags are
+/// not caller preferences, they are preconditions of this UI:
+///
+///  - **Alternate screen.** Frames are painted at absolute rows by
+///    ``AltScreenCore``. On the normal buffer those frames overwrite the user's
+///    scrollback, and any scroll of the real viewport permanently desynchronises
+///    every later repaint — the UI then looks frozen, with new frames (including
+///    an approval modal) landing off-viewport.
+///  - **Mouse reporting.** A corollary of the first: the alternate screen has no
+///    scrollback for the terminal to scroll, so the wheel must reach the app or
+///    it does nothing at all.
+///
+/// A caller that wants a scripted, headless lifecycle still injects its own into
+/// ``runFullScreenClient(baseURL:token:target:input:resize:lifecycle:)``.
+@MainActor
+public func fullScreenClientLifecycle() -> TerminalLifecycle {
+    TerminalLifecycle(useAlternateScreen: true, enableMouse: true)
+}
+
 /// Run the two-pane full-screen client against a `domo serve` runtime at
 /// `baseURL`, authenticated with `token`, until the user quits.
 ///

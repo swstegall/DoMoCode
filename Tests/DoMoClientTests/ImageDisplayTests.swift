@@ -45,7 +45,7 @@ struct ImageDisplayTests {
         let store = EventStore()
         let block = ToolResultBlock(toolCallID: "t1", toolName: "screenshot", output: "ok", images: [png(width: 40, height: 40)])
         store.seed([.tool(block)])
-        #expect(store.transcript.contains { if case .tool(name: "screenshot", _, _, _) = $0 { true } else { false } })
+        #expect(store.transcript.contains { if case .tool(name: "screenshot", _, _, _, _) = $0 { true } else { false } })
         #expect(store.transcript.contains(where: isImage))
     }
 

@@ -34,12 +34,23 @@ public final class ClientApp {
 
     private var surface: ScreenSurface?
     private var eventTask: Task<Void, Never>?
+    /// Drives the in-flight animation. The transcript's spinner is a pure function
+    /// of a frame index, so something has to advance it; this is that clock, and it
+    /// only runs while there is something in flight. Its second job is diagnostic: a
+    /// spinner that stops moving means the render loop itself is wedged, which a
+    /// static "…" could never tell you.
+    private var spinnerTask: Task<Void, Never>?
 
     // Permission approval modal (Phase 8b). Driven off `store.pendingPermission` via
     // `reconcilePermissionOverlay`, so every show/dismiss path funnels through one place.
     private let keybindings = Keybindings()
     private var permissionHandle: ScreenOverlayHandle?
     private var permissionList: SelectList?
+    /// The terminal size the modal was laid out for, so a resize can rebuild it.
+    private var permissionOverlaySize: (columns: Int, rows: Int)?
+    /// Whether the session's event stream is currently up. Surfaced in the status
+    /// line, because a dead stream is otherwise indistinguishable from a slow model.
+    private var streamConnected = true
 
     private static let ctrlC: [UInt8] = [0x03]
     private static let escape: [UInt8] = [0x1b]
@@ -81,6 +92,8 @@ public final class ClientApp {
         // mutations' coalesced renders never fire before the alt screen is active
         // and leak a frame onto the normal buffer. The UI comes up immediately and
         // fills in as the network responds.
+        startSpinnerClock()
+
         let driver = TerminalDriver(input: inputStream, resize: resize, lifecycle: lifecycle)
         await driver.run(self, quit: quit, background: { [weak self] in
             await self?.bootstrap()
@@ -88,6 +101,8 @@ public final class ClientApp {
 
         eventTask?.cancel()
         eventTask = nil
+        spinnerTask?.cancel()
+        spinnerTask = nil
 
         if let error = driver.startupError { throw error }
         if let error = driver.renderError { throw error }
@@ -113,29 +128,107 @@ public final class ClientApp {
         transcriptView.running = store.runState == .running
         statusBar.text = statusText()
 
-        let sidebarWidth = min(32, max(16, width / 4))
+        let layout = ClientLayout(width: width, height: height)
         let main = Column([
             Flexible(1, TranscriptNode(view: transcriptView, capabilities: graphicsCapabilities, cell: cellSize)),
             Fixed(.absolute(1), statusBar.layout),
             Fixed(.absolute(1), promptInput.layout),
         ])
         return Row([
-            Fixed(.absolute(sidebarWidth), sidebar.layout),
+            Fixed(.absolute(layout.sidebarWidth), sidebar.layout),
             Flexible(1, main),
         ])
     }
 
+    /// The status line: what the run is doing right now, then the key hints.
+    ///
+    /// The run state alone ("streaming…") is not enough to distinguish "the model is
+    /// thinking", "a tool is running" and "a tool is parked waiting for you" — and
+    /// the third is the one a user reads as a freeze. Each gets its own text.
     private func statusText() -> String {
         var parts: [String] = []
-        switch store.runState {
-        case .running: parts.append("streaming…")
-        case .idle: parts.append(store.lastStopReason.map { "idle (\($0))" } ?? "idle")
+        if !streamConnected {
+            parts.append("\u{1b}[31mdisconnected — reconnecting…\u{1b}[0m")
+        }
+        if let active = store.activeToolCall {
+            let label = active.detail.isEmpty ? active.name : "\(active.name) \(active.detail)"
+            switch active.state {
+            case .awaitingApproval:
+                parts.append("⏳ \(label) — needs approval")
+            default:
+                parts.append("\(spinnerGlyph()) \(label)")
+            }
+        } else {
+            switch store.runState {
+            case .running: parts.append("\(spinnerGlyph()) thinking…")
+            case .idle: parts.append(store.lastStopReason.map { "idle (\($0))" } ?? "idle")
+            }
+        }
+        if transcriptView.scrollOffset > 0 {
+            parts.append("↑ \(transcriptView.scrollOffset) rows — scroll down to follow")
         }
         parts.append("Tab: pane")
         parts.append("Enter: send")
         parts.append("Esc: abort")
         parts.append("^C: quit")
         return parts.joined(separator: "   ")
+    }
+
+    private func spinnerGlyph() -> String {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        return frames[((transcriptView.spinnerFrame % frames.count) + frames.count) % frames.count]
+    }
+
+    // MARK: In-flight animation
+
+    /// Advance the spinner while anything is in flight, and repaint.
+    ///
+    /// Adaptive: it ticks at the animation rate only when there is something to
+    /// animate, and otherwise idles at a slow poll — an idle session must not repaint
+    /// ten times a second forever. Cancelled with the session.
+    private func startSpinnerClock() {
+        spinnerTask?.cancel()
+        spinnerTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let animating = self.store.runState == .running || self.store.activeToolCall != nil
+                if animating {
+                    self.transcriptView.spinnerFrame &+= 1
+                    self.surface?.requestRender()
+                }
+                try? await Task.sleep(for: animating ? .milliseconds(100) : .milliseconds(250))
+            }
+        }
+    }
+
+    // MARK: Mouse
+
+    /// Route a wheel report to the pane under the pointer.
+    ///
+    /// Pointer-targeted rather than focus-targeted, which is what every terminal
+    /// application does and what a user expects: you scroll what you are looking at,
+    /// without first Tab-ing focus to it. Buttons and motion are ignored — this
+    /// takes the mouse only so the wheel works, since the alternate screen has no
+    /// scrollback for the terminal to scroll on our behalf.
+    private func handleMouse(_ event: MouseEvent) {
+        guard event.kind == .scrollUp || event.kind == .scrollDown else { return }
+        guard let target = surface?.target else { return }
+        let layout = ClientLayout(width: target.columns, height: target.rows)
+        // Ctrl-wheel pages, matching the convention of a viewport that has no
+        // separate page keys.
+        let step = event.ctrl ? max(1, layout.transcriptHeight - 1) : 3
+        let up = event.kind == .scrollUp
+
+        switch layout.pane(atColumn: event.column, row: event.row) {
+        case .sidebar:
+            sidebar.scroll(by: up ? -step : step, viewportHeight: layout.height)
+        case .transcript, .mainFooter:
+            // The transcript is the main column's scrollable body; the status and
+            // prompt rows are one line each and scroll it too, so a wheel near the
+            // bottom edge is not silently dead.
+            transcriptView.scrollOffset = max(0, transcriptView.scrollOffset + (up ? step : -step))
+        }
+        surface?.requestRender()
     }
 
     // MARK: Session lifecycle
@@ -158,7 +251,25 @@ public final class ClientApp {
     }
 
     private func open(_ sessionID: String) async {
+        // A new session's transcript is a different document; carrying the old
+        // scroll position into it would open it part-way up at an arbitrary row.
+        transcriptView.scrollToBottom()
         store.select(sessionID)
+
+        // Make the session LIVE on the server before touching its live endpoints.
+        //
+        // The sidebar lists sessions from DISK, but the runtime only knows sessions
+        // it created this process. Every session from a previous launch was therefore
+        // dead: `/events` 404'd (so no transcript updates and, crucially, no
+        // permission_request could ever arrive), and `/prompt` and `/abort` 404'd into
+        // a `try?`. Since bootstrap opens the most recent session, the SECOND and
+        // every later launch of `domo` came up attached to a session where nothing
+        // worked and nothing said so. `createSession(resume:)` is idempotent — it
+        // returns the existing reference when the session is already live — so this is
+        // also correct for the session we just created.
+        _ = try? await client.createSession(resume: sessionID)
+        guard store.selectedSessionID == sessionID else { return }
+
         let history = (try? await client.messages(sessionID: sessionID)) ?? []
         // A newer selection may have superseded this one while messages() was in
         // flight (a slow session opened, then a fast one). Drop this stale
@@ -170,25 +281,55 @@ public final class ClientApp {
         attachEvents(sessionID)
     }
 
+    /// Subscribe to a session's event stream, and KEEP it subscribed.
+    ///
+    /// The stream is the only push path for `permission_request`, so losing it parks
+    /// the server run forever with no modal and no way to answer — the UI keeps
+    /// animating "thinking…", indistinguishable from a slow model. It used to be lost
+    /// permanently by two doors: a thrown transport error (swallowed by an empty
+    /// `catch`) and a clean end-of-body (which fell out of the `for await` and was not
+    /// an error at all). Both now land in the same reconnect loop, and the reconnect
+    /// re-runs the `connected` reconcile, which recovers any prompt asked while the
+    /// client was away.
     private func attachEvents(_ sessionID: String) {
         eventTask?.cancel()
         eventTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                for try await event in self.client.events(sessionID: sessionID) {
-                    self.store.apply(event)
-                    // Reconcile pending prompts only AFTER the SSE is live (the server
-                    // sends `connected` first). Doing the GET before subscribing would
-                    // lose a prompt asked in the gap — the run would hang with no one
-                    // to answer. Now anything asked pre-subscribe is caught by the GET
-                    // and anything after arrives live.
-                    if case .connected = event { await self.reconcilePendingPermissions(sessionID) }
+            var backoffMS = 125
+            while !Task.isCancelled {
+                guard let self, self.store.selectedSessionID == sessionID else { return }
+                do {
+                    for try await event in self.client.events(sessionID: sessionID) {
+                        guard self.store.selectedSessionID == sessionID else { return }
+                        if case .connected = event {
+                            // Reconcile pending prompts only AFTER the SSE is live (the
+                            // server sends `connected` first). Doing the GET before
+                            // subscribing would lose a prompt asked in the gap.
+                            backoffMS = 125
+                            self.setStreamConnected(true)
+                            self.store.apply(event)
+                            await self.reconcilePendingPermissions(sessionID)
+                            continue
+                        }
+                        self.store.apply(event)
+                    }
+                } catch {
+                    // Fall through to the same retry as a clean end.
                 }
-            } catch {
-                // The stream ended or errored; the next selection re-attaches. The
-                // transcript stays as last seen rather than clearing under the user.
+                guard !Task.isCancelled, self.store.selectedSessionID == sessionID else { return }
+                // The stream is down. Say so — a silent disconnect is exactly what made
+                // this look like a freeze — then retry with bounded backoff.
+                self.setStreamConnected(false)
+                try? await Task.sleep(for: .milliseconds(backoffMS))
+                backoffMS = min(backoffMS * 2, 4000)
             }
         }
+    }
+
+    /// Record the stream's health for the status line, repainting on a change.
+    private func setStreamConnected(_ connected: Bool) {
+        guard streamConnected != connected else { return }
+        streamConnected = connected
+        surface?.requestRender()
     }
 
     /// Fetch and fold any still-open prompts for `sessionID` (a prompt the client
@@ -214,6 +355,10 @@ public final class ClientApp {
 
     private func submit(_ text: String) {
         guard let id = store.selectedSessionID else { return }
+        // Sending snaps the transcript back to the tail: a user who scrolled up to
+        // re-read something and then asks a question must see the answer, not stay
+        // parked in the history while the reply streams in off-screen.
+        transcriptView.scrollToBottom()
         Task { @MainActor [weak self] in
             try? await self?.client.sendPrompt(sessionID: id, prompt: text)
         }
@@ -239,6 +384,13 @@ public final class ClientApp {
         }
     }
 
+    /// The modal's outer width. The content is framed in a ``Box``, whose rows are
+    /// always exactly this wide — which is what makes the modal *opaque*: the old
+    /// unframed overlay spliced only as many columns as each line happened to
+    /// occupy, so the transcript showed through around it and a prompt on a busy
+    /// screen was easy to miss entirely.
+    private static let permissionOverlayWidth = 64
+
     private func presentPermissionOverlay(_ request: PermissionRequest) {
         var items = [SelectItem(value: "once", label: "Allow once", description: nil)]
         if !request.disableAlways {
@@ -246,30 +398,82 @@ public final class ClientApp {
         }
         items.append(SelectItem(value: "reject", label: "Reject", description: nil))
 
-        let list = SelectList(items: items, maxVisible: items.count, keybindings: keybindings)
+        // Fit the modal to the terminal, shedding decoration before substance.
+        //
+        // The overlay compositor keeps a clipped overlay's FIRST rows and drops the
+        // rest, so a modal taller than the screen lost exactly the part that has to be
+        // there: the options, the key hints and the bottom border. The prompt then
+        // looked like decoration and could not be answered — a stalled tool call with
+        // no visible way out. So the options are never optional; the title, the blank
+        // spacers and the hint are, in that order of sacrifice.
+        let available = max(1, (surface?.target.rows ?? 24) - 2)
+        let borderRows = 2
+        var budget = available - borderRows - items.count      // rows left for the rest
+        let showTitle = budget >= 1
+        if showTitle { budget -= 1 }
+        let showAction = budget >= 1
+        if showAction { budget -= 1 }
+        let showHint = budget >= 1
+        if showHint { budget -= 1 }
+        let showSpacers = budget >= 2
+
+        // The list gets whatever vertical room actually remains, so its selection
+        // marker is always on screen — a marker scrolled out of view meant Enter acted
+        // on an option the user could not see.
+        let visibleItems = max(1, min(items.count, available - borderRows))
+        let list = SelectList(items: items, maxVisible: visibleItems, keybindings: keybindings)
         permissionList = list
 
-        let header = Self.permissionHeader(request)
-        let container = Container()
-        for line in header { container.addChild(Text(line, wrap: false)) }
-        container.addChild(list)
+        // Box takes one column of border and one of padding on each side.
+        let innerWidth = Self.permissionOverlayWidth - 4
+        let header = Self.permissionHeader(request, width: innerWidth)
+        let inner = Container()
+        if showTitle, let title = header.first { inner.addChild(Text(title, wrap: false)) }
+        if showAction, header.count > 1 { inner.addChild(Text(header[1], wrap: false)) }
+        if showSpacers { inner.addChild(Spacer(lines: 1)) }
+        inner.addChild(list)
+        if showSpacers { inner.addChild(Spacer(lines: 1)) }
+        if showHint { inner.addChild(Text(dim("↑/↓ choose · Enter confirm · Esc reject"), wrap: false)) }
 
+        var contentHeight = visibleItems
+        if showTitle { contentHeight += 1 }
+        if showAction, header.count > 1 { contentHeight += 1 }
+        if showSpacers { contentHeight += 2 }
+        if showHint { contentHeight += 1 }
+
+        permissionOverlaySize = surface.map { ($0.target.columns, $0.target.rows) }
         permissionHandle = surface?.showOverlay(
-            container,
+            Box(inner, paddingX: 1),
             options: OverlayOptions(
-                width: .absolute(64),
-                minWidth: 30,
-                maxHeight: .absolute(header.count + items.count + 1),
-                anchor: .center,
-                nonCapturing: true
+                width: .absolute(min(Self.permissionOverlayWidth, max(30, surface?.target.columns ?? Self.permissionOverlayWidth))),
+                minWidth: 20,
+                maxHeight: .absolute(contentHeight + borderRows),
+                anchor: .center
             )
         )
+    }
+
+    /// Rebuild the modal when the terminal size changes.
+    ///
+    /// The overlay's height budget is decided once, when the ask arrives. Without
+    /// this, resizing the window smaller while a prompt is up re-clips it back to an
+    /// unanswerable stub, and resizing larger leaves it needlessly cramped.
+    private func rebuildPermissionOverlayIfResized() {
+        guard permissionHandle != nil, let surface, let request = store.pendingPermission else { return }
+        let size = (surface.target.columns, surface.target.rows)
+        guard let previous = permissionOverlaySize, previous != size else {
+            permissionOverlaySize = size
+            return
+        }
+        dismissPermissionOverlay()
+        presentPermissionOverlay(request)
     }
 
     private func dismissPermissionOverlay() {
         permissionHandle?.hide()
         permissionHandle = nil
         permissionList = nil
+        permissionOverlaySize = nil
     }
 
     /// Answer the pending prompt: dismiss the modal, clear the store optimistically
@@ -301,14 +505,34 @@ public final class ClientApp {
         }
     }
 
-    private static func permissionHeader(_ request: PermissionRequest) -> [String] {
-        var lines = ["⚠ Allow \(request.permission)?"]
-        if let command = request.metadata["command"]?.stringValue, !command.isEmpty {
-            lines.append("  " + truncateToWidth(command, 60))
-        } else if let filepath = request.metadata["filepath"]?.stringValue, !filepath.isEmpty {
-            lines.append("  " + truncateToWidth(filepath, 60))
-        } else if let first = request.patterns.first, first != "*" {
-            lines.append("  " + truncateToWidth(first, 60))
+    /// The modal's headline rows: what is being asked for, and on what.
+    ///
+    /// The target is elided from the LEFT, so a deep path keeps the filename that
+    /// actually identifies it, and a multi-line shell command is folded to one row
+    /// so it cannot blow the modal's height budget.
+    ///
+    /// Deliberately glyph-free. `⚠` is East-Asian-ambiguous: terminals disagree with
+    /// each other (and with our own ``graphemeWidth``) about whether it occupies one
+    /// column or two, and inside a framed box a one-column disagreement visibly
+    /// breaks the right border. Bold yellow inside a box is alarm enough, and its
+    /// width is exactly what it looks like.
+    private static func permissionHeader(_ request: PermissionRequest, width: Int) -> [String] {
+        var lines = ["\u{1b}[1;33mPermission required\u{1b}[0m"]
+        let target: String? =
+            request.metadata["command"]?.stringValue
+            ?? request.metadata["filepath"]?.stringValue
+            ?? request.patterns.first.flatMap { $0 == "*" ? nil : $0 }
+
+        // The permission name and the target both come from the model's tool call, so
+        // they are sanitized before being framed — an escape here would erase the very
+        // prompt the user has to answer.
+        let permission = sanitizeUntrustedText(request.permission)
+        let action = "\u{1b}[1m" + permission + sgrReset
+        if let target, !target.isEmpty {
+            let budget = max(1, width - visibleWidth(permission) - 2)
+            lines.append(action + "  " + elideLeading(sanitizeUntrustedText(collapseToOneLine(target)), width: budget))
+        } else {
+            lines.append(action)
         }
         return lines
     }
@@ -324,24 +548,45 @@ extension ClientApp: TerminalApp {
     }
 
     public func renderSync() throws(DoMoError) {
+        // The driver repaints on resize, which is the only hook the app gets; use it
+        // to re-fit a modal that is already up.
+        rebuildPermissionOverlayIfResized()
         try surface?.renderSync()
     }
 
     public func handleInput(_ data: [UInt8]) {
-        // A permission prompt captures all input: arrows move, Enter confirms,
-        // Escape/Ctrl-C reject; everything else is swallowed while a tool waits.
+        // The mouse is handled first, and outside every other branch: scrolling back
+        // through the transcript has to work WHILE a modal is up (that is exactly
+        // when you want to re-read what the tool is about to do), and a wheel report
+        // that fell through to a text handler would be typed into the prompt as
+        // escape gibberish.
+        if let mouse = decodeMouseEvent(data) {
+            handleMouse(mouse)
+            return
+        }
+        // Ctrl-C quits, ALWAYS — checked before the modal, which used to consume it.
+        // A modal that swallowed Ctrl-C turned it into "reject this one prompt", so an
+        // agent that re-asks on every tool call left the session genuinely unquittable
+        // while the status bar still advertised "^C: quit".
+        if data == Self.ctrlC { quit.quit(); return }
+        // A permission prompt captures the rest of the keyboard: arrows move, Enter
+        // confirms, Escape rejects; everything else is swallowed while a tool waits.
         if let list = permissionList {
+            // Kitty key-RELEASE frames are not answers. Every other input path in the
+            // app drops them (ScreenSurface honours `wantsKeyRelease`); this branch
+            // bypassed that, so on a Kitty-protocol terminal the release of the very
+            // key that opened the modal could confirm it.
+            if isKeyRelease(data) { return }
             if keybindings.matches(data, .selectUp) || keybindings.matches(data, .selectDown) {
                 list.handleInput(data)
                 surface?.requestRender()
             } else if keybindings.matches(data, .selectConfirm) {
                 answer(Self.reply(for: list.getSelectedItem()?.value))
-            } else if keybindings.matches(data, .selectCancel) || data == Self.ctrlC {
+            } else if keybindings.matches(data, .selectCancel) {
                 answer(.reject(message: nil))
             }
             return
         }
-        if data == Self.ctrlC { quit.quit(); return }
         if data == Self.escape { abort(); return }
         surface?.handleInput(data)
     }

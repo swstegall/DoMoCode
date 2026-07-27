@@ -11,7 +11,8 @@ import DoMoTermGraphics
 import DoMoTUI
 
 /// Lays the transcript's text + image rows into a rect, pinned to the bottom
-/// (auto-scroll to the newest rows).
+/// (auto-scroll to the newest rows) unless the view carries a scroll offset, in
+/// which case the viewport is that many rows further up.
 @MainActor
 struct TranscriptNode: LayoutNode {
     let view: TranscriptView
@@ -33,8 +34,17 @@ struct TranscriptNode: LayoutNode {
     func place(in rect: Rect, into buffer: inout CellBuffer) {
         guard rect.width > 0, rect.height > 0 else { return }
         let rows = view.visualRows(width: rect.width, capabilities: capabilities, cell: cell)
-        // Tail-clip to the last rect.height visual rows (newest at the bottom).
-        let shown = rows.count > rect.height ? Array(rows.suffix(rect.height)) : rows
+        // The viewport is `rect.height` rows ending `scrollOffset` rows above the
+        // newest row. Clamping happens HERE — this is the only place that knows the
+        // viewport height — and the clamped value is written back so the app's
+        // scroll handler and the status line agree with what was actually painted
+        // (a wheel spun past the top must not leave a phantom offset behind).
+        let maxOffset = max(0, rows.count - rect.height)
+        let offset = min(max(0, view.scrollOffset), maxOffset)
+        view.scrollOffset = offset
+        let end = max(0, rows.count - offset)
+        let start = max(0, end - rect.height)
+        let shown = Array(rows[start..<end])
         for (i, row) in shown.enumerated() {
             let screenRow = rect.y + i
             switch row {

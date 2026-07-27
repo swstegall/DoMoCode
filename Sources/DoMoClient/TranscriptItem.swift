@@ -8,6 +8,31 @@
 
 import DoMoLLM
 
+// MARK: - Tool call state
+
+/// Where a tool call has got to.
+///
+/// The wire carries `tool_start` and `tool_end` but nothing in between, and the
+/// gap between them is exactly where a run parks waiting for the user to approve
+/// the call. Modelling the middle explicitly is what lets the transcript say
+/// "running" and "waiting for you" rather than showing a finished-looking row with
+/// an empty result — the state a user reads as "it froze".
+public enum ToolCallState: Sendable, Hashable {
+    /// Started, still executing.
+    case running
+    /// Started, and parked on a permission prompt nobody has answered yet.
+    case awaitingApproval
+    /// Finished successfully.
+    case succeeded
+    /// Finished with an error (including a rejected permission).
+    case failed
+
+    /// Whether the call is still in flight — the two states that animate.
+    public var isActive: Bool {
+        self == .running || self == .awaitingApproval
+    }
+}
+
 // MARK: - Transcript item
 
 /// One rendered block in a session transcript.
@@ -24,9 +49,14 @@ public enum TranscriptItem: Sendable, Hashable {
     case assistant(String)
     /// Assistant reasoning, when the gateway forwarded it.
     case reasoning(String)
-    /// A tool invocation and its result. `output` is empty while the tool runs
-    /// (between `tool_start` and `tool_end`).
-    case tool(name: String, output: String, isError: Bool, imageCount: Int)
+    /// A tool invocation and its result.
+    ///
+    /// `detail` is the one-line argument summary (the file path, the shell command,
+    /// the search pattern) taken from the `tool_start` arguments, so the row says
+    /// *what* the tool is doing and not merely that it is doing something. `output`
+    /// is empty until `tool_end`; `state` says whether that emptiness means
+    /// "running", "waiting for you", or "finished with nothing to say".
+    case tool(name: String, detail: String, output: String, state: ToolCallState, imageCount: Int)
     /// An image to display inline — a user attachment or a tool-produced image.
     /// The `imageId` is a stable Kitty id, allocated once when the item is created,
     /// so the differential renderer can track and delete the image across frames.

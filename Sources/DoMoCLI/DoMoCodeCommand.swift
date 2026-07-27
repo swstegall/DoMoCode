@@ -588,7 +588,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let target = TerminalOutputTarget()
         let input = TerminalDriver.standardInputStream()
         let resize = TerminalSize.resizeStream()
-        let lifecycle = TerminalLifecycle()
+        // The full-screen UI declares the terminal state it needs (alternate screen
+        // + mouse reporting); this must not be a default-constructed lifecycle, as
+        // it once was — see `fullScreenClientLifecycle`.
+        let lifecycle = fullScreenClientLifecycle()
         do {
             try await runFullScreenClient(
                 baseURL: baseURL,

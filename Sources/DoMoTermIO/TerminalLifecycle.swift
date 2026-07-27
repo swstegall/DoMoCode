@@ -49,6 +49,17 @@ private let enterAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049h".utf8)
 /// the saved cursor, exactly reversing `?1049h`. Part of the full-screen exit
 /// sequence, and the byte a crash must never fail to emit.
 private let exitAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049l".utf8)
+/// Enable mouse reporting: `?1000h` turns on button/wheel reports, `?1006h` asks
+/// for them in the SGR encoding (decimal, unbounded coordinates, press and release
+/// distinguishable). Only written in full-screen mode — on the alternate screen
+/// there is no scrollback for the terminal to scroll, so the wheel is the app's to
+/// handle; inline, taking the mouse would break the user's own selection and
+/// scrollback for no gain.
+private let enableMouseSequence: [UInt8] = Array("\u{1b}[?1000h\u{1b}[?1006h".utf8)
+/// Disable mouse reporting, in reverse of enable. A terminal left in `?1000h`
+/// after a crash types raw mouse escapes into the user's shell, so this is part of
+/// the crash-safe restore, not merely of `stop()`.
+private let disableMouseSequence: [UInt8] = Array("\u{1b}[?1006l\u{1b}[?1000l".utf8)
 
 /// The teardown bytes for the inline model: disable paste, then show cursor —
 /// the exact reverse of the enter order. Preallocated so the restore path, which
@@ -61,6 +72,12 @@ private let inlineExitSequence: [UInt8] = disableBracketedPasteSequence + showCu
 /// alternate screen (`?1049l` LAST — the exact reverse of enter, whose alt-screen
 /// switch came first). Preallocated for the same allocation-free-restore reason.
 private let alternateScreenExitSequence: [UInt8] = inlineExitSequence + exitAlternateScreenSequence
+/// Full-screen with the mouse taken: release the mouse FIRST (enter took it last),
+/// then the ordinary full-screen teardown. Preallocated, like its siblings — the
+/// four mode combinations are all precomputed so `performRestore` only ever
+/// replays a stored array.
+private let mouseInlineExitSequence: [UInt8] = disableMouseSequence + inlineExitSequence
+private let mouseAlternateScreenExitSequence: [UInt8] = disableMouseSequence + alternateScreenExitSequence
 
 // MARK: - Global restore registry
 
@@ -156,8 +173,13 @@ public final class TerminalLifecycle: Sendable {
     private let outputDescriptor: Int32
     /// Whether enter switches to the alternate screen buffer and teardown leaves
     /// it. Fixed at init; it selects the exit sequence registered for the
-    /// crash-safe restore.
-    private let useAlternateScreen: Bool
+    /// crash-safe restore. Readable so a caller's *choice* of terminal mode can be
+    /// asserted without standing up a tty — the mode a UI needs is part of its
+    /// contract, not an implementation detail of `enter()`.
+    public let useAlternateScreen: Bool
+    /// Whether enter takes over mouse reporting and teardown gives it back. Fixed
+    /// at init, and readable, for the same reasons as ``useAlternateScreen``.
+    public let enableMouse: Bool
 
     /// The signal sources, retained so they keep firing. Non-`Sendable`
     /// `DispatchSource`s live safely inside the `Mutex`, which serialises every
@@ -170,25 +192,37 @@ public final class TerminalLifecycle: Sendable {
     ///   - useAlternateScreen: when true, enter the alternate screen buffer on
     ///     ``enter()`` and leave it on teardown. Defaults to false — the inline
     ///     model — so existing callers are unaffected.
+    ///   - enableMouse: when true, take over mouse reporting (`?1000h`/`?1006h`)
+    ///     on ``enter()`` and give it back on teardown, so the app receives wheel
+    ///     and click reports on stdin. Defaults to false; pair it with
+    ///     `useAlternateScreen`, since inline the terminal's own scrollback is the
+    ///     better owner of the wheel.
     public init(
         inputDescriptor: Int32 = STDIN_FILENO,
         outputDescriptor: Int32 = STDOUT_FILENO,
-        useAlternateScreen: Bool = false
+        useAlternateScreen: Bool = false,
+        enableMouse: Bool = false
     ) {
         self.inputDescriptor = inputDescriptor
         self.outputDescriptor = outputDescriptor
         self.useAlternateScreen = useAlternateScreen
+        self.enableMouse = enableMouse
     }
 
     /// The exact teardown bytes replayed on exit for a given mode.
     ///
     /// The single source ``enter()`` draws the registration's exit sequence from,
-    /// exposed so the crash-safe ordering — paste disabled and cursor shown BEFORE
-    /// the alternate screen is left, with `?1049l` LAST — can be asserted without
+    /// exposed so the crash-safe ordering — mouse released FIRST, then paste
+    /// disabled and cursor shown, with `?1049l` LAST — can be asserted without
     /// standing up a real terminal. Because the registration uses this, the tested
     /// bytes are exactly the emitted bytes.
-    public static func teardownSequence(useAlternateScreen: Bool) -> [UInt8] {
-        useAlternateScreen ? alternateScreenExitSequence : inlineExitSequence
+    public static func teardownSequence(useAlternateScreen: Bool, enableMouse: Bool = false) -> [UInt8] {
+        switch (useAlternateScreen, enableMouse) {
+        case (false, false): return inlineExitSequence
+        case (true, false): return alternateScreenExitSequence
+        case (false, true): return mouseInlineExitSequence
+        case (true, true): return mouseAlternateScreenExitSequence
+        }
     }
 
     /// Enter raw mode, optionally switch to the alternate screen, hide the
@@ -214,8 +248,14 @@ public final class TerminalLifecycle: Sendable {
         }
         writeAll(outputDescriptor, hideCursorSequence)
         writeAll(outputDescriptor, enableBracketedPasteSequence)
+        // Mouse LAST, so teardown (which releases it first) is the exact reverse.
+        // Gated on a real tty for the same reason the alt-screen switch is: a
+        // redirected stdout must not collect tracking-mode escapes.
+        if enableMouse, isatty(outputDescriptor) == 1 {
+            writeAll(outputDescriptor, enableMouseSequence)
+        }
 
-        let exitSequence = Self.teardownSequence(useAlternateScreen: useAlternateScreen)
+        let exitSequence = Self.teardownSequence(useAlternateScreen: useAlternateScreen, enableMouse: enableMouse)
         restoreRegistration.withLock { slot in
             slot = RestoreRegistration(
                 rawMode: rawMode,

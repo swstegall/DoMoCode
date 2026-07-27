@@ -88,17 +88,21 @@ public final class EventStore {
             case .system:
                 continue
             case .user(let user):
-                if !user.text.isEmpty { transcript.append(.user(user.text)) }
+                if !user.text.isEmpty { transcript.append(.user(sanitizeUntrustedText(user.text))) }
                 appendImages(user.content.compactMap(\.imageBlock))
             case .assistant(let assistant):
                 if !assistant.text.isEmpty {
-                    transcript.append(.assistant(assistant.text))
+                    transcript.append(.assistant(sanitizeUntrustedText(assistant.text)))
                 }
             case .tool(let result):
+                // History carries no arguments (the tool-result message has only the
+                // name and the output), so `detail` is empty for seeded rows — live
+                // rows fill it from `tool_start`.
                 transcript.append(.tool(
-                    name: result.toolName,
-                    output: result.output,
-                    isError: result.isError,
+                    name: sanitizeUntrustedText(result.toolName),
+                    detail: "",
+                    output: sanitizeUntrustedText(result.output),
+                    state: result.isError ? .failed : .succeeded,
                     imageCount: result.images.count
                 ))
                 appendImages(result.images)
@@ -128,6 +132,11 @@ public final class EventStore {
             // A turn that ended cannot still be waiting on approval.
             if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
             pendingPermission = nil
+            // The loop emits a `tool_end` for every call it started, including
+            // aborted ones — but a run that died before the loop settled (the
+            // server's `errored` close) can leave a row in flight. Settle it, so a
+            // spinner cannot outlive the turn that owns it.
+            settleActiveToolCalls()
 
         case .permissionRequest(let id, let sessionID, let permission, let patterns, let always, let metadata, let disableAlways):
             // Drop a prompt that is NOT for the selected session (a late frame from a
@@ -139,15 +148,19 @@ public final class EventStore {
                 id: id, sessionID: sessionID, permission: permission,
                 patterns: patterns, always: always, metadata: metadata, disableAlways: disableAlways
             )
+            markPendingToolAwaitingApproval()
 
         case .permissionResolved(let id):
             resolvedRequestIDs.insert(id)
-            if pendingPermission?.id == id { pendingPermission = nil }
+            if pendingPermission?.id == id {
+                pendingPermission = nil
+                markPendingToolAwaitingApproval()
+            }
 
         case .messageStart(let message):
             switch message {
             case .user(let user):
-                if !user.text.isEmpty { transcript.append(.user(user.text)) }
+                if !user.text.isEmpty { transcript.append(.user(sanitizeUntrustedText(user.text))) }
                 appendImages(user.content.compactMap(\.imageBlock))
             case .assistant:
                 // Don't reserve a row yet: the first non-empty delta (or a
@@ -161,8 +174,8 @@ public final class EventStore {
             }
 
         case .messageDelta(let text, let reasoning):
-            if let text, !text.isEmpty { appendAssistantDelta(text) }
-            if let reasoning, !reasoning.isEmpty { appendReasoningDelta(reasoning) }
+            if let text, !text.isEmpty { appendAssistantDelta(sanitizeUntrustedText(text)) }
+            if let reasoning, !reasoning.isEmpty { appendReasoningDelta(sanitizeUntrustedText(reasoning)) }
 
         case .messageEnd(let message):
             switch message {
@@ -171,9 +184,9 @@ public final class EventStore {
                 // a row was streamed, else append. A tool-call-only turn (empty text)
                 // leaves nothing.
                 if let index = streamingAssistantIndex, transcript.indices.contains(index) {
-                    transcript[index] = .assistant(assistant.text)
+                    transcript[index] = .assistant(sanitizeUntrustedText(assistant.text))
                 } else {
-                    transcript.append(.assistant(assistant.text))
+                    transcript.append(.assistant(sanitizeUntrustedText(assistant.text)))
                 }
             case .tool(let result):
                 // The tool row itself came from tool_start/tool_end (which carry only
@@ -186,12 +199,37 @@ public final class EventStore {
             streamingAssistantIndex = nil
             streamingReasoningIndex = nil
 
-        case .toolStart(let id, let name, _):
-            transcript.append(.tool(name: name, output: "", isError: false, imageCount: 0))
+        case .toolStart(let id, let name, let arguments):
+            // The arguments ride the wire and used to be dropped on the floor; they
+            // are what turns an anonymous `edit` row into `edit  src/Foo.swift`.
+            transcript.append(.tool(
+                name: sanitizeUntrustedText(name),
+                detail: toolCallDetail(name: name, arguments: arguments),
+                output: "",
+                state: .running,
+                imageCount: 0
+            ))
             toolIndexByID[id] = transcript.count - 1
+            // A prompt can be asked before this row exists (the ask and the start are
+            // separate frames, and the drop-oldest stream can reorder nothing but can
+            // deliver the ask first on a reconcile); re-apply the marking so the new
+            // row picks it up.
+            markPendingToolAwaitingApproval()
 
         case .toolEnd(let id, let name, let output, let isError, let imageCount):
-            let item = TranscriptItem.tool(name: name, output: output, isError: isError, imageCount: imageCount)
+            // Keep the detail from `tool_start` — `tool_end` does not repeat it.
+            var detail = ""
+            if let index = toolIndexByID[id], transcript.indices.contains(index),
+               case .tool(_, let existing, _, _, _) = transcript[index] {
+                detail = existing
+            }
+            let item = TranscriptItem.tool(
+                name: sanitizeUntrustedText(name),
+                detail: detail,
+                output: sanitizeUntrustedText(output),
+                state: isError ? .failed : .succeeded,
+                imageCount: imageCount
+            )
             if let index = toolIndexByID[id], transcript.indices.contains(index) {
                 transcript[index] = item
                 toolIndexByID[id] = nil
@@ -200,6 +238,38 @@ public final class EventStore {
             }
         }
         onChange?()
+    }
+
+    // MARK: Tool call state
+
+    /// The tool call currently in flight, if any — what the status line reports so
+    /// "busy" can name the thing it is busy with.
+    public var activeToolCall: (name: String, detail: String, state: ToolCallState)? {
+        for item in transcript.reversed() {
+            guard case .tool(let name, let detail, _, let state, _) = item else { continue }
+            if state.isActive { return (name, detail, state) }
+        }
+        return nil
+    }
+
+    /// Mark the newest in-flight tool row as parked on approval, or put it back to
+    /// running when nothing is pending.
+    ///
+    /// Permission asks are strictly sequential (the agent loop prepares tool calls
+    /// one at a time, and the ask happens inside that preparation), so "the newest
+    /// active tool call" is unambiguously the one being asked about. Deriving it
+    /// this way means no new field has to be threaded onto the wire to correlate a
+    /// request id with a tool call id.
+    private func markPendingToolAwaitingApproval() {
+        let wanted: ToolCallState = pendingPermission == nil ? .running : .awaitingApproval
+        for index in transcript.indices.reversed() {
+            guard case .tool(let name, let detail, let output, let state, let imageCount) = transcript[index] else { continue }
+            guard state.isActive else { continue }
+            if state != wanted {
+                transcript[index] = .tool(name: name, detail: detail, output: output, state: wanted, imageCount: imageCount)
+            }
+            return
+        }
     }
 
     // MARK: Streaming helpers
@@ -239,7 +309,21 @@ public final class EventStore {
     /// overlay-reconcile does not re-present the request it just answered.
     public func clearPendingPermission() {
         pendingPermission = nil
+        markPendingToolAwaitingApproval()
         onChange?()
+    }
+
+    /// Turn any still-in-flight tool row into a terminal state. A call that never
+    /// reported an end did not succeed, so it settles as failed rather than being
+    /// left to look either finished or forever busy.
+    private func settleActiveToolCalls() {
+        for index in transcript.indices {
+            guard case .tool(let name, let detail, let output, let state, let imageCount) = transcript[index],
+                  state.isActive
+            else { continue }
+            transcript[index] = .tool(name: name, detail: detail, output: output, state: .failed, imageCount: imageCount)
+        }
+        toolIndexByID = [:]
     }
 
     private func endStreaming() {

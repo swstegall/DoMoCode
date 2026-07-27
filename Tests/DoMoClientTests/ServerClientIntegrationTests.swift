@@ -125,6 +125,72 @@ struct ServerClientIntegrationTests {
         _ = try? await serverTask.value
     }
 
+    @Test("A session from a previous launch is dead until resumed — and resuming revives it")
+    func sessionFromAPreviousLaunchMustBeResumed() async throws {
+        // The regression this pins: the sidebar lists sessions from DISK, but the
+        // runtime only knows the ones IT created. Every session from an earlier launch
+        // was therefore inert — /events, /prompt and /abort all 404 — and because
+        // bootstrap opens the most recent session, the second and every later launch
+        // of `domo` came up attached to a session where nothing worked and nothing
+        // said so. It looked exactly like a hang.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+
+        // Launch 1: create a session, then tear the server down.
+        let first = makeServer(dirs, answer: "from launch one")
+        let (firstPorts, firstCont) = AsyncStream<Int>.makeStream()
+        let firstTask = Task { try await first.run(onReady: { firstCont.yield($0); firstCont.finish() }) }
+        var firstIterator = firstPorts.makeAsyncIterator()
+        let firstPort = await firstIterator.next() ?? 0
+        let http = HTTPClient(eventLoopGroupProvider: .singleton)
+        let sessionID = try await ServerClient(
+            baseURL: "http://127.0.0.1:\(firstPort)", token: Self.token, http: http
+        ).createSession().id
+        firstTask.cancel()
+        _ = try? await firstTask.value
+
+        // Launch 2: a fresh runtime over the same session directory. The session is on
+        // disk and listed, but the runtime has never heard of it.
+        let second = makeServer(dirs, answer: "from launch two")
+        let (secondPorts, secondCont) = AsyncStream<Int>.makeStream()
+        let secondTask = Task { try await second.run(onReady: { secondCont.yield($0); secondCont.finish() }) }
+        var secondIterator = secondPorts.makeAsyncIterator()
+        let secondPort = await secondIterator.next() ?? 0
+        let client = ServerClient(baseURL: "http://127.0.0.1:\(secondPort)", token: Self.token, http: http)
+
+        #expect(try await client.listSessions().contains { $0.id == sessionID }, "listed from disk")
+
+        // Before resuming, the live endpoints reject it.
+        do {
+            try await client.sendPrompt(sessionID: sessionID, prompt: "does this reach the agent?")
+            Issue.record("expected an un-resumed session to be unknown to the runtime")
+        } catch let ServerClientError.unexpectedStatus(status, _) {
+            #expect(status == 404)
+        }
+
+        // Resuming makes it live, and it is idempotent (the client calls it on every
+        // open, including for a session it just created).
+        let resumed = try await client.createSession(resume: sessionID)
+        #expect(resumed.id == sessionID)
+        #expect(try await client.createSession(resume: sessionID).id == sessionID)
+
+        // Now the whole live surface works: subscribe, prompt, and receive the turn.
+        var sawEnd = false
+        var posted = false
+        for try await event in client.events(sessionID: sessionID) {
+            if case .connected = event, !posted {
+                posted = true
+                try await client.sendPrompt(sessionID: sessionID, prompt: "hello again")
+            }
+            if case .agentEnd = event { sawEnd = true; break }
+        }
+        #expect(sawEnd)
+
+        try await http.shutdown()
+        secondTask.cancel()
+        _ = try? await secondTask.value
+    }
+
     @Test("A wrong bearer token is rejected with 401")
     func unauthorized() async throws {
         let dirs = try Dirs()

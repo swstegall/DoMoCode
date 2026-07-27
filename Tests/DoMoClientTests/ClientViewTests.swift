@@ -68,12 +68,12 @@ struct ClientViewTests {
         view.items = [
             .user("hi there"),
             .assistant("hello back"),
-            .tool(name: "bash", output: "ok", isError: false, imageCount: 0),
+            .tool(name: "bash", detail: "", output: "ok", state: .succeeded, imageCount: 0),
         ]
         let lines = view.render(width: 40)
         #expect(lines.contains { $0.contains("›") && $0.contains("hi there") })
         #expect(lines.contains { $0.contains("hello back") })
-        #expect(lines.contains { $0.contains("⚙") && $0.contains("bash") })
+        #expect(lines.contains { $0.contains("✓") && $0.contains("bash") })
         // Every line fits the width budget.
         #expect(lines.allSatisfy { visibleWidth($0) <= 40 })
     }

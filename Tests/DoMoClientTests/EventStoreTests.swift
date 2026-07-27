@@ -31,7 +31,7 @@ struct EventStoreTests {
         #expect(store.transcript == [
             .user("hi"),
             .assistant("hello"),
-            .tool(name: "bash", output: "ok", isError: false, imageCount: 0),
+            .tool(name: "bash", detail: "", output: "ok", state: .succeeded, imageCount: 0),
         ])
     }
 
@@ -126,9 +126,9 @@ struct EventStoreTests {
     func toolCallInPlace() {
         let store = EventStore()
         store.apply(.toolStart(id: "t1", name: "bash", arguments: .object([:])))
-        #expect(store.transcript == [.tool(name: "bash", output: "", isError: false, imageCount: 0)])
+        #expect(store.transcript == [.tool(name: "bash", detail: "", output: "", state: .running, imageCount: 0)])
         store.apply(.toolEnd(id: "t1", name: "bash", output: "done", isError: false, imageCount: 0))
-        #expect(store.transcript == [.tool(name: "bash", output: "done", isError: false, imageCount: 0)])
+        #expect(store.transcript == [.tool(name: "bash", detail: "", output: "done", state: .succeeded, imageCount: 0)])
     }
 
     @Test("Tool-result messages and system messages never double-count a tool row")
@@ -140,7 +140,7 @@ struct EventStoreTests {
         // NOT add a second row.
         store.apply(.messageStart(.tool(ToolResultBlock(toolCallID: "t1", toolName: "read", output: "contents"))))
         store.apply(.messageEnd(.tool(ToolResultBlock(toolCallID: "t1", toolName: "read", output: "contents"))))
-        #expect(store.transcript == [.tool(name: "read", output: "contents", isError: false, imageCount: 1)])
+        #expect(store.transcript == [.tool(name: "read", detail: "", output: "contents", state: .succeeded, imageCount: 1)])
     }
 
     @Test("Reasoning deltas accumulate into their own item")
@@ -164,7 +164,7 @@ struct EventStoreTests {
         store.apply(.toolStart(id: "t1", name: "bash", arguments: .object([:])))
         store.apply(.toolEnd(id: "t1", name: "bash", output: "ok", isError: false, imageCount: 0))
         store.apply(.agentEnd(reason: "completed"))
-        #expect(store.transcript == [.tool(name: "bash", output: "ok", isError: false, imageCount: 0)])
+        #expect(store.transcript == [.tool(name: "bash", detail: "", output: "ok", state: .succeeded, imageCount: 0)])
     }
 
     @Test("An aborted turn before any output leaves no empty row")
