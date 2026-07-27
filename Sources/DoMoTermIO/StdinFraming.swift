@@ -103,6 +103,22 @@ public struct StdinFramer: Sendable {
     /// cannot drift apart.
     public static let disambiguationTimeout: Duration = .milliseconds(10)
 
+    /// How long a bracketed paste may stay open with no further bytes before the
+    /// framer gives up on its end marker and emits what it has.
+    ///
+    /// Deliberately far longer than ``disambiguationTimeout``: the gap between
+    /// `read()` chunks WITHIN one legitimate paste is routinely tens of milliseconds
+    /// (a large paste, ssh, tmux, a slow link), and cutting a paste in half would be
+    /// worse than the deadlock it guards — the remainder would be re-framed as
+    /// keystrokes, so a pasted newline would submit the prompt mid-paste and pasted
+    /// control bytes would fire commands. This only ever fires after real silence.
+    public static let pasteTimeout: Duration = .milliseconds(750)
+
+    /// The largest paste held in memory before it is force-drained. A terminal that
+    /// sends a start marker and then streams without ever closing it must not be able
+    /// to grow this without bound.
+    private static let pasteBufferLimit = 8 * 1024 * 1024
+
     /// True while an incomplete escape or multi-byte tail is held back.
     ///
     /// The I/O layer polls this after every ``process(_:)`` to decide whether to
@@ -110,6 +126,15 @@ public struct StdinFramer: Sendable {
     /// the start of a longer sequence until either more bytes or the timeout
     /// resolve it.
     public var hasPendingBytes: Bool { !buffer.isEmpty }
+
+    /// Whether an unterminated bracketed paste is open.
+    ///
+    /// Reported separately from ``hasPendingBytes`` because it needs a different
+    /// deadline: an escape tail resolves in milliseconds, a paste does not. Without
+    /// it, an `ESC[200~` whose `ESC[201~` never arrived left the framer swallowing
+    /// EVERY subsequent byte forever — the UI kept painting, but no keystroke, not
+    /// even Ctrl-C, could ever reach it again.
+    public var hasPendingPaste: Bool { pasteMode }
 
     /// Feed a chunk of raw bytes; returns every sequence and paste it completed.
     public mutating func process(_ incoming: [UInt8]) -> [StdinEvent] {
@@ -125,6 +150,7 @@ public struct StdinFramer: Sendable {
     /// tail that will never complete has to leave the buffer rather than swallow
     /// the next real keystroke behind it.
     public mutating func flush() -> [StdinEvent] {
+        if pasteMode { return flushPaste() }
         guard !buffer.isEmpty else { return [] }
         let sequence = buffer
         buffer = []
@@ -132,6 +158,21 @@ public struct StdinFramer: Sendable {
         var events: [StdinEvent] = []
         emitDataSequence(sequence, into: &events)
         return events
+    }
+
+    /// Abandon an unterminated paste, emitting what arrived as paste CONTENT.
+    ///
+    /// Emitted as `.paste`, never re-framed through `extractCompleteSequences`: the
+    /// bytes were announced as data, and an aborted paste's embedded newlines and
+    /// control characters must stay inert rather than becoming a submit and a handful
+    /// of commands.
+    public mutating func flushPaste() -> [StdinEvent] {
+        guard pasteMode else { return [] }
+        let content = pasteBuffer
+        pasteMode = false
+        pasteBuffer = []
+        pendingKittyPrintableCodepoint = nil
+        return content.isEmpty ? [] : [.paste(content)]
     }
 
     /// Drop all buffered and paste state without emitting.
@@ -162,6 +203,11 @@ public struct StdinFramer: Sendable {
             pasteBuffer.append(contentsOf: buffer)
             buffer = []
             drainPasteIfClosed(into: &events)
+            // A paste that never closes must not grow without bound; drain what we
+            // have and return to normal framing.
+            if pasteMode, pasteBuffer.count > StdinFramer.pasteBufferLimit {
+                events.append(contentsOf: flushPaste())
+            }
             return
         }
 

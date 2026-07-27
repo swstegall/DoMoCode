@@ -10,6 +10,7 @@
 
 import DoMoCore
 import DoMoPermissions
+import Foundation
 import DoMoServer
 import DoMoTUI
 import DoMoTermGraphics
@@ -48,9 +49,17 @@ public final class ClientApp {
     private var permissionList: SelectList?
     /// The terminal size the modal was laid out for, so a resize can rebuild it.
     private var permissionOverlaySize: (columns: Int, rows: Int)?
+    /// The modal's row values in order, so Escape can find the "Reject" row without
+    /// assuming a fixed layout (the "always" row is conditional).
+    private var permissionItemValues: [String] = []
     /// Whether the session's event stream is currently up. Surfaced in the status
     /// line, because a dead stream is otherwise indistinguishable from a slow model.
     private var streamConnected = true
+    /// A transient status-line message and when it lapses — the client's only error
+    /// surface. Without one there is nowhere to report a refused or failed action,
+    /// which is precisely why they used to be swallowed.
+    private var notice: String?
+    private var noticeExpiry: Date?
 
     private static let ctrlC: [UInt8] = [0x03]
     private static let escape: [UInt8] = [0x1b]
@@ -164,14 +173,39 @@ public final class ClientApp {
             case .idle: parts.append(store.lastStopReason.map { "idle (\($0))" } ?? "idle")
             }
         }
+        if let notice {
+            parts.append("\u{1b}[33m\(notice)\u{1b}[0m")
+        }
         if transcriptView.scrollOffset > 0 {
             parts.append("↑ \(transcriptView.scrollOffset) rows — scroll down to follow")
         }
-        parts.append("Tab: pane")
-        parts.append("Enter: send")
-        parts.append("Esc: abort")
-        parts.append("^C: quit")
+        // While a modal owns the keyboard the ordinary hints are lies: Enter answers
+        // the prompt rather than sending, and Escape selects Reject rather than
+        // aborting the turn. Advertising the wrong contract is how a user ends up
+        // pressing keys that do something they did not intend.
+        if permissionList != nil {
+            parts.append("↑/↓: choose")
+            parts.append("Enter: answer")
+            parts.append("Esc: select Reject")
+            parts.append("^C: quit")
+        } else {
+            parts.append("Tab: pane")
+            parts.append("Enter: send")
+            parts.append("Esc: abort")
+            parts.append("^C: quit")
+        }
         return parts.joined(separator: "   ")
+    }
+
+    /// Post a transient message to the status line.
+    ///
+    /// The client had no error surface at all, which is why every failure it could
+    /// not handle was simply swallowed. Anything that refuses or loses user input has
+    /// somewhere to say so now.
+    private func post(notice text: String, seconds: Double = 4) {
+        notice = text
+        noticeExpiry = Date().addingTimeInterval(seconds)
+        surface?.requestRender()
     }
 
     private func spinnerGlyph() -> String {
@@ -191,6 +225,11 @@ public final class ClientApp {
         spinnerTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                if let expiry = self.noticeExpiry, Date() >= expiry {
+                    self.notice = nil
+                    self.noticeExpiry = nil
+                    self.surface?.requestRender()
+                }
                 let animating = self.store.runState == .running || self.store.activeToolCall != nil
                 if animating {
                     self.transcriptView.spinnerFrame &+= 1
@@ -353,19 +392,52 @@ public final class ClientApp {
         Task { @MainActor [weak self] in await self?.createAndOpen() }
     }
 
+    /// Send a prompt — and never destroy it silently.
+    ///
+    /// `PromptInput` clears its text BEFORE calling this, so the typed string survives
+    /// only as this argument. It used to be handed to a detached `try?`, so a refusal
+    /// (the server allows one turn at a time and answers 409 `sessionBusy`) erased the
+    /// user's message with no message, no retry and no trace. Two guards now: a
+    /// synchronous one for the common case, which can put the text back in the same
+    /// main-actor turn as the keystroke; and a `catch` for every remaining race, which
+    /// restores it too.
     private func submit(_ text: String) {
-        guard let id = store.selectedSessionID else { return }
+        guard let id = store.selectedSessionID else {
+            promptInput.restore(text)
+            post(notice: "no session is open")
+            return
+        }
+        // The client's view of run state is racy against the server's, so this is an
+        // optimisation of the common case, not the guarantee — the catch below is.
+        if store.runState == .running {
+            promptInput.restore(text)
+            post(notice: "a turn is already running — Esc to abort it, or wait")
+            return
+        }
         // Sending snaps the transcript back to the tail: a user who scrolled up to
         // re-read something and then asks a question must see the answer, not stay
         // parked in the history while the reply streams in off-screen.
         transcriptView.scrollToBottom()
         Task { @MainActor [weak self] in
-            try? await self?.client.sendPrompt(sessionID: id, prompt: text)
+            guard let self else { return }
+            do {
+                try await self.client.sendPrompt(sessionID: id, prompt: text)
+            } catch ServerClientError.unexpectedStatus(409, _) {
+                self.promptInput.restore(text)
+                self.post(notice: "a turn is already running — Esc to abort it, or wait")
+            } catch {
+                self.promptInput.restore(text)
+                self.post(notice: "could not send — the message was put back")
+            }
         }
     }
 
     private func abort() {
-        guard let id = store.selectedSessionID, store.runState == .running else { return }
+        // No `runState == .running` guard: the client's copy of that flag can be stale
+        // (it is reset on every session selection), and aborting an idle session is a
+        // harmless 200 — `ServerRuntime.abort` cancels a nil task and drains an empty
+        // map. Refusing to try was how "Esc does nothing" happened.
+        guard let id = store.selectedSessionID else { return }
         Task { @MainActor [weak self] in
             try? await self?.client.abort(sessionID: id)
         }
@@ -393,8 +465,20 @@ public final class ClientApp {
 
     private func presentPermissionOverlay(_ request: PermissionRequest) {
         var items = [SelectItem(value: "once", label: "Allow once", description: nil)]
-        if !request.disableAlways {
-            items.append(SelectItem(value: "always", label: "Allow always", description: request.always.first.map { "grants \($0)" }))
+        // Name the grant in the ROW, not in a dim hint beside it. This row writes to
+        // the user's global settings.json and survives restarts, so "Allow always"
+        // under a bold `edit  a.txt` must not be read as "always allow edits to
+        // a.txt" when it means something wider. Hidden entirely when there is nothing
+        // to persist, rather than offered as a choice that does nothing.
+        if !request.disableAlways, !request.always.isEmpty {
+            let scope = request.always.count > 1
+                ? "\(request.always[0]) +\(request.always.count - 1) more"
+                : request.always[0]
+            items.append(SelectItem(
+                value: "always",
+                label: "Always allow " + elideLeading(sanitizeUntrustedText(scope), width: 34),
+                description: nil
+            ))
         }
         items.append(SelectItem(value: "reject", label: "Reject", description: nil))
 
@@ -423,6 +507,7 @@ public final class ClientApp {
         let visibleItems = max(1, min(items.count, available - borderRows))
         let list = SelectList(items: items, maxVisible: visibleItems, keybindings: keybindings)
         permissionList = list
+        permissionItemValues = items.map(\.value)
 
         // Box takes one column of border and one of padding on each side.
         let innerWidth = Self.permissionOverlayWidth - 4
@@ -433,7 +518,7 @@ public final class ClientApp {
         if showSpacers { inner.addChild(Spacer(lines: 1)) }
         inner.addChild(list)
         if showSpacers { inner.addChild(Spacer(lines: 1)) }
-        if showHint { inner.addChild(Text(dim("↑/↓ choose · Enter confirm · Esc reject"), wrap: false)) }
+        if showHint { inner.addChild(Text(dim("↑/↓ choose · Enter confirm · Esc selects Reject · ^C quits"), wrap: false)) }
 
         var contentHeight = visibleItems
         if showTitle { contentHeight += 1 }
@@ -469,11 +554,20 @@ public final class ClientApp {
         presentPermissionOverlay(request)
     }
 
+    /// Move the modal's selection onto "Reject" (what Escape does), so the
+    /// destructive answer is one deliberate Enter away rather than one stray byte.
+    private func selectRejectRow() {
+        guard let list = permissionList else { return }
+        list.setSelectedIndex(permissionItemValues.firstIndex(of: "reject") ?? 0)
+        surface?.requestRender()
+    }
+
     private func dismissPermissionOverlay() {
         permissionHandle?.hide()
         permissionHandle = nil
         permissionList = nil
         permissionOverlaySize = nil
+        permissionItemValues = []
     }
 
     /// Answer the pending prompt: dismiss the modal, clear the store optimistically
@@ -583,7 +677,15 @@ extension ClientApp: TerminalApp {
             } else if keybindings.matches(data, .selectConfirm) {
                 answer(Self.reply(for: list.getSelectedItem()?.value))
             } else if keybindings.matches(data, .selectCancel) {
-                answer(.reject(message: nil))
+                // Escape SELECTS "Reject"; it does not answer. A terminal splits an
+                // arrow key into `ESC` and `[B`, and if the two land more than the
+                // disambiguation window apart the lone `ESC` is delivered as a real
+                // Escape — indistinguishable from a keypress at this point, because
+                // the tail only arrives after we would already have replied. Answering
+                // on it meant a cursor keystroke silently rejected the tool call. One
+                // extra Enter is a small price for a destructive action that can be
+                // triggered by a timing race.
+                selectRejectRow()
             }
             return
         }

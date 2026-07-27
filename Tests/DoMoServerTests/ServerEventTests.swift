@@ -75,7 +75,7 @@ struct ServerEventTests {
     @Test("Every case round-trips through JSON")
     func codecRoundTrip() throws {
         let cases: [ServerEvent] = [
-            .connected(protocolVersion: serverProtocolVersion, sessionID: "s-1"),
+            .connected(protocolVersion: serverProtocolVersion, sessionID: "s-1", running: false),
             .heartbeat,
             .agentStart,
             .agentEnd(reason: "completed"),
@@ -102,7 +102,7 @@ struct ServerEventTests {
     @Test("The wire carries a stable snake_case type discriminator and version")
     func wireShape() throws {
         let connected = try JSONValue(parsing: try JSONEncoder().encode(
-            ServerEvent.connected(protocolVersion: 1, sessionID: "s-1")))
+            ServerEvent.connected(protocolVersion: 1, sessionID: "s-1", running: true)))
         #expect(connected["type"]?.stringValue == "connected")
         #expect(connected["protocolVersion"]?.intValue == 1)
         #expect(connected["sessionId"]?.stringValue == "s-1")

@@ -42,23 +42,50 @@ public struct PermissionRequestFactory: Sendable {
             return PermissionRequestSpec(
                 permission: toolName,
                 patterns: [path],
-                always: ["*"],
+                always: Self.pathGrant(path),
                 metadata: ["filepath": .string(path)],
                 configProtected: isProtected(path)
             )
         case "read":
             // read keys on the real path so the `.env` secret guard can classify it.
             let path = pathArgument(arguments)
-            return PermissionRequestSpec(permission: "read", patterns: [path], always: ["*"], metadata: ["filepath": .string(path)])
+            return PermissionRequestSpec(
+                permission: "read",
+                patterns: [path],
+                always: Self.pathGrant(path),
+                metadata: ["filepath": .string(path)]
+            )
         case "ls":
             let path = arguments["path"]?.stringValue ?? "."
-            return PermissionRequestSpec(permission: "ls", patterns: [path], always: ["*"])
+            return PermissionRequestSpec(permission: "ls", patterns: [path], always: Self.pathGrant(path))
         default:
             // find/grep/todo/etc. and every MCP tool: a coarse `*` resource. Known
             // read-only tools are auto-allowed by the baseline; an unknown MCP name is
             // gated exactly like an untrusted call (default `ask`).
             return PermissionRequestSpec(permission: toolName, patterns: ["*"], always: ["*"])
         }
+    }
+
+    /// What "allow always" persists for a path-keyed tool: THAT path, and nothing
+    /// wider.
+    ///
+    /// This used to be `["*"]`. Approving "Allow always" on `edit a.txt` therefore
+    /// wrote `edit: {"*": "allow"}` into the user's GLOBAL settings.json — every edit
+    /// to every file in every project, forever, from a prompt whose bold line read
+    /// `edit  a.txt`. On `read` it was worse: a single "always" on any file disabled
+    /// the `.env` secret guard everywhere, which is the one rule the baseline exists
+    /// to enforce.
+    ///
+    /// A narrow grant is honoured by the resolver — ``resolvePermission`` accepts a
+    /// saved rule when `wildcardMatch(savedPattern, basePattern)`, and a literal path
+    /// matches the baseline's `*` — so this genuinely suppresses the prompt for that
+    /// file while leaving every other file gated. The cost is a prompt per new file;
+    /// that is the honest price of a grant that means what its label says.
+    ///
+    /// An empty path grants nothing, and the surfaces hide the "always" row rather
+    /// than offering a choice that would silently do nothing.
+    private static func pathGrant(_ path: String) -> [String] {
+        path.isEmpty ? [] : [path]
     }
 
     private func bashSpec(_ arguments: JSONValue) -> PermissionRequestSpec {

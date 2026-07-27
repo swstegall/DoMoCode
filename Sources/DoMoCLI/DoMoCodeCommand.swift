@@ -660,11 +660,15 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     + ".domocode/settings.json will not be used. Pass --trust to override and re-trust it."
             )
         case .none:
+            // The message must not blame "print mode": this gate runs for EVERY
+            // surface, so an interactive user opening the TUI in a project that
+            // happens to have a .domocode/settings.json was told their problem was a
+            // mode they had not asked for. Name the actual remedy instead.
             throw DoMoError(
                 .configuration,
-                "Project \(workingDirectory.string) has a .domocode/settings.json but is not trusted, and "
-                    + "non-interactive print mode cannot prompt. Re-run with --trust to trust this directory "
-                    + "(recorded in \(store.path.string)), or remove the file."
+                "Project \(workingDirectory.string) has a .domocode/settings.json, which can change how tools "
+                    + "and permissions behave, and this directory is not trusted yet. Re-run with --trust to "
+                    + "trust it (recorded in \(store.path.string)), or remove the file to run without it."
             )
         }
     }

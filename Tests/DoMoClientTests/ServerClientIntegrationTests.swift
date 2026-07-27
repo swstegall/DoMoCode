@@ -90,7 +90,7 @@ struct ServerClientIntegrationTests {
         var posted = false
         for try await event in client.events(sessionID: ref.id) {
             events.append(event)
-            if case .connected(let version, let sessionID) = event {
+            if case .connected(let version, let sessionID, _) = event {
                 #expect(version == serverProtocolVersion)
                 #expect(sessionID == ref.id)
                 if !posted {

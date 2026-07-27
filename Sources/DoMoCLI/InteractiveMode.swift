@@ -257,7 +257,26 @@ final class InteractiveCoordinator {
     private let completionSeq = Mutex<Int>(0)
 
     private let idleStatus = "  @ file · / command · enter to send · esc to interrupt"
-    private let runningStatus = "  ⋯ working — esc to interrupt"
+
+    /// The animation frame for the running/parked status line, advanced by
+    /// ``progressTask``. The inline surface previously showed a STATIC "⋯ working"
+    /// for the entire turn — through a ten-minute tool call, a model stall, or a
+    /// wedged render loop — so there was nothing on screen that could distinguish
+    /// "busy" from "dead".
+    private var progressFrame = 0
+    private var progressTask: Task<Void, Never>?
+    private static let progressFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    /// The status line while a turn is in flight — animated, and distinct while a
+    /// tool call is parked on approval, which is the state most easily mistaken for
+    /// a freeze.
+    private var runningStatus: String {
+        let glyph = Self.progressFrames[((progressFrame % 10) + 10) % 10]
+        if pendingPermission != nil {
+            return "  \(glyph) waiting for your approval — choose above"
+        }
+        return "  \(glyph) working — esc to interrupt"
+    }
 
     /// The sandboxed filesystem, for resolving `@path` image mentions into
     /// attachments at submit time. `nil` in tests that drive the coordinator
@@ -575,6 +594,9 @@ final class InteractiveCoordinator {
             await withCheckedContinuation { (continuation: CheckedContinuation<PermissionReply, Never>) in
                 pendingPermission = continuation
                 presentPermissionOverlay(request)
+                // Say so in the status line too: the modal is centered, and a user
+                // whose eyes are on the transcript otherwise sees only "working".
+                statusLine.text = runningStatus
                 render()
             }
         } onCancel: {
@@ -591,6 +613,10 @@ final class InteractiveCoordinator {
         permissionHandle?.hide()
         permissionHandle = nil
         permissionList = nil
+        // Put the status line back to plain "working": `runOne` only assigns it at the
+        // start and end of a turn, so the approval-specific text would otherwise
+        // persist for the whole remainder of the run.
+        if running { statusLine.text = runningStatus }
         continuation.resume(returning: reply)
     }
 
@@ -604,8 +630,18 @@ final class InteractiveCoordinator {
 
     private func presentPermissionOverlay(_ request: PermissionRequest) {
         var items = [SelectItem(value: "once", label: "Allow once", description: nil)]
-        if !request.disableAlways {
-            items.append(SelectItem(value: "always", label: "Allow always", description: Self.alwaysHint(request)))
+        // Name the grant in the row itself — it is written to the user's global
+        // settings.json and survives restarts — and offer it only when there is
+        // something to grant.
+        if !request.disableAlways, !request.always.isEmpty {
+            let scope = request.always.count > 1
+                ? "\(request.always[0]) +\(request.always.count - 1) more"
+                : request.always[0]
+            items.append(SelectItem(
+                value: "always",
+                label: "Always allow " + elideLeading(sanitizeUntrustedText(scope), width: 34),
+                description: nil
+            ))
         }
         items.append(SelectItem(value: "reject", label: "Reject", description: nil))
 
@@ -616,13 +652,21 @@ final class InteractiveCoordinator {
         let container = Container()
         for line in header { container.addChild(Text(line, wrap: false)) }
         container.addChild(list)
+        container.addChild(Text("\u{1b}[2m  ↑/↓ choose · enter confirm · esc reject\u{1b}[0m", wrap: false))
 
+        // Budget the height from the rows the container ACTUALLY renders, not from a
+        // count of header strings. A header string containing newlines renders as
+        // several rows, so a multi-line bash command used to push the Allow/Reject
+        // list straight off the bottom of the overlay — an approval prompt with no
+        // visible way to approve. (The header is collapsed to one line now too; this
+        // is the belt to that pair of braces.)
+        let renderedRows = container.render(width: 62).count
         permissionHandle = tui.showOverlay(
             container,
             options: OverlayOptions(
                 width: .absolute(64),
                 minWidth: 30,
-                maxHeight: .absolute(header.count + items.count + 1),
+                maxHeight: .absolute(max(renderedRows, items.count + 1)),
                 anchor: .center,
                 nonCapturing: true
             )
@@ -630,22 +674,20 @@ final class InteractiveCoordinator {
     }
 
     /// The modal's descriptive lines: what tool wants to run and on what.
+    ///
+    /// Collapsed to ONE line and sanitized: the value is model-controlled, so a
+    /// multi-line `bash` command would otherwise grow the modal until the options fell
+    /// off the screen, and a `ESC[2J` in it would erase the very prompt being answered.
     private static func permissionHeader(_ request: PermissionRequest) -> [String] {
-        var lines = ["⚠ Allow \(request.permission)?"]
-        if let command = request.metadata["command"]?.stringValue, !command.isEmpty {
-            lines.append("  " + truncateToWidth(command, 60))
-        } else if let filepath = request.metadata["filepath"]?.stringValue, !filepath.isEmpty {
-            lines.append("  " + truncateToWidth(filepath, 60))
-        } else if let first = request.patterns.first, first != "*" {
-            lines.append("  " + truncateToWidth(first, 60))
+        var lines = ["⚠ Allow \(sanitizeUntrustedText(request.permission))?"]
+        let target: String? =
+            request.metadata["command"]?.stringValue
+            ?? request.metadata["filepath"]?.stringValue
+            ?? request.patterns.first.flatMap { $0 == "*" ? nil : $0 }
+        if let target, !target.isEmpty {
+            lines.append("  " + truncateToWidth(sanitizeUntrustedText(collapseToOneLine(target)), 60))
         }
         return lines
-    }
-
-    /// The "allow always" hint: the broader glob that would be granted.
-    private static func alwaysHint(_ request: PermissionRequest) -> String? {
-        guard let glob = request.always.first else { return nil }
-        return "grants \(glob)"
     }
 
     // MARK: Agent loop
@@ -689,6 +731,7 @@ final class InteractiveCoordinator {
         currentAssistant = nil
         assistantBuffer = ""
         statusLine.text = runningStatus
+        startProgressClock()
         render()
 
         // Resolve any `@path` image mentions into attachments before the turn —
@@ -725,11 +768,35 @@ final class InteractiveCoordinator {
         currentRunTask = nil
 
         running = false
+        stopProgressClock()
         statusLine.text = idleStatus
         if reason == .aborted {
             appendInterrupted()
         }
         render()
+    }
+
+    /// Advance the status-line spinner while a turn is in flight.
+    ///
+    /// ~10 Hz, and only the status row changes, so the differential renderer emits a
+    /// single short row per tick rather than a frame. Cancelled the moment the run
+    /// settles, so an idle REPL is completely silent.
+    private func startProgressClock() {
+        progressTask?.cancel()
+        progressTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard let self, self.running, !Task.isCancelled else { return }
+                self.progressFrame &+= 1
+                self.statusLine.text = self.runningStatus
+                self.render()
+            }
+        }
+    }
+
+    private func stopProgressClock() {
+        progressTask?.cancel()
+        progressTask = nil
     }
 
     /// Resolve `@path` image mentions in a submitted line into image attachments.

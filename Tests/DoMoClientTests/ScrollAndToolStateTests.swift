@@ -288,6 +288,59 @@ struct ScrollAndToolStateTests {
         #expect(detail.contains("⏎"))
     }
 
+    // MARK: Run state and prompt safety
+
+    @Test("Attaching mid-turn adopts the server's run state")
+    func connectedFrameCarriesRunState() {
+        // The client's run state used to be write-once per attach: it learned
+        // "running" only from an `agent_start` it witnessed. Attaching mid-turn — a
+        // session switch, a reconnect, re-opening the same session — therefore left
+        // it stuck on "idle" for the rest of the turn, which killed the spinner,
+        // disabled Esc/abort, and made every prompt look refusable.
+        let store = EventStore()
+        store.select("s1")
+        #expect(store.runState == .idle)
+        store.apply(.connected(protocolVersion: 1, sessionID: "s1", running: true))
+        #expect(store.runState == .running)
+
+        // A fresh attach to a quiet session must NOT invent a running turn.
+        let quiet = EventStore()
+        quiet.select("s2")
+        quiet.apply(.connected(protocolVersion: 1, sessionID: "s2", running: false))
+        #expect(quiet.runState == .idle)
+    }
+
+    @Test("A connected frame never downgrades a turn already known to be running")
+    func connectedDoesNotClobberRunning() {
+        let store = EventStore()
+        store.select("s1")
+        store.apply(.agentStart)
+        store.apply(.connected(protocolVersion: 1, sessionID: "s1", running: false))
+        #expect(store.runState == .running, "a stale `running: false` must not stop a live turn")
+    }
+
+    @Test("A refused prompt is put back, not destroyed")
+    func promptInputRestores() {
+        // `handleInput` clears the text BEFORE onSubmit runs, so the typed string
+        // survives only as the callback argument — and a refused send used to drop it
+        // on the floor with no message.
+        let input = PromptInput()
+        input.focused = true
+        for byte in Array("hello there".utf8) { input.handleInput([byte]) }
+        #expect(input.text == "hello there")
+        input.handleInput([0x0d])            // Enter clears it
+        #expect(input.text.isEmpty)
+
+        input.restore("hello there")
+        #expect(input.text == "hello there")
+
+        // Restoring must not clobber something typed in the meantime: a failure can
+        // arrive asynchronously.
+        for byte in Array("new".utf8) { input.handleInput([byte]) }
+        input.restore("older")
+        #expect(input.text.contains("older") && input.text.contains("new"))
+    }
+
     // MARK: Untrusted text
 
     @Test("Control characters in model/tool text are neutralised")

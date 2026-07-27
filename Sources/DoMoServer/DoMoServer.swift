@@ -264,7 +264,10 @@ public struct DoMoServer: Sendable {
                 forward.cancel()
                 heartbeat.cancel()
             }
-            try await writer.write(Self.frame(.connected(protocolVersion: serverProtocolVersion, sessionID: sessionID)))
+            let running = await runtime.isRunning(sessionID: sessionID)
+            try await writer.write(Self.frame(
+                .connected(protocolVersion: serverProtocolVersion, sessionID: sessionID, running: running)
+            ))
             for await event in merged {
                 try await writer.write(Self.frame(event))
             }

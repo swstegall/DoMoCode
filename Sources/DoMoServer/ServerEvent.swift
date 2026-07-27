@@ -32,8 +32,16 @@ public let serverProtocolVersion = 1
 /// source; every other case is produced by ``project(_:)``.
 public enum ServerEvent: Sendable, Hashable {
     /// The opening frame, sent once when a client attaches. Carries the protocol
-    /// version so a client verifies compatibility before reading anything else.
-    case connected(protocolVersion: Int, sessionID: String)
+    /// version so a client verifies compatibility before reading anything else, and
+    /// whether a turn is ALREADY running.
+    ///
+    /// `running` exists because the client's run state is otherwise write-once per
+    /// attach: it learns "running" only from an `agent_start` it was present for. A
+    /// client that attaches mid-turn — a session switch, a reconnect, re-opening the
+    /// same session — therefore believed the session was idle for the rest of the
+    /// turn, which disabled Esc/abort and made the spinner stop. Run state has to be
+    /// authoritative from the side that owns it.
+    case connected(protocolVersion: Int, sessionID: String, running: Bool)
     /// A periodic keep-alive so a proxy or a client read-timeout does not tear
     /// down an idle-but-live stream between turns.
     case heartbeat
@@ -146,6 +154,7 @@ extension ServerEvent: Codable {
         case type
         case protocolVersion
         case sessionID = "sessionId"
+        case running
         case reason
         case message
         case text
@@ -169,7 +178,10 @@ extension ServerEvent: Codable {
         case .connected:
             self = .connected(
                 protocolVersion: try container.decode(Int.self, forKey: .protocolVersion),
-                sessionID: try container.decode(String.self, forKey: .sessionID)
+                sessionID: try container.decode(String.self, forKey: .sessionID),
+                // Absent from an older server's frame; "not running" is the safe
+                // default, and matches the previous behaviour exactly.
+                running: try container.decodeIfPresent(Bool.self, forKey: .running) ?? false
             )
         case .heartbeat:
             self = .heartbeat
@@ -222,10 +234,11 @@ extension ServerEvent: Codable {
     public func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .connected(let protocolVersion, let sessionID):
+        case .connected(let protocolVersion, let sessionID, let running):
             try container.encode(Kind.connected, forKey: .type)
             try container.encode(protocolVersion, forKey: .protocolVersion)
             try container.encode(sessionID, forKey: .sessionID)
+            try container.encode(running, forKey: .running)
         case .heartbeat:
             try container.encode(Kind.heartbeat, forKey: .type)
         case .agentStart:

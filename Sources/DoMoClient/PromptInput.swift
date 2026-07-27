@@ -17,6 +17,19 @@ final class PromptInput: @MainActor Focusable {
     var onSubmit: ((String) -> Void)?
 
     private(set) var text = ""
+
+    /// Put a submitted message back after the send was refused.
+    ///
+    /// `handleInput` clears `text` before `onSubmit` runs, so a failed send would
+    /// otherwise destroy what the user typed. Restoring PREPENDS rather than
+    /// overwrites: a failure can arrive asynchronously, by which time the user may
+    /// already be typing the next thing, and clobbering that would trade one kind of
+    /// data loss for another.
+    func restore(_ restored: String) {
+        guard !restored.isEmpty else { return }
+        text = text.isEmpty ? restored : restored + " " + text
+    }
+
     private let prompt = "❯ "
     private let placeholder = "Type a message — Enter to send, Tab to switch pane"
 

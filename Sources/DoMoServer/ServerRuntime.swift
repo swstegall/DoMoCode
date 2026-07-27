@@ -358,6 +358,15 @@ public actor ServerRuntime {
         }
     }
 
+    /// Whether a turn is currently in flight for `sessionID`.
+    ///
+    /// The runtime is the only authority on this — the client's copy is reset on every
+    /// session selection — so a client attaching mid-turn asks rather than assumes.
+    /// An unknown session is not running.
+    public func isRunning(sessionID: String) -> Bool {
+        sessions[sessionID]?.runTask != nil
+    }
+
     /// The broadcast sink for a live session, for the SSE handler to subscribe to.
     public func sink(for sessionID: String) throws -> BroadcastEventSink {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }

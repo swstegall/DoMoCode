@@ -314,12 +314,19 @@ public final class TerminalDriver {
         let events = framer.process(chunk)
         dispatch(events, to: app)
 
-        // A held tail (a lone ESC, a split CSI) is neither a keypress nor noise
-        // until the disambiguation window closes. Arm the flush the framer's I/O
-        // contract asks for; a following chunk cancels it above.
-        if framer.hasPendingBytes {
+        // A held tail (a lone ESC, a split CSI) is neither a keypress nor noise until
+        // the disambiguation window closes. An OPEN PASTE is held too, but on a much
+        // longer deadline — the gap between chunks inside one paste is routinely
+        // longer than the 10 ms escape window, and firing early would chop the paste
+        // and re-frame its remainder as keystrokes. Either way a following chunk
+        // cancels the timer above, so these only fire after real silence.
+        let timeout: Duration? =
+            framer.hasPendingBytes
+            ? StdinFramer.disambiguationTimeout
+            : (framer.hasPendingPaste ? StdinFramer.pasteTimeout : nil)
+        if let timeout {
             flushTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: StdinFramer.disambiguationTimeout)
+                try? await Task.sleep(for: timeout)
                 guard let self, !Task.isCancelled else { return }
                 let flushed = self.framer.flush()
                 self.dispatch(flushed, to: app)

@@ -519,7 +519,12 @@ public func matchesKey(_ data: [UInt8], _ keyId: KeyId, kittyProtocolActive: Boo
     switch keyId.base {
     case .escape:
         if modifier != 0 { return false }
+        // `[esc, esc]` is Escape too — see the matching note in `parseKey`. This
+        // case is separate from `parseKey` (a binding match never routes through
+        // it), so the two have to agree explicitly or a keybinding would still see
+        // a double Escape as nothing at all.
         return data == [esc]
+            || data == [esc, esc]
             || matchesKittySequence(data, Codepoint.escape, 0)
             || matchesModifyOtherKeys(data, Codepoint.escape, 0)
 
@@ -801,10 +806,17 @@ public func parseKey(_ data: [UInt8], kittyProtocolActive: Bool = false) -> KeyI
     if let mapped = legacySequenceKeyIds[data] { return mapped }
 
     if data == [esc] { return Key.escape }
+    // `ESC ESC` is a user mashing Escape, not a chord. The framer holds a lone ESC
+    // for the disambiguation window and then flushes whatever it has, so two Escapes
+    // pressed in quick succession arrive as one two-byte sequence — which decoded to
+    // ctrl+alt+`[`, a chord nothing in this program binds, so the keypress vanished
+    // and a user hammering Escape at a modal got no response whatsoever. Decoding it
+    // as Escape fixes every consumer at once (the modals, the abort key, SelectList)
+    // and costs nothing: alt+Escape has no binding here.
+    if data == [esc, esc] { return Key.escape }
     if data == [0x1c] { return KeyId(base: .char("\\"), ctrl: true) }
     if data == [0x1d] { return KeyId(base: .char("]"), ctrl: true) }
     if data == [0x1f] { return KeyId(base: .char("-"), ctrl: true) }
-    if data == [esc, 0x1b] { return KeyId(base: .char("["), alt: true, ctrl: true) }
     if data == [esc, 0x1c] { return KeyId(base: .char("\\"), alt: true, ctrl: true) }
     if data == [esc, 0x1d] { return KeyId(base: .char("]"), alt: true, ctrl: true) }
     if data == [esc, 0x1f] { return KeyId(base: .char("-"), alt: true, ctrl: true) }

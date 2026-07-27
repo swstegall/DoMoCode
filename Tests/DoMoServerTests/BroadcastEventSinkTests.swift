@@ -57,10 +57,10 @@ struct BroadcastEventSinkTests {
     func broadcastServerFrame() async {
         let sink = BroadcastEventSink()
         let sub = sink.subscribe()
-        sink.broadcast(.connected(protocolVersion: serverProtocolVersion, sessionID: "s-1"))
+        sink.broadcast(.connected(protocolVersion: serverProtocolVersion, sessionID: "s-1", running: false))
         var it = sub.events.makeAsyncIterator()
         let received = await it.next()
-        #expect(received == .connected(protocolVersion: serverProtocolVersion, sessionID: "s-1"))
+        #expect(received == .connected(protocolVersion: serverProtocolVersion, sessionID: "s-1", running: false))
     }
 
     @Test("A non-projecting event is dropped, not forwarded as an empty frame")

@@ -14,6 +14,7 @@ import DoMoLLM
 import DoMoPermissions
 import DoMoServer
 import DoMoTermGraphics
+import DoMoTUI
 
 // MARK: - Event store
 
@@ -118,8 +119,20 @@ public final class EventStore {
     /// system messages are ignored, so a tool call is never double-counted.
     public func apply(_ event: ServerEvent) {
         switch event {
-        case .connected, .heartbeat, .turnStart, .turnEnd:
-            return   // no transcript effect (connection/version handled by the caller)
+        case .connected(_, _, let running):
+            // Adopt the server's run state. Without this the client's flag is
+            // write-once per attach — it only ever learns "running" from an
+            // `agent_start` it witnessed — so attaching mid-turn (a session switch, a
+            // reconnect, re-opening the same session) left it stuck on "idle" for the
+            // rest of the turn: no spinner, Esc refused to abort, and prompts were
+            // refused as if nothing were happening.
+            if running {
+                runState = .running
+                lastStopReason = nil
+            }
+
+        case .heartbeat, .turnStart, .turnEnd:
+            return   // no transcript effect (version handled by the caller)
 
         case .agentStart:
             runState = .running

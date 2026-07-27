@@ -56,6 +56,17 @@ private func mergeEntry(_ existing: PermissionConfigEntry, _ grant: PermissionCo
     case .none: patterns = []
     }
     for grantPattern in grantPatterns {
+        // Never let a persisted grant overrule a deny the user wrote by hand.
+        //
+        // Evaluation is last-match-wins and a new pattern is APPENDED, so a grant
+        // written after an existing deny silently wins over it from the next launch
+        // onwards — `{"yarn.lock": "deny"}` plus an appended allow that also matches
+        // `yarn.lock` turns the user's own rule off. The engine will not normally
+        // prompt for something already denied, so reaching this is a sign the config
+        // changed underneath us; either way the safe direction is to keep the deny.
+        if patterns.contains(where: { $0.action == .deny && denyCovers($0.pattern, grantPattern.pattern) }) {
+            continue
+        }
         if let index = patterns.firstIndex(where: { $0.pattern == grantPattern.pattern }) {
             patterns[index] = grantPattern
         } else {
@@ -63,6 +74,14 @@ private func mergeEntry(_ existing: PermissionConfigEntry, _ grant: PermissionCo
         }
     }
     return PermissionConfigEntry(permission: existing.permission, value: .map(patterns))
+}
+
+/// Whether an existing `deny` pattern covers everything a new grant pattern would
+/// allow. Both directions are checked: a deny of `*.lock` covers a grant of
+/// `yarn.lock`, and a deny of `yarn.lock` is covered by a grant of `*` — in which
+/// case the broad grant would bury it and must also be refused.
+private func denyCovers(_ denyPattern: String, _ grantPattern: String) -> Bool {
+    wildcardMatch(grantPattern, denyPattern) || wildcardMatch(denyPattern, grantPattern)
 }
 
 /// A `PermissionConfig` as an ordered JSON value (for writing back).
