@@ -56,19 +56,34 @@ private func mergeEntry(_ existing: PermissionConfigEntry, _ grant: PermissionCo
     case .none: patterns = []
     }
     for grantPattern in grantPatterns {
-        // Never let a persisted grant overrule a deny the user wrote by hand.
+        // A deny the user wrote by hand always wins over a grant we persist.
         //
-        // Evaluation is last-match-wins and a new pattern is APPENDED, so a grant
-        // written after an existing deny silently wins over it from the next launch
-        // onwards — `{"yarn.lock": "deny"}` plus an appended allow that also matches
-        // `yarn.lock` turns the user's own rule off. The engine will not normally
-        // prompt for something already denied, so reaching this is a sign the config
-        // changed underneath us; either way the safe direction is to keep the deny.
-        if patterns.contains(where: { $0.action == .deny && denyCovers($0.pattern, grantPattern.pattern) }) {
-            continue
+        // Evaluation is last-match-wins, so simply appending a grant lets it overrule
+        // an earlier deny from the next launch onwards. There are three cases, and
+        // they want three different answers:
+        //
+        //  1. The grant's pattern EQUALS a deny — overwriting it in place would
+        //     delete the user's rule outright. Refuse.
+        //  2. A deny is STRICTLY NARROWER than the grant (`secrets.txt` under a `*`
+        //     grant) — both can hold if the grant goes BEFORE the deny, since the
+        //     narrower rule then matches last. Insert, do not drop.
+        //  3. A deny is BROADER than the grant (`*.lock` covering `yarn.lock`) — no
+        //     ordering satisfies both, because the deny is the more specific
+        //     statement of intent about this file. Refuse.
+        if let collision = patterns.first(where: {
+            $0.action == .deny && denyBlocks($0.pattern, grantPattern.pattern)
+        }) {
+            // Case 1 and 3.
+            if collision.pattern == grantPattern.pattern { continue }
+            if wildcardMatch(grantPattern.pattern, collision.pattern) { continue }
         }
         if let index = patterns.firstIndex(where: { $0.pattern == grantPattern.pattern }) {
             patterns[index] = grantPattern
+        } else if let firstCoveredDeny = patterns.firstIndex(where: {
+            $0.action == .deny && wildcardMatch($0.pattern, grantPattern.pattern)
+        }) {
+            // Case 2: keep the narrower deny effective by putting the grant ahead of it.
+            patterns.insert(grantPattern, at: firstCoveredDeny)
         } else {
             patterns.append(grantPattern)
         }
@@ -76,11 +91,9 @@ private func mergeEntry(_ existing: PermissionConfigEntry, _ grant: PermissionCo
     return PermissionConfigEntry(permission: existing.permission, value: .map(patterns))
 }
 
-/// Whether an existing `deny` pattern covers everything a new grant pattern would
-/// allow. Both directions are checked: a deny of `*.lock` covers a grant of
-/// `yarn.lock`, and a deny of `yarn.lock` is covered by a grant of `*` — in which
-/// case the broad grant would bury it and must also be refused.
-private func denyCovers(_ denyPattern: String, _ grantPattern: String) -> Bool {
+/// Whether an existing `deny` and a new grant pattern overlap at all — in either
+/// direction, since a grant can be wider or narrower than the deny it meets.
+private func denyBlocks(_ denyPattern: String, _ grantPattern: String) -> Bool {
     wildcardMatch(grantPattern, denyPattern) || wildcardMatch(denyPattern, grantPattern)
 }
 

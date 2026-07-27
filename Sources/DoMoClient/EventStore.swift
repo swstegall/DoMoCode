@@ -120,15 +120,30 @@ public final class EventStore {
     public func apply(_ event: ServerEvent) {
         switch event {
         case .connected(_, _, let running):
-            // Adopt the server's run state. Without this the client's flag is
-            // write-once per attach — it only ever learns "running" from an
-            // `agent_start` it witnessed — so attaching mid-turn (a session switch, a
-            // reconnect, re-opening the same session) left it stuck on "idle" for the
-            // rest of the turn: no spinner, Esc refused to abort, and prompts were
-            // refused as if nothing were happening.
+            // Adopt the server's run state, in BOTH directions.
+            //
+            // Without adopting it at all, the client's flag is write-once per attach —
+            // it only ever learns "running" from an `agent_start` it witnessed — so
+            // attaching mid-turn left it stuck on "idle" for the rest of the turn.
+            // Adopting only the `true` direction is just as bad the other way: a
+            // reconnect that missed the turn's `agent_end` pins the client on
+            // "running" FOREVER, and the synchronous submit guard then refuses every
+            // prompt for the life of the session. The server owns this flag; the frame
+            // is authoritative at the instant it is sent.
+            //
+            // `nil` means the server predates the field and said nothing, which is not
+            // the same as saying "idle" — leave the old behaviour alone.
+            guard let running else { break }
             if running {
                 runState = .running
                 lastStopReason = nil
+            } else {
+                runState = .idle
+                // A turn that is over cannot still have a tool call in flight; without
+                // this the row (and its spinner) animates forever.
+                settleActiveToolCalls()
+                if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
+                pendingPermission = nil
             }
 
         case .heartbeat, .turnStart, .turnEnd:

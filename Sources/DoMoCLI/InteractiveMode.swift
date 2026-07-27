@@ -265,6 +265,9 @@ final class InteractiveCoordinator {
     /// "busy" from "dead".
     private var progressFrame = 0
     private var progressTask: Task<Void, Never>?
+    /// The modal's row values in order, so Escape can find "Reject" without assuming
+    /// a fixed layout (the "always" row is conditional).
+    private var permissionItemValues: [String] = []
     private static let progressFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     /// The status line while a turn is in flight — animated, and distinct while a
@@ -359,17 +362,32 @@ final class InteractiveCoordinator {
         let kb = keybindings
 
         // A permission prompt captures ALL input: arrows move the choice, Enter
-        // confirms it, Escape rejects; every other key is swallowed so the editor
-        // cannot change while a tool waits on a decision.
+        // confirms it, Ctrl-C rejects outright, Escape only MOVES the selection onto
+        // Reject; every other key is swallowed so the editor cannot change while a
+        // tool waits on a decision.
         if let list = permissionList {
+            if isKeyRelease(data) { return }
             if kb.matches(data, .selectUp) || kb.matches(data, .selectDown) {
                 list.handleInput(data)
                 render()
             } else if kb.matches(data, .selectConfirm) {
                 resolvePermission(Self.reply(for: list.getSelectedItem()?.value))
                 render()
-            } else if kb.matches(data, .selectCancel) {
+            } else if data == [0x03] {
+                // Ctrl-C is an unambiguous single byte, so it can answer directly.
+                // Checked BEFORE `.selectCancel`, which is bound to both Ctrl-C and
+                // Escape, and Escape must not answer — see below.
                 resolvePermission(.reject(message: nil))
+                render()
+            } else if kb.matches(data, .selectCancel) {
+                // Escape SELECTS Reject; it does not answer. A terminal splits an
+                // arrow key into `ESC` and `[B`, and if they land more than the
+                // disambiguation window apart the lone `ESC` is delivered as a real
+                // Escape — indistinguishable from a keypress here, since the tail only
+                // arrives after we would already have replied. Answering on it meant a
+                // cursor keystroke silently rejected the tool call. Mirrors the
+                // full-screen client.
+                list.setSelectedIndex(permissionItemValues.firstIndex(of: "reject") ?? 0)
                 render()
             }
             return
@@ -613,6 +631,7 @@ final class InteractiveCoordinator {
         permissionHandle?.hide()
         permissionHandle = nil
         permissionList = nil
+        permissionItemValues = []
         // Put the status line back to plain "working": `runOne` only assigns it at the
         // start and end of a turn, so the approval-specific text would otherwise
         // persist for the whole remainder of the run.
@@ -647,12 +666,13 @@ final class InteractiveCoordinator {
 
         let list = SelectList(items: items, maxVisible: items.count, keybindings: keybindings)
         permissionList = list
+        permissionItemValues = items.map(\.value)
 
         let header = Self.permissionHeader(request)
         let container = Container()
         for line in header { container.addChild(Text(line, wrap: false)) }
         container.addChild(list)
-        container.addChild(Text("\u{1b}[2m  ↑/↓ choose · enter confirm · esc reject\u{1b}[0m", wrap: false))
+        container.addChild(Text("\u{1b}[2m  ↑/↓ choose · enter confirm · esc selects Reject · ^C rejects\u{1b}[0m", wrap: false))
 
         // Budget the height from the rows the container ACTUALLY renders, not from a
         // count of header strings. A header string containing newlines renders as

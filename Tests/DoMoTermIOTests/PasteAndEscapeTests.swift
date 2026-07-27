@@ -53,6 +53,9 @@ struct PasteAndEscapeTests {
         #expect(framer.hasPendingPaste, "an open paste must be reported, so the driver can arm its watchdog")
         #expect(!framer.hasPendingBytes, "and reported SEPARATELY from an escape tail, which has a shorter deadline")
 
+        // First firing: the bytes that DID arrive are emitted as paste data (never
+        // re-framed as keystrokes), and the paste stays open — a merely-slow paste
+        // must not be chopped in half.
         let flushed = framer.flush()
         #expect(flushed.count == 1)
         guard case .paste(let content) = flushed.first else {
@@ -60,12 +63,38 @@ struct PasteAndEscapeTests {
             return
         }
         #expect(String(decoding: content, as: UTF8.self) == "stranded")
+        #expect(framer.hasPendingPaste, "still open — more of the paste may yet arrive")
+
+        // Second firing with nothing new: the end marker is never coming, so the
+        // paste closes and the keyboard comes back.
+        #expect(framer.flush().isEmpty)
         #expect(!framer.hasPendingPaste)
 
         // And the framer is usable again: a following keystroke gets through.
         let after = framer.process(Array("x".utf8))
         #expect(after.count == 1)
         if case .sequence(let bytes) = after[0] { #expect(bytes == Array("x".utf8)) } else { Issue.record("expected a key") }
+    }
+
+    @Test("A slow paste survives a watchdog firing and still closes as one stream")
+    func slowPasteIsNotChopped() {
+        // The regression this guards: leaving paste mode on the first watchdog firing
+        // re-framed the REST of a legitimate paste as keystrokes, so an embedded
+        // newline would submit the prompt mid-paste.
+        var framer = StdinFramer()
+        _ = framer.process(pasteStart + Array("first half\r".utf8))
+        let drained = framer.flush()                       // the user's link stalled
+        #expect(drained.count == 1)
+        #expect(framer.hasPendingPaste, "the paste is slow, not abandoned")
+
+        let rest = framer.process(Array("second half".utf8) + pasteEnd)
+        #expect(rest.count == 1)
+        guard case .paste(let tail) = rest.first else { Issue.record("expected paste"); return }
+        #expect(String(decoding: tail, as: UTF8.self) == "second half")
+        #expect(!framer.hasPendingPaste)
+        // Crucially, the embedded CR came through as DATA in the first piece.
+        guard case .paste(let head) = drained.first else { Issue.record("expected paste"); return }
+        #expect(String(decoding: head, as: UTF8.self) == "first half\r")
     }
 
     @Test("An abandoned paste's newlines stay data, never commands")

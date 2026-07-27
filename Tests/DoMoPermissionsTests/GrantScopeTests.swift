@@ -80,6 +80,36 @@ struct GrantScopeTests {
         #expect(spec("edit", path: "").always.isEmpty)
     }
 
+    @Test("A path containing a glob metacharacter grants NOTHING")
+    func globbyPathGrantsNothing() {
+        // The hole scoping-to-the-path left open: a grant is stored as a PATTERN, and
+        // patterns are matched with wildcardMatch, where `*` and `?` are the two
+        // characters left unescaped. The path comes from the model and `write`
+        // creates whatever it is given — so `write *` produced a prompt reading
+        // "Always allow *" that persisted `{"write": {"*": "allow"}}` globally: the
+        // exact blanket rule scoping was meant to remove. `read *.env` is worse, since
+        // it disables the secret guard the baseline exists to enforce.
+        #expect(spec("write", path: "*").always.isEmpty)
+        #expect(spec("write", path: "n*.txt").always.isEmpty)
+        #expect(spec("read", path: "*.env").always.isEmpty)
+        #expect(spec("edit", path: "a?.txt").always.isEmpty)
+        #expect(spec("ls", path: "src/*").always.isEmpty)
+        // An ordinary path is unaffected.
+        #expect(spec("edit", path: "src/Foo.swift").always == ["src/Foo.swift"])
+        // Characters wildcardMatch already escapes are NOT glob-active, so they stay
+        // grantable — refusing them would be needless.
+        #expect(spec("edit", path: "a[1].txt").always == ["a[1].txt"])
+        #expect(spec("edit", path: "a+b(c).txt").always == ["a+b(c).txt"])
+    }
+
+    @Test("bash grants stay globs — the restriction is for path-keyed tools only")
+    func bashGrantsAreStillGlobs() {
+        // `bashAlwaysGlob` produces `git *` by design; a blanket "no globby grants"
+        // rule at the persistence layer would have broken it.
+        let bash = factory.make(toolName: "bash", arguments: .object(["command": .string("git status")]))
+        #expect(bash.always.contains { $0.contains("*") })
+    }
+
     // MARK: Persistence
 
     @Test("A persisted grant never buries a deny the user wrote by hand")
@@ -97,16 +127,33 @@ struct GrantScopeTests {
         #expect(text?.contains("allow") == false, "the deny must survive: \(text ?? "nil")")
     }
 
-    @Test("A broad grant that would bury a narrower deny is refused too")
-    func broadGrantCannotBuryANarrowDeny() {
+    @Test("A broad grant is ordered BEFORE a narrower deny, so both keep their meaning")
+    func broadGrantIsOrderedBeforeANarrowDeny() {
+        // Evaluation is last-match-wins, so a grant wider than an existing deny can
+        // satisfy both by going first — refusing it outright would needlessly break a
+        // grant the user asked for, and appending it would bury their deny.
         let existing = """
             {"permission": {"edit": {"secrets.txt": "deny"}}}
             """
-        let text = settingsText(existing, mergingGrants: [
+        guard let text = settingsText(existing, mergingGrants: [
             PermissionRule(permission: "edit", pattern: "*", action: .allow)
+        ]) else { Issue.record("expected a merged config"); return }
+        guard let allowAt = text.range(of: "\"*\""), let denyAt = text.range(of: "secrets.txt") else {
+            Issue.record("both rules must be present: \(text)"); return
+        }
+        #expect(allowAt.lowerBound < denyAt.lowerBound, "the narrower deny must match LAST: \(text)")
+        #expect(text.contains("deny"))
+    }
+
+    @Test("A deny BROADER than the grant still refuses it — no ordering satisfies both")
+    func broaderDenyRefusesTheGrant() {
+        let existing = """
+            {"permission": {"edit": {"*.lock": "deny"}}}
+            """
+        let text = settingsText(existing, mergingGrants: [
+            PermissionRule(permission: "edit", pattern: "yarn.lock", action: .allow)
         ])
-        #expect(text?.contains("deny") == true)
-        #expect(text?.contains("allow") == false, "a `*` allow must not leapfrog an existing deny: \(text ?? "nil")")
+        #expect(text?.contains("allow") == false, "the more specific statement of intent wins: \(text ?? "nil")")
     }
 
     @Test("An unrelated grant still persists normally")

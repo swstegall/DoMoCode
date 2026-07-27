@@ -84,8 +84,24 @@ public struct PermissionRequestFactory: Sendable {
     ///
     /// An empty path grants nothing, and the surfaces hide the "always" row rather
     /// than offering a choice that would silently do nothing.
+    ///
+    /// A path containing a glob metacharacter grants nothing either, and that is the
+    /// load-bearing part. A grant is stored as a *pattern*, and patterns are matched
+    /// with ``wildcardMatch``, where `*` and `?` are the two characters left
+    /// unescaped. The path comes from the model, and `write` creates whatever file it
+    /// is named — so a model that asks to write `*` gets a prompt reading
+    /// "Always allow *" which, if approved, persists `{"write": {"*": "allow"}}` to
+    /// the global config: exactly the blanket rule scoping this was meant to remove.
+    /// `read *.env` is worse, since it disables the secret guard the baseline exists
+    /// to enforce. There is no escape syntax to fall back on (`\` is normalised to
+    /// `/` on both sides), so such a call simply gets no persistable grant and the
+    /// answer degrades to "allow once".
+    ///
+    /// Only path-keyed tools come through here. `bash` grants are *deliberately*
+    /// globs (`git *`), which is why this cannot live at the persistence boundary.
     private static func pathGrant(_ path: String) -> [String] {
-        path.isEmpty ? [] : [path]
+        guard !path.isEmpty, !path.contains("*"), !path.contains("?") else { return [] }
+        return [path]
     }
 
     private func bashSpec(_ arguments: JSONValue) -> PermissionRequestSpec {

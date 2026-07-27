@@ -325,16 +325,32 @@ public final class TerminalDriver {
             ? StdinFramer.disambiguationTimeout
             : (framer.hasPendingPaste ? StdinFramer.pasteTimeout : nil)
         if let timeout {
-            flushTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: timeout)
-                guard let self, !Task.isCancelled else { return }
-                let flushed = self.framer.flush()
-                self.dispatch(flushed, to: app)
-                self.render()
-            }
+            armFlush(after: timeout, app: app)
         }
 
         render()
+    }
+
+    /// Arm the disambiguation/paste watchdog, re-arming itself while anything is
+    /// still held.
+    ///
+    /// The re-arm is what makes an abandoned paste terminate: the first firing drains
+    /// the bytes that did arrive and keeps the paste open (so a slow paste is not
+    /// chopped), and the next firing — reached only if nothing further arrived —
+    /// finds an empty buffer and closes it, handing the keyboard back. A following
+    /// input chunk cancels the timer in `ingest`, so this never fires while bytes are
+    /// actually flowing.
+    private func armFlush(after timeout: Duration, app: any TerminalApp) {
+        flushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard let self, !Task.isCancelled else { return }
+            let flushed = self.framer.flush()
+            self.dispatch(flushed, to: app)
+            self.render()
+            if self.framer.hasPendingPaste {
+                self.armFlush(after: StdinFramer.pasteTimeout, app: app)
+            }
+        }
     }
 
     private func dispatch(_ events: [StdinEvent], to app: any TerminalApp) {

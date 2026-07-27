@@ -21,7 +21,12 @@ public nonisolated func collapseToOneLine(_ text: String) -> String {
     var result = ""
     var lastWasSpace = false
     for character in text {
-        if character == "\n" || character == "\r" {
+        // Match on the cluster's FIRST scalar, not on the whole Character: Swift
+        // joins CR+LF into ONE grapheme that equals neither "\n" nor "\r", so an
+        // equality test silently passes Windows line endings straight through into a
+        // frame row — which is exactly the newline injection this exists to stop.
+        let leading = character.unicodeScalars.first?.value ?? 0
+        if leading == 0x0A || leading == 0x0D {
             if !result.isEmpty && !lastWasSpace { result.append(" ") }
             result.append("⏎")
             lastWasSpace = false

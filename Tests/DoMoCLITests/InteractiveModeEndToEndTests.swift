@@ -429,7 +429,18 @@ struct InteractiveModeEndToEndTests {
         let modalUp = await waitUntil { screenContains(target, rows: rows, cols: cols, "Allow bash") }
         #expect(modalUp, "the approval modal never appeared")
 
-        inputCont.yield(bytes("\u{1b}"))   // Escape -> reject
+        // Escape SELECTS the Reject row; Enter confirms it. Escape deliberately no
+        // longer answers on its own: a terminal splits an arrow key into `ESC` and
+        // `[B`, and a late lone `ESC` is indistinguishable from a keypress, so
+        // answering on it let a cursor keystroke silently reject a tool call.
+        inputCont.yield(bytes("\u{1b}"))
+        // Wait for the MARKER to move onto Reject, not merely for the modal to still
+        // be there. A lone ESC is held for the disambiguation window, so sending Enter
+        // before that window closes would coalesce the two into one `ESC \r` sequence
+        // and neither key would be delivered.
+        let rejectSelected = await waitUntil { screenContains(target, rows: rows, cols: cols, "→ Reject") }
+        #expect(rejectSelected, "Escape must move the selection onto Reject without answering")
+        inputCont.yield(bytes("\r"))
         let finished = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
         #expect(finished, "the run never completed after rejection")
         #expect(gateway.requestCount == 2)

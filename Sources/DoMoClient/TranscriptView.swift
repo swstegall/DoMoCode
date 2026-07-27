@@ -41,10 +41,6 @@ final class TranscriptView: Component {
     /// viewport height, which only it knows.
     var scrollOffset = 0
 
-    /// The row count of the last built frame, so an append that lands while the
-    /// user is scrolled up can push the offset and keep the viewport still.
-    private var lastRowCount = 0
-
     private let toolOutputCap = 8
     private let toolOutputCharCap = 4000
 
@@ -72,14 +68,20 @@ final class TranscriptView: Component {
            cache.capabilities == capabilities, cache.cell == cell, cache.items == items {
             return cache.rows
         }
+        let previous = cache
         let rows = buildVisualRows(width: width, capabilities: capabilities, cell: cell)
-        // Only an append (rows grew) shifts the anchor. A shrink — a session switch,
-        // a re-seed — leaves the offset to ``TranscriptNode``'s clamp instead of
-        // scrolling backwards under the user.
-        if scrollOffset > 0, rows.count > lastRowCount {
-            scrollOffset += rows.count - lastRowCount
+        // Only an append (rows grew) shifts the anchor, and only when the previous
+        // frame had the SAME geometry. A row count is only comparable at one width:
+        // re-wrapping at a new width changes it for reasons that have nothing to do
+        // with new content, so comparing across a resize walked the viewport
+        // backwards through history on every drag of the window edge. A shrink — a
+        // session switch, a re-seed — is left to ``TranscriptNode``'s clamp.
+        if scrollOffset > 0,
+           let previous,
+           previous.width == width, previous.capabilities == capabilities, previous.cell == cell,
+           rows.count > previous.rows.count {
+            scrollOffset += rows.count - previous.rows.count
         }
-        lastRowCount = rows.count
         cache = (items, running, spinnerFrame, width, capabilities, cell, rows)
         return rows
     }

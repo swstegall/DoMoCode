@@ -493,10 +493,15 @@ public final class ClientApp {
         let available = max(1, (surface?.target.rows ?? 24) - 2)
         let borderRows = 2
         var budget = available - borderRows - items.count      // rows left for the rest
-        let showTitle = budget >= 1
-        if showTitle { budget -= 1 }
+        // Substance before decoration: `header[1]` names the tool and its target and
+        // is the ONLY row that says what is being approved; `header[0]` is the
+        // constant "Permission required", which the framed yellow box already
+        // conveys. Budgeting the title first meant that on a short terminal the user
+        // was asked to approve something the modal never named.
         let showAction = budget >= 1
         if showAction { budget -= 1 }
+        let showTitle = budget >= 1
+        if showTitle { budget -= 1 }
         let showHint = budget >= 1
         if showHint { budget -= 1 }
         let showSpacers = budget >= 2
@@ -521,6 +526,10 @@ public final class ClientApp {
         if showHint { inner.addChild(Text(dim("↑/↓ choose · Enter confirm · Esc selects Reject · ^C quits"), wrap: false)) }
 
         var contentHeight = visibleItems
+        // SelectList appends a "(N more below)" row whenever its window cannot show
+        // every option. Unbudgeted, the compositor's prefix-clip eats the Box's
+        // bottom border instead.
+        if visibleItems < items.count { contentHeight += 1 }
         if showTitle { contentHeight += 1 }
         if showAction, header.count > 1 { contentHeight += 1 }
         if showSpacers { contentHeight += 2 }
@@ -550,8 +559,16 @@ public final class ClientApp {
             permissionOverlaySize = size
             return
         }
+        // Carry the current choice across the rebuild, by VALUE not index (the rows
+        // are conditional). Losing it silently reset an Escape-selected "Reject" to
+        // the default "Allow once", so a window resize could turn a rejection into an
+        // approval on the next Enter.
+        let selected = permissionList?.getSelectedItem()?.value
         dismissPermissionOverlay()
         presentPermissionOverlay(request)
+        if let selected, let index = permissionItemValues.firstIndex(of: selected) {
+            permissionList?.setSelectedIndex(index)
+        }
     }
 
     /// Move the modal's selection onto "Reject" (what Escape does), so the
@@ -689,7 +706,12 @@ extension ClientApp: TerminalApp {
             }
             return
         }
-        if data == Self.escape { abort(); return }
+        // Through the decoder, not a raw byte compare: the framer delivers two fast
+        // Escapes as ONE `[esc, esc]` frame, which a byte compare against `[0x1b]`
+        // never matches — so the abort key did not get the fix the decoder did.
+        // `matchesKey` (not `.selectCancel`) deliberately: that action is also bound
+        // to Ctrl-C, which must keep meaning quit.
+        if matchesKey(data, Key.escape) { abort(); return }
         surface?.handleInput(data)
     }
 

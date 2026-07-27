@@ -127,7 +127,8 @@ public struct StdinFramer: Sendable {
     /// resolve it.
     public var hasPendingBytes: Bool { !buffer.isEmpty }
 
-    /// Whether an unterminated bracketed paste is open.
+    /// Whether an unterminated bracketed paste is open. Note that a watchdog drain
+    /// does NOT clear this — only the closing marker (or ``reset()``) ends a paste.
     ///
     /// Reported separately from ``hasPendingBytes`` because it needs a different
     /// deadline: an escape tail resolves in milliseconds, a paste does not. Without
@@ -168,11 +169,28 @@ public struct StdinFramer: Sendable {
     /// of commands.
     public mutating func flushPaste() -> [StdinEvent] {
         guard pasteMode else { return [] }
+        // Two different situations reach this watchdog, told apart by whether any
+        // bytes arrived since the last time it fired:
+        //
+        //  - Bytes DID arrive: the paste is merely slow (a big paste, ssh, tmux).
+        //    Emit them and STAY in paste mode. Leaving here is what would chop a
+        //    legitimate paste — the remainder would be re-framed as KEYSTROKES, so an
+        //    embedded newline would submit the prompt mid-paste and control bytes
+        //    would fire commands. A late `ESC[201~` still closes it cleanly; the only
+        //    visible effect is that a slow paste lands in more than one piece.
+        //
+        //  - Nothing arrived at all: the terminal sent a start marker and then went
+        //    silent, so the end marker is never coming. Leave paste mode and give the
+        //    keyboard back — otherwise every later keystroke, Ctrl-C included, is
+        //    swallowed as paste content forever.
+        guard !pasteBuffer.isEmpty else {
+            pasteMode = false
+            return []
+        }
         let content = pasteBuffer
-        pasteMode = false
         pasteBuffer = []
         pendingKittyPrintableCodepoint = nil
-        return content.isEmpty ? [] : [.paste(content)]
+        return [.paste(content)]
     }
 
     /// Drop all buffered and paste state without emitting.
@@ -206,6 +224,7 @@ public struct StdinFramer: Sendable {
             // A paste that never closes must not grow without bound; drain what we
             // have and return to normal framing.
             if pasteMode, pasteBuffer.count > StdinFramer.pasteBufferLimit {
+                // Same reasoning as the watchdog: drain, but stay in paste mode.
                 events.append(contentsOf: flushPaste())
             }
             return

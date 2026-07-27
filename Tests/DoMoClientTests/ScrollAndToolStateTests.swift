@@ -310,13 +310,29 @@ struct ScrollAndToolStateTests {
         #expect(quiet.runState == .idle)
     }
 
-    @Test("A connected frame never downgrades a turn already known to be running")
-    func connectedDoesNotClobberRunning() {
+    @Test("The server's run state is adopted in BOTH directions")
+    func connectedIsAuthoritativeBothWays() {
+        // Adopting only `true` was its own bug: a reconnect that missed the turn's
+        // `agent_end` pinned the client on "running" forever, and the synchronous
+        // submit guard then refused every prompt for the life of the session. The
+        // server owns this flag; `connected` is authoritative at the instant it is
+        // sent (and always arrives first on a stream).
         let store = EventStore()
         store.select("s1")
         store.apply(.agentStart)
+        store.apply(.toolStart(id: "t1", name: "bash", arguments: .object([:])))
         store.apply(.connected(protocolVersion: 1, sessionID: "s1", running: false))
-        #expect(store.runState == .running, "a stale `running: false` must not stop a live turn")
+        #expect(store.runState == .idle)
+        #expect(store.activeToolCall == nil, "a settled turn cannot leave a tool call spinning")
+    }
+
+    @Test("A server that predates the field says nothing, and is not read as idle")
+    func connectedWithoutRunStateIsIgnored() {
+        let store = EventStore()
+        store.select("s1")
+        store.apply(.agentStart)
+        store.apply(.connected(protocolVersion: 1, sessionID: "s1", running: nil))
+        #expect(store.runState == .running, "absent is not the same as `false`")
     }
 
     @Test("A refused prompt is put back, not destroyed")

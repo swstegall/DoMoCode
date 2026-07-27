@@ -41,7 +41,7 @@ public enum ServerEvent: Sendable, Hashable {
     /// same session — therefore believed the session was idle for the rest of the
     /// turn, which disabled Esc/abort and made the spinner stop. Run state has to be
     /// authoritative from the side that owns it.
-    case connected(protocolVersion: Int, sessionID: String, running: Bool)
+    case connected(protocolVersion: Int, sessionID: String, running: Bool?)
     /// A periodic keep-alive so a proxy or a client read-timeout does not tear
     /// down an idle-but-live stream between turns.
     case heartbeat
@@ -179,9 +179,11 @@ extension ServerEvent: Codable {
             self = .connected(
                 protocolVersion: try container.decode(Int.self, forKey: .protocolVersion),
                 sessionID: try container.decode(String.self, forKey: .sessionID),
-                // Absent from an older server's frame; "not running" is the safe
-                // default, and matches the previous behaviour exactly.
-                running: try container.decodeIfPresent(Bool.self, forKey: .running) ?? false
+                // Absent from an older server's frame. Kept as `nil` rather than
+                // defaulted to `false`: a client must be able to tell "the server
+                // says idle" from "the server did not say", because it adopts the
+                // former and must ignore the latter.
+                running: try container.decodeIfPresent(Bool.self, forKey: .running)
             )
         case .heartbeat:
             self = .heartbeat
@@ -238,7 +240,7 @@ extension ServerEvent: Codable {
             try container.encode(Kind.connected, forKey: .type)
             try container.encode(protocolVersion, forKey: .protocolVersion)
             try container.encode(sessionID, forKey: .sessionID)
-            try container.encode(running, forKey: .running)
+            try container.encodeIfPresent(running, forKey: .running)
         case .heartbeat:
             try container.encode(Kind.heartbeat, forKey: .type)
         case .agentStart:
