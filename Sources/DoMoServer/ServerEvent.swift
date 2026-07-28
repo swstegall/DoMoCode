@@ -207,26 +207,15 @@ public struct ServerNotice: Sendable, Hashable, Codable {
             text: notice.text,
             detail: notice.detail,
             kind: notice.kind,
-            ttlMilliseconds: notice.ttl.map(Self.milliseconds)
+            // The single projection of a `Duration` onto a millisecond count
+            // lives in `DoMoCore`; a second copy here would be a copy that can
+            // drift. A TTL can be built from a `Retry-After` header, which is
+            // text from the far side of a wire, so it must saturate at `Int.max`
+            // ("forever", the right answer for a hostile header) rather than
+            // trap and kill the server — which is exactly what that projection
+            // does.
+            ttlMilliseconds: notice.ttl.map(DoMoError.wholeMilliseconds)
         )
-    }
-
-    /// Whole milliseconds, rounded down, saturating rather than trapping.
-    ///
-    /// `Duration` is arithmetic over a 128-bit value, so `seconds * 1000`
-    /// overflows `Int64` long before a `Duration` runs out of range — and a TTL
-    /// can be built from a `Retry-After` header, which is text from the far side
-    /// of a wire. A dwell time that saturates at `Int.max` reads as "forever",
-    /// which is the right answer; a trap here would kill the server.
-    private static func milliseconds(_ duration: Duration) -> Int {
-        let components = duration.components
-        let (scaled, scaleOverflowed) = components.seconds.multipliedReportingOverflow(by: 1000)
-        guard !scaleOverflowed else { return components.seconds > 0 ? Int.max : Int.min }
-        let (total, addOverflowed) = scaled.addingReportingOverflow(
-            components.attoseconds / 1_000_000_000_000_000
-        )
-        guard !addOverflowed else { return components.seconds > 0 ? Int.max : Int.min }
-        return Int(total)
     }
 }
 

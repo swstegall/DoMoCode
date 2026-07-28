@@ -7,6 +7,7 @@ import DoMoHarness
 import DoMoLLM
 import DoMoPermissions
 import Foundation
+import Synchronization
 import SystemPackage
 
 // MARK: - Errors and value types
@@ -154,6 +155,55 @@ public actor ServerRuntime {
         }
     }
 
+    /// One run's tap on a session's shared ``BroadcastEventSink``, which can be
+    /// switched off for good.
+    ///
+    /// ``forceClearRun(sessionID:)`` walks away from a run that by construction
+    /// cannot be stopped — it holds the slot precisely because nothing can unwind
+    /// it — while carrying the session's sink across to the replacement state, so
+    /// attached SSE subscribers survive. Without this gate the abandoned run keeps
+    /// broadcasting into that shared sink whenever it eventually settles: a
+    /// `tool_end` for a call the client never saw start, a foreign assistant
+    /// message, a spurious `turn_end`, and — the damaging one — a terminal
+    /// `agent_end`. A client folds `agent_end` into `runState = .idle` while a
+    /// *different* run is actually holding the slot, so the spinner stops, the user
+    /// types, and the server answers 409 "a turn is already running". That is the
+    /// exact "the session stopped accepting prompts" symptom this whole feature
+    /// exists to remove, re-created by its own escape hatch.
+    ///
+    /// ``finishRun(_:token:)``'s token guard protects the SLOT; this protects the
+    /// STREAM. Both are needed: they are consulted at different moments by
+    /// different threads, and neither implies the other.
+    ///
+    /// The flag is a `Mutex` rather than actor state because ``emit(_:)`` is called
+    /// from the run's task on whatever executor the loop is on, while ``detach()``
+    /// is called from the runtime actor.
+    private final class RunSink: AgentEventSink {
+        private let inner: BroadcastEventSink
+        private let live = Mutex(true)
+
+        init(_ inner: BroadcastEventSink) {
+            self.inner = inner
+        }
+
+        /// Silence this run permanently. Idempotent; never un-does.
+        func detach() {
+            live.withLock { $0 = false }
+        }
+
+        func emit(_ event: AgentEvent) async {
+            guard live.withLock({ $0 }) else { return }
+            await inner.emit(event)
+        }
+
+        /// A server-originated frame on behalf of this run (its terminal
+        /// `agent_end` when the loop could not emit its own), gated identically.
+        func broadcast(_ event: ServerEvent) {
+            guard live.withLock({ $0 }) else { return }
+            inner.broadcast(event)
+        }
+    }
+
     /// One live session's mutable state. A reference type held only inside the
     /// actor, so its `runTask` mutation is serialized by the actor, not shared.
     ///
@@ -166,6 +216,9 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let sink: BroadcastEventSink
         var runTask: Task<Void, Never>?
+        /// The gate on the current run's output. Retained beside `runTask` so
+        /// ``forceClearRun(sessionID:)`` can silence a run it is abandoning.
+        var runSink: RunSink?
         /// When the run currently holding the slot was admitted; nil when idle.
         /// Set beside `runTask` and cleared beside it, so the pair cannot drift.
         var runStartedAt: Date?
@@ -290,14 +343,14 @@ public actor ServerRuntime {
         let id: String
         if let resume {
             let path = try await resolveResume(resume)
-            let resumedID = try JSONLSessionStore(path: path).readHeader().id
+            let resumedID = try await Self.readSessionID(at: path)
             // Already live? Return it rather than standing up a second harness over
             // the same file — that would orphan the running task and leave the
             // existing SSE subscribers attached to a sink no run feeds.
             if let existing = sessions[resumedID] {
                 return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
             }
-            harness = try AgentHarness.open(path: path, configuration: harnessConfiguration(sessionID: resumedID))
+            harness = try await Self.reopen(path: path, configuration: harnessConfiguration(sessionID: resumedID))
             id = resumedID
         } else {
             id = UUIDv7.generate().description
@@ -309,6 +362,10 @@ public actor ServerRuntime {
             )
         }
         let path = await harness.sessionFilePath
+        // Re-check after every suspension above, for the same reason as the first
+        // check: a concurrent resume of the same id must not replace a live session
+        // and strand its run and its subscribers. `harness` is dropped unused.
+        if sessions[id] != nil { return SessionRef(id: id, path: path.string) }
         sessions[id] = makeState(harness: harness, sink: BroadcastEventSink())
         return SessionRef(id: id, path: path.string)
     }
@@ -318,14 +375,14 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         let forked = try await session.harness.fork(sessionDirectory: config.sessionDirectory)
         let path = await forked.sessionFilePath
-        let id = try JSONLSessionStore(path: path).readHeader().id
+        let id = try await Self.readSessionID(at: path)
         // `fork` reuses the PARENT's configuration, whose permission hook is bound to
         // the parent's sessionID — a prompt from the forked run would route to the
         // wrong session and hang. Re-open the forked file with a correctly-bound
         // config (only when gating is on; ungated forks keep the cheap path).
         let harness: AgentHarness
         if config.permissions != nil {
-            harness = try AgentHarness.open(path: path, configuration: harnessConfiguration(sessionID: id))
+            harness = try await Self.reopen(path: path, configuration: harnessConfiguration(sessionID: id))
         } else {
             harness = forked
         }
@@ -345,8 +402,13 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
         let harness = session.harness
-        let sink = session.sink
+        // NOT `session.sink` directly: everything this run emits goes through a gate
+        // the runtime can close, so a run that ``forceClearRun(sessionID:)`` walked
+        // away from cannot narrate itself into a stream a later run owns. See
+        // ``RunSink``.
+        let sink = RunSink(session.sink)
         let token = session.token
+        session.runSink = sink
         session.runStartedAt = Date()
         session.runTask = Task { [weak self] in
             do {
@@ -378,6 +440,9 @@ public actor ServerRuntime {
     private func finishRun(_ sessionID: String, token: Int) {
         guard let session = sessions[sessionID], session.token == token else { return }
         session.runTask = nil
+        session.runSink = nil
+        // Cleared beside `runTask`, so `status` can never report `running: false`
+        // next to a stale start time a client would render as "running for 14m".
         session.runStartedAt = nil
     }
 
@@ -420,34 +485,63 @@ public actor ServerRuntime {
     /// takes for a live session — and the new state's `token` makes the existing
     /// `finishRun` guard no-op the doomed run's completion hop if it ever settles.
     ///
+    /// Because the abandoned run is still alive, two things it shares with the
+    /// session have to be taken away from it:
+    ///
+    /// - **The stream.** Its ``RunSink`` is detached here, so nothing it emits when
+    ///   it finally settles — least of all a terminal `agent_end` — reaches the
+    ///   subscribers a *different* run is now feeding.
+    /// - **The transcript.** Its ``DoMoHarness/SessionPersistenceSink`` still writes
+    ///   to the same JSONL file, and the file's leaf is "last entry wins", so a late
+    ///   append moves the file leaf onto the dead branch. Every live read therefore
+    ///   walks back from the *live harness's* tip instead — see ``messages(sessionID:)``.
+    ///   The residual hazard is a cold re-open in a **later process** (the live
+    ///   harness's tip died with this one), which lands on the abandoned branch;
+    ///   closing that needs an `AgentHarness.open(path:configuration:leaf:)` seam
+    ///   this module does not own, and the recovered turn is still on disk and
+    ///   reachable via ``children(sessionID:parent:)``, not lost.
+    ///
     /// It is **atomic**: the replacement harness is opened before anything is
     /// cancelled or drained, so a failure to re-open the session file leaves the
     /// session exactly as it was and the call can simply be retried. Half-clearing
     /// a session — cancelled and drained but still holding its slot on a harness
     /// whose `isRunning` is stuck — would be strictly worse than not trying.
     ///
+    /// It is also safely **repeatable and concurrent**: a caller whose session was
+    /// replaced while it was opening the file (a double-press on the diagnostics
+    /// panel's force-clear row) reports "nothing held" rather than throwing
+    /// `sessionNotFound` for a session that is plainly right there.
+    ///
     /// - Returns: whether anything was actually holding the session.
     @discardableResult
     public func forceClearRun(sessionID: String) async throws -> Bool {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         let path = await session.harness.sessionFilePath
-        // Re-check after the suspension: a concurrent shutdown or replacement must
-        // win rather than be clobbered by a state built from a stale snapshot.
-        guard let current = sessions[sessionID], current === session else {
-            throw ServerRuntimeError.sessionNotFound
-        }
-        // Opened FIRST, while nothing has been mutated yet.
-        let fresh = try AgentHarness.open(
+        // Opened FIRST, while nothing has been mutated yet — and OFF this actor,
+        // because it parses the whole session file and this lever is pulled exactly
+        // when the runtime is already unhealthy and every other session's calls are
+        // the last thing that should queue behind it.
+        let fresh = try await Self.reopen(
             path: path,
             configuration: harnessConfiguration(sessionID: sessionID)
         )
+        // Re-check after the suspensions above: a concurrent shutdown or a
+        // concurrent force-clear must win rather than be clobbered by a state built
+        // from a stale snapshot. `fresh` is simply dropped in that case — nothing
+        // has been mutated yet, which is the point of opening first.
+        guard let current = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard current === session else { return false }
 
         let held = session.runTask != nil || !session.pending.isEmpty
+        // Silence the doomed run BEFORE the swap, so there is no window in which it
+        // can emit into a sink the replacement state already owns.
+        session.runSink?.detach()
         session.runTask?.cancel()
         drainPending(session, reason: "The run was cleared at the client's request.")
         sessions[sessionID] = makeState(harness: fresh, sink: session.sink)
         // Terminal frame for anyone still attached: the client's run state is
-        // edge-triggered, so without this it stays pinned on "thinking…".
+        // edge-triggered, so without this it stays pinned on "thinking…". Sent on
+        // the raw sink — this frame is the runtime's, not the abandoned run's.
         session.sink.broadcast(.agentEnd(reason: "aborted"))
         return held
     }
@@ -520,23 +614,81 @@ public actor ServerRuntime {
     /// The linear root-to-leaf message path of a session — what a client renders
     /// as the transcript. Reads from disk, so it works for a session that is live
     /// or one that only exists as a file.
+    ///
+    /// For a **live** session the walk starts from the harness's own tip, not from
+    /// the file's last-written entry. Those are normally the same entry, and were
+    /// assumed to be until ``forceClearRun(sessionID:)`` existed: the run it
+    /// abandons keeps its own persistence sink over the same file, so when it
+    /// finally settles its late append becomes the file's leaf and a file-leaf walk
+    /// returns the **dead** branch — the recovered prompt and the model's answer to
+    /// it simply disappear from the transcript. The live harness is the authority on
+    /// which branch this session is actually on; the file is only the authority on
+    /// what is on it.
     public func messages(sessionID: String) async throws -> [Message] {
-        try await Self.loadMessages(at: try await sessionPath(sessionID))
+        let location = try await readLocation(sessionID)
+        return try await Self.loadMessages(at: location.path, from: location.leaf)
     }
 
     /// The direct children of a node (or of the tree roots when `parent` is nil),
     /// in chronological order — the branch-navigation primitive.
+    ///
+    /// Deliberately NOT leaf-relative: `SessionTree.children(of:)` filters entries
+    /// by `parentId` and never consults the leaf, so the force-clear hazard
+    /// ``messages(sessionID:)`` guards against does not exist here. Showing *both*
+    /// children of the fork point is the correct answer for branch navigation — it
+    /// is how a client reaches the abandoned run's tail at all.
     public func children(sessionID: String, parent: String?) async throws -> [SessionTreeEntry] {
         try await Self.loadChildren(at: try await sessionPath(sessionID), parent: parent)
     }
 
+    /// Which file to read, and which tip to walk back from — `nil` meaning "the
+    /// file's own leaf", the only answer available for a session that is not live.
+    private struct ReadLocation {
+        let path: FilePath
+        let leaf: String?
+    }
+
+    private func readLocation(_ id: String) async throws -> ReadLocation {
+        guard let session = sessions[id] else {
+            return ReadLocation(
+                path: try await Self.locate(id: id, cwd: config.cwd, sessionDirectory: config.sessionDirectory),
+                leaf: nil
+            )
+        }
+        // Both reads on the SAME harness object, so a replacement landing between
+        // them cannot pair one state's path with another's leaf.
+        let harness = session.harness
+        return ReadLocation(path: await harness.sessionFilePath, leaf: await harness.currentLeafID)
+    }
+
     @concurrent
-    private static func loadMessages(at path: FilePath) async throws -> [Message] {
+    private static func loadMessages(at path: FilePath, from leaf: String?) async throws -> [Message] {
         let tree = try SessionTree.load(from: JSONLSessionStore(path: path))
-        return try tree.branch().compactMap { entry in
+        // `branch(from:)` throws on a tip that is not in the file rather than
+        // silently falling back to the file's leaf: falling back is exactly the
+        // behaviour whose loss of the recovered turn this parameter exists to
+        // prevent, and a refusal is the store's own stance on a broken chain.
+        return try tree.branch(from: leaf).compactMap { entry in
             if case .message(let message) = entry.payload { return message }
             return nil
         }
+    }
+
+    /// Re-open a session file off this actor. `@concurrent` is load-bearing: an
+    /// unmarked `async func` would run on the caller's actor — this one — which is
+    /// the whole thing being avoided.
+    @concurrent
+    private static func reopen(
+        path: FilePath,
+        configuration: AgentHarness.Configuration
+    ) async throws -> AgentHarness {
+        try AgentHarness.open(path: path, configuration: configuration)
+    }
+
+    /// Read a session file's header id off this actor.
+    @concurrent
+    private static func readSessionID(at path: FilePath) async throws -> String {
+        try JSONLSessionStore(path: path).readHeader().id
     }
 
     @concurrent

@@ -336,6 +336,41 @@ struct AgentHarnessTests {
         #expect(responder.callCount == 1)
     }
 
+    // MARK: - The runaway guard reaches every embedding
+
+    @Test("an unbounded harness run is still stopped by the default no-progress guard")
+    func defaultNoProgressGuardBoundsAnUnboundedRun() async throws {
+        // `AgentHarness.Configuration.maxTurns` defaults to nil — unbounded — so
+        // the ONLY thing that ends a stuck run is `AgentLoopConfig`'s
+        // `noProgressLimit` default, inherited because `run(prompt:)` does not
+        // pass the argument at all. That inheritance is the whole product effect
+        // of the guard (server, print mode and the inline REPL all arrive here),
+        // and nothing else in the suite pins it: a `noProgressLimit: nil` added
+        // to that construction leaves every loop-level test green.
+        //
+        // 15 identical tool-call turns are scripted, then an answer. Guarded, the
+        // run settles `.noProgress` on turn 12 and the answer is never requested.
+        let stuckTurn = AssistantMessage(
+            content: [.toolCall(ToolCallBlock(id: "c1", name: "echo"))],
+            model: "test-model",
+            stopReason: .toolUse
+        )
+        let responder = ScriptedResponder(Array(repeating: stuckTurn, count: 15) + [assistant("done")])
+        let ids = SequentialIDs(prefix: "stuck")
+        let config = configuration(streamFn: responder.fn(), tools: [EchoTool()], ids: ids)
+        #expect(config.maxTurns == nil)
+
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: config
+        )
+        let result = try await harness.run(prompt: "go")
+
+        #expect(result.stopReason == .noProgress)
+        #expect(responder.callCount == 12)
+    }
+
     // MARK: - Resume correctness (the exit criterion)
 
     @Test("a fresh harness opened on a two-turn file rebuilds the identical next-turn context")

@@ -222,7 +222,8 @@ public struct LiteLLMClient: Sendable {
         /// clamped into `[minimumRetryAfter, maxRetryDelay]` — it is
         /// attacker-influenced text, so neither end of it is trusted. Otherwise
         /// the schedule is `min(baseRetryDelay * 2^(attempt-1), maxRetryDelay)`
-        /// scaled by `jitter`.
+        /// scaled by `jitter`, and then floored the same way the server-supplied
+        /// branch is, so no path can schedule a zero-delay retry.
         ///
         /// Pure and public so the whole table is testable without a transport,
         /// a clock, or a sleep.
@@ -230,18 +231,59 @@ public struct LiteLLMClient: Sendable {
             if let retryAfter {
                 return min(max(retryAfter, Self.minimumRetryAfter), maxRetryDelay)
             }
-            // `1 << shift` is the doubling; the saturation at 30 keeps the shift
-            // itself from overflowing on an absurd attempt number, and the cap
-            // makes anything past ~7 attempts moot anyway.
+            // `shift` is the doubling count; the saturation at 30 keeps it from
+            // overflowing on an absurd attempt number, and the cap makes
+            // anything past ~7 attempts moot anyway.
             let shift = min(max(0, attempt - 1), 30)
-            let capped = min(baseRetryDelay * Double(1 << shift), maxRetryDelay)
+            let capped = doubling(baseRetryDelay, times: shift)
             // NaN loses every comparison, so a plain `min(max(j, 0), 1)` passes
             // it straight through — and `Duration * Double` converts through
             // `Int128`, which TRAPS on a NaN or an infinity. `jitter` is
             // injectable, so this is reachable from a caller's bug, not just
-            // from ours: a non-finite multiplier reads as its sign's bound.
-            let factor = jitter.isFinite ? min(max(jitter, 0), 1) : (jitter > 0 ? 1 : 0)
-            return capped * factor
+            // from ours.
+            //
+            // A non-finite multiplier reads as the FULL delay, not as none. The
+            // two directions are not symmetric: rounding a broken multiplier up
+            // wastes one backoff, rounding it down fires the entire ten-attempt
+            // budget back to back at a provider that just said it was
+            // overloaded — a client bug turned into a retry storm.
+            let factor = jitter.isFinite ? min(max(jitter, 0), 1) : 1
+            // `Duration * Double` round-trips through `Double`, which cannot
+            // represent every `Duration` exactly, so an unjittered delay is
+            // returned untouched rather than losing its low bits to a multiply
+            // by one.
+            let jittered = factor == 1 ? capped : capped * factor
+            // And for the same reason the floor applies here too, not only to a
+            // server-supplied delay: `jitter = { 0 }` (AWS "full jitter" can
+            // draw it), or a finite negative, would otherwise schedule zero —
+            // ten immediate requests, the exact hot loop `minimumRetryAfter`
+            // exists to stop. The floor never *raises* a delay above the nominal
+            // one, so a base below it — including zero — is still honoured.
+            return max(jittered, min(Self.minimumRetryAfter, capped))
+        }
+
+        /// `base` doubled `times` times, saturating at ``maxRetryDelay``.
+        ///
+        /// Doubling in `Duration` rather than multiplying by `Double(1 << shift)`
+        /// because that multiply converts through `_Int128` and *traps* on
+        /// overflow rather than saturating — and both operands are configurable:
+        /// `DOMOCODE_RETRY_BASE_MS` and `DOMOCODE_RETRY_MAX_MS` accept any
+        /// non-negative `Int`, so an absurd-but-accepted pair plus
+        /// `DOMOCODE_MAX_RETRIES >= 16` was a config-driven process kill. Here
+        /// the loop stops the moment the ceiling is reached, so nothing can grow
+        /// past a value `Duration` already holds.
+        private func doubling(_ base: Duration, times: Int) -> Duration {
+            // Neither knob is reachable as a negative through the CLI parser,
+            // which rejects negatives, but `Configuration` is public: doubling a
+            // negative base grows without bound in the one direction the ceiling
+            // does not stop, and a negative ceiling makes every delay negative.
+            guard base > .zero, maxRetryDelay > .zero else { return .zero }
+            var value = min(base, maxRetryDelay)
+            for _ in 0..<max(0, times) {
+                if value >= maxRetryDelay { return maxRetryDelay }
+                value += value
+            }
+            return min(value, maxRetryDelay)
         }
     }
 
@@ -934,7 +976,14 @@ enum LiteLLMErrorPatterns {
     /// `packages/ai/src/utils/retry.ts` RETRYABLE_PROVIDER_ERROR_PATTERN.
     static let retryable = [
         #"overloaded"#, #"rate.?limit"#, #"too many requests"#,
-        #"429"#, #"500"#, #"502"#, #"503"#, #"504"#, #"524"#,
+        // pi spells these as bare substrings; here they carry word boundaries.
+        // Without them a status code is matched inside any longer digit run,
+        // and the digit runs a 400 body actually contains are byte counts and
+        // token counts: `image exceeds 5 MB maximum: 5502341 bytes` matched
+        // `502` and bought a permanently-fatal request ten retries. A status
+        // code in prose is always token-delimited ("Error code: 502", "HTTP
+        // 503", "(status=500)"), so the boundaries cost no real match.
+        #"\b429\b"#, #"\b500\b"#, #"\b502\b"#, #"\b503\b"#, #"\b504\b"#, #"\b524\b"#,
         #"service.?unavailable"#, #"server.?error"#, #"internal.?error"#,
         #"provider.?returned.?error"#,
         #"network.?error"#, #"connection.?error"#, #"connection.?refused"#, #"connection.?lost"#,
@@ -953,18 +1002,45 @@ enum LiteLLMErrorPatterns {
         // status alone is not sufficient: `isRetryableBody` is what decides
         // retryability for a non-429 status (see `classify`), so a busy
         // provider whose overload arrives as a 400 is only caught by wording.
-        #"\bbusy\b"#,  // "The server is busy", "model is busy"
-        #"\bcapacity\b"#,  // "at capacity", "insufficient capacity"
+        //
+        // Every one of these must name *server state*, and must name it with
+        // enough context that echoed user content cannot say it by accident. A
+        // false negative here costs one transient failure the user can retry by
+        // hand; a false positive costs ten attempts and four minutes of backoff
+        // on a request that will never succeed, with the real error hidden the
+        // whole time. The two are not equally bad, so the wording is narrow.
+        //
+        // "The server is busy", "our servers are busy", "the model is
+        // currently busy" — but not `'busy' is not a registered tool`, which is
+        // an echoed tool name in a permanently-fatal 400.
+        #"(?:server|service|model|provider|deployment|engine|gateway|upstream|system|api)s?\s+"#
+            + #"(?:is\s+|are\s+|was\s+|were\s+)?(?:currently\s+|temporarily\s+|too\s+|very\s+)?busy"#,
+        // "at capacity", "over capacity", "insufficient capacity" — but not a
+        // field named `capacity` quoted back out of a rejected tool schema.
+        #"(?:at|over|beyond|insufficient|exceeded|reached|no)\s+capacity"#,
         #"temporarily unavailable"#,
-        #"please try again"#,  // Anthropic/Vertex "Please try again later."
         #"try again (?:later|shortly|in a (?:moment|few|little))"#,
-        #"529"#,  // an upstream Anthropic 529 wrapped in a LiteLLM 400
         #"no healthy (?:upstream|deployment)"#,  // LiteLLM router
         #"all deployments? (?:are )?(?:rate limited|unhealthy|failed)"#,  // LiteLLM router
-        // Deliberately NOT here: a bare `try again`. It would fire on a
-        // genuinely malformed request ("check your parameters and try again")
-        // and spend the whole ten-retry budget on a 400 that will never
-        // succeed. The alternations above only match server-state wording.
+        // Deliberately NOT here, each because it was measured turning a fatal
+        // 400/404 into ten retries and ~243 seconds of backoff:
+        //
+        //   - a bare `try again`, and a bare `please try again`: ordinary remedy
+        //     prose on a permanently-fatal request. "model 'claude-sonnet-9' not
+        //     found. Please try again with a valid model name." is a 404 that
+        //     will never succeed, and a mistyped model is the most common user
+        //     error there is. The `try again later|shortly|in a moment` form
+        //     above still catches every legitimate Anthropic/Vertex phrasing,
+        //     because those name a *time*.
+        //   - a bare `529`, for an upstream Anthropic overload wrapped in a
+        //     LiteLLM 400. As a substring it fires inside any longer digit run:
+        //     an oversized image ("5529341 bytes"), a token count ("65290"), an
+        //     Anthropic request id ("req_011CQ529xyz"), a `code` field that
+        //     `WireError.summary` folds into the match text. It bought nothing
+        //     either: a real 529 is retryable by status
+        //     (``DoMoCore/DoMoError/isRetryableStatus(_:)`` covers all of 5xx),
+        //     and the wrapped-in-a-400 form arrives as "AnthropicException -
+        //     529 overloaded_error", which `overloaded` above already matches.
     ].joined(separator: "|")
 
     /// `packages/ai/src/utils/retry.ts` NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.

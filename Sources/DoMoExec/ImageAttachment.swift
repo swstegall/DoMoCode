@@ -191,17 +191,51 @@ public struct ImageAttachmentLoadResult: Sendable {
     public var loaded: [LoadedImage]
     public var rejected: [ImageAttachmentRejection]
 
-    public init(loaded: [LoadedImage] = [], rejected: [ImageAttachmentRejection] = []) {
+    /// Paths that named an image already staged on this turn, as the caller
+    /// spelled them.
+    ///
+    /// A duplicate is neither a success nor a failure, and it needs its own
+    /// slot because those are the only two things the caller can otherwise
+    /// conclude. Dragging the same photo onto the prompt twice must not be read
+    /// as "this text was not a drop" — that would type the path into the prompt
+    /// as literal text — and must not be read as "one more image attached"
+    /// either.
+    public var skippedDuplicates: [FilePath]
+
+    /// The batch stopped early because the task was cancelled.
+    ///
+    /// ``loaded`` holds whatever was read before the stop; ``rejected``
+    /// deliberately holds nothing the cancellation caused. A cancelled drop is a
+    /// gesture the user took back, and it must produce silence rather than one
+    /// "could not be read" notice per file.
+    public var wasCancelled: Bool
+
+    public init(
+        loaded: [LoadedImage] = [],
+        rejected: [ImageAttachmentRejection] = [],
+        skippedDuplicates: [FilePath] = [],
+        wasCancelled: Bool = false
+    ) {
         self.loaded = loaded
         self.rejected = rejected
+        self.skippedDuplicates = skippedDuplicates
+        self.wasCancelled = wasCancelled
     }
 
-    /// Every candidate became an image, and there was at least one.
+    /// Every candidate resolved, and there was at least one.
     ///
     /// This is what ``ImageAttachmentLoader/resolveDrop(candidates:using:limits:alreadyLoaded:)``
     /// ranks readings by: a reading that produced even one rejection is the wrong
     /// reading of the drop, not a partially successful one.
-    public var isCompleteSuccess: Bool { rejected.isEmpty && !loaded.isEmpty }
+    ///
+    /// A batch of nothing but duplicates counts, because every path in it named
+    /// a real image — it just named one that is already attached. The caller
+    /// consumes the text and adds no chip. A cancelled batch never counts: it
+    /// stopped before it knew.
+    public var isCompleteSuccess: Bool {
+        guard !wasCancelled, rejected.isEmpty else { return false }
+        return !loaded.isEmpty || !skippedDuplicates.isEmpty
+    }
 
     /// Total raw bytes of everything loaded.
     public var byteCount: Int { loaded.reduce(0) { $0 + $1.byteCount } }
@@ -317,8 +351,21 @@ public enum ImageAttachmentLoader {
     /// budget is refused whole, with the reason that names the budget.
     ///
     /// Duplicates — by canonical path, so a symlink and its target count once —
-    /// are skipped silently. Attaching a file twice is not an error the user
-    /// needs to hear about, and it is not a failed reading of the drop either.
+    /// are skipped silently, and recorded in
+    /// ``ImageAttachmentLoadResult/skippedDuplicates``. Attaching a file twice is
+    /// not an error the user needs to hear about, and it is not a failed reading
+    /// of the drop either; the caller needs to be able to tell those two apart
+    /// from each other.
+    ///
+    /// Cancellation ENDS the batch. `POSIXFileSystem` checks
+    /// `Task.isCancelled` before every read and stat and throws
+    /// `DoMoError(.cancelled,)`, which arrives here indistinguishable from a
+    /// permission failure; classifying it as one would turn a cancelled
+    /// eight-image drop into eight bogus "could not be read" notices. The task
+    /// flag is checked instead of the error because it is the same condition
+    /// (`FileSystem.checkCancellation` throws only when it is set) and it also
+    /// catches a cancellation that lands BETWEEN two files, where there is no
+    /// error to inspect.
     @concurrent
     public static func loadAll(
         _ paths: [FilePath],
@@ -332,6 +379,11 @@ public enum ImageAttachmentLoader {
         var total = alreadyLoaded.reduce(0) { $0 + $1.byteCount }
 
         for path in paths {
+            guard !Task.isCancelled else {
+                result.wasCancelled = true
+                return result
+            }
+
             let absolute = fileSystem.absolutePath(path)
 
             // Cheap identity check first, so a duplicate costs a readlink walk
@@ -340,6 +392,7 @@ public enum ImageAttachmentLoader {
             if let canonical = try? await fileSystem.canonicalPath(absolute),
                 seen.contains(canonical)
             {
+                result.skippedDuplicates.append(absolute)
                 continue
             }
 
@@ -361,12 +414,22 @@ public enum ImageAttachmentLoader {
 
             switch await load(absolute, using: fileSystem, maximumBytes: cap) {
             case .success(let image):
-                guard seen.insert(image.path).inserted else { continue }
+                guard seen.insert(image.path).inserted else {
+                    result.skippedDuplicates.append(absolute)
+                    continue
+                }
                 result.loaded.append(image)
                 count += 1
                 total += image.byteCount
 
             case .failure(let rejection):
+                // A cancelled read reaches `load` as an ordinary filesystem
+                // error and comes back as `.unreadable`. It is not one, and it
+                // is not the user's business either.
+                guard !Task.isCancelled else {
+                    result.wasCancelled = true
+                    return result
+                }
                 result.rejected.append(Self.restating(rejection, against: limits, remaining: remaining))
             }
         }
@@ -382,11 +445,17 @@ public enum ImageAttachmentLoader {
     /// `/Users/x/my` and `pic.png` (two files) without asking the disk, so it
     /// offers both and this picks.
     ///
+    /// A reading in which every path was ALREADY staged resolves completely too,
+    /// with nothing loaded. Re-dropping a photo that is already attached is a
+    /// no-op, not a failed reading; treating it as a failure would make the
+    /// caller re-insert the path into the prompt as text.
+    ///
     /// When no reading resolves completely, the FIRST reading's result is
     /// returned, because it is the most likely intended one and therefore the
     /// one whose rejection message names the path the user meant. With no
     /// candidates at all the result is empty — which is not a success, so a
-    /// caller can treat "nothing resolved" uniformly.
+    /// caller can treat "nothing resolved" uniformly. A cancelled reading stops
+    /// the search: the remaining readings would only be cancelled as well.
     @concurrent
     public static func resolveDrop(
         candidates: [[String]],
@@ -402,7 +471,7 @@ public enum ImageAttachmentLoader {
                 limits: limits,
                 alreadyLoaded: alreadyLoaded
             )
-            if result.isCompleteSuccess { return result }
+            if result.isCompleteSuccess || result.wasCancelled { return result }
             if first == nil { first = result }
         }
         return first ?? ImageAttachmentLoadResult()
@@ -416,6 +485,13 @@ public enum ImageAttachmentLoader {
     /// one the user can act on differently. A sandbox refusal, a permission
     /// denial and an I/O error are all `unreadable`: they mean the same thing to
     /// someone who just dropped a file.
+    ///
+    /// Cancellation (`DoMoError.isCancellation`) is deliberately NOT given a
+    /// reason of its own. A rejection is a fact ABOUT A PATH, and "the user took
+    /// the gesture back" is not one; ``ImageAttachmentRejection/Reason`` would
+    /// have to grow a case that every switch over it then has to render. It is
+    /// caught one level up instead, in ``loadAll(_:using:limits:alreadyLoaded:)``,
+    /// which drops the rejection entirely rather than labelling it.
     private static func reason(for error: DoMoError) -> ImageAttachmentRejection.Reason {
         guard case .file(_, let errno) = error.kind else { return .unreadable }
         switch errno {

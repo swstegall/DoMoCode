@@ -71,6 +71,39 @@ struct RetryScheduleTests {
         let config = scheduleConfig(base: .zero)
         #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: 1.0) == .zero)
     }
+
+    /// `DOMOCODE_RETRY_BASE_MS` and `DOMOCODE_RETRY_MAX_MS` accept any
+    /// non-negative `Int`, and `Duration * Double` converts through `_Int128`,
+    /// which *traps* rather than saturating. An absurd-but-accepted config must
+    /// therefore saturate here, in the arithmetic, or it kills the process —
+    /// without this the two expectations below do not fail, they crash the
+    /// runner ("Double value cannot be converted to _Int128").
+    @Test("An absurd base delay saturates at the ceiling instead of trapping")
+    func absurdBaseDelaySaturates() {
+        let capped = scheduleConfig(base: .milliseconds(Int.max), cap: .seconds(60), maxRetries: 40)
+        #expect(capped.retryDelay(attempt: 31, retryAfter: nil, jitter: 1.0) == .seconds(60))
+        #expect(capped.retryDelay(attempt: 1, retryAfter: nil, jitter: 1.0) == .seconds(60))
+
+        // Both knobs absurd: the ceiling itself is the answer, still no trap.
+        let uncapped = scheduleConfig(base: .milliseconds(Int.max), cap: .milliseconds(Int.max))
+        #expect(uncapped.retryDelay(attempt: 31, retryAfter: nil, jitter: 1.0) == .milliseconds(Int.max))
+    }
+
+    /// A base above the ceiling is meaningless but configurable; it must read as
+    /// the ceiling from the very first retry rather than doubling past it.
+    @Test("A base above the ceiling is clamped before it is doubled")
+    func baseAboveCeiling() {
+        let config = scheduleConfig(base: .seconds(120), cap: .seconds(60))
+        #expect((1...5).allSatisfy { config.retryDelay(attempt: $0, retryAfter: nil, jitter: 1.0) == .seconds(60) })
+    }
+
+    /// A negative base is not reachable through the CLI parser, which rejects
+    /// negatives, but `Configuration` is public and its doubling would overflow.
+    @Test("A negative base delay reads as no delay rather than overflowing")
+    func negativeBaseDelay() {
+        let config = scheduleConfig(base: .seconds(-5))
+        #expect(config.retryDelay(attempt: 31, retryAfter: nil, jitter: 1.0) == .zero)
+    }
 }
 
 // MARK: - Jitter
@@ -96,17 +129,48 @@ struct RetryJitterTests {
     }
 
     /// A jitter generator is injectable, therefore it is untrusted.
+    ///
+    /// A multiplier that is not a number at all is a *caller bug*, and the two
+    /// directions it can fail in are not symmetric: rounding it up wastes one
+    /// backoff, rounding it down fires the whole ten-attempt budget back to back
+    /// at a provider that just said it was overloaded. So a non-finite
+    /// multiplier reads as the full delay, never as none.
     @Test("A jitter multiplier outside 0...1 is clamped, never amplified or negated")
     func jitterIsClampedToUnitInterval() {
         let config = scheduleConfig()
         #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: 5.0) == .seconds(4))
         #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: .infinity) == .seconds(4))
-        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: -1.0) == .zero)
-        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: -.infinity) == .zero)
         // NaN loses every comparison, so a naive clamp passes it through and
-        // `Duration * Double` then traps converting it. It must read as zero.
-        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: .nan) == .zero)
-        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: .signalingNaN) == .zero)
+        // `Duration * Double` then traps converting it.
+        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: .nan) == .seconds(4))
+        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: .signalingNaN) == .seconds(4))
+        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: -.infinity) == .seconds(4))
+        // A *finite* negative is unambiguous arithmetic and still clamps down —
+        // but the floor below keeps even that off zero.
+        #expect(config.retryDelay(attempt: 3, retryAfter: nil, jitter: -1.0) == .milliseconds(100))
+    }
+
+    /// No computed delay may ever be zero while the nominal delay is not, no
+    /// matter what the multiplier is: a zero-delay retry is a hot loop of ten
+    /// immediate requests, which is the exact behaviour ``minimumRetryAfter``
+    /// exists to stop on the server-supplied branch.
+    @Test(
+        "A computed delay is floored away from zero for every degenerate multiplier",
+        arguments: [Double.nan, -.infinity, .infinity, -1.0, -0.0, 0.0, .leastNonzeroMagnitude])
+    func computedDelayIsNeverZero(jitter: Double) {
+        let config = scheduleConfig()
+        let delay = config.retryDelay(attempt: 3, retryAfter: nil, jitter: jitter)
+        #expect(delay >= LiteLLMClient.Configuration.minimumRetryAfter, "jitter \(jitter) produced \(delay)")
+    }
+
+    /// The floor is a floor, not an inflation: it never raises a delay above the
+    /// nominal one the schedule asked for.
+    @Test("The zero floor never exceeds the nominal delay it is flooring")
+    func floorNeverExceedsNominal() {
+        let tiny = scheduleConfig(base: .milliseconds(20))
+        #expect(tiny.retryDelay(attempt: 1, retryAfter: nil, jitter: 1.0) == .milliseconds(20))
+        #expect(tiny.retryDelay(attempt: 1, retryAfter: nil, jitter: 0.0) == .milliseconds(20))
+        #expect(scheduleConfig(base: .zero).retryDelay(attempt: 1, retryAfter: nil, jitter: 0.0) == .zero)
     }
 
     /// Jitter never applies to a delay the server named.
@@ -280,13 +344,17 @@ struct RetryNoticeTests {
 @Suite("Duration to milliseconds")
 struct WholeMillisecondsTests {
 
-    @Test("Whole milliseconds round down and never trap")
+    @Test("Whole milliseconds truncate toward zero and never trap")
     func projection() {
         #expect(DoMoError.wholeMilliseconds(.seconds(1)) == 1000)
         #expect(DoMoError.wholeMilliseconds(.milliseconds(1500)) == 1500)
         #expect(DoMoError.wholeMilliseconds(.microseconds(999)) == 0)
         #expect(DoMoError.wholeMilliseconds(.zero) == 0)
         #expect(DoMoError.wholeMilliseconds(.milliseconds(-1500)) == -1500)
+        // Integer division truncates toward zero; it does not floor. The doc
+        // comment used to say "rounds down", which is only true above zero.
+        #expect(DoMoError.wholeMilliseconds(.microseconds(-999)) == 0)
+        #expect(DoMoError.wholeMilliseconds(.microseconds(-1500)) == -1)
     }
 
     /// The naive `components.seconds * 1000` traps here. That is the whole

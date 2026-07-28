@@ -201,6 +201,114 @@ struct DroppedPathsSafetyTests {
     }
 }
 
+// MARK: - Smuggling through the escaping layers
+
+/// A token can pass ``DroppedPaths/isPathShaped(_:)`` as written and hold
+/// something else entirely once an escaping layer is peeled off. Percent-
+/// encoding is the layer that matters, because ``DroppedPaths/candidates(_:)``
+/// peels it twice: once for a `file:` URL, once for the kitty fallback variant.
+@Suite("DroppedPaths: nothing smuggles through percent-decoding")
+struct DroppedPathsSmugglingTests {
+
+    @Test("a file: URL cannot carry an escape sequence in through its escapes")
+    func fileURLCannotSmuggleAnEscapeSequence() {
+        // ESC ] 0 ; pwned BEL — an OSC title-set. A rejection message is
+        // documented as safe to show verbatim, so a candidate must never hold
+        // one.
+        let readings = DroppedPaths.candidates("file:///tmp/a%1B%5D0;pwned%07.png")
+        #expect(readings.isEmpty)
+        #expect(
+            readings.flatMap { $0 }.contains { $0.unicodeScalars.contains { $0.value == 0x1B } }
+                == false
+        )
+    }
+
+    @Test("a file: URL cannot carry a newline in through its escapes")
+    func fileURLCannotSmuggleANewline() {
+        #expect(DroppedPaths.candidates("file:///tmp/a%0Ab.png").isEmpty)
+        #expect(DroppedPaths.candidates("file:///tmp/a%0Db.png").isEmpty)
+        #expect(DroppedPaths.candidates("file:///tmp/a%7Fb.png").isEmpty)
+    }
+
+    @Test("a file: URL cannot carry a NUL in through its escapes")
+    func fileURLCannotSmuggleANUL() {
+        // `FilePath` TRUNCATES at a NUL, so a candidate holding one names a
+        // different file than it reads as: `file:///etc/passwd%00.png` looks
+        // like a PNG and opens `/etc/passwd`.
+        for drop in ["file:///tmp/secret%00.png", "file:///etc/passwd%00.png"] {
+            let readings = DroppedPaths.candidates(drop)
+            #expect(readings.isEmpty, "\(drop) parsed as a drop")
+            #expect(
+                readings.flatMap { $0 }.contains { $0.unicodeScalars.contains { $0.value == 0 } }
+                    == false
+            )
+        }
+    }
+
+    @Test("the same gate applies to the kitty percent-decoded variant")
+    func decodedVariantIsGatedToo() {
+        // The literal reading stands — a file may legitimately be named
+        // `a%0Ab.png` — but the decoded variant holds a newline and is dropped.
+        #expect(DroppedPaths.candidates("/tmp/a%0Ab.png") == [["/tmp/a%0Ab.png"]])
+        #expect(DroppedPaths.candidates("/tmp/a%1Bb.png") == [["/tmp/a%1Bb.png"]])
+        #expect(DroppedPaths.candidates("/tmp/a%00b.png") == [["/tmp/a%00b.png"]])
+    }
+
+    @Test("a legitimate file: URL still decodes — the gate rejects content, not the scheme")
+    func theGateDoesNotRefuseOrdinaryURLs() {
+        #expect(DroppedPaths.candidates("file:///tmp/a%20b.png").first == ["/tmp/a b.png"])
+        #expect(DroppedPaths.candidates("file:///a/b%2520c.png").first == ["/a/b%20c.png"])
+    }
+
+    @Test("a file: URL naming another host is dropped by the parser, not passed on")
+    func remoteHostURLIsNotAPseudoPath() {
+        // `decodingFileURL` refuses to localize it; leaving it in the reading
+        // would let `FilePath` collapse `//` and turn the host into a directory
+        // component one layer down.
+        #expect(DroppedPaths.isPathShaped("file://fileserver/share/a.png") == false)
+        #expect(DroppedPaths.isPathShaped("file://host") == false)
+        #expect(DroppedPaths.candidates("file://fileserver/share/a.png").isEmpty)
+    }
+
+    @Test("an exotic line separator suppresses the whole-string readings")
+    func exoticLineSeparatorsAreNewlinesToo() {
+        // U+2028/U+2029/U+0085 are `isNewline` but not control characters, so
+        // `isPathShaped` accepts them; only the newline suppression stops a
+        // multi-line paste using them from being offered as one filename.
+        #expect(DroppedPaths.candidates("/tmp/a\u{2028}b.png").isEmpty)
+        #expect(DroppedPaths.candidates("/tmp/a\u{2029}b.png").isEmpty)
+        #expect(DroppedPaths.candidates("/tmp/a\u{85}b.png").isEmpty)
+    }
+
+    /// The two limits in the file bound every reading at 16 tokens of 4096
+    /// bytes, so a larger paste can only ever return `[]` — but it used to do so
+    /// after building a grapheme-cluster array of the whole input, on the main
+    /// actor, mid-paste. The answer is unchanged, so timing is the only signal a
+    /// regression leaves; the margin here is three orders of magnitude, not the
+    /// few percent a flaky benchmark would rest on.
+    @Test("an oversized paste is refused without scanning it")
+    func hugePasteIsRefusedWithoutScanning() {
+        let paste = String(repeating: "/aaaaaaaaa", count: 800_000)  // ~8 MB, one token
+        #expect(paste.utf8.count > DroppedPaths.maximumInputBytes)
+        let started = ContinuousClock.now
+        #expect(DroppedPaths.candidates(paste).isEmpty)
+        #expect(ContinuousClock.now - started < .milliseconds(250))
+    }
+
+    @Test("the input limit leaves room for the largest drop the other limits allow")
+    func theInputLimitDoesNotCutIntoValidDrops() {
+        // 16 tokens at the full path limit, every space backslash-escaped: the
+        // worst case the tokenizer can still accept.
+        let token = "/" + String(repeating: "a b", count: DroppedPaths.maximumPathBytes / 4)
+        let escaped = token.replacingOccurrences(of: " ", with: #"\ "#)
+        let drop = Array(repeating: escaped, count: DroppedPaths.maximumTokens)
+            .joined(separator: " ")
+        #expect(token.utf8.count <= DroppedPaths.maximumPathBytes)
+        #expect(drop.utf8.count <= DroppedPaths.maximumInputBytes)
+        #expect(DroppedPaths.candidates(drop).first?.count == DroppedPaths.maximumTokens)
+    }
+}
+
 // MARK: - Tokenizer
 
 @Suite("DroppedPaths.tokenize")

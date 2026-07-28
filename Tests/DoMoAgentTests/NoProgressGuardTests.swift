@@ -304,6 +304,28 @@ func noProgressStopsAtExactlyTheLimit(limit: Int) async {
     #expect(result.assistantMessages.count == 4)
 }
 
+// MARK: - The default is live
+
+@Test func theDefaultLimitIsLiveWithoutBeingAskedFor() async {
+    // The headline effect of this wave: `--max-turns` becomes unlimited, so the
+    // DEFAULT `noProgressLimit` is the only thing bounding a stuck run. Every
+    // other test here names a limit explicitly, which pins the mechanism but not
+    // the value that actually ships. A config that names no limit must still be
+    // guarded, and at 12.
+    let sink = RecordingSink()
+    let stream = ScriptedStream(stuckTurns(40))
+
+    let result = await runOnce(
+        context: AgentContext(tools: [constantTool("stuck")]),
+        config: AgentLoopConfig(model: "test-model"),  // no noProgressLimit:
+        sink: sink,
+        streamFn: stream.fn
+    )
+
+    #expect(result.stopReason == .noProgress)
+    #expect(result.assistantMessages.count == 12)
+}
+
 // MARK: - Turning it off
 
 @Test func nilNoProgressLimitDisablesTheGuardEntirely() async {
@@ -324,10 +346,12 @@ func noProgressStopsAtExactlyTheLimit(limit: Int) async {
 }
 
 @Test(arguments: [0, 1, -1])
-func aLimitBelowTwoDisablesTheGuard(limit: Int) async {
-    // One turn is not a repetition of anything, so a limit below 2 could only
-    // mean "stop at the first tool call" — which would fire on varied work.
-    // Refusing to honour it is safer than silently rounding it up to 2.
+func aLimitBelowTwoIsClampedToTwoRatherThanDisablingTheGuard(limit: Int) async {
+    // One turn is not a repetition of anything, so a limit below 2 cannot be
+    // honoured literally — "stop at the first tool call" would fire on perfectly
+    // varied work. But this is the only bound on a run once `maxTurns` is nil, so
+    // it must fail CLOSED: a nonsense or over-strict limit clamps UP to the
+    // strictest meaningful value (2), never off. `nil` is the only disable.
     let sink = RecordingSink()
     let stream = ScriptedStream(stuckTurns(30))
 
@@ -338,8 +362,32 @@ func aLimitBelowTwoDisablesTheGuard(limit: Int) async {
         streamFn: stream.fn
     )
 
-    #expect(result.stopReason == .maxTurnsReached)
-    #expect(result.assistantMessages.count == 6)
+    #expect(result.stopReason == .noProgress)
+    #expect(result.assistantMessages.count == 2)
+}
+
+@Test func aClampedLimitStillCannotFireOnVariedWork() async {
+    // Clamping up must not make the guard trigger-happy: even at its strictest,
+    // two turns of DIFFERENT work are not a repetition.
+    let sink = RecordingSink()
+    let scripts =
+        (0..<20).map { index in
+            assistantTurn(
+                toolCalls: [tc("work", id: "call-\(index)", arguments: .object(["step": .int(index)]))],
+                stopReason: .toolUse
+            )
+        } + [finalTextTurn()]
+    let stream = ScriptedStream(scripts)
+
+    let result = await runOnce(
+        context: AgentContext(tools: [constantTool("work")]),
+        config: AgentLoopConfig(model: "test-model", maxTurns: nil, noProgressLimit: 1),
+        sink: sink,
+        streamFn: stream.fn
+    )
+
+    #expect(result.stopReason == .completed)
+    #expect(result.assistantMessages.count == 21)
 }
 
 // MARK: - Turns with no tool calls
@@ -408,6 +456,29 @@ func aLimitBelowTwoDisablesTheGuard(limit: Int) async {
     #expect(result.toolResults.count >= 4)
 }
 
+@Test func steeringOnEveryTurnDoesNotBuyTheModelMoreRope() async {
+    // The counterpart to the two tests above, and the case they leave uncovered:
+    // a human typing a correction between EVERY pair of identical tool turns.
+    // Steering is deliberately not a reset. A model that keeps making the same
+    // call with the same result while being corrected is the stuck case, not the
+    // exception to it — and if steering did reset the streak, any embedder that
+    // injects a message every turn (a periodic status line, a nagging prompt)
+    // would silently disable the only bound this run has.
+    let steering: @Sendable () async -> [Message] = { [.user("stop doing that")] }
+    let sink = RecordingSink()
+    let stream = ScriptedStream(stuckTurns(30))
+
+    let result = await runOnce(
+        context: AgentContext(tools: [constantTool("stuck")]),
+        config: AgentLoopConfig(model: "test-model", noProgressLimit: 3, getSteeringMessages: steering),
+        sink: sink,
+        streamFn: stream.fn
+    )
+
+    #expect(result.stopReason == .noProgress)
+    #expect(result.assistantMessages.count == 3)
+}
+
 // MARK: - Interaction with the other stop reasons
 
 @Test func maxTurnsStillWinsWhenItComesFirst() async {
@@ -425,10 +496,12 @@ func aLimitBelowTwoDisablesTheGuard(limit: Int) async {
     #expect(result.assistantMessages.count == 3)
 }
 
-@Test func aStopHookStillSeesEveryTurnThatRan() async {
-    // The guard sits before `shouldStopAfterTurn`, so a hook must still be
-    // consulted for every turn that actually ran — including the last one only
-    // when the guard did not already end the run on it.
+@Test func aStopHookIsNotConsultedOnTheTurnThatTripsTheGuard() async {
+    // The guard settles the run BEFORE `shouldStopAfterTurn` runs, so on the
+    // turn that trips it the hook is never asked: the run is already decided and
+    // `.noProgress` wins the reason over `.stoppedByHook`. Four turns run; the
+    // hook sees the first three. Both numbers are asserted below so the
+    // off-by-one is legible here rather than inferred from another test.
     let seen = Box(0)
     let sink = RecordingSink()
     let stream = ScriptedStream(stuckTurns(30))
@@ -448,7 +521,73 @@ func aLimitBelowTwoDisablesTheGuard(limit: Int) async {
     )
 
     #expect(result.stopReason == .noProgress)
+    #expect(result.assistantMessages.count == 4)
     #expect(seen.value == 3)
+}
+
+@Test func aTerminatingBatchBeatsTheGuardOnTheTurnThatWouldTripIt() async {
+    // A `finish`/`submit`-style tool that reports the same output every time and
+    // sets `terminate` when it decides to stop: `terminate` is not part of the
+    // signature (it is not model-visible work), so the terminating turn looks
+    // identical to the ones before it. The run ended the way it was asked to —
+    // reporting `.noProgress` would flip print mode's exit code from 0 to 3.
+    let calls = Box(0)
+    let submit = FakeTool("submit") { _ in
+        let n = calls.withLock { current -> Int in
+            current += 1
+            return current
+        }
+        return AgentToolResult(output: "working", terminate: n >= 4)
+    }
+    let sink = RecordingSink()
+    let stream = ScriptedStream(stuckTurns(10, tool: "submit"))
+
+    let result = await runOnce(
+        context: AgentContext(tools: [submit]),
+        config: AgentLoopConfig(model: "test-model", noProgressLimit: 4),
+        sink: sink,
+        streamFn: stream.fn
+    )
+
+    #expect(result.stopReason == .terminatedByTool)
+    #expect(result.assistantMessages.count == 4)
+}
+
+@Test func aRunThatKeepsRepeatingAfterATerminatingTurnIsStillCaught() async {
+    // The terminate exemption must not be a way to stay unbounded: a follow-up
+    // that resumes the run past a terminating batch restarts the streak, and the
+    // guard fires again on the next `limit` identical turns.
+    let followUps = Box(1)
+    let resume: @Sendable () async -> [Message] = {
+        let more = followUps.withLock { count -> Bool in
+            guard count > 0 else { return false }
+            count -= 1
+            return true
+        }
+        return more ? [.user("keep going")] : []
+    }
+    let calls = Box(0)
+    let submit = FakeTool("submit") { _ in
+        let n = calls.withLock { current -> Int in
+            current += 1
+            return current
+        }
+        return AgentToolResult(output: "working", terminate: n == 2)
+    }
+    let sink = RecordingSink()
+    let stream = ScriptedStream(stuckTurns(20, tool: "submit"))
+
+    let result = await runOnce(
+        context: AgentContext(tools: [submit]),
+        config: AgentLoopConfig(model: "test-model", noProgressLimit: 3, getFollowUpMessages: resume),
+        sink: sink,
+        streamFn: stream.fn
+    )
+
+    // Turns 1-2 run (2 terminates), the follow-up resumes, turns 3-5 repeat and
+    // the guard fires on the third of those.
+    #expect(result.stopReason == .noProgress)
+    #expect(result.assistantMessages.count == 5)
 }
 
 // MARK: - The signature itself

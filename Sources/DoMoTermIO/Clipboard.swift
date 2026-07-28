@@ -156,9 +156,12 @@ private let clipboardHelpers: [ClipboardCommand] = [
 ///   1. `pbcopy` — Darwin's system helper, and never present elsewhere.
 ///   2. `WAYLAND_DISPLAY` set → `wl-copy`.
 ///   3. `DISPLAY` set → `xclip -selection clipboard`, then `xsel --clipboard --input`.
-///   4. Neither display variable set → the first of `wl-copy`/`xclip`/`xsel`
-///      that exists. An ssh session with no forwarded display may still reach a
-///      helper, and trying costs one refused spawn.
+///   4. OTHERWISE — whatever the display variables say, including when they name a
+///      server whose helper is not installed — the first of `wl-copy`/`xclip`/`xsel`
+///      that exists. The display variables are a PREFERENCE, not a filter: a box
+///      with `DISPLAY` set and only `wl-copy` installed still gets `wl-copy`, and an
+///      ssh session with no forwarded display may still reach a helper. Trying costs
+///      one refused spawn; refusing to try costs the user their copy.
 ///
 /// A `nil` result is not a failure: OSC 52 is then the only path, which is exactly
 /// the right answer on a remote host.

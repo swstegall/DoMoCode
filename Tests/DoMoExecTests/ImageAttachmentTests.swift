@@ -85,12 +85,28 @@ struct StubFileSystem: FileSystem {
     let workingDirectory: FilePath
     let homeDirectory: FilePath
 
+    /// Whether every operation checks `Task.isCancelled` first and throws
+    /// `DoMoError(.cancelled,)`, exactly as `POSIXFileSystem.checkCancellation`
+    /// does. Off by default so the rest of the suite is unaffected; a loader
+    /// tested only against a stub that ignores cancellation cannot be shown to
+    /// handle it.
+    let checksCancellation: Bool
+
+    /// Called at the start of every operation, BEFORE the cancellation check, so
+    /// a test can change the world — cancel the running task, most usefully — at
+    /// an exact point in a batch instead of racing it.
+    let onOperation: @Sendable (String, FilePath) -> Void
+
     init(
         nodes: [String: Node],
         log: FileSystemCallLog = FileSystemCallLog(),
         workingDirectory: FilePath = "/work",
-        homeDirectory: FilePath = "/home/sam"
+        homeDirectory: FilePath = "/home/sam",
+        checksCancellation: Bool = false,
+        onOperation: @escaping @Sendable (String, FilePath) -> Void = { _, _ in }
     ) {
+        self.checksCancellation = checksCancellation
+        self.onOperation = onOperation
         // Ancestors are implied, so a test names only the files it cares about.
         var filled = nodes
         for key in nodes.keys {
@@ -112,11 +128,19 @@ struct StubFileSystem: FileSystem {
             .absolutePath(path)
     }
 
+    /// The hook and the cancellation check every operation runs first.
+    private func begin(_ operation: String, _ path: FilePath) throws(DoMoError) {
+        onOperation(operation, path)
+        guard checksCancellation, Task.isCancelled else { return }
+        throw DoMoError(.cancelled, "filesystem operation cancelled")
+    }
+
     @concurrent
     func canonicalPath(
         _ path: FilePath,
         allowingMissingComponents: Bool
     ) async throws(DoMoError) -> FilePath {
+        try begin("canonicalPath", path)
         var pending = Array(absolutePath(path).components.map(\.string).reversed())
         var resolved = FilePath("/")
         var hops = 0
@@ -173,18 +197,21 @@ struct StubFileSystem: FileSystem {
     @concurrent
     func read(_ path: FilePath) async throws(DoMoError) -> Data {
         log.record("read", path)
+        try begin("read", path)
         return try bytes(at: path)
     }
 
     @concurrent
     func readPrefix(_ path: FilePath, maximumBytes: Int) async throws(DoMoError) -> Data {
         log.record("readPrefix", path)
+        try begin("readPrefix", path)
         return try bytes(at: path).prefix(maximumBytes)
     }
 
     @concurrent
     func metadata(_ path: FilePath) async throws(DoMoError) -> FileMetadata {
         log.record("metadata", path)
+        try begin("metadata", path)
         let kind: FileKind
         let size: Int64
         switch try node(at: path) {
@@ -580,6 +607,8 @@ struct ImageAttachmentLoadAllTests {
         #expect(result.isCompleteSuccess)
         // The first spelling wins the chip label.
         #expect(result.loaded.first?.displayName == "link.png")
+        // The second spelling is a duplicate, not a failure and not a second image.
+        #expect(result.skippedDuplicates == ["/pics/real.png"])
     }
 
     @Test("a path repeated in one drop attaches once and is not read twice")
@@ -590,7 +619,7 @@ struct ImageAttachmentLoadAllTests {
         #expect(fs.log.count("read") == 1)
     }
 
-    @Test("an already-staged image is not attached a second time")
+    @Test("an already-staged image is not attached a second time, and says so")
     func dedupesAgainstAlreadyLoaded() async {
         let fs = StubFileSystem(nodes: ["/a/x.png": .file(ImageBytes.png)])
         let staged = LoadedImage(
@@ -602,7 +631,20 @@ struct ImageAttachmentLoadAllTests {
         let result = await ImageAttachmentLoader.loadAll(["/a/x.png"], using: fs, alreadyLoaded: [staged])
         #expect(result.loaded.isEmpty)
         #expect(result.rejected.isEmpty)
-        #expect(result.isCompleteSuccess == false)
+        // The skip is RECORDED. An empty result would be indistinguishable from
+        // "this was not a drop", which is what makes the caller re-insert the
+        // path as prompt text.
+        #expect(result.skippedDuplicates == ["/a/x.png"])
+        #expect(result.isCompleteSuccess)
+    }
+
+    @Test("a path repeated in one drop is recorded as the duplicate it is")
+    func recordsRepeatedPathsAsDuplicates() async {
+        let fs = StubFileSystem(nodes: ["/a/x.png": .file(ImageBytes.png)])
+        let result = await ImageAttachmentLoader.loadAll(["/a/x.png", "/a/x.png"], using: fs)
+        #expect(result.loaded.map(\.path) == ["/a/x.png"])
+        #expect(result.skippedDuplicates == ["/a/x.png"])
+        #expect(result.isCompleteSuccess)
     }
 
     @Test("no paths is an empty, non-successful result")
@@ -611,6 +653,9 @@ struct ImageAttachmentLoadAllTests {
         let result = await ImageAttachmentLoader.loadAll([], using: fs)
         #expect(result.loaded.isEmpty)
         #expect(result.rejected.isEmpty)
+        #expect(result.skippedDuplicates.isEmpty)
+        // Nothing was asked for, so nothing succeeded: a duplicate is a success
+        // only because a real image was named.
         #expect(result.isCompleteSuccess == false)
         #expect(result.byteCount == 0)
     }
@@ -731,6 +776,53 @@ struct ImageAttachmentResolveDropTests {
         #expect(result.loaded.map(\.displayName) == ["my pic.png", "b.png"])
     }
 
+    @Test("dropping a photo that is already attached is not a failed reading")
+    func reDroppingAStagedImageSucceeds() async {
+        let fs = StubFileSystem(nodes: ["/a/x.png": .file(ImageBytes.png)])
+        let staged = LoadedImage(
+            path: "/a/x.png",
+            displayName: "x.png",
+            mediaType: "image/png",
+            data: ImageBytes.png
+        )
+        let result = await ImageAttachmentLoader.resolveDrop(
+            candidates: DroppedPaths.candidates("/a/x.png"),
+            using: fs,
+            alreadyLoaded: [staged]
+        )
+        // The caller has two outcomes: attach, or hand the text back to the
+        // prompt verbatim. An empty non-success would pick the second, and drag
+        // the same photo in twice would type `/a/x.png` into the message.
+        #expect(result.isCompleteSuccess)
+        #expect(result.loaded.isEmpty)
+        #expect(result.rejected.isEmpty)
+        #expect(result.skippedDuplicates == ["/a/x.png"])
+    }
+
+    @Test("a re-drop of one staged and one new photo attaches only the new one")
+    func reDropOfAMixedSelection() async {
+        let fs = StubFileSystem(
+            nodes: [
+                "/a/x.png": .file(ImageBytes.png),
+                "/a/y.png": .file(ImageBytes.jpeg),
+            ]
+        )
+        let staged = LoadedImage(
+            path: "/a/x.png",
+            displayName: "x.png",
+            mediaType: "image/png",
+            data: ImageBytes.png
+        )
+        let result = await ImageAttachmentLoader.resolveDrop(
+            candidates: [["/a/x.png", "/a/y.png"]],
+            using: fs,
+            alreadyLoaded: [staged]
+        )
+        #expect(result.isCompleteSuccess)
+        #expect(result.loaded.map(\.path) == ["/a/y.png"])
+        #expect(result.skippedDuplicates == ["/a/x.png"])
+    }
+
     @Test("limits apply to a drop exactly as they do to a batch")
     func limitsApplyToDrops() async {
         let fs = StubFileSystem(
@@ -746,6 +838,159 @@ struct ImageAttachmentResolveDropTests {
         )
         #expect(result.loaded.count == 1)
         #expect(result.rejected.first?.reason == .countLimitReached(limit: 1))
+    }
+}
+
+// MARK: - Cancellation
+
+/// A gate a spawned task waits at before doing any work, so a test can cancel
+/// it FIRST. Without it the child races the `cancel()` call and the test is
+/// only usually right.
+private final class TaskGate: Sendable {
+    private let opened = Mutex(false)
+    func open() { opened.withLock { $0 = true } }
+    func wait() async { while !opened.withLock({ $0 }) { await Task.yield() } }
+}
+
+/// Holds the task under test so a filesystem operation can cancel it at an
+/// exact point in a batch.
+private final class CancelBox: Sendable {
+    private let handle = Mutex<Task<ImageAttachmentLoadResult, Never>?>(nil)
+    func arm(_ task: Task<ImageAttachmentLoadResult, Never>) { handle.withLock { $0 = task } }
+    func cancel() { handle.withLock { $0 }?.cancel() }
+    func waitUntilArmed() async {
+        while handle.withLock({ $0 }) == nil { await Task.yield() }
+    }
+}
+
+/// `POSIXFileSystem` checks `Task.isCancelled` before every read and stat and
+/// throws `DoMoError(.cancelled,)`. That arrives at the loader looking exactly
+/// like a permission failure, and a loader that classifies it as one turns a
+/// cancelled eight-image drop into eight "could not be read" notices. These
+/// tests use `checksCancellation: true`, because a stub that ignores
+/// cancellation cannot show any of this.
+@Suite("ImageAttachmentLoader cancellation")
+struct ImageAttachmentCancellationTests {
+
+    private static let threePNGs: [String: StubFileSystem.Node] = [
+        "/a/1.png": .file(ImageBytes.png),
+        "/a/2.png": .file(ImageBytes.png),
+        "/a/3.png": .file(ImageBytes.png),
+    ]
+
+    @Test("a batch cancelled before it starts does nothing and says nothing")
+    func cancelledBeforeStart() async {
+        let gate = TaskGate()
+        let fs = StubFileSystem(nodes: Self.threePNGs, checksCancellation: true)
+        let task = Task {
+            await gate.wait()
+            return await ImageAttachmentLoader.loadAll(
+                ["/a/1.png", "/a/2.png", "/a/3.png"],
+                using: fs
+            )
+        }
+        task.cancel()
+        gate.open()
+        let result = await task.value
+
+        #expect(result.wasCancelled)
+        // The bug this pins: three bogus `.unreadable` rejections, one per file.
+        #expect(result.rejected.isEmpty)
+        #expect(result.loaded.isEmpty)
+        #expect(result.isCompleteSuccess == false)
+        // And it stopped, rather than walking the rest of the batch.
+        #expect(fs.log.all.isEmpty)
+    }
+
+    @Test("the batch stops on cancellation even when the filesystem never notices")
+    func cancelledAgainstAFilesystemThatDoesNotCheck() async {
+        // `checksCancellation` is OFF: every read succeeds, so nothing throws
+        // and there is no error to classify. The loop itself has to look. This
+        // is the case the original suite could not see, because its only
+        // filesystem was this one.
+        let gate = TaskGate()
+        let fs = StubFileSystem(nodes: Self.threePNGs)
+        let task = Task {
+            await gate.wait()
+            return await ImageAttachmentLoader.loadAll(
+                ["/a/1.png", "/a/2.png", "/a/3.png"],
+                using: fs
+            )
+        }
+        task.cancel()
+        gate.open()
+        let result = await task.value
+
+        #expect(result.wasCancelled)
+        #expect(result.loaded.isEmpty)
+        #expect(fs.log.count("read") == 0)
+    }
+
+    @Test("cancellation partway through keeps what was read and rejects nothing")
+    func cancelledMidBatch() async {
+        let box = CancelBox()
+        let fs = StubFileSystem(
+            nodes: Self.threePNGs,
+            checksCancellation: true,
+            onOperation: { _, path in
+                if path.string == "/a/2.png" { box.cancel() }
+            }
+        )
+        let task = Task {
+            await box.waitUntilArmed()
+            return await ImageAttachmentLoader.loadAll(
+                ["/a/1.png", "/a/2.png", "/a/3.png"],
+                using: fs
+            )
+        }
+        box.arm(task)
+        let result = await task.value
+
+        #expect(result.wasCancelled)
+        #expect(result.loaded.map(\.path) == ["/a/1.png"])
+        // `/a/2.png` was cancelled mid-`load`, which reaches the batch as an
+        // ordinary rejection. It must not be shown as one.
+        #expect(result.rejected.isEmpty)
+        #expect(result.isCompleteSuccess == false)
+        // `/a/3.png` was never touched.
+        #expect(fs.log.count("read") == 1)
+    }
+
+    @Test("a cancelled drop is not resolved by a later reading")
+    func cancelledDropStopsSearching() async {
+        // Two readings, the second of which WOULD resolve completely. A
+        // cancelled drop must not come back as a successful attachment of a file
+        // the user was in the middle of taking back.
+        let gate = TaskGate()
+        let fs = StubFileSystem(nodes: ["/a/b c.png": .file(ImageBytes.png)])
+        let task = Task {
+            await gate.wait()
+            return await ImageAttachmentLoader.resolveDrop(
+                candidates: [["/a/b", "c.png"], ["/a/b c.png"]],
+                using: fs
+            )
+        }
+        task.cancel()
+        gate.open()
+        let result = await task.value
+
+        #expect(result.wasCancelled)
+        #expect(result.rejected.isEmpty)
+        #expect(result.loaded.isEmpty)
+        #expect(result.isCompleteSuccess == false)
+        #expect(fs.log.all.isEmpty)
+    }
+
+    @Test("an uncancelled batch on a cancellation-checking filesystem is unaffected")
+    func uncancelledBatchIsNormal() async {
+        let fs = StubFileSystem(nodes: Self.threePNGs, checksCancellation: true)
+        let result = await ImageAttachmentLoader.loadAll(
+            ["/a/1.png", "/a/2.png", "/a/3.png"],
+            using: fs
+        )
+        #expect(result.wasCancelled == false)
+        #expect(result.loaded.count == 3)
+        #expect(result.isCompleteSuccess)
     }
 }
 

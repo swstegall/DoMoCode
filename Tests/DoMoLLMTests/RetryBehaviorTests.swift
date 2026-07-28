@@ -516,12 +516,33 @@ struct BusyClassificationTests {
 
     /// The guard on the widened wording: a genuinely malformed request must
     /// still fail on the first attempt rather than burn the whole budget.
+    ///
+    /// Every case below was *measured* burning all ten retries (~243s of
+    /// backoff) against an earlier, looser pattern table, so each one is a
+    /// regression pin, not a hypothetical:
+    ///
+    /// - a byte count or a token count that happens to contain a status-shaped
+    ///   digit run (`5529341`, `65290`, `5502341`) — the bare `529`/`502`
+    ///   substrings,
+    /// - an Anthropic request id, which routinely contains one (`req_011CQ529xyz`),
+    /// - a `code` field, which `WireError.summary` folds into the match text,
+    /// - remedy prose on a permanently-fatal request (`please try again`),
+    /// - user or tool content echoed back into the message (`'busy'`,
+    ///   `'capacity'`), which a bare `\busy\b` matched.
     @Test(
         "A plain bad request is never retried",
         arguments: [
             #"{"error":{"type":"invalid_request_error","message":"Unknown parameter: 'foo'"}}"#,
             #"{"error":{"message":"tool_use ids must be unique"}}"#,
             #"{"error":{"message":"messages: at least one message is required"}}"#,
+            #"{"error":{"message":"messages.0.content.1.image: image exceeds 5 MB maximum: 5529341 bytes"}}"#,
+            #"{"error":{"message":"messages.0.content.1.image: image exceeds 5 MB maximum: 5502341 bytes"}}"#,
+            #"{"error":{"message":"Invalid value for 'max_tokens': 65290"}}"#,
+            #"{"error":{"message":"Unknown parameter 'foo' (request id req_011CQ529xyz)"}}"#,
+            #"{"message":"Bad request","code":5290}"#,
+            #"{"error":{"message":"Invalid tool name in messages.2: 'busy' is not a registered tool"}}"#,
+            #"{"error":{"message":"Unknown field 'capacity' in tool input schema"}}"#,
+            #"{"error":{"message":"Your request body is malformed: check your parameters and please try again"}}"#,
         ]
     )
     func plainBadRequestsAreNotRetried(body: String) async {
@@ -534,6 +555,48 @@ struct BusyClassificationTests {
         #expect(sleeps.count == 0)
         #expect(retryNotices(events).isEmpty)
         #expect(error?.isRetryable == false)
+    }
+
+    /// The headline case, and the reason the pattern table is not allowed to be
+    /// generous: a mistyped model name is the single most common user error
+    /// there is, and it must surface immediately rather than after ten retries
+    /// and four minutes of backoff.
+    @Test("A typo'd model name fails on the first attempt, not after the whole budget")
+    func typoedModelNameIsNotRetried() async {
+        let sleeps = Sleeps()
+        let body = #"""
+            {"error":{"type":"not_found_error","message":"model 'claude-sonnet-9' not found. Please try again with a valid model name."}}
+            """#
+        let transport = ReplayTransport([.error(404, body)])
+        let (events, error) = await drain(
+            client(transport, sleeps: sleeps).streamCompletion(model: "claude-sonnet-9", context: retryContext))
+
+        #expect(transport.executeCount == 1)
+        #expect(sleeps.all.isEmpty)
+        #expect(retryNotices(events).isEmpty)
+        #expect(error?.kind == .provider(status: 404, isRetryable: false))
+        #expect(error?.message.contains("claude-sonnet-9") == true)
+    }
+
+    /// The other half of the same contract: tightening the wording must not
+    /// cost a genuinely transient answer its retries.
+    @Test(
+        "A busy answer phrased differently is still retried",
+        arguments: [
+            #"{"error":{"message":"Our servers are busy right now"}}"#,
+            #"{"error":{"message":"The model is currently busy"}}"#,
+            #"{"error":{"message":"Deployment is over capacity"}}"#,
+            #"{"error":{"message":"litellm.APIError: AnthropicException - Error code: 502 Bad Gateway"}}"#,
+            #"{"error":{"message":"upstream returned 503 while proxying"}}"#,
+        ]
+    )
+    func busyWordingVariantsAreRetried(body: String) async {
+        let transport = ReplayTransport([.error(400, body)])
+        let (_, error) = await drain(
+            client(transport, maxRetries: 2).streamCompletion(model: "m", context: retryContext))
+
+        #expect(transport.executeCount == 3, "\(body) was not retried")
+        #expect(error?.isRetryable == true)
     }
 
     @Test("Anthropic's 529 overloaded_error is retried and keeps its wording")

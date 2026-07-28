@@ -58,6 +58,22 @@ public enum DroppedPaths {
     /// a filename.
     public static let maximumPathBytes = 4096
 
+    /// The most input ``candidates(_:)`` will even look at, in UTF-8 bytes.
+    ///
+    /// The two limits above already bound the answer: every reading is at most
+    /// ``maximumTokens`` tokens of at most ``maximumPathBytes`` each, and the
+    /// escaping a terminal applies can at worst double a token (a backslash
+    /// before every byte) and add a pair of quotes, plus one separator per
+    /// token. Anything longer than that cannot produce a reading, so scanning it
+    /// is provably wasted work.
+    ///
+    /// This is a latency limit, not a safety one. ``candidates(_:)`` is consulted
+    /// synchronously on the MAIN ACTOR as the first step of handling a paste, and
+    /// the scan begins by materializing the whole input as a grapheme-cluster
+    /// array — about 16 bytes per `Character`. Without this gate a 4 MiB paste
+    /// stalled the render loop for roughly a second before returning `[]`.
+    public static let maximumInputBytes = maximumTokens * (2 * maximumPathBytes + 3)
+
     // MARK: Candidates
 
     /// Every plausible reading of `text` as a list of dropped file paths, most
@@ -81,10 +97,23 @@ public enum DroppedPaths {
     ///
     /// Readings (2) and (3) are suppressed when the text contains a newline: a
     /// multi-line paste beginning with `/` is a code block, not a filename.
+    /// For an ordinary `\n` that suppression is belt and braces —
+    /// ``isPathShaped(_:)`` already refuses any token carrying a control
+    /// character, and `\n` is one. Its real job is the separators
+    /// `Character.isNewline` recognizes that are NOT control characters and that
+    /// the shape check therefore accepts: U+0085, U+2028 and U+2029. Those split
+    /// reading (1) apart without disqualifying reading (2), so a multi-line
+    /// paste using them would otherwise be offered as one enormous filename.
     ///
     /// A `file:` URL token is decoded to a plain path in every reading, so the
-    /// caller never has to know the scheme existed.
+    /// caller never has to know the scheme existed. The DECODED form is shape-
+    /// checked too: percent-encoding is an escaping layer, and a token that
+    /// passes ``isPathShaped(_:)`` before decoding may hold an escape sequence,
+    /// a newline or a NUL after it. A NUL is the sharpest of the three, because
+    /// `FilePath` truncates at it — the path shown in a message would not be the
+    /// path opened.
     public static func candidates(_ text: String) -> [[String]] {
+        guard text.utf8.count <= maximumInputBytes else { return [] }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
@@ -108,7 +137,12 @@ public enum DroppedPaths {
 
         var readings: [[String]] = []
         for reading in raw {
+            // Gated AFTER decoding, exactly like the percent-decoded variants
+            // below. `file:///tmp/a%1B%5D0;x%07.png` is path-shaped as written
+            // and holds an OSC title-set sequence once decoded; `%00` decodes to
+            // a NUL that `FilePath` silently truncates at.
             let resolved = reading.map(decodingFileURL)
+            guard resolved.allSatisfy(isPathShaped) else { continue }
             if !readings.contains(resolved) { readings.append(resolved) }
         }
 
@@ -246,17 +280,27 @@ public enum DroppedPaths {
     /// whole file exists to keep: never silently swallow text the user meant as
     /// text. No terminal drops a relative path anyway — a drag carries a URL.
     ///
-    /// Control characters are refused as well. A real filename may legally
-    /// contain them, but a *dropped* one will not, and a path carrying an escape
+    /// Control characters are refused as well — NUL (`\0`) included, which the
+    /// `< 0x20` test covers. A real filename may legally contain a control
+    /// character, but a *dropped* one will not, and a path carrying an escape
     /// sequence is a terminal-injection vector the moment it is echoed into a
-    /// chip label.
+    /// chip label. NUL is worse than injection: `FilePath` truncates at it, so a
+    /// token containing one names a different file than it reads as.
+    ///
+    /// A `file:` URL is path-shaped only when ``decodingFileURL(_:)`` can turn
+    /// it into a plain path. That excludes a URL naming some other host —
+    /// `file://fileserver/share/a.png` — which the decoder deliberately refuses
+    /// to localize. Passing such a token on as a pseudo-path would undo the
+    /// refusal one layer down, where `FilePath` collapses `//` and the host name
+    /// quietly becomes a directory component.
     public static func isPathShaped(_ token: String) -> Bool {
         guard !token.isEmpty, token.utf8.count <= maximumPathBytes else { return false }
         let hasControl = token.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
         guard !hasControl else { return false }
         if token.hasPrefix("/") { return true }
         if token == "~" || token.hasPrefix("~/") { return true }
-        return isFileURL(token)
+        guard isFileURL(token) else { return false }
+        return decodingFileURL(token).hasPrefix("/")
     }
 
     // MARK: file: URLs
@@ -270,9 +314,10 @@ public enum DroppedPaths {
     /// exactly once.
     ///
     /// Accepts `file:///a/b`, `file://localhost/a/b` and the degenerate
-    /// `file:/a/b`. A URL naming some *other* host is left alone: its bytes are
-    /// not on this machine, so pretending its path is local would attach the
-    /// wrong file.
+    /// `file:/a/b`. A URL naming some *other* host is returned unchanged: its
+    /// bytes are not on this machine, so pretending its path is local would
+    /// attach the wrong file. ``isPathShaped(_:)`` then drops such a token from
+    /// the reading entirely, so the refusal actually holds — see there.
     ///
     /// A token that is not a `file:` URL is returned VERBATIM — never decoded —
     /// so an ordinary path containing a literal `%20` survives intact. The

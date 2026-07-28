@@ -172,6 +172,23 @@ struct ClipboardTests {
         #expect(command.program == "xsel")
     }
 
+    @Test("A display variable is a preference, not a filter: an installed helper still wins")
+    func displayVariablesDoNotFilterOutTheOnlyInstalledHelper() {
+        // DISPLAY names an X server but neither X helper is installed. The rule is
+        // "prefer the matching helper, then take whatever exists", NOT "only helpers
+        // that match the display server", so this must reach wl-copy rather than
+        // falling through to nil and leaving OSC 52 as the only path.
+        let waylandOnly = try! #require(resolve(["DISPLAY": ":0"], available: ["wl-copy"]))
+        #expect(waylandOnly.program == "wl-copy")
+        // And the mirror image: WAYLAND_DISPLAY set, only X helpers installed.
+        let xOnly = try! #require(resolve(["WAYLAND_DISPLAY": "wayland-0"], available: ["xclip", "xsel"]))
+        #expect(xOnly.program == "xclip")
+        // Both display variables set and only one helper installed: still that one.
+        #expect(
+            resolve(["DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"], available: ["xsel"])?.program == "xsel"
+        )
+    }
+
     @Test("Nothing installed resolves to nil, which is OSC 52's cue")
     func nothingAvailableResolvesToNil() {
         #expect(resolve(["DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"], available: []) == nil)

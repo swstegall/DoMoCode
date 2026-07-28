@@ -283,15 +283,21 @@ public struct AgentLoopConfig: Sendable {
     public var maxTurns: Int?
 
     /// Consecutive turns that made the SAME tool calls and got the SAME results
-    /// before the run stops with ``RunStopReason/noProgress``. `nil` disables.
+    /// before the run stops with ``RunStopReason/noProgress``.
     ///
     /// Safe to leave on when ``maxTurns`` is `nil`: it cannot fire on varied
     /// work, however long that work runs — only on a turn that is byte-for-byte
     /// a repeat of the one before it, `limit` times running.
     ///
-    /// DECLARED, NOT YET ENFORCED. The turn-loop check that consumes it lands in
-    /// a later wave; until then this is inert at every value, which is why the
-    /// default can ship ahead of the behaviour.
+    /// `nil` is the ONLY value that disables the guard. Any other value below 2
+    /// is clamped UP to 2, not honoured and not treated as "off": one turn is
+    /// not a repetition of anything, so a literal limit of 1 would fire on
+    /// perfectly varied work, but this is the only bound on a run once
+    /// ``maxTurns`` is `nil`, so an over-strict or nonsensical setting must make
+    /// the guard stricter-but-sane rather than absent.
+    ///
+    /// A turn whose tools asked to terminate is exempt: the run is ending the
+    /// way it was asked to, and settles ``RunStopReason/terminatedByTool``.
     public var noProgressLimit: Int? = 12
 
     /// Before-execution hook; see ``BeforeToolCallHook``.

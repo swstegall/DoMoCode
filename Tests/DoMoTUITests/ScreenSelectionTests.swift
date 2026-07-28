@@ -99,6 +99,13 @@ struct ScreenSelectionTests {
     /// ASCII, a style that opens and closes, a row whose own reset lands inside a
     /// likely span, wide CJK, emoji (including a ZWJ family), a combining mark, and
     /// an OSC-8 hyperlink pair.
+    ///
+    /// The last four rows carry a STANDALONE zero-width cluster — one Swift
+    /// `Character` that measures zero columns and is not merged into a base. Swift
+    /// only produces one at the start of a string or after a C0 control (grapheme
+    /// break GB4), which is why every earlier fixture missed the class: writing
+    /// `"e\u{0301}cole"` in source produces `é`, a single width-1 cluster, and never
+    /// exercises a bare mark at a segment boundary at all.
     private func styledRows(width: Int) -> [String] {
         let raw = [
             "let total = count + 1",
@@ -110,6 +117,22 @@ struct ScreenSelectionTests {
             "\(escape)]8;;https://example.com\u{07}link text\(escape)]8;;\u{07} after",
             "",
             "   ",
+            // A bare combining acute at the head of the row.
+            "\u{0301}leading mark abc",
+            // A bare ZWJ at the head of the row, and a wide glyph after it.
+            "\u{200d}zwj 漢 tail",
+            // A bare mark immediately after an OSC-8 close, i.e. after the BEL that
+            // terminates it — the realistic way one appears mid-row.
+            "\(escape)]8;;https://e.co\u{07}link\(escape)]8;;\u{07}\u{0301}after 漢",
+            // U+2064 is a default-ignorable that is GCB=Control, so it stands alone
+            // AFTER a printable base and breaks the cluster that follows it too.
+            "a\u{2064}\u{0301}b wide 漢 ✅ end",
+            // An emoji with a TRAILING ZWJ, separated from the next emoji only by an
+            // escape. Suppressing that escape inside the span concatenates the two
+            // and Swift re-segments them into ONE cluster worth two columns instead
+            // of two clusters worth four.
+            "✅\u{200d}\(escape)[31m✅ fuse",
+            "👩‍👩‍👧‍👦\u{200d}\(escape)[2m👩‍👩‍👧‍👦 zwj",
         ]
         return raw.map { padToWidth($0, width) }
     }
@@ -126,9 +149,95 @@ struct ScreenSelectionTests {
                         visibleWidth(decorated) == width,
                         "from \(from) to \(to) measured \(visibleWidth(decorated)) on \(String(reflecting: row))"
                     )
+                    guard to > from else { continue }
+                    // The reverse-video run must measure the span EXACTLY. Total
+                    // width alone does not say that: the per-segment trailing
+                    // padding repairs a miscount into a row that is still `width`
+                    // columns wide with the highlight boundary in the wrong place.
+                    // Searching for `ESC[7m` also catches the merge case head-on —
+                    // `String.range(of:)` is cluster-aware, so an opener whose `m`
+                    // has been absorbed by a following combining mark is simply not
+                    // found.
+                    let run = reverseVideoRun(of: decorated)
+                    #expect(run != nil, "from \(from) to \(to) lost its reverse-video brackets")
+                    #expect(
+                        visibleWidth(run ?? "") == to - from,
+                        "from \(from) to \(to) highlighted \(visibleWidth(run ?? "")) columns on \(String(reflecting: row))"
+                    )
                 }
             }
         }
+    }
+
+    @Test("Width invariance holds over a generated corpus of adversarial rows")
+    func widthInvarianceOverGeneratedRows() {
+        // The hand-written fixtures above are a table of cases someone thought of.
+        // This is the same property over rows assembled from the pieces that break
+        // it — bare marks, ZWJ, default-ignorables, wide glyphs, every escape form,
+        // and raw controls — in every order, from a FIXED seed so a failure is
+        // reproducible rather than a flake.
+        let atoms = [
+            "a", "b", " ", "漢", "✅", "👩‍👩‍👧‍👦", "\u{0301}", "\u{200d}", "\u{2064}",
+            "\(escape)[0m", "\(escape)[2m", "\(escape)[31m", "\(escape)]8;;u\u{07}",
+            "\(escape)]8;;\u{07}", "\u{07}", "\(escape)[K", escape,
+        ]
+        var seed: UInt64 = 0x2545_F491_4F6C_DD1D
+        func nextRandom() -> UInt64 {
+            seed ^= seed << 13
+            seed ^= seed >> 7
+            seed ^= seed << 17
+            return seed
+        }
+        let width = 12
+        var rowsChecked = 0
+        for _ in 0..<400 {
+            var raw = ""
+            for _ in 0..<(Int(nextRandom() % 8) + 1) {
+                raw += atoms[Int(nextRandom() % UInt64(atoms.count))]
+            }
+            let row = padToWidth(raw, width)
+            guard visibleWidth(row) == width else { continue }
+            // Skip rows whose OWN escapes are already broken. An ASCII scalar that
+            // has absorbed a following combining scalar is precisely what
+            // TextWidth.swift documents as impossible ("ESC never joins a following
+            // scalar"), and such a row is mismeasured before `highlightColumns` ever
+            // sees it — the renderer paints it wrong with or without a selection.
+            let wellFormed = !row.contains { character in
+                character.unicodeScalars.count > 1 && (character.unicodeScalars.first?.isASCII ?? false)
+            }
+            guard wellFormed else { continue }
+            rowsChecked += 1
+            for from in 0...width {
+                for to in from...width {
+                    let decorated = highlightColumns(row, from: from, to: to, width: width)
+                    #expect(
+                        visibleWidth(decorated) == width,
+                        "from \(from) to \(to) measured \(visibleWidth(decorated)) on \(String(reflecting: row))"
+                    )
+                }
+            }
+        }
+        #expect(rowsChecked > 150, "the corpus filtered itself away: only \(rowsChecked) rows survived")
+    }
+
+    @Test("Suppressing the span's own escapes must not fuse two emoji into one cluster")
+    func spanDoesNotFuseAdjacentClusters() {
+        // `✅` + ZWJ and `✅` are two clusters worth four columns while the SGR
+        // stands between them, and ONE cluster worth two the moment the span drops
+        // that SGR — so the row loses two columns and paints stale glyphs at its
+        // right edge.
+        let row = padToWidth("✅\u{200d}\(escape)[31m✅ tail", 16)
+        #expect(visibleWidth(row) == 16)
+        for from in 0...16 {
+            for to in from...16 {
+                let decorated = highlightColumns(row, from: from, to: to, width: 16)
+                #expect(visibleWidth(decorated) == 16, "from \(from) to \(to) measured \(visibleWidth(decorated))")
+            }
+        }
+        // Both emoji are still inside the highlight, still four columns of it.
+        let whole = highlightColumns(row, from: 0, to: 16, width: 16)
+        #expect(visibleWidth(reverseVideoRun(of: whole) ?? "") == 16)
+        #expect(whole.contains("✅"), "the emoji themselves must survive")
     }
 
     @Test("A span that straddles a wide glyph blanks it rather than splitting it")
@@ -138,10 +247,103 @@ struct ScreenSelectionTests {
         let decorated = highlightColumns(row, from: 0, to: 3, width: 10)
         #expect(visibleWidth(decorated) == 10)
         #expect(!strippingANSI(decorated).contains("漢"), "a half-covered wide glyph must not survive")
+        // Width alone does not pin the blank's POSITION: the per-segment trailing
+        // padding repairs any miscount inside the straddle loop into a row that is
+        // still exactly `width` columns but has every later column shifted. Assert
+        // the exact plain text so a miscount is a failure rather than a silent
+        // one-column slide of `cd`.
+        #expect(strippingANSI(decorated) == "ab  cd    ")
         // The same straddle at the LEFT edge of the span.
         let leftStraddle = highlightColumns(row, from: 3, to: 10, width: 10)
         #expect(visibleWidth(leftStraddle) == 10)
         #expect(!strippingANSI(leftStraddle).contains("漢"))
+        #expect(strippingANSI(leftStraddle) == "ab  cd    ")
+        // Each blank lands in the segment that owns its column: the span 0..<3 keeps
+        // the first blank inside the reverse-video run and pushes the second into the
+        // tail, and the span 3..<10 does the exact opposite.
+        #expect(reverseVideoRun(of: decorated) == "ab ")
+        #expect(reverseVideoRun(of: leftStraddle) == " cd    ")
+    }
+
+    /// The text between `ESC[7m` and `ESC[27m` — the run the terminal actually
+    /// paints in reverse video.
+    private func reverseVideoRun(of decorated: String) -> String? {
+        guard let open = decorated.range(of: "\(escape)[7m"),
+            let close = decorated.range(of: "\(escape)[27m")
+        else { return nil }
+        return String(decorated[open.upperBound..<close.lowerBound])
+    }
+
+    @Test("A standalone zero-width cluster at a span boundary does not eat the row's width")
+    func zeroWidthClusterAtASpanBoundary() {
+        // A combining acute with no base in front of it is its own grapheme cluster.
+        // Spliced straight after `ESC[7m` it MERGES with that `m`, the escape scanner
+        // stops recognising the sequence, and the row silently measures short —
+        // stale glyphs left at the right of the line, and, when the tail carries no
+        // further CSI final byte, an OVER-wide row, which `AltScreenCore.frame`
+        // throws on and the driver escalates to ending the session.
+        let row = padToWidth("\u{0301}abc", 12)
+        #expect(visibleWidth(row) == 12)
+        let decorated = highlightColumns(row, from: 0, to: 4, width: 12)
+        #expect(visibleWidth(decorated) == 12, "measured \(visibleWidth(decorated))")
+        // The mark decorated nothing, so it is dropped rather than relocated: the
+        // visible text is unchanged and every column keeps its place.
+        #expect(strippingANSI(decorated) == "abc" + String(repeating: " ", count: 9))
+        #expect(reverseVideoRun(of: decorated) == "abc ")
+
+        // The same cluster at the head of the TAIL, after `ESC[27mESC[0m`. Here the
+        // merge can leave the trailing `ESC[0` with no final byte at all, so the
+        // scanner gives up and counts `[0` + the merged cluster as TEXT — a row wider
+        // than the page.
+        let tailRow = padToWidth("ab\(escape)]8;;u\u{07}\u{0301}cd", 12)
+        #expect(visibleWidth(tailRow) == 12)
+        for from in 0...12 {
+            for to in from...12 {
+                let out = highlightColumns(tailRow, from: from, to: to, width: 12)
+                #expect(visibleWidth(out) == 12, "from \(from) to \(to) measured \(visibleWidth(out))")
+            }
+        }
+    }
+
+    // `cursorMarker` infers `@MainActor` from DoMoTUI's default isolation, so the
+    // one test that drives the REAL constant — and thereby pins the `nonisolated`
+    // copy `highlightColumns` has to keep — hops onto the main actor to read it.
+    @Test("The hardware-cursor marker survives exactly once, at the column it marked")
+    @MainActor
+    func cursorMarkerIsNeitherDuplicatedNorMovedNorLost() {
+        // `cursorMarker` is an APC POSITION marker, not a style: `AltScreenCore`
+        // strips the FIRST one it finds and parks the real cursor at its column. A
+        // second copy therefore reaches the terminal as raw bytes, a moved copy parks
+        // the caret at the wrong column, and a dropped copy leaves it wherever the
+        // previous frame put it.
+        let row = padToWidth("ab" + cursorMarker + "cd", 20)
+        #expect(visibleWidth(row) == 20)
+        // Marker before the span, inside it, at the head of it, and with the span
+        // running to the page edge (which is where the carried styles are dropped).
+        for (from, to) in [(5, 10), (0, 10), (0, 20), (2, 20), (0, 2), (1, 3)] {
+            let decorated = highlightColumns(row, from: from, to: to, width: 20)
+            #expect(
+                occurrences(of: cursorMarker, in: decorated) == 1,
+                "span \(from)..<\(to) left \(occurrences(of: cursorMarker, in: decorated)) markers"
+            )
+            if let marker = decorated.range(of: cursorMarker) {
+                #expect(
+                    visibleWidth(String(decorated[decorated.startIndex..<marker.lowerBound])) == 2,
+                    "span \(from)..<\(to) moved the caret off column 2"
+                )
+            }
+            #expect(visibleWidth(decorated) == 20)
+        }
+    }
+
+    private func occurrences(of needle: String, in haystack: String) -> Int {
+        var count = 0
+        var searchFrom = haystack.startIndex
+        while let found = haystack.range(of: needle, range: searchFrom..<haystack.endIndex) {
+            count += 1
+            searchFrom = found.upperBound
+        }
+        return count
     }
 
     @Test("A degenerate or inverted span returns the row untouched")

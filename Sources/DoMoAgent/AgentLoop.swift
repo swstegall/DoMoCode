@@ -192,14 +192,33 @@ public func runAgentLoop(
             // `Hashable` conformance is unordered, so two spellings of the same
             // object compare equal.
             //
-            // A turn with NO tool calls is not counted and clears the streak.
-            // Such a turn sets `hasMoreToolCalls = false`, so the inner loop can
-            // only continue if steering or a follow-up injected new work — i.e.
-            // because something OUTSIDE the model acted. That is an embedder or
-            // a human driving the run, not a model spinning, and it is not what
-            // this guard is for. Counting it would also let a run stop with
-            // `.noProgress` when its "repetition" is that it did no tool work at
-            // all, which reads as a bug.
+            // Two kinds of turn are not counted and clear the streak, both for
+            // the same reason: they END the inner loop, so there is no runaway
+            // to catch. A turn with NO tool calls, and a turn whose batch asked
+            // to `terminate`, both set `hasMoreToolCalls = false`; the loop can
+            // only continue past them if steering or a follow-up injected new
+            // work, which is an embedder or a human deciding to keep going.
+            // Skipping the terminating batch also keeps the reason honest: the
+            // run ended the way a tool asked it to, so it settles
+            // `.terminatedByTool` at the bottom rather than being reported as a
+            // runaway. (`terminate` is deliberately not part of
+            // ``TurnToolSignature`` — it is not model-visible work — so a
+            // `finish`-style tool that reports the same output every call would
+            // otherwise trip the guard on the very turn it stopped the run, and
+            // flip print mode's exit code from 0 to 3.) Counting a tool-free
+            // turn would also let a run stop with `.noProgress` when its
+            // "repetition" is that it did no tool work at all, which reads as a
+            // bug.
+            //
+            // Steering, by contrast, is NOT a reset. The rule fires on repeated
+            // tool work whether or not a human is typing, and that is deliberate
+            // both ways: a model that keeps making the same call and getting the
+            // same result while being corrected is precisely the stuck case, and
+            // if an injected message cleared the streak, any embedder that
+            // queues one every turn (a periodic status line, a nagging prompt)
+            // would silently disable the only bound an unbounded run has. A user
+            // whose steering does land sees the model do something different,
+            // which changes the signature and resets the streak on its own.
             //
             // Deliberately NOT detected: longer cycles (A, B, A, B…). Catching
             // those needs a window and a similarity rule, and every such rule
@@ -207,17 +226,23 @@ public func runAgentLoop(
             // the only comparison that is safe to leave on by default.
             //
             // Checked after `turn_end` so the turn the user can see is complete
-            // before the run settles, and before `shouldStopAfterTurn` so a host
-            // hook still sees every turn that actually ran.
+            // before the run settles, and before `shouldStopAfterTurn`, matching
+            // the design. Note the hook is NOT consulted on the turn that trips
+            // the guard: the run has already been decided, so `.noProgress` wins
+            // the reason over `.stoppedByHook`.
             //
-            // `nil` disables the guard, and so does any limit below 2: one turn
-            // is not a repetition of anything, so a limit of 1 could only mean
-            // "stop at the first tool call", which would fire on a run doing
-            // perfectly varied work. Refusing to honour it is safer than
-            // silently rounding it up. With `limit >= 2` the streak below can
-            // only reach `limit` through the `+= 1` branch, so exactly `limit`
-            // identical turns run and `limit - 1` never stops the run.
-            if let limit = config.noProgressLimit, limit > 1, !toolCalls.isEmpty {
+            // `nil` is the ONLY disable. Anything else clamps UP to 2 rather
+            // than switching off, because this is the only bound on a run once
+            // `maxTurns` is nil and it must fail closed: a limit below 2 cannot
+            // be honoured literally (one turn is not a repetition of anything,
+            // so "stop at the first tool call" would fire on perfectly varied
+            // work), but answering a request for the strictest possible guard
+            // with no guard at all is the wrong direction to fail. With
+            // `limit >= 2` the streak below can only reach `limit` through the
+            // `+= 1` branch, so exactly `limit` identical turns run and
+            // `limit - 1` never stops the run.
+            if let requestedLimit = config.noProgressLimit, !toolCalls.isEmpty, !lastBatchTerminated {
+                let limit = max(2, requestedLimit)
                 let signature = TurnToolSignature(calls: toolCalls, results: toolResults)
                 if signature == lastSignature {
                     repeatedTurns += 1

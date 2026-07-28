@@ -208,6 +208,65 @@ private nonisolated let selectionOpen = "\u{1b}[0m\u{1b}[7m"
 /// Reverse video off, then a full reset, so nothing leaks into the tail.
 private nonisolated let selectionClose = "\u{1b}[27m\u{1b}[0m"
 
+/// A `nonisolated` copy of ``cursorMarker``.
+///
+/// `cursorMarker` is a `public let` declared in a module built with
+/// `.defaultIsolation(MainActor.self)` and carries no `nonisolated`, so it infers
+/// `@MainActor` and cannot be read from this file, every declaration of which is
+/// `nonisolated` on purpose (see the header). Duplicating the four-byte literal is
+/// the smaller evil; `cursorMarkerIsNeitherDuplicatedNorMovedNorLost` drives
+/// ``highlightColumns(_:from:to:width:)`` with the REAL ``cursorMarker``, so the
+/// two drifting apart is a test failure rather than a silent regression.
+private nonisolated let caretMarkerSequence = "\u{1b}_pi:c\u{07}"
+
+/// Where the LAST thing ``highlightColumns(_:from:to:width:)`` emitted went, so a
+/// zero-width cluster can follow it into the same segment.
+///
+/// A zero-width cluster decorates the cluster in front of it, and Swift already
+/// merged it into that cluster whenever the two form one grapheme — so a cluster
+/// that measures zero and stands ALONE only ever follows a C0 control (grapheme
+/// break GB4) or begins the row. Appending it to whichever segment received its
+/// neighbour reproduces the row's own adjacency exactly; when the neighbour was an
+/// escape that the span SUPPRESSED, or there was no neighbour at all, the mark has
+/// nothing left to decorate and is dropped. Both cost zero columns, and both are
+/// what keeps an inserted SGR's final `m` from being eaten by a following mark.
+private nonisolated enum ZeroWidthSink {
+    case none
+    case before
+    case middle
+    case after
+    /// The neighbour was an in-span style escape, which is not re-emitted.
+    case suppressed
+}
+
+/// Reverse video, RE-stated, used inside the span purely as a zero-width grapheme
+/// break.
+///
+/// The span is re-emitted plain, so the escapes that stood between two clusters in
+/// the row are gone — and Swift RE-SEGMENTS what is left when they are
+/// concatenated. `"✅" + ZWJ` beside `"✅"` is two clusters worth four columns
+/// while an escape separates them and ONE cluster worth two the instant it is
+/// removed, so the row would quietly lose two columns and the frame would paint
+/// stale glyphs at its right edge. Putting the attribute the span is ALREADY
+/// painting back into the gap restores the break for zero visible columns, and it
+/// cannot stripe the selection the way replaying the row's own `ESC[0m` would,
+/// because it turns reverse video on where reverse video is already on.
+private nonisolated let selectionGraphemeBreak = "\u{1b}[7m"
+
+/// Whether `next`, appended directly after `previous`, would fuse into a single
+/// grapheme cluster.
+///
+/// Two printable ASCII clusters never fuse (no ASCII scalar is Extend, ZWJ,
+/// SpacingMark or a Regional Indicator), which is the fast path for every ordinary
+/// row; anything else is decided by asking Swift, since Swift's segmenter is the
+/// authority the rest of this file measures against.
+private nonisolated func fusesWithPreceding(_ previous: Character, _ next: Character) -> Bool {
+    if previous.isASCII, next.isASCII { return false }
+    var probe = String(previous)
+    probe.append(next)
+    return probe.count == 1
+}
+
 /// `line` with visible columns `from..<to` rendered in reverse video, in EXACTLY
 /// the same number of visible columns as `line` occupied.
 ///
@@ -229,6 +288,23 @@ private nonisolated let selectionClose = "\u{1b}[27m\u{1b}[0m"
 /// page, is replaced by one blank per column it covered, in the segment that owns
 /// that column. That is the only construction that both preserves the width and
 /// keeps the highlight boundary where the user put it.
+///
+/// A ZERO-WIDTH cluster follows whatever cluster it followed in `line`, or is
+/// dropped when that neighbour did not survive the split (see ``ZeroWidthSink``).
+/// Splicing one anywhere else would be a WIDTH bug, not a cosmetic one: a bare
+/// combining mark placed straight after `ESC[7m` merges with that final `m` into
+/// a single `Character`, ``ansiEscapeLength(in:at:)`` stops recognising the
+/// escape, and the scanner swallows the text after it — the row then measures
+/// short and the frame paints stale glyphs at the right of the line.
+///
+/// The APC ``cursorMarker`` is carried in the segment that owns its column rather
+/// than replayed with the entering styles. It is a POSITION, not a style:
+/// replaying it would emit it TWICE when the caret is left of the span (once in
+/// place, once with the restored styles), move it to the end of the span when the
+/// caret is inside, and lose it entirely when the span runs to the page edge and
+/// the carried styles are dropped. `AltScreenCore.extractCursorPosition` strips
+/// only the first marker in a row, so each of those is a real defect: raw APC
+/// bytes on the wire, or the hardware cursor parked in the wrong column.
 ///
 /// An image row (``isImageLine(_:)``) is returned untouched: its escape is an
 /// opaque payload and slicing it corrupts the image — the same guard
@@ -252,17 +328,46 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
     var entering = ""
     var column = 0
     var index = 0
+    /// Which segment the previous emitted item landed in — see ``ZeroWidthSink``.
+    var lastSink = ZeroWidthSink.none
+
+    /// Append a PRINTABLE cluster to the span, keeping the grapheme break the
+    /// suppressed escapes used to provide (see ``selectionGraphemeBreak``). Only
+    /// ever called with a cluster of non-zero width, which is what makes inserting
+    /// an escape here safe: a cluster that could fuse with the break's trailing `m`
+    /// would have to start with an Extend, a ZWJ or a SpacingMark, and every one of
+    /// those measures zero and is routed elsewhere.
+    func appendToSpan(_ character: Character) {
+        if let previous = middle.last, fusesWithPreceding(previous, character) {
+            middle += selectionGraphemeBreak
+        }
+        middle.append(character)
+    }
 
     while index < chars.count {
         if let length = ansiEscapeLength(in: chars, at: index) {
             let code = String(chars[index..<index + length])
-            if column < spanEnd {
+            // The APC caret marker is a position, not a style, so it is never
+            // replayed with `entering`: it rides in the segment that owns its
+            // column and stays at exactly the column it marked.
+            let isCaretMarker = code == caretMarkerSequence
+            if column < spanStart {
+                before += code
+                lastSink = .before
+                if !isCaretMarker { entering += code }
+            } else if column < spanEnd {
                 // Escapes inside the span are suppressed (the span is plain) but
                 // still count towards the style the tail inherits.
-                if column < spanStart { before += code }
-                entering += code
+                if isCaretMarker {
+                    middle += code
+                    lastSink = .middle
+                } else {
+                    entering += code
+                    lastSink = .suppressed
+                }
             } else {
                 after += code
+                lastSink = .after
             }
             index += length
             continue
@@ -282,22 +387,29 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
         let clusterEnd = column + clusterWidth
 
         if clusterWidth == 0 {
-            if clusterStart < spanStart {
-                before.append(character)
-            } else if clusterStart < spanEnd {
-                middle.append(character)
-            } else {
-                after.append(character)
+            // It decorates the cluster BEFORE it, wherever that went. Not the
+            // column it nominally sits at: a zero-width cluster spliced to the
+            // head of a segment lands straight after an escape this function
+            // inserted, merges with that escape's final byte, and takes the
+            // escape — and the width of everything after it — with it.
+            switch lastSink {
+            case .before: before.append(character)
+            case .middle: middle.append(character)
+            case .after: after.append(character)
+            case .none, .suppressed: break
             }
         } else if clusterEnd <= spanStart {
             before.append(character)
             beforeWidth += clusterWidth
+            lastSink = .before
         } else if clusterStart >= spanStart, clusterEnd <= spanEnd {
-            middle.append(character)
+            appendToSpan(character)
             middleWidth += clusterWidth
+            lastSink = .middle
         } else if clusterStart >= spanEnd, clusterEnd <= width {
             after.append(character)
             afterWidth += clusterWidth
+            lastSink = .after
         } else {
             // Straddles a boundary. Blank each column it covered, in whichever
             // segment owns that column, so no segment loses or gains a cell.
@@ -305,12 +417,15 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
                 if covered < spanStart {
                     before += " "
                     beforeWidth += 1
+                    lastSink = .before
                 } else if covered < spanEnd {
-                    middle += " "
+                    appendToSpan(" ")
                     middleWidth += 1
+                    lastSink = .middle
                 } else {
                     after += " "
                     afterWidth += 1
+                    lastSink = .after
                 }
             }
         }

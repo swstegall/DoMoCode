@@ -7,6 +7,11 @@
 // installs process-global signal/atexit handlers, so the byte *composition* is
 // asserted directly through the public teardown seam instead — the same bytes the
 // registration replays.
+//
+// That is composition only, and composition is not behaviour: every test here
+// passes with `setMouseReporting`'s body deleted. MouseReportingLifecycleTests
+// drives the real object against a pty for the parts that need a terminal — the
+// bytes actually written, and the rewrite of the registered exit sequence.
 
 import DoMoTermIO
 import Testing

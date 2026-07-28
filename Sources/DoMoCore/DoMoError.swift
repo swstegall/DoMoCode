@@ -276,8 +276,8 @@ extension DoMoError {
         status == 408 || status == 425 || status == 429 || (500..<600).contains(status)
     }
 
-    /// Whole milliseconds of `duration`, rounded down, saturating rather than
-    /// trapping.
+    /// Whole milliseconds of `duration`, truncated toward zero, saturating
+    /// rather than trapping.
     ///
     /// The single projection of a `Duration` onto a millisecond count, because
     /// the naive `components.seconds * 1000` is a trap waiting to happen:
@@ -287,7 +287,11 @@ extension DoMoError {
     /// side of a wire. Saturating at `Int.max` reads as "forever", which is the
     /// right answer for a hostile header; a trap would kill the process.
     ///
-    /// A sub-millisecond duration truncates *down* to `0`, deliberately.
+    /// A sub-millisecond duration truncates to `0`, deliberately — and it
+    /// truncates toward *zero*, not downward: `-500µs` is `0`, not `-1`. The
+    /// durations that reach here (retry delays, notice TTLs) are non-negative,
+    /// so the distinction never bites; it is documented so nobody reads
+    /// "rounds down" and relies on a floor this does not implement.
     public static func wholeMilliseconds(_ duration: Duration) -> Int {
         let components = duration.components
         let (scaled, scaleOverflowed) = components.seconds.multipliedReportingOverflow(by: 1000)
