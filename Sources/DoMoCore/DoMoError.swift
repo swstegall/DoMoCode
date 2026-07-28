@@ -262,12 +262,41 @@ extension DoMoError {
     /// 503, 504, plus 524 via the 5xx range). 408 is included because pi's
     /// pattern list retries request timeouts by wording anyway.
     ///
-    /// Deliberately narrow: it answers only the question a status code can
-    /// answer. Retryability decided from a response *body* belongs to the
+    /// The whole 5xx range is deliberate, and is what already covers the two
+    /// "the provider is busy" statuses that matter most in practice: 503, and
+    /// Anthropic's 529 `overloaded_error` as LiteLLM forwards it. 425 (Too
+    /// Early) is here because RFC 8470 §5.2 names retrying as *the* remedy —
+    /// the request was refused for when it arrived, not for what it said.
+    ///
+    /// Deliberately narrow otherwise: it answers only the question a status code
+    /// can answer. Retryability decided from a response *body* belongs to the
     /// provider adapter that understands that provider's vocabulary, and reaches
     /// callers through ``Kind/provider(status:isRetryable:)``.
     public static func isRetryableStatus(_ status: Int) -> Bool {
-        status == 408 || status == 429 || (500..<600).contains(status)
+        status == 408 || status == 425 || status == 429 || (500..<600).contains(status)
+    }
+
+    /// Whole milliseconds of `duration`, rounded down, saturating rather than
+    /// trapping.
+    ///
+    /// The single projection of a `Duration` onto a millisecond count, because
+    /// the naive `components.seconds * 1000` is a trap waiting to happen:
+    /// `Duration` is arithmetic over a 128-bit value, so the multiply overflows
+    /// `Int64` long before a `Duration` runs out of range — and the durations
+    /// that reach here are built from `Retry-After`, which is text from the far
+    /// side of a wire. Saturating at `Int.max` reads as "forever", which is the
+    /// right answer for a hostile header; a trap would kill the process.
+    ///
+    /// A sub-millisecond duration truncates *down* to `0`, deliberately.
+    public static func wholeMilliseconds(_ duration: Duration) -> Int {
+        let components = duration.components
+        let (scaled, scaleOverflowed) = components.seconds.multipliedReportingOverflow(by: 1000)
+        guard !scaleOverflowed else { return components.seconds > 0 ? Int.max : Int.min }
+        let (total, addOverflowed) = scaled.addingReportingOverflow(
+            components.attoseconds / 1_000_000_000_000_000
+        )
+        guard !addOverflowed else { return components.seconds > 0 ? Int.max : Int.min }
+        return Int(total)
     }
 }
 

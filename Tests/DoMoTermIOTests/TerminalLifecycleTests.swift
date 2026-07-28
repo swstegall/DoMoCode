@@ -41,9 +41,9 @@ struct TerminalLifecycleTests {
     func mouseTeardownOrdering() {
         let bytes = TerminalLifecycle.teardownSequence(useAlternateScreen: true, enableMouse: true)
         #expect(bytes == disableMouse + disablePaste + showCursor + leaveAlternateScreen)
-        // A terminal left in `?1000h` after a crash types raw mouse escapes into the
-        // user's shell, so releasing it is part of the crash-safe restore — and it
-        // goes first, exactly reversing an enter that took the mouse last.
+        // A terminal left in `?1000h`/`?1002h` after a crash types raw mouse escapes
+        // into the user's shell, so releasing it is part of the crash-safe restore —
+        // and it goes first, exactly reversing an enter that took the mouse last.
         #expect(Array(bytes.prefix(disableMouse.count)) == disableMouse, "mouse must be released first")
         #expect(
             Array(bytes.suffix(leaveAlternateScreen.count)) == leaveAlternateScreen,
@@ -51,15 +51,77 @@ struct TerminalLifecycleTests {
         )
     }
 
+    @Test("Taking the mouse enables button-event tracking, so a drag reports at all")
+    func mouseEnableIncludesMotionTracking() {
+        #expect(TerminalLifecycle.mouseSequence(enabled: true) == enableMouse)
+        // `?1002h` is the whole reason a drag-selection is possible: under `?1000h`
+        // alone a terminal reports the press and the release and nothing between.
+        #expect(containsSubsequence(enableMouse, Array("\u{1b}[?1002h".utf8)))
+        // `?1003h` is deliberately absent — its button-less motion reports carry the
+        // same button bits X10 uses for a release, so it would end drags mid-gesture.
+        #expect(!containsSubsequence(enableMouse, Array("\u{1b}[?1003h".utf8)))
+    }
+
+    @Test("The mouse release order is the exact reverse of the take order")
+    func mouseDisableIsTheExactReverseOfEnable() {
+        let taken = modes(in: TerminalLifecycle.mouseSequence(enabled: true))
+        let released = modes(in: TerminalLifecycle.mouseSequence(enabled: false))
+        #expect(taken == ["1000h", "1002h", "1006h"])
+        #expect(released == ["1006l", "1002l", "1000l"])
+        // Reversing the release order is what leaves a terminal half-configured when
+        // a mode's disable depends on an outer mode still being set.
+        #expect(released.map { String($0.dropLast()) } == taken.map { String($0.dropLast()) }.reversed())
+        #expect(TerminalLifecycle.mouseSequence(enabled: false) == disableMouse)
+    }
+
     @Test("Mouse is opt-in: the default teardown does not touch mouse modes")
     func mouseIsOptIn() {
         let inline = TerminalLifecycle.teardownSequence(useAlternateScreen: false)
         let fullScreen = TerminalLifecycle.teardownSequence(useAlternateScreen: true)
-        #expect(!containsSubsequence(inline, disableMouse))
-        #expect(!containsSubsequence(fullScreen, disableMouse))
+        for sequence in [inline, fullScreen] {
+            #expect(!containsSubsequence(sequence, disableMouse))
+            #expect(!containsSubsequence(sequence, Array("\u{1b}[?1000l".utf8)))
+            #expect(!containsSubsequence(sequence, Array("\u{1b}[?1002l".utf8)))
+            #expect(!containsSubsequence(sequence, Array("\u{1b}[?1006l".utf8)))
+        }
+        // And explicitly opting out says the same thing.
+        #expect(TerminalLifecycle.teardownSequence(useAlternateScreen: true, enableMouse: false) == fullScreen)
     }
 
-    private let disableMouse = Array("\u{1b}[?1006l\u{1b}[?1000l".utf8)
+    @Test("setMouseReporting is a no-op off a tty, and never leaves the terminal changed")
+    func setMouseReportingIsInertWithoutATTY() {
+        // A closed descriptor is definitively not a terminal, which is what exercises
+        // the `isatty` gate: the escape must not leak into a redirected stream, and
+        // with no registration armed there is nothing to rewrite. It must not crash,
+        // must not hang, and must be safe to call before `enter()` ever ran. Driving
+        // the real stdout here would be a bug in the test — on a developer's terminal
+        // it would take the mouse and never give it back.
+        let lifecycle = TerminalLifecycle(
+            outputDescriptor: -1,
+            useAlternateScreen: true,
+            enableMouse: true
+        )
+        lifecycle.setMouseReporting(false)
+        lifecycle.setMouseReporting(true)
+        // The declared mode is fixed at init and a mid-session toggle does not
+        // rewrite it — only the registered exit bytes change.
+        #expect(lifecycle.enableMouse == true)
+        #expect(lifecycle.useAlternateScreen == true)
+    }
+
+    private let enableMouse = Array("\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1006h".utf8)
+    private let disableMouse = Array("\u{1b}[?1006l\u{1b}[?1002l\u{1b}[?1000l".utf8)
+
+    /// The `?<digits><h|l>` private modes in a run of `ESC [ ? … h|l` sequences, in
+    /// the order they are written.
+    private func modes(in bytes: [UInt8]) -> [String] {
+        String(decoding: bytes, as: UTF8.self)
+            .split(separator: "\u{1b}", omittingEmptySubsequences: true)
+            .compactMap { chunk in
+                guard chunk.hasPrefix("[?") else { return nil }
+                return String(chunk.dropFirst(2))
+            }
+    }
 
     private func containsSubsequence(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool {
         guard !needle.isEmpty, haystack.count >= needle.count else { return false }

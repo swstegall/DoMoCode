@@ -3,10 +3,18 @@
 //
 // Mouse report decoding. pi never reads the mouse — its inline model leaves the
 // terminal's own selection and scrollback in charge — so this has no upstream to
-// port from; it is the decoder side of the `?1000h`/`?1006h` modes the full-screen
-// lifecycle enables, and it exists because the alternate screen has no scrollback
-// for the terminal to scroll on the user's behalf. Once the app owns the whole
-// page, the wheel is the app's to handle.
+// port from; it is the decoder side of the `?1000h`/`?1002h`/`?1006h` modes the
+// full-screen lifecycle enables.
+//
+// It started as wheel handling: the alternate screen has no scrollback for the
+// terminal to scroll on the user's behalf, so once the app owns the whole page the
+// wheel is the app's to handle. But taking the mouse also takes away the
+// terminal's own click-drag text selection, so the app owes the user a selection
+// back — which is what `?1002h` (button-event tracking) is for. Under `?1000h`
+// alone a drag is a press and a release with nothing in between; `?1002h` adds a
+// motion report per cell crossed WHILE A BUTTON IS HELD, and those arrive here as
+// `.move` with the held button named. `?1003h` (any-motion) is deliberately not
+// enabled — see the X10 caveat on `decodeX10MouseEvent` below.
 //
 // Two encodings arrive in practice and ``StdinFramer`` already frames both as
 // whole sequences:
@@ -81,6 +89,15 @@ public struct MouseEvent: Sendable, Hashable {
         case .press, .release, .move: return false
         }
     }
+
+    /// Whether this report is part of a button gesture — a press, a drag, or a
+    /// release — rather than a wheel notch.
+    ///
+    /// The complement of ``isScroll``, named so a selection handler can say what it
+    /// wants instead of saying what it does not: the two consumers of a mouse
+    /// report are "scroll me" and "the user is pointing at something", and a
+    /// gesture that is one is never the other.
+    public var isButtonEvent: Bool { !isScroll }
 }
 
 // MARK: - Decoding
@@ -137,6 +154,16 @@ private func decodeSGRMouseEvent(_ data: [UInt8]) -> MouseEvent? {
 }
 
 /// `ESC [ M` + three bytes, each biased by 32 — the pre-SGR encoding.
+///
+/// - Note: X10 has no release code of its own; it signals "a button came up" with
+///   button bits `3` and no button identity, which is why a release decodes as
+///   ``MouseEvent/Button/none`` and a drag handler must treat that as ending the
+///   gesture. The same bit pattern is what a *button-less motion* report carries,
+///   so under `?1003h` (any-motion tracking) a pointer merely crossing the screen
+///   would decode as a release and silently end a drag the user is still making.
+///   That is the concrete reason the lifecycle enables `?1002h` and never
+///   `?1003h`; the ambiguity is in the encoding, not in this decoder, and cannot
+///   be resolved here.
 private func decodeX10MouseEvent(_ data: [UInt8]) -> MouseEvent? {
     guard data.count == 6, data[0] == 0x1b, data[1] == 0x5b, data[2] == 0x4d else { return nil }
     let code = Int(data[3]) - 32

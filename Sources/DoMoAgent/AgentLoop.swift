@@ -82,6 +82,12 @@ public func runAgentLoop(
     var firstTurn = true
     var turnCount = 0
     var lastBatchTerminated = false
+    // Runaway guard state. `lastSignature` is the tool work of the previous turn
+    // that did any; `repeatedTurns` is how many turns in a row have now produced
+    // exactly that work, counting the turn that established it. See the check
+    // after each `turn_end`.
+    var lastSignature: TurnToolSignature?
+    var repeatedTurns = 0
     // Steering may already be queued (the user typed while the agent was idle).
     var pendingMessages = await drain(config.getSteeringMessages)
 
@@ -166,6 +172,66 @@ public func runAgentLoop(
             }
 
             await sink.emit(.turnEnd(message: message, toolResults: toolResults))
+
+            // ── Runaway guard ────────────────────────────────────────────────
+            // The replacement for a turn cap. It fires ONLY on a state that is
+            // definitionally not progress — `noProgressLimit` turns in a row
+            // that made the SAME tool calls and got back the SAME results — so
+            // it cannot end a run that is doing varied work, however long that
+            // work runs. That property is the whole point: a guard that could
+            // stop a legitimate 200-turn refactor would be worse than the cap
+            // it replaces, because it would be trusted.
+            //
+            // "The same" means every call's name AND arguments AND every
+            // result's tool name, output and error flag, in order.
+            // ``TurnToolSignature`` deliberately drops tool-call ids (fresh per
+            // turn, so keeping them would make every turn unique and disable the
+            // guard) and keeps outputs (dropping them would fire on a legitimate
+            // poll whose answer keeps changing). Argument key ORDER cannot
+            // matter: `JSONValue.object` is a `[String: JSONValue]`, whose
+            // `Hashable` conformance is unordered, so two spellings of the same
+            // object compare equal.
+            //
+            // A turn with NO tool calls is not counted and clears the streak.
+            // Such a turn sets `hasMoreToolCalls = false`, so the inner loop can
+            // only continue if steering or a follow-up injected new work — i.e.
+            // because something OUTSIDE the model acted. That is an embedder or
+            // a human driving the run, not a model spinning, and it is not what
+            // this guard is for. Counting it would also let a run stop with
+            // `.noProgress` when its "repetition" is that it did no tool work at
+            // all, which reads as a bug.
+            //
+            // Deliberately NOT detected: longer cycles (A, B, A, B…). Catching
+            // those needs a window and a similarity rule, and every such rule
+            // can fire on real alternating work. Strict consecutive identity is
+            // the only comparison that is safe to leave on by default.
+            //
+            // Checked after `turn_end` so the turn the user can see is complete
+            // before the run settles, and before `shouldStopAfterTurn` so a host
+            // hook still sees every turn that actually ran.
+            //
+            // `nil` disables the guard, and so does any limit below 2: one turn
+            // is not a repetition of anything, so a limit of 1 could only mean
+            // "stop at the first tool call", which would fire on a run doing
+            // perfectly varied work. Refusing to honour it is safer than
+            // silently rounding it up. With `limit >= 2` the streak below can
+            // only reach `limit` through the `+= 1` branch, so exactly `limit`
+            // identical turns run and `limit - 1` never stops the run.
+            if let limit = config.noProgressLimit, limit > 1, !toolCalls.isEmpty {
+                let signature = TurnToolSignature(calls: toolCalls, results: toolResults)
+                if signature == lastSignature {
+                    repeatedTurns += 1
+                } else {
+                    lastSignature = signature
+                    repeatedTurns = 1
+                }
+                if repeatedTurns >= limit {
+                    return await settle(.noProgress)
+                }
+            } else {
+                lastSignature = nil
+                repeatedTurns = 0
+            }
 
             if let shouldStopAfterTurn = config.shouldStopAfterTurn {
                 let turnResult = TurnResult(message: message, toolResults: toolResults, messages: produced)
@@ -305,7 +371,7 @@ extension AssemblyEvent {
             .toolCallStart(_, let snapshot),
             .toolCallEnd(_, _, let snapshot):
             return snapshot
-        case .textDelta, .reasoningDelta, .toolCallDelta, .done, .failed:
+        case .textDelta, .reasoningDelta, .toolCallDelta, .retrying, .done, .failed:
             return nil
         }
     }

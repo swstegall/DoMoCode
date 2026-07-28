@@ -107,6 +107,14 @@ public struct LiteLLMClient: Sendable {
         public var authScheme: String
 
         /// Client-side retry attempts after the initial call. `0` disables retry.
+        ///
+        /// Ten, because the failure this exists for — "the provider is busy" —
+        /// is one that clears on its own, and giving up after three tries turns
+        /// a provider's bad ninety seconds into a failed turn the user has to
+        /// retype. The cost of ten is bounded from three directions: the delay
+        /// ceiling (``maxRetryDelay``), the total sleep budget
+        /// (``retryDelayBudget``), and the far lower ``maxPreConnectRetries``
+        /// for the case where the gateway never answered at all.
         public var maxRetries: Int
 
         /// First backoff delay; each further attempt doubles it before jitter.
@@ -115,6 +123,51 @@ public struct LiteLLMClient: Sendable {
         /// Backoff ceiling. Also caps a server-supplied `retry-after`, so a
         /// hostile or mistaken header cannot freeze the client on a long sleep.
         public var maxRetryDelay: Duration
+
+        /// Retry budget for a failure that happened *before* any response head
+        /// arrived.
+        ///
+        /// Deliberately far lower than ``maxRetries``, and the reason raising
+        /// ``maxRetries`` to ten does not change what a dead gateway costs. A
+        /// pre-connect failure is a different animal from a busy provider: there
+        /// is no evidence anything is listening, each attempt burns a whole
+        /// connect timeout (`AsyncHTTPClientTransport.defaultConnectTimeout`, 10
+        /// seconds) *before* its backoff, and the actionable answer — "is the
+        /// gateway running?" — is one the user can act on immediately and cannot
+        /// see until the budget is spent. One retry is exactly enough to cover
+        /// the case that does heal on its own: a proxy mid-restart, or a DNS
+        /// blip. An operator who disagrees has this knob; the important part is
+        /// that it is now explicit rather than an implicit `min(maxRetries, 1)`,
+        /// so nobody raises `maxRetries` and silently changes it.
+        public var maxPreConnectRetries: Int
+
+        /// Total time one call may spend *asleep* between attempts. Retrying
+        /// stops when the next delay would push past it, even with attempts
+        /// left. `nil` disables the budget.
+        ///
+        /// This bounds the case a count alone cannot: a server that answers
+        /// every attempt with `Retry-After: 60` costs ten minutes on attempts
+        /// alone. Note it charges *scheduled sleep*, not wall clock — a run
+        /// whose requests each burn a long `DOMOCODE_TIMEOUT_MS` is not bounded
+        /// by it. That is deliberate: scheduled sleep is deterministic under the
+        /// injected ``sleep``, so the budget is testable without a clock.
+        public var retryDelayBudget: Duration?
+
+        /// The jitter multiplier applied to a *computed* backoff, never to a
+        /// server-supplied `retry-after` — the server named a time, and second
+        /// -guessing it is how a client turns a polite throttle into a stampede.
+        /// The result is clamped into `0...1`, so a hostile or buggy generator
+        /// cannot produce a negative or an unbounded delay.
+        ///
+        /// Injectable so a schedule test can be exact and instantaneous.
+        ///
+        /// The default draws from ``defaultJitterRange`` (`0.5...1.0`, "half
+        /// jitter"), not AWS's "full jitter" `0...1`. Full jitter exists to
+        /// de-correlate a *fleet* of clients; this is one interactive CLI, which
+        /// has no herd to spread, and full jitter's near-zero draws would let it
+        /// hammer a provider that just said it was overloaded. Set
+        /// `jitter = { Double.random(in: 0...1) }` for full jitter.
+        public var jitter: @Sendable () -> Double
 
         /// Overall per-request deadline. `nil` uses the transport's default.
         public var timeout: Duration?
@@ -128,9 +181,12 @@ public struct LiteLLMClient: Sendable {
             apiKey: String? = nil,
             authHeaderName: String = "Authorization",
             authScheme: String = "Bearer",
-            maxRetries: Int = 3,
-            baseRetryDelay: Duration = .milliseconds(500),
+            maxRetries: Int = 10,
+            baseRetryDelay: Duration = .seconds(1),
             maxRetryDelay: Duration = .seconds(60),
+            maxPreConnectRetries: Int = 1,
+            retryDelayBudget: Duration? = .seconds(300),
+            jitter: @escaping @Sendable () -> Double = { Double.random(in: Configuration.defaultJitterRange) },
             timeout: Duration? = nil,
             sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
         ) {
@@ -141,8 +197,51 @@ public struct LiteLLMClient: Sendable {
             self.maxRetries = maxRetries
             self.baseRetryDelay = baseRetryDelay
             self.maxRetryDelay = maxRetryDelay
+            self.maxPreConnectRetries = maxPreConnectRetries
+            self.retryDelayBudget = retryDelayBudget
+            self.jitter = jitter
             self.timeout = timeout
             self.sleep = sleep
+        }
+
+        /// The multiplier range the default ``jitter`` draws from.
+        public static let defaultJitterRange: ClosedRange<Double> = 0.5...1.0
+
+        /// The floor a server-supplied delay is raised to.
+        ///
+        /// Small enough to preserve the millisecond precision `retry-after-ms`
+        /// exists for, large enough that `Retry-After: 0` — which
+        /// ``DoMoCore/DoMoError/parseRetryAfter(retryAfter:retryAfterMilliseconds:now:)``
+        /// also produces for a negative or a stale HTTP-date — cannot become a
+        /// zero-delay hot loop of ten immediate requests.
+        public static let minimumRetryAfter = Duration.milliseconds(100)
+
+        /// The delay before retry `attempt` (1-based).
+        ///
+        /// A server-supplied `retryAfter` wins and is *not* jittered, but is
+        /// clamped into `[minimumRetryAfter, maxRetryDelay]` — it is
+        /// attacker-influenced text, so neither end of it is trusted. Otherwise
+        /// the schedule is `min(baseRetryDelay * 2^(attempt-1), maxRetryDelay)`
+        /// scaled by `jitter`.
+        ///
+        /// Pure and public so the whole table is testable without a transport,
+        /// a clock, or a sleep.
+        public func retryDelay(attempt: Int, retryAfter: Duration?, jitter: Double) -> Duration {
+            if let retryAfter {
+                return min(max(retryAfter, Self.minimumRetryAfter), maxRetryDelay)
+            }
+            // `1 << shift` is the doubling; the saturation at 30 keeps the shift
+            // itself from overflowing on an absurd attempt number, and the cap
+            // makes anything past ~7 attempts moot anyway.
+            let shift = min(max(0, attempt - 1), 30)
+            let capped = min(baseRetryDelay * Double(1 << shift), maxRetryDelay)
+            // NaN loses every comparison, so a plain `min(max(j, 0), 1)` passes
+            // it straight through — and `Duration * Double` converts through
+            // `Int128`, which TRAPS on a NaN or an infinity. `jitter` is
+            // injectable, so this is reachable from a caller's bug, not just
+            // from ours: a non-finite multiplier reads as its sign's bound.
+            let factor = jitter.isFinite ? min(max(jitter, 0), 1) : (jitter > 0 ? 1 : 0)
+            return capped * factor
         }
     }
 
@@ -230,6 +329,7 @@ public struct LiteLLMClient: Sendable {
         let assembly = StreamingAssembly(model: model, rates: rates)
         var attempt = 0
         var everConnected = false
+        var spentOnRetries = Duration.zero
 
         while true {
             let response: StreamingResponse
@@ -251,13 +351,39 @@ public struct LiteLLMClient: Sendable {
                 // the full retry budget. The former usually means the gateway is
                 // down, unreachable, or misconfigured — it rarely clears on
                 // immediate retry, and each attempt costs a whole connect timeout,
-                // so it is capped low. One retry catches a proxy mid-restart; more
-                // just makes the user wait out the transient-error budget before
-                // the actionable "is the gateway running?" message appears.
-                let cap = everConnected ? configuration.maxRetries : min(configuration.maxRetries, 1)
-                if classified.isRetryable, attempt < cap {
+                // so it keeps its own, much smaller budget.
+                //
+                // DECISION (retry-to-ten): the pre-connect cap STAYS. The
+                // feature asked for is "retry a busy provider ten times", and a
+                // busy provider answers — it is an HTTP status, and it goes down
+                // the path below, not this one. Down here there is no evidence
+                // anything is listening at all, ten attempts would cost ~110
+                // seconds of dead connects *on top of* five minutes of backoff,
+                // and the thing the user needs to see ("is the gateway
+                // running?") is only shown once the budget is spent. Staring at
+                // a dead gateway for ten backoffs is the real cost this avoids;
+                // the transient DNS blip it has to survive is covered by the one
+                // retry, and by `everConnected`, which hands the FULL budget to
+                // any endpoint that has answered even once — including with a
+                // 503. See ``Configuration/maxPreConnectRetries``.
+                let cap = everConnected
+                    ? configuration.maxRetries
+                    : min(configuration.maxRetries, configuration.maxPreConnectRetries)
+                if classified.isRetryable, attempt < cap,
+                    let delay = nextRetryDelay(
+                        attempt: attempt + 1, retryAfter: classified.retryAfter, spent: &spentOnRetries)
+                {
                     attempt += 1
-                    guard await sleepBeforeRetry(attempt: attempt, retryAfter: classified.retryAfter) else {
+                    continuation.yield(
+                        .retrying(
+                            RetryNotice(
+                                attempt: attempt,
+                                maxAttempts: cap,
+                                delay: delay,
+                                reason: RetryNotice.reason(for: classified),
+                                message: DoMoError.truncating(classified.message, to: Self.retryNoticeMessageCap)
+                            )))
+                    guard await sleepForRetry(delay) else {
                         finishAborted(assembly, continuation)
                         return
                     }
@@ -271,9 +397,26 @@ public struct LiteLLMClient: Sendable {
             if !(200..<300).contains(status) {
                 let bodyText = await Self.collectBody(response.body, cap: Self.errorBodyByteCap)
                 let error = Self.classify(status: status, head: response.head, body: bodyText)
-                if error.isRetryable, attempt < configuration.maxRetries {
+                // A `Retry-After` on a 503 or an Anthropic 529 is as binding as
+                // one on a 429, but `DoMoError` only carries the header for
+                // `.rateLimit`, so read the head directly rather than silently
+                // falling back to a guess the server already corrected.
+                let serverDelay = error.retryAfter ?? Self.retryAfter(from: response.head)
+                if error.isRetryable, attempt < configuration.maxRetries,
+                    let delay = nextRetryDelay(
+                        attempt: attempt + 1, retryAfter: serverDelay, spent: &spentOnRetries)
+                {
                     attempt += 1
-                    guard await sleepBeforeRetry(attempt: attempt, retryAfter: error.retryAfter) else {
+                    continuation.yield(
+                        .retrying(
+                            RetryNotice(
+                                attempt: attempt,
+                                maxAttempts: configuration.maxRetries,
+                                delay: delay,
+                                reason: RetryNotice.reason(for: error),
+                                message: DoMoError.truncating(error.message, to: Self.retryNoticeMessageCap)
+                            )))
+                    guard await sleepForRetry(delay) else {
                         finishAborted(assembly, continuation)
                         return
                     }
@@ -358,6 +501,10 @@ public struct LiteLLMClient: Sendable {
     /// ``AssistantMessage/init(response:model:rates:)``, so a provider `error`
     /// inside a 200 becomes a message whose ``AssistantMessage/failure`` the
     /// caller inspects.
+    ///
+    /// `onRetry` is the non-streaming twin of ``AssemblyEvent/retrying(_:)``:
+    /// there is no event stream here to carry a retry notice, so a caller that
+    /// wants to report one passes a callback.
     @concurrent
     public func complete(
         model: String,
@@ -367,7 +514,8 @@ public struct LiteLLMClient: Sendable {
         reasoningEffort: ReasoningEffort? = nil,
         toolChoice: WireToolChoice? = nil,
         rates: ModelCostRates? = nil,
-        onResponse: (@Sendable (ResponseMetadata) -> Void)? = nil
+        onResponse: (@Sendable (ResponseMetadata) -> Void)? = nil,
+        onRetry: (@Sendable (RetryNotice) -> Void)? = nil
     ) async throws -> AssistantMessage {
         let built = try buildRequest(
             model: model,
@@ -380,6 +528,8 @@ public struct LiteLLMClient: Sendable {
         )
 
         var attempt = 0
+        var everConnected = false
+        var spentOnRetries = Duration.zero
         while true {
             let response: StreamingResponse
             do {
@@ -388,13 +538,34 @@ public struct LiteLLMClient: Sendable {
                     body: built.body,
                     timeout: configuration.timeout
                 )
+                everConnected = true
             } catch let error where DoMoError.isCancellation(error) {
                 throw DoMoError(.cancelled, "Request was aborted", cause: error)
             } catch {
                 let classified = Self.classifyTransport(error)
-                if classified.isRetryable, attempt < configuration.maxRetries {
+                // Same asymmetry as the streaming path, and here for the same
+                // reason: before this, `complete` had no pre-connect cap at all,
+                // so raising `maxRetries` to ten would have made a dead gateway
+                // cost eleven full connect timeouts on this path alone.
+                let cap = everConnected
+                    ? configuration.maxRetries
+                    : min(configuration.maxRetries, configuration.maxPreConnectRetries)
+                if classified.isRetryable, attempt < cap,
+                    let delay = nextRetryDelay(
+                        attempt: attempt + 1, retryAfter: classified.retryAfter, spent: &spentOnRetries)
+                {
                     attempt += 1
-                    try await backoff(attempt: attempt, retryAfter: classified.retryAfter)
+                    onRetry?(
+                        RetryNotice(
+                            attempt: attempt,
+                            maxAttempts: cap,
+                            delay: delay,
+                            reason: RetryNotice.reason(for: classified),
+                            message: DoMoError.truncating(classified.message, to: Self.retryNoticeMessageCap)
+                        ))
+                    guard await sleepForRetry(delay) else {
+                        throw DoMoError(.cancelled, "Request was aborted")
+                    }
                     continue
                 }
                 throw classified
@@ -404,9 +575,26 @@ public struct LiteLLMClient: Sendable {
             let bodyText = await Self.collectBody(response.body, cap: Self.responseBodyByteCap)
             if !(200..<300).contains(status) {
                 let error = Self.classify(status: status, head: response.head, body: bodyText)
-                if error.isRetryable, attempt < configuration.maxRetries {
+                let serverDelay = error.retryAfter ?? Self.retryAfter(from: response.head)
+                if error.isRetryable, attempt < configuration.maxRetries,
+                    let delay = nextRetryDelay(
+                        attempt: attempt + 1, retryAfter: serverDelay, spent: &spentOnRetries)
+                {
                     attempt += 1
-                    try await backoff(attempt: attempt, retryAfter: error.retryAfter)
+                    onRetry?(
+                        RetryNotice(
+                            attempt: attempt,
+                            maxAttempts: configuration.maxRetries,
+                            delay: delay,
+                            reason: RetryNotice.reason(for: error),
+                            message: DoMoError.truncating(error.message, to: Self.retryNoticeMessageCap)
+                        ))
+                    guard await sleepForRetry(delay) else {
+                        // Cancellation mid-backoff leaves as `.cancelled`, not as
+                        // a raw `CancellationError`, matching the transport arm
+                        // above so callers only have one shape to recognize.
+                        throw DoMoError(.cancelled, "Request was aborted")
+                    }
                     continue
                 }
                 throw error
@@ -523,33 +711,47 @@ public struct LiteLLMClient: Sendable {
 
     // MARK: Retry timing
 
-    /// Sleeps the backoff for `attempt`, returning `false` if the sleep was
-    /// interrupted (cancellation) so the caller can terminate as aborted.
-    private func sleepBeforeRetry(attempt: Int, retryAfter: Duration?) async -> Bool {
+    /// The delay for `attempt`, or `nil` when the sleep budget is spent — in
+    /// which case the caller must stop retrying and report the error it holds.
+    ///
+    /// Charging `spent` here, rather than checking it at the call site, is what
+    /// keeps the two retry sites (and the two entry points) from disagreeing
+    /// about how much of the budget a skipped or an early-returned attempt used.
+    /// A delay that would push past the budget is *not* charged and *not*
+    /// truncated to fit: a half-length backoff is worse than no backoff, and
+    /// spending the budget on a shortened wait just fails a step later.
+    private func nextRetryDelay(attempt: Int, retryAfter: Duration?, spent: inout Duration) -> Duration? {
+        let delay = configuration.retryDelay(
+            attempt: attempt,
+            retryAfter: retryAfter,
+            jitter: configuration.jitter()
+        )
+        if let budget = configuration.retryDelayBudget, spent + delay > budget { return nil }
+        spent += delay
+        return delay
+    }
+
+    /// Sleeps `delay`, returning `false` if the sleep was interrupted so the
+    /// caller can terminate as aborted.
+    ///
+    /// Cancellation must win here, and it does: the default sleeper is
+    /// `Task.sleep(for:)`, which throws `CancellationError` the moment the task
+    /// is cancelled rather than at the end of the interval, so aborting a turn
+    /// during a sixty-second backoff returns immediately instead of waiting the
+    /// delay out. An injected sleeper that swallows cancellation would break
+    /// that; the `throws` in ``Configuration/sleep``'s type is the contract.
+    private func sleepForRetry(_ delay: Duration) async -> Bool {
         do {
-            try await backoff(attempt: attempt, retryAfter: retryAfter)
+            try await configuration.sleep(delay)
             return true
         } catch {
             return false
         }
     }
 
-    /// Exponential backoff with jitter, or the server-requested delay when one
-    /// was supplied. A `retry-after` is used as given (capped), without jitter,
-    /// because the server named a specific time; only the client's own guess is
-    /// jittered, to spread a thundering herd of retried requests.
-    private func backoff(attempt: Int, retryAfter: Duration?) async throws {
-        let delay: Duration
-        if let retryAfter {
-            delay = min(retryAfter, configuration.maxRetryDelay)
-        } else {
-            let shift = min(max(0, attempt - 1), 30)
-            let scaled = configuration.baseRetryDelay * Double(1 << shift)
-            let capped = min(scaled, configuration.maxRetryDelay)
-            delay = capped * Double.random(in: 0.5...1.0)
-        }
-        try await configuration.sleep(delay)
-    }
+    /// The cap on the provider's own words carried in a ``RetryNotice``. A
+    /// status line, not a log: one line's worth.
+    static let retryNoticeMessageCap = 200
 
     // MARK: Body collection
 
@@ -746,6 +948,23 @@ enum LiteLLMErrorPatterns {
         #"retry delay"#,
         #"you can retry your request"#, #"try your request again"#, #"please retry your request"#,
         #"ResourceExhausted"#,
+        // Additions beyond pi's list. These matter because LiteLLM wraps an
+        // upstream 5xx in its own `400 litellm.APIError` often enough that the
+        // status alone is not sufficient: `isRetryableBody` is what decides
+        // retryability for a non-429 status (see `classify`), so a busy
+        // provider whose overload arrives as a 400 is only caught by wording.
+        #"\bbusy\b"#,  // "The server is busy", "model is busy"
+        #"\bcapacity\b"#,  // "at capacity", "insufficient capacity"
+        #"temporarily unavailable"#,
+        #"please try again"#,  // Anthropic/Vertex "Please try again later."
+        #"try again (?:later|shortly|in a (?:moment|few|little))"#,
+        #"529"#,  // an upstream Anthropic 529 wrapped in a LiteLLM 400
+        #"no healthy (?:upstream|deployment)"#,  // LiteLLM router
+        #"all deployments? (?:are )?(?:rate limited|unhealthy|failed)"#,  // LiteLLM router
+        // Deliberately NOT here: a bare `try again`. It would fire on a
+        // genuinely malformed request ("check your parameters and try again")
+        // and spend the whole ten-retry budget on a 400 that will never
+        // succeed. The alternations above only match server-state wording.
     ].joined(separator: "|")
 
     /// `packages/ai/src/utils/retry.ts` NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.

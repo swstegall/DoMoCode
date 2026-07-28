@@ -29,7 +29,7 @@ struct ConfigurationTests {
         #expect(config.authScheme == "Bearer")
         #expect(config.model == nil)
         #expect(config.apiKey == nil)
-        #expect(config.maxRetries == 3)
+        #expect(config.maxRetries == 10)
         #expect(config.timeout == .milliseconds(600_000))
         #expect(config.streamTimeout == .milliseconds(30_000))
         #expect(config.offline == false)

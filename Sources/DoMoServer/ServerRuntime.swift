@@ -29,6 +29,37 @@ public struct SessionRef: Sendable, Codable, Hashable {
     }
 }
 
+/// An authoritative snapshot of what the server believes about one session.
+///
+/// The server owns run state and the pending-prompt set; a client's copy is only
+/// ever a fold of edge-triggered SSE frames, and every one of those edges can be
+/// missed (a dropped frame on the bounded broadcast buffer, a half-open socket, a
+/// run that never emits its close). This is the level-triggered answer, so a
+/// wedged client can ask instead of guess.
+public struct SessionStatus: Sendable, Codable, Hashable {
+    public var sessionID: String
+    public var running: Bool
+    public var pendingPermissionIDs: [String]
+    public var subscribers: Int
+    /// ISO8601, or nil when nothing is running. Lets a client say "running for
+    /// 14m" instead of an undifferentiated spinner.
+    public var runStartedAt: String?
+
+    public init(
+        sessionID: String,
+        running: Bool,
+        pendingPermissionIDs: [String],
+        subscribers: Int,
+        runStartedAt: String?
+    ) {
+        self.sessionID = sessionID
+        self.running = running
+        self.pendingPermissionIDs = pendingPermissionIDs
+        self.subscribers = subscribers
+        self.runStartedAt = runStartedAt
+    }
+}
+
 /// A row in the session listing.
 public struct SessionSummary: Sendable, Codable, Hashable {
     public let id: String
@@ -135,6 +166,9 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let sink: BroadcastEventSink
         var runTask: Task<Void, Never>?
+        /// When the run currently holding the slot was admitted; nil when idle.
+        /// Set beside `runTask` and cleared beside it, so the pair cannot drift.
+        var runStartedAt: Date?
         /// Permission prompts awaiting a client answer, keyed by request id. The
         /// engine's prompter suspends on the continuation; a REST answer (or an
         /// abort/shutdown) resumes it. Held only inside the actor, never shared.
@@ -255,7 +289,7 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let id: String
         if let resume {
-            let path = try resolveResume(resume)
+            let path = try await resolveResume(resume)
             let resumedID = try JSONLSessionStore(path: path).readHeader().id
             // Already live? Return it rather than standing up a second harness over
             // the same file — that would orphan the running task and leave the
@@ -313,6 +347,7 @@ public actor ServerRuntime {
         let harness = session.harness
         let sink = session.sink
         let token = session.token
+        session.runStartedAt = Date()
         session.runTask = Task { [weak self] in
             do {
                 _ = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
@@ -333,9 +368,17 @@ public actor ServerRuntime {
     /// Clear the run slot, but only if the session is still the one that started the
     /// run — a session replaced since must not have a completing run nil its
     /// successor's slot.
+    ///
+    /// This guard used to be dead code (no code path ever replaced a live
+    /// `SessionState`). ``forceClearRun(sessionID:)`` makes it load-bearing: the
+    /// doomed run it walks away from may settle at any later moment, and when it
+    /// does its completion hop must not free a slot that a *different*, healthy run
+    /// now holds. `ServerRuntimeForceClearTests.forceClearTokenGuardProtectsTheNextRun`
+    /// pins exactly that.
     private func finishRun(_ sessionID: String, token: Int) {
-        guard sessions[sessionID]?.token == token else { return }
-        sessions[sessionID]?.runTask = nil
+        guard let session = sessions[sessionID], session.token == token else { return }
+        session.runTask = nil
+        session.runStartedAt = nil
     }
 
     /// Cancel a running turn. The run settles cooperatively and clears its own slot.
@@ -352,6 +395,82 @@ public actor ServerRuntime {
         session.runTask?.cancel()
         drainPending(session, reason: "The tool call was aborted.")
         return wasRunning
+    }
+
+    /// Free the run slot **unconditionally**, whatever the run is doing.
+    ///
+    /// ``abort(sessionID:)`` only *cancels*: it never nils `runTask`, so clearing
+    /// the slot depends entirely on the run reaching ``finishRun(_:token:)``. A run
+    /// parked on something that cannot observe cancellation — an uncancellable tool,
+    /// a stalled-but-open socket before the transport's idle guard existed — holds
+    /// the slot for the life of the process, and every later prompt on that session
+    /// 409s. That is the "I had to make a new session" bug. This is the lever that
+    /// gets the session back without one.
+    ///
+    /// The `SessionState` is *replaced* rather than patched, because
+    /// ``DoMoHarness/AgentHarness/run(prompt:attachments:sink:)`` guards on its own
+    /// `isRunning` flag and clears it only in its own `defer`: a wedged run leaves
+    /// that flag set forever, so reusing the harness would make the very next prompt
+    /// fail with "already running a turn" and the wedge would simply move. Re-opening
+    /// from the session file re-derives the leaf and every persisted message, so the
+    /// only thing lost is the un-persisted tail of a run that was already dead.
+    ///
+    /// The session's ``BroadcastEventSink`` is carried across the replacement, so
+    /// every attached SSE subscriber survives — the same care `createSession(resume:)`
+    /// takes for a live session — and the new state's `token` makes the existing
+    /// `finishRun` guard no-op the doomed run's completion hop if it ever settles.
+    ///
+    /// It is **atomic**: the replacement harness is opened before anything is
+    /// cancelled or drained, so a failure to re-open the session file leaves the
+    /// session exactly as it was and the call can simply be retried. Half-clearing
+    /// a session — cancelled and drained but still holding its slot on a harness
+    /// whose `isRunning` is stuck — would be strictly worse than not trying.
+    ///
+    /// - Returns: whether anything was actually holding the session.
+    @discardableResult
+    public func forceClearRun(sessionID: String) async throws -> Bool {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        let path = await session.harness.sessionFilePath
+        // Re-check after the suspension: a concurrent shutdown or replacement must
+        // win rather than be clobbered by a state built from a stale snapshot.
+        guard let current = sessions[sessionID], current === session else {
+            throw ServerRuntimeError.sessionNotFound
+        }
+        // Opened FIRST, while nothing has been mutated yet.
+        let fresh = try AgentHarness.open(
+            path: path,
+            configuration: harnessConfiguration(sessionID: sessionID)
+        )
+
+        let held = session.runTask != nil || !session.pending.isEmpty
+        session.runTask?.cancel()
+        drainPending(session, reason: "The run was cleared at the client's request.")
+        sessions[sessionID] = makeState(harness: fresh, sink: session.sink)
+        // Terminal frame for anyone still attached: the client's run state is
+        // edge-triggered, so without this it stays pinned on "thinking…".
+        session.sink.broadcast(.agentEnd(reason: "aborted"))
+        return held
+    }
+
+    /// The server's authoritative view of one session — see ``SessionStatus``.
+    public func status(sessionID: String) throws -> SessionStatus {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        return SessionStatus(
+            sessionID: sessionID,
+            running: session.runTask != nil,
+            // Sorted so the projection is stable across calls; the pending map is
+            // a dictionary and its iteration order is not.
+            pendingPermissionIDs: session.pending.keys.sorted(),
+            subscribers: session.sink.subscriberCount,
+            runStartedAt: session.runStartedAt.map(Self.iso8601)
+        )
+    }
+
+    /// Matches `JSONLSessionStore.iso8601`, which is internal to DoMoHarness.
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     /// Resume every pending prompt on `session` with a reject, and tell subscribers to
@@ -382,29 +501,66 @@ public actor ServerRuntime {
 
     // MARK: Reads
 
-    public func listSessions() throws -> [SessionSummary] {
-        let listings = try JSONLSessionStore.list(cwd: config.cwd, sessionDirectory: config.sessionDirectory)
-        return listings.map {
-            SessionSummary(id: $0.header.id, path: $0.path.string, cwd: $0.header.cwd, timestamp: $0.header.timestamp)
-        }
+    // Every read below parses whole JSONL files. That work used to run **while
+    // holding this actor**, so a large session stalled `startRun`, `abort`,
+    // `resolvePermission` and the `isRunning` read that produces the SSE
+    // `connected(running:)` frame for as long as the parse took — seconds, on a
+    // long transcript — which both hurt latency and widened every run-state race.
+    // The resolution stays on the actor (it reads `sessions`); the parsing hops
+    // off through the `@concurrent` helpers.
+    //
+    // `@concurrent` is load-bearing, not decoration: under
+    // NonisolatedNonsendingByDefault an unmarked `async func` runs on the
+    // CALLER's actor, which here is this one — i.e. exactly the bug being fixed.
+
+    public func listSessions() async throws -> [SessionSummary] {
+        try await Self.loadListing(cwd: config.cwd, sessionDirectory: config.sessionDirectory)
     }
 
     /// The linear root-to-leaf message path of a session — what a client renders
     /// as the transcript. Reads from disk, so it works for a session that is live
     /// or one that only exists as a file.
     public func messages(sessionID: String) async throws -> [Message] {
-        let tree = try SessionTree.load(from: JSONLSessionStore(path: try await sessionPath(sessionID)))
+        try await Self.loadMessages(at: try await sessionPath(sessionID))
+    }
+
+    /// The direct children of a node (or of the tree roots when `parent` is nil),
+    /// in chronological order — the branch-navigation primitive.
+    public func children(sessionID: String, parent: String?) async throws -> [SessionTreeEntry] {
+        try await Self.loadChildren(at: try await sessionPath(sessionID), parent: parent)
+    }
+
+    @concurrent
+    private static func loadMessages(at path: FilePath) async throws -> [Message] {
+        let tree = try SessionTree.load(from: JSONLSessionStore(path: path))
         return try tree.branch().compactMap { entry in
             if case .message(let message) = entry.payload { return message }
             return nil
         }
     }
 
-    /// The direct children of a node (or of the tree roots when `parent` is nil),
-    /// in chronological order — the branch-navigation primitive.
-    public func children(sessionID: String, parent: String?) async throws -> [SessionTreeEntry] {
-        let tree = try SessionTree.load(from: JSONLSessionStore(path: try await sessionPath(sessionID)))
+    @concurrent
+    private static func loadChildren(at path: FilePath, parent: String?) async throws -> [SessionTreeEntry] {
+        let tree = try SessionTree.load(from: JSONLSessionStore(path: path))
         return tree.children(of: parent)
+    }
+
+    @concurrent
+    private static func loadListing(cwd: String, sessionDirectory: FilePath) async throws -> [SessionSummary] {
+        try JSONLSessionStore.list(cwd: cwd, sessionDirectory: sessionDirectory).map {
+            SessionSummary(id: $0.header.id, path: $0.path.string, cwd: $0.header.cwd, timestamp: $0.header.timestamp)
+        }
+    }
+
+    /// The on-disk path of a session that is only a file, resolved off the actor —
+    /// `JSONLSessionStore.list` scans and header-parses the whole directory.
+    @concurrent
+    private static func locate(id: String, cwd: String, sessionDirectory: FilePath) async throws -> FilePath {
+        let listings = (try? JSONLSessionStore.list(cwd: cwd, sessionDirectory: sessionDirectory)) ?? []
+        guard let match = listings.first(where: { $0.header.id == id }) else {
+            throw ServerRuntimeError.sessionNotFound
+        }
+        return match.path
     }
 
     // MARK: Shutdown
@@ -424,11 +580,7 @@ public actor ServerRuntime {
 
     private func sessionPath(_ id: String) async throws -> FilePath {
         if let session = sessions[id] { return await session.harness.sessionFilePath }
-        let listings = (try? JSONLSessionStore.list(cwd: config.cwd, sessionDirectory: config.sessionDirectory)) ?? []
-        guard let match = listings.first(where: { $0.header.id == id }) else {
-            throw ServerRuntimeError.sessionNotFound
-        }
-        return match.path
+        return try await Self.locate(id: id, cwd: config.cwd, sessionDirectory: config.sessionDirectory)
     }
 
     /// Resolve `resume` strictly as a session id within this cwd's session
@@ -436,11 +588,7 @@ public actor ServerRuntime {
     /// trusted, but treating the value as a path would let it open and *append to*
     /// any JSONL file the process can read, outside the session scope; keeping it an
     /// id keeps a session contained to the directory `listSessions` exposes.
-    private func resolveResume(_ value: String) throws -> FilePath {
-        let listings = (try? JSONLSessionStore.list(cwd: config.cwd, sessionDirectory: config.sessionDirectory)) ?? []
-        guard let match = listings.first(where: { $0.header.id == value }) else {
-            throw ServerRuntimeError.sessionNotFound
-        }
-        return match.path
+    private func resolveResume(_ value: String) async throws -> FilePath {
+        try await Self.locate(id: value, cwd: config.cwd, sessionDirectory: config.sessionDirectory)
     }
 }
