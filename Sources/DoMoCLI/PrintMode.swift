@@ -234,6 +234,15 @@ struct PrintEventSink: AgentEventSink {
             )
             emitImages(result.images)
 
+        case .notice:
+            // INERT SEAM. Nothing emits `.notice` yet, so print mode drops it and
+            // its output is byte-identical to before the case existed. The wave
+            // that adds the notice producers fills in the body here: a JSON
+            // `notice` event carrying level/code/text/detail/kind in JSON mode,
+            // and a single dim line on stderr in text mode (stderr, not stdout —
+            // `-p` output is scripted against and must stay clean).
+            break
+
         case .turnStart, .turnEnd, .agentEnd:
             break
         }
@@ -595,7 +604,7 @@ public struct PrintMode: Sendable {
     ///
     /// This is the one place the run decides success from failure, so the exit-code
     /// contract lives here: a clean completion is `0`, hitting ``maxTurns`` is `2`,
-    /// and every other non-completion is `1`.
+    /// stopping for lack of progress is `3`, and every other non-completion is `1`.
     private func finish(result: AgentRunResult, turns: Int) -> Int32 {
         let lastAssistant = Self.lastAssistant(in: result.messages)
 
@@ -624,6 +633,22 @@ public struct PrintMode: Sendable {
             log.emit("error", ["message": .string(message), "stopReason": .string("maxTurns")])
             channel.writeErr(message + "\n")
             return 2
+
+        case .noProgress:
+            // A distinct exit code from `2`, because it is a distinct condition:
+            // the budget did not run out, the model stopped getting anywhere.
+            // A script that retries on `2` (raise the limit) must not retry on
+            // this — raising the limit changes nothing.
+            //
+            // UNREACHABLE TODAY: the loop does not yet produce `.noProgress`.
+            // The arm ships now so the enforcement wave is a pure loop change.
+            let message = """
+                Stopped: the model repeated the same tool call with the same result \
+                and made no progress. Nothing was accomplished by continuing.
+                """
+            log.emit("error", ["message": .string(message), "stopReason": .string("noProgress")])
+            channel.writeErr(message + "\n")
+            return 3
         }
     }
 

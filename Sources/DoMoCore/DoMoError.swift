@@ -527,32 +527,12 @@ extension DoMoError: LocalizedError {
     ///
     /// `nil` where there is nothing honest to say. A suggestion that only
     /// restates the error trains people to stop reading them.
-    public var recoverySuggestion: String? {
-        switch kind {
-        case .transport:
-            return "Check network connectivity; this request can be retried."
-        case .authentication:
-            return "Check that the provider credential is set and has not expired."
-        case .rateLimit(let delay):
-            return delay.map { "Rate limited. Retry in \($0)." }
-                ?? "Rate limited. Retry after a short backoff."
-        case .quotaExhausted:
-            return
-                "The account is out of quota or credit. Waiting will not help — top up or switch model."
-        case .contextOverflow:
-            return "The conversation no longer fits the model's context window. Compact it and retry."
-        case .file(_, let errno):
-            switch errno {
-            case .noSuchFileOrDirectory: return "Check that the path exists."
-            case .permissionDenied: return "Check file permissions."
-            default: return nil
-            }
-        case .configuration:
-            return "Correct the configuration and start again."
-        case .provider, .malformedResponse, .toolExecution, .cancelled:
-            return nil
-        }
-    }
+    ///
+    /// The strings themselves live in ``ErrorPresentation/hint(for:)`` so that a
+    /// consumer holding only a wire *label* — a `ServerNotice`'s `kind`, with no
+    /// `DoMoError` to hand — reaches exactly the same wording. This property is
+    /// the same rule read through a value that still has its kind.
+    public var recoverySuggestion: String? { ErrorPresentation.hint(for: kind) }
 }
 
 // MARK: - Text

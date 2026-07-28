@@ -867,6 +867,15 @@ final class InteractiveCoordinator {
             startTool(id: id, name: name, arguments: arguments.value)
         case .toolExecutionEnd(let id, let name, let result, let isError):
             endTool(id: id, name: name, result: result, isError: isError)
+        case .notice:
+            // INERT SEAM. Nothing emits `.notice` yet, so the REPL's transcript is
+            // byte-identical to before the case existed. The wave that adds the
+            // notice producers fills in the body here: a dim, sanitized one-line
+            // transcript entry (a notice is model/gateway-controlled text), with
+            // `.error` levels routed through the same red treatment `appendError`
+            // uses rather than a second, divergent style.
+            break
+
         case .agentStart, .agentEnd, .turnStart, .turnEnd:
             break
         }

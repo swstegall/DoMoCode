@@ -337,6 +337,48 @@ public final class Editor: Component, Focusable {
     public var onChange: ((String) -> Void)?
     public var disableSubmit = false
 
+    /// Consulted before a bracketed paste is inserted. Return `true` to swallow
+    /// it — the editor then does nothing at all, not even push an undo snapshot.
+    ///
+    /// The hook lives here rather than in each embedding surface because the
+    /// editor is the only layer that sees a WHOLE paste: a bracketed paste is
+    /// buffered across `handleInput` calls until its terminator arrives, so a
+    /// caller sniffing raw bytes would miss any paste the driver did not deliver
+    /// in one chunk.
+    ///
+    /// `nil` by default, which is exactly today's behaviour.
+    public var onPaste: ((String) -> Bool)?
+
+    /// How many text lines the editor shows at once, or `nil` for the derived
+    /// default (30% of the terminal's rows, at least 5).
+    ///
+    /// An embedder that owns a layout — one that has already decided how many
+    /// rows the prompt gets — needs to say so, rather than have the editor
+    /// re-derive a number from the terminal height and disagree with the box it
+    /// was placed in.
+    ///
+    /// `nil` by default, which is exactly today's behaviour.
+    public var maxVisibleLines: Int?
+
+    /// Whether to emit the horizontal rules above and below the text.
+    ///
+    /// The rules double as scroll indicators (`─── ↑ 3 more ───`), so turning
+    /// them off costs that affordance; an embedder that does it is taking on the
+    /// job of showing the user there is more text off-screen.
+    ///
+    /// `true` by default, which is exactly today's behaviour.
+    public var showBorders = true
+
+    /// The number of text lines `render(width:)` will show.
+    ///
+    /// The floor of 1 is not reachable through the derived default (which is at
+    /// least 5) — it exists so an embedder that sets `maxVisibleLines` to 0 or a
+    /// negative gets a degenerate-but-valid editor instead of an empty range and
+    /// a trap in the slice below.
+    private var visibleLineCap: Int {
+        Swift.max(1, maxVisibleLines ?? Swift.max(5, Int(Double(rows()) * 0.3)))
+    }
+
     public var wantsKeyRelease: Bool { false }
 
     private static let pasteStart = "\u{1b}[200~"
@@ -623,20 +665,19 @@ public final class Editor: Component, Focusable {
         let horizontal = theme.borderColor("─")
         let layoutLines = layoutText(layoutWidth)
 
-        let terminalRows = rows()
-        let maxVisibleLines = max(5, Int(Double(terminalRows) * 0.3))
+        let lineCap = visibleLineCap
 
         let cursorLineIndex = layoutLines.firstIndex(where: { $0.hasCursor }) ?? 0
 
         if cursorLineIndex < scrollOffset {
             scrollOffset = cursorLineIndex
-        } else if cursorLineIndex >= scrollOffset + maxVisibleLines {
-            scrollOffset = cursorLineIndex - maxVisibleLines + 1
+        } else if cursorLineIndex >= scrollOffset + lineCap {
+            scrollOffset = cursorLineIndex - lineCap + 1
         }
-        let maxScrollOffset = max(0, layoutLines.count - maxVisibleLines)
+        let maxScrollOffset = max(0, layoutLines.count - lineCap)
         scrollOffset = max(0, min(scrollOffset, maxScrollOffset))
 
-        let visibleEnd = min(scrollOffset + maxVisibleLines, layoutLines.count)
+        let visibleEnd = min(scrollOffset + lineCap, layoutLines.count)
         let visibleLines = Array(layoutLines[scrollOffset..<visibleEnd])
 
         var result: [String] = []
@@ -644,16 +685,18 @@ public final class Editor: Component, Focusable {
         let rightPadding = leftPadding
 
         // Top border.
-        if scrollOffset > 0 {
-            let indicator = "─── ↑ \(scrollOffset) more "
-            let remaining = width - visibleWidth(indicator)
-            if remaining >= 0 {
-                result.append(theme.borderColor(indicator + String(repeating: "─", count: remaining)))
+        if showBorders {
+            if scrollOffset > 0 {
+                let indicator = "─── ↑ \(scrollOffset) more "
+                let remaining = width - visibleWidth(indicator)
+                if remaining >= 0 {
+                    result.append(theme.borderColor(indicator + String(repeating: "─", count: remaining)))
+                } else {
+                    result.append(theme.borderColor(truncateToWidth(indicator, width, ellipsis: "")))
+                }
             } else {
-                result.append(theme.borderColor(truncateToWidth(indicator, width, ellipsis: "")))
+                result.append(String(repeating: horizontal, count: width))
             }
-        } else {
-            result.append(String(repeating: horizontal, count: width))
         }
 
         let emitCursorMarker = focused
@@ -689,13 +732,15 @@ public final class Editor: Component, Focusable {
         }
 
         // Bottom border.
-        let linesBelow = layoutLines.count - (scrollOffset + visibleLines.count)
-        if linesBelow > 0 {
-            let indicator = "─── ↓ \(linesBelow) more "
-            let remaining = width - visibleWidth(indicator)
-            result.append(theme.borderColor(indicator + String(repeating: "─", count: max(0, remaining))))
-        } else {
-            result.append(String(repeating: horizontal, count: width))
+        if showBorders {
+            let linesBelow = layoutLines.count - (scrollOffset + visibleLines.count)
+            if linesBelow > 0 {
+                let indicator = "─── ↓ \(linesBelow) more "
+                let remaining = width - visibleWidth(indicator)
+                result.append(theme.borderColor(indicator + String(repeating: "─", count: max(0, remaining))))
+            } else {
+                result.append(String(repeating: horizontal, count: width))
+            }
         }
 
         return result
@@ -775,6 +820,12 @@ public final class Editor: Component, Focusable {
     }
 
     private func handlePaste(_ pastedText: String) {
+        // FIRST, before any state moves. A swallowed paste must leave the editor
+        // exactly as it was — no history exit, no undo snapshot, no `onChange`.
+        // An undo entry for an edit that never happened is a keystroke the user
+        // has to spend undoing nothing.
+        if let onPaste, onPaste(pastedText) { return }
+
         exitHistoryBrowsing()
         lastAction = nil
         pushUndoSnapshot()
@@ -1184,8 +1235,10 @@ public final class Editor: Component, Focusable {
 
     private func pageScroll(_ direction: Int) {
         lastAction = nil
-        let terminalRows = rows()
-        let pageSize = max(5, Int(Double(terminalRows) * 0.3))
+        // A page is a viewport, so it must be the SAME number `render` shows —
+        // otherwise an embedder that caps the height finds page-down scrolling
+        // past what it can see.
+        let pageSize = visibleLineCap
         let visualLines = buildVisualLineMap(lastWidth)
         let currentVisualLine = findCurrentVisualLine(visualLines)
         let targetVisualLine = max(0, min(visualLines.count - 1, currentVisualLine + direction * pageSize))

@@ -149,6 +149,15 @@ public final class EventStore {
         case .heartbeat, .turnStart, .turnEnd:
             return   // no transcript effect (version handled by the caller)
 
+        case .notice:
+            // INERT SEAM. Nothing broadcasts `.notice` yet, so the transcript is
+            // byte-identical to before the case existed. The wave that adds the
+            // notice producers fills in the body here: an `.error` level appends
+            // a persistent `.error` transcript row built from
+            // `ErrorPresentation.rows(label:message:)`; `.warning`/`.info` set a
+            // transient `lastNotice` the status line shows and nothing else.
+            return
+
         case .agentStart:
             runState = .running
             lastStopReason = nil

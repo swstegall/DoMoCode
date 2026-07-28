@@ -61,4 +61,16 @@ public enum TranscriptItem: Sendable, Hashable {
     /// The `imageId` is a stable Kitty id, allocated once when the item is created,
     /// so the differential renderer can track and delete the image across frames.
     case image(ImageBlock, imageId: UInt32)
+    /// A failure with no message of its own.
+    ///
+    /// A transcript row rather than a status-line notice, because an error the
+    /// user has to act on must not evaporate after four seconds — it has to
+    /// survive scrollback, and be copyable. The three parts are the ones
+    /// ``DoMoCore/ErrorPresentation/rows(label:message:)`` produces: `headline`
+    /// names the class of failure, `message` is what actually happened, `hint`
+    /// is what to do about it (nil where there is nothing honest to say).
+    ///
+    /// `message` is model- or gateway-controlled and is sanitized on the way in,
+    /// exactly like assistant text and tool output.
+    case error(headline: String, message: String, hint: String?)
 }

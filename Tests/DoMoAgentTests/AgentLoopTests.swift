@@ -150,6 +150,10 @@ extension AgentEvent {
         case .messageEnd(let message): "messageEnd(\(message.role.rawValue))"
         case .toolExecutionStart(_, let name, _): "toolStart(\(name))"
         case .toolExecutionEnd(_, let name, _, _): "toolEnd(\(name))"
+        // Nothing in the loop emits `.notice` yet, so no order assertion can see
+        // one. The label names the code so a later wave's assertion reads the
+        // same way as every other kind here.
+        case .notice(let notice): "notice(\(notice.code))"
         }
     }
 }

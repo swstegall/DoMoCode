@@ -119,6 +119,9 @@ final class TranscriptView: Component {
                 rows += toolBody(output, width: width).map(TranscriptVisualRow.text)
             case .image(let block, let imageId):
                 rows += imageRows(block, imageId: imageId, width: width, capabilities: capabilities, cell: cell)
+            case .error(let headline, let message, let hint):
+                rows += errorRows(headline: headline, message: message, hint: hint, width: width)
+                    .map(TranscriptVisualRow.text)
             }
             rows.append(.text(""))   // a blank spacer between items
         }
@@ -199,6 +202,46 @@ final class TranscriptView: Component {
         let remaining = width - headWidth - visibleWidth(separator)
         guard remaining > 1 else { return truncateToWidth(styledHead, width) }
         return styledHead + separator + dim(elideLeading(detail, width: remaining))
+    }
+
+    /// The rows for a ``TranscriptItem/error(headline:message:hint:)``.
+    ///
+    /// `✗ <headline>` in bold red, the message indented two spaces and wrapped,
+    /// then `→ <hint>` dimmed when there is one. The SGR is applied AFTER
+    /// wrapping, never before — the same discipline `toolBody` follows — so the
+    /// wrap arithmetic is over plain text and every emitted row's visible width
+    /// is exactly what it looks like.
+    ///
+    /// All three parts are sanitized here rather than trusted from the caller:
+    /// the message is gateway-controlled prose, and a headline or hint that came
+    /// off the wire went through `ErrorPresentation` but not necessarily through
+    /// anything that strips an ESC. Sanitizing at the render boundary means
+    /// there is one place to be right about it.
+    private func errorRows(headline: String, message: String, hint: String?, width: Int) -> [String] {
+        guard width > 0 else { return [] }
+        // The two-space indent is dropped rather than clamped on a pane too
+        // narrow to hold it: `max(1, width - 2)` bottoms out at 1, and adding a
+        // two-column prefix to that is three columns in a two-column pane. A
+        // one-column-wide error row is useless either way, but an OVER-WIDE one
+        // corrupts the frame around it.
+        let indent = width >= 4 ? "  " : ""
+        let bodyWidth = max(1, width - indent.count)
+
+        var rows: [String] = [
+            truncateToWidth("\u{1b}[1;31m" + "✗ " + sanitizeUntrustedText(headline) + sgrReset, width)
+        ]
+        let body = sanitizeUntrustedText(message)
+        if !body.isEmpty {
+            rows += wrapToWidth(body, width: bodyWidth).map {
+                indent + "\u{1b}[31m" + $0 + sgrReset
+            }
+        }
+        if let hint, !hint.isEmpty {
+            rows += wrapToWidth("→ " + sanitizeUntrustedText(hint), width: bodyWidth).map {
+                dim(indent + $0)
+            }
+        }
+        return rows
     }
 
     private func toolBody(_ output: String, width: Int) -> [String] {

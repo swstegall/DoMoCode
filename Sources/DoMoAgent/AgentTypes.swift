@@ -282,6 +282,18 @@ public struct AgentLoopConfig: Sendable {
     /// into the pure loop so every embedding gets it.
     public var maxTurns: Int?
 
+    /// Consecutive turns that made the SAME tool calls and got the SAME results
+    /// before the run stops with ``RunStopReason/noProgress``. `nil` disables.
+    ///
+    /// Safe to leave on when ``maxTurns`` is `nil`: it cannot fire on varied
+    /// work, however long that work runs — only on a turn that is byte-for-byte
+    /// a repeat of the one before it, `limit` times running.
+    ///
+    /// DECLARED, NOT YET ENFORCED. The turn-loop check that consumes it lands in
+    /// a later wave; until then this is inert at every value, which is why the
+    /// default can ship ahead of the behaviour.
+    public var noProgressLimit: Int? = 12
+
     /// Before-execution hook; see ``BeforeToolCallHook``.
     public var beforeToolCall: BeforeToolCallHook?
 
@@ -306,6 +318,7 @@ public struct AgentLoopConfig: Sendable {
         model: String = "unknown",
         toolExecution: ToolExecutionMode = .parallel,
         maxTurns: Int? = nil,
+        noProgressLimit: Int? = 12,
         beforeToolCall: BeforeToolCallHook? = nil,
         afterToolCall: AfterToolCallHook? = nil,
         getSteeringMessages: (@Sendable () async -> [Message])? = nil,
@@ -315,6 +328,7 @@ public struct AgentLoopConfig: Sendable {
         self.model = model
         self.toolExecution = toolExecution
         self.maxTurns = maxTurns
+        self.noProgressLimit = noProgressLimit
         self.beforeToolCall = beforeToolCall
         self.afterToolCall = afterToolCall
         self.getSteeringMessages = getSteeringMessages
@@ -357,6 +371,61 @@ public enum RunStopReason: Sendable, Hashable {
     case stoppedByHook
     /// Every tool in the final batch set ``AgentToolResult/terminate``.
     case terminatedByTool
+    /// ``AgentLoopConfig/noProgressLimit`` consecutive turns made the SAME tool
+    /// calls and got the SAME results.
+    ///
+    /// Distinct from ``maxTurnsReached``: a turn budget says "you have had
+    /// enough time", this says "you are not getting anywhere", and only the
+    /// second is a defect worth naming to the user. It is also what makes an
+    /// unbounded `maxTurns` safe — the shape that can spin forever is repeated
+    /// identical tool calls, and this catches exactly that shape.
+    case noProgress
+}
+
+/// What a turn's tool activity looked like, reduced to the parts that decide
+/// whether the run is making progress.
+///
+/// Not the raw blocks: a `ToolCallBlock` carries a per-call `id` that is fresh
+/// every turn, so comparing blocks directly would report every turn as different
+/// and the guard would never fire. Comparing the *name and arguments* it asked
+/// for against the *name, output and error flag* it got back is the honest
+/// question — the same request answered the same way is not work.
+///
+/// Images are deliberately not compared: `ToolResultBlock.images` can be
+/// megabytes, and a tool that returns a fresh screenshot each turn while its
+/// text output never changes is still stuck.
+public struct TurnToolSignature: Sendable, Hashable {
+    public struct Call: Sendable, Hashable {
+        public var name: String
+        public var arguments: JSONValue
+
+        public init(name: String, arguments: JSONValue) {
+            self.name = name
+            self.arguments = arguments
+        }
+    }
+
+    public struct Result: Sendable, Hashable {
+        public var name: String
+        public var output: String
+        public var isError: Bool
+
+        public init(name: String, output: String, isError: Bool) {
+            self.name = name
+            self.output = output
+            self.isError = isError
+        }
+    }
+
+    public var calls: [Call]
+    public var results: [Result]
+
+    public init(calls: [ToolCallBlock], results: [ToolResultBlock]) {
+        self.calls = calls.map { Call(name: $0.name, arguments: $0.arguments) }
+        self.results = results.map {
+            Result(name: $0.toolName, output: $0.output, isError: $0.isError)
+        }
+    }
 }
 
 /// The outcome of a run: the messages it produced and why it stopped.
@@ -368,8 +437,27 @@ public struct AgentRunResult: Sendable {
     public var messages: [Message]
     public var stopReason: RunStopReason
 
-    public init(messages: [Message], stopReason: RunStopReason) {
+    /// The classified failure that ended the run, when it ended in one.
+    ///
+    /// Always `nil` for ``RunStopReason/completed``, ``RunStopReason/aborted``,
+    /// ``RunStopReason/maxTurnsReached``, ``RunStopReason/stoppedByHook``,
+    /// ``RunStopReason/terminatedByTool`` and ``RunStopReason/noProgress`` — a
+    /// cancellation is not a failure, and a budget that ran out is not one
+    /// either. ``RunStopReason/errored`` is the case this exists for.
+    ///
+    /// This is why the type is `Sendable`-only and must stay that way: a
+    /// `DoMoError` carries `cause: (any Error)?` and is therefore neither
+    /// `Equatable` nor `Hashable`. The same value must NOT be put on
+    /// ``AgentEvent``, which IS `Hashable`; an event that wants to report a
+    /// failure carries an ``AgentNotice`` instead.
+    ///
+    /// DECLARED, NOT YET POPULATED. Nothing sets it to a non-`nil` value until
+    /// the wave that stops discarding the classified error in `AgentLoop`.
+    public var failure: DoMoError?
+
+    public init(messages: [Message], stopReason: RunStopReason, failure: DoMoError? = nil) {
         self.messages = messages
         self.stopReason = stopReason
+        self.failure = failure
     }
 }

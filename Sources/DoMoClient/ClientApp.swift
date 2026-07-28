@@ -437,7 +437,7 @@ public final class ClientApp {
             guard let self else { return }
             do {
                 try await self.client.sendPrompt(sessionID: id, prompt: text)
-            } catch ServerClientError.unexpectedStatus(409, _) {
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
                 self.promptInput.restore(text)
                 self.post(notice: "a turn is already running — Esc to abort it, or wait")
             } catch {

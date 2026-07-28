@@ -427,6 +427,12 @@ struct ScrollAndToolStateTests {
             case .assistant(let t), .user(let t), .reasoning(let t): return !t.contains("\u{1b}")
             case .tool(let n, let d, let o, _, _): return ![n, d, o].contains { $0.contains("\u{1b}") }
             case .image: return true
+            // Nothing produces `.error` yet, so this arm is unreachable from this
+            // fixture — but the invariant it asserts is the one that will matter
+            // when a producer lands: an error row's three parts are as untrusted
+            // as any other ingress and must carry no ESC introducer.
+            case .error(let headline, let message, let hint):
+                return ![headline, message, hint ?? ""].contains { $0.contains("\u{1b}") }
             }
         })
     }

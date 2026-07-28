@@ -22,7 +22,28 @@ import Foundation
 
 public enum ServerClientError: Error, Sendable, Equatable {
     /// A response arrived with a status the endpoint's contract does not use.
-    case unexpectedStatus(UInt, path: String)
+    ///
+    /// `body` is the first of what the server said about it. Without it a 500 is
+    /// indistinguishable from a 502 that carried a real explanation, and the
+    /// user is told only that a number happened.
+    ///
+    /// NOT YET POPULATED: every throw site currently passes `nil`. The wave that
+    /// threads the response body through `expect` fills it in; the parameter
+    /// ships now so nothing downstream is written against the two-value shape.
+    case unexpectedStatus(UInt, path: String, body: String?)
+
+    /// A REST call whose body never completed within the request timeout.
+    ///
+    /// NOT YET THROWN — declared so the wave that adds the body watchdog does not
+    /// have to re-break every `catch` in the package.
+    case timedOut(path: String)
+
+    /// An SSE stream that delivered nothing — not even a heartbeat — for the
+    /// stream idle timeout. A half-open socket throws nothing on its own: the
+    /// read simply never returns, which is exactly the wedged-session symptom.
+    ///
+    /// NOT YET THROWN — declared for the same reason as ``timedOut(path:)``.
+    case streamIdle(path: String)
 }
 
 // MARK: - Client
@@ -174,7 +195,7 @@ public struct ServerClient: Sendable {
                     // active, and the consumer cancels on teardown / session switch.
                     let response = try await http.execute(request, timeout: .hours(24))
                     guard response.status.code == 200 else {
-                        throw ServerClientError.unexpectedStatus(response.status.code, path: path)
+                        throw ServerClientError.unexpectedStatus(response.status.code, path: path, body: nil)
                     }
                     var decoder = SSEFrameDecoder()
                     for try await chunk in response.body {
@@ -199,6 +220,13 @@ public struct ServerClient: Sendable {
     /// is COMPLETE: decoding each transport chunk to a `String` first (as the naive
     /// version did) replaces any multibyte UTF-8 character split across a chunk
     /// boundary with U+FFFD, silently corrupting emoji/CJK/accented assistant text.
+    ///
+    /// The `try?` is the FORWARD-COMPATIBILITY DOOR and must stay. A frame whose
+    /// `type` this build does not know decodes to `nil` and is dropped, so a
+    /// client older than the server it is attached to loses only the frames it
+    /// could not have rendered anyway — it does not tear the stream down. That
+    /// is why `serverProtocolVersion` need not move for an additive frame; see
+    /// its doc comment in `DoMoServer/ServerEvent.swift`.
     static func parseFrame(_ frame: [UInt8]) -> ServerEvent? {
         let prefix = Array("data: ".utf8)
         guard frame.count >= prefix.count, Array(frame.prefix(prefix.count)) == prefix else { return nil }
@@ -222,7 +250,7 @@ public struct ServerClient: Sendable {
     }
 
     private func expect(_ status: UInt, _ wanted: UInt, _ path: String) throws {
-        guard status == wanted else { throw ServerClientError.unexpectedStatus(status, path: path) }
+        guard status == wanted else { throw ServerClientError.unexpectedStatus(status, path: path, body: nil) }
     }
 }
 
