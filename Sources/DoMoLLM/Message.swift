@@ -697,10 +697,11 @@ public struct AssistantMessage: Sendable, Hashable, Codable {
         case .aborted:
             return DoMoError(.cancelled, errorMessage ?? "Request was aborted")
         case .error:
-            // The persisted label when there is one, so a rebuilt transcript keeps
-            // the classification the run made. `labeled` answers nil for a label a
-            // newer build wrote and this one does not know, which correctly reads as
-            // "unclassified" rather than as some wrong kind.
+            // Coarse ON PURPOSE, and a known limitation rather than an oversight:
+            // this message was rebuilt from the session file, which records a
+            // failure's prose and stop reason but not its `DoMoError.Kind`, so there
+            // is no honest classification to return here. A LIVE failure keeps its
+            // kind — it reaches a client through the notice frame, not through this.
             return DoMoError(
                 .provider(status: nil, isRetryable: false),
                 errorMessage ?? "Provider returned an error stop reason"
