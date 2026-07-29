@@ -24,19 +24,46 @@ import DoMoTUI
 import Foundation
 
 /// A `RenderTarget` that accumulates every byte the driver writes.
+///
+/// The reported size is mutable so a test can stage a resize: the live stdout
+/// target learns its new size from the kernel on `SIGWINCH`, and a headless one
+/// has to be told — which is what ``ResizableRenderTarget`` exists for. Without
+/// this seam nothing in a headless test can reach the app's resize handling at
+/// all, so the whole re-fit path (a modal and the ^G panel are both laid out for
+/// a size that a window drag invalidates) was unreachable and uncovered.
 @MainActor
 final class WedgeCaptureTarget: RenderTarget {
-    let columns: Int
-    let rows: Int
+    private(set) var columns: Int
+    private(set) var rows: Int
+    /// The grid the EMULATOR is replayed at, fixed for the life of the run.
+    ///
+    /// Deliberately not `columns`/`rows`. The oracle re-feeds the whole byte log
+    /// from the start on every poll, so replaying it at a size the app was not
+    /// using when those bytes were written would wrap and scroll history that
+    /// never wrapped on the real screen. A test that stages a resize therefore
+    /// pins this at the LARGEST size the run will ever report: a smaller app just
+    /// paints into the left of it, and the full clear+redraw that every size
+    /// change forces wipes whatever the previous layout left behind.
+    let oracleColumns: Int
+    let oracleRows: Int
     private var buffer = ""
 
-    init(columns: Int, rows: Int) {
+    init(columns: Int, rows: Int, oracleColumns: Int? = nil, oracleRows: Int? = nil) {
         self.columns = columns
         self.rows = rows
+        self.oracleColumns = oracleColumns ?? columns
+        self.oracleRows = oracleRows ?? rows
     }
 
     func write(_ bytes: String) { buffer += bytes }
     func snapshot() -> String { buffer }
+}
+
+extension WedgeCaptureTarget: @MainActor ResizableRenderTarget {
+    func setSize(_ size: TerminalSize) {
+        columns = size.columns
+        rows = size.rows
+    }
 }
 
 /// There is no tty to put into raw mode headlessly; the driver needs only that
@@ -74,9 +101,16 @@ final class WedgeClient {
         // not the question these tests ask.
         columns: Int = 220,
         rows: Int = 34,
+        // The emulator's own grid, when a test intends to ``resize(columns:rows:)``
+        // the app to something LARGER than it starts at. See
+        // ``WedgeCaptureTarget/oracleColumns``.
+        oracleColumns: Int? = nil,
+        oracleRows: Int? = nil,
         watching: [String] = []
     ) {
-        self.target = WedgeCaptureTarget(columns: columns, rows: rows)
+        self.target = WedgeCaptureTarget(
+            columns: columns, rows: rows, oracleColumns: oracleColumns, oracleRows: oracleRows
+        )
         self.watching = Set(watching)
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
@@ -104,6 +138,15 @@ final class WedgeClient {
     /// Enter.
     func press() { inputCont.yield([0x0d]) }
 
+    /// Stage a terminal resize, exactly as a window drag would: the driver adopts
+    /// the new size into the target and repaints on the same hop.
+    ///
+    /// Never larger than the emulator's own grid — see
+    /// ``WedgeCaptureTarget/oracleColumns``.
+    func resize(columns: Int, rows: Int) {
+        resizeCont.yield(TerminalSize(columns: columns, rows: rows))
+    }
+
     /// Quit with ^C and wait for the client task to unwind.
     func quit() async {
         guard !stopped else { return }
@@ -118,7 +161,7 @@ final class WedgeClient {
 
     /// The screen right now, plus anything that scrolled off.
     func screen() -> [String] {
-        let oracle = ScreenOracle(rows: target.rows, cols: target.columns)
+        let oracle = ScreenOracle(rows: target.oracleRows, cols: target.oracleColumns)
         oracle.feed(target.snapshot())
         return oracle.screen + oracle.transcript
     }

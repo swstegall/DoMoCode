@@ -251,6 +251,12 @@ public final class ClientApp {
         promptInput.onDrop = { [weak self] token, candidates in
             self?.resolveDrop(token: token, candidates: candidates)
         }
+        // Enter while a drop is still being read is REFUSED, not queued and not
+        // sent without the picture. The prompt has no status line, so it says so
+        // here, and it names the thing to wait for rather than just "try again".
+        promptInput.onSubmitDeferredForDrop = { [weak self] in
+            self?.post(notice: "still reading the dropped file — Enter again once the 📎 chip appears")
+        }
         sidebar.onSelect = { [weak self] id in self?.openSession(id) }
         sidebar.onNew = { [weak self] in self?.newSession() }
 
@@ -363,7 +369,10 @@ public final class ClientApp {
             parts.append("\u{1b}[33m\(notice)\u{1b}[0m")
         }
         if transcriptView.scrollOffset > 0 {
-            parts.append("↑ \(transcriptView.scrollOffset) rows — scroll down to follow")
+            // Names a key, not a wheel. The wheel is gone the moment the mouse is
+            // released, and this segment used to go on advertising "scroll down to
+            // follow" while no gesture on the machine could do it.
+            parts.append("↑ \(transcriptView.scrollOffset) rows — PgDn to follow")
         }
         // While a modal owns the keyboard the ordinary hints are lies: Enter answers
         // the prompt rather than sending, and Escape selects Reject rather than
@@ -391,7 +400,28 @@ public final class ClientApp {
             // transcript), and a status line is truncated from the right, so a
             // mode marker at the end is a mode marker that vanishes on a narrow
             // terminal exactly when a notice is explaining it.
-            if !mouseOwned { parts.append("mouse released") }
+            //
+            // It also carries the scroll keys, and it is the ONLY place they are
+            // advertised, for two reasons. The line is already over budget at
+            // ordinary widths — a ninth constant hint would push `Esc: abort` off
+            // an 80-column terminal — and this is exactly the state in which the
+            // wheel does not work, so it is the state in which the keys have to be
+            // discoverable. With the mouse captured the wheel is the gesture, and
+            // the "↑ N rows — PgDn to follow" segment names the key the moment
+            // there is anything to scroll back to.
+            //
+            // Spelled "mouse: released" rather than "mouse released" so it is not a
+            // substring of the six-second F8 notice: the two used to be
+            // indistinguishable on the page, which meant deleting this marker
+            // entirely changed nothing any test could see.
+            //
+            // Kept SHORT on purpose. Naming the keys here instead cost 21 columns
+            // and pushed "Esc: abort" and "^C: quit" off a 150-column terminal
+            // whenever the mouse was released — the same harm this block's own
+            // reasoning avoids by not adding a ninth constant hint. The keys go on
+            // the transient F8 notice, which has the room and is on screen at
+            // exactly the moment the user needs them.
+            if !mouseOwned { parts.append("mouse: released") }
             // CONTEXTUAL HINTS FIRST, then the constants.
             //
             // The line is truncated from the RIGHT, and four separate waves each
@@ -568,6 +598,90 @@ public final class ClientApp {
         }
     }
 
+    // MARK: Scrolling
+
+    /// Move a pane's viewport. The ONE writer of ``TranscriptView/scrollOffset``.
+    ///
+    /// Shared by the wheel and by the keyboard deliberately. Until this existed the
+    /// offset was written in exactly one place — inside `handleMouse`, behind
+    /// `guard mouseOwned` — so releasing the mouse (F8, or `--no-mouse` for a whole
+    /// session) left the transcript with no way to scroll at all while the status
+    /// line went on advertising a gesture that no longer existed.
+    ///
+    /// No upper clamp here: only ``TranscriptNode/place(in:into:)`` knows the
+    /// viewport height, and it writes the clamped value back after painting, so a
+    /// PgUp past the top self-corrects on the very next frame rather than leaving a
+    /// phantom offset the status line would report.
+    private func scroll(_ pane: ClientLayout.Pane, rows: Int, up: Bool, layout: ClientLayout) {
+        // Rows are about to move under the selection, so it is gone by definition —
+        // cleared BEFORE the scroll, so no frame is ever composed with a highlight
+        // over content that has shifted. The click run goes with it: a second click
+        // in the same cell after a scroll is a click on different text and must not
+        // expand to a word.
+        selection.clear()
+        selection.resetClickRun()
+        switch pane {
+        case .sidebar:
+            sidebar.scroll(by: up ? -rows : rows, viewportHeight: layout.height)
+        case .transcript, .mainFooter:
+            // The transcript is the main column's scrollable body; the status and
+            // prompt rows are one line each and scroll it too, so a wheel near the
+            // bottom edge is not silently dead.
+            transcriptView.scrollOffset = max(0, transcriptView.scrollOffset + (up ? rows : -rows))
+        }
+    }
+
+    /// A scroll asked for with the keyboard, or nil when `data` is not one.
+    ///
+    /// PgUp/PgDn is the primary binding and Shift+↑/↓ the fine-grained one. Both
+    /// were checked against `DoMoTermIO/KeyDecoding.swift` rather than assumed:
+    ///
+    /// * PgUp/PgDn arrive as `\e[5~`/`\e[6~` (`legacyKeySequences`) or as the
+    ///   Kitty `\e[5;1~` form, both unmodified and both unambiguous. They are
+    ///   bound to `.editorPageUp`/`.editorPageDown` in `Keybindings.defaults`, so
+    ///   intercepting them here TAKES them from the prompt — deliberately. The
+    ///   prompt is capped at about a third of the screen and its page motion there
+    ///   is indistinguishable from ↑/↓, while the transcript is the only viewport
+    ///   in this UI with a page worth turning. They are also bound to
+    ///   `.selectPageUp`/`.selectPageDown`, which is why this check sits BELOW the
+    ///   modal and diagnostics branches: a list that is up keeps its own paging.
+    /// * Shift+↑/↓ arrive as `\e[1;2A`/`\e[1;2B` (xterm/kitty/iTerm2) or `\e[a`/
+    ///   `\e[b` (rxvt) — different bytes from the bare `\e[A`/`\e[B` that recall
+    ///   prompt history, so the decoder tells them apart and the boundary-row
+    ///   history gesture is untouched. On a terminal that sends bare arrows for
+    ///   Shift+arrow the keystroke simply recalls history, exactly as it does
+    ///   today.
+    ///
+    /// Ctrl-U/Ctrl-D were rejected: `Keybindings.defaults` binds them to
+    /// `.editorDeleteToLineStart` and `.editorDeleteCharForward`, so taking them
+    /// would make a scroll key delete the user's text on a terminal where the
+    /// other bindings work.
+    private func keyboardScroll(_ data: [UInt8]) -> (rows: Int, up: Bool, page: Bool)? {
+        if matchesKey(data, Key.pageUp) { return (0, true, true) }
+        if matchesKey(data, Key.pageDown) { return (0, false, true) }
+        if matchesKey(data, KeyId(base: .up, shift: true)) { return (1, true, false) }
+        if matchesKey(data, KeyId(base: .down, shift: true)) { return (1, false, false) }
+        return nil
+    }
+
+    /// Scroll the pane the user is looking at, from the keyboard.
+    ///
+    /// FOCUS-targeted, unlike the wheel, because a keystroke carries no
+    /// coordinates: with the sidebar focused the keys page the session list, and
+    /// otherwise — including the ordinary case where the prompt holds the caret —
+    /// they page the transcript, which is what a user reading a long reply while
+    /// typing the next question expects.
+    private func scrollFromKeyboard(rows: Int, up: Bool, page: Bool) {
+        let columns = surface?.target.columns ?? 0
+        let height = surface?.target.rows ?? 0
+        let layout = ClientLayout(width: columns, height: height, promptRows: promptRows)
+        // A page keeps one row of overlap, so the eye has an anchor across the
+        // jump — the same step the Ctrl-wheel already uses.
+        let step = page ? max(1, layout.transcriptHeight - 1) : max(1, rows)
+        scroll(focus.current === sidebar ? .sidebar : .transcript, rows: step, up: up, layout: layout)
+        surface?.requestRender()
+    }
+
     // MARK: Mouse
 
     /// Route a mouse report to the pane under the pointer.
@@ -591,26 +705,15 @@ public final class ClientApp {
 
         if event.isScroll {
             guard event.kind == .scrollUp || event.kind == .scrollDown else { return }
-            // Rows are about to move under the selection, so it is gone by
-            // definition — cleared BEFORE the scroll, so no frame is ever composed
-            // with a highlight over content that has shifted. The click run goes
-            // with it: a second click in the same cell after a scroll is a click on
-            // different text and must not expand to a word.
-            selection.clear()
-            selection.resetClickRun()
             // Ctrl-wheel pages, matching the convention of a viewport that has no
             // separate page keys.
             let step = event.ctrl ? max(1, layout.transcriptHeight - 1) : 3
-            let up = event.kind == .scrollUp
-            switch layout.pane(atColumn: event.column, row: event.row) {
-            case .sidebar:
-                sidebar.scroll(by: up ? -step : step, viewportHeight: layout.height)
-            case .transcript, .mainFooter:
-                // The transcript is the main column's scrollable body; the status and
-                // prompt rows are one line each and scroll it too, so a wheel near the
-                // bottom edge is not silently dead.
-                transcriptView.scrollOffset = max(0, transcriptView.scrollOffset + (up ? step : -step))
-            }
+            scroll(
+                layout.pane(atColumn: event.column, row: event.row),
+                rows: step,
+                up: event.kind == .scrollUp,
+                layout: layout
+            )
             surface?.requestRender()
             return
         }
@@ -714,9 +817,16 @@ public final class ClientApp {
         selection.clear()
         lifecycle?.setMouseReporting(mouseOwned)
         post(
+            // The wheel goes WITH the mouse — that is the surprise, and saying it
+            // is the whole point of this notice: a user who pressed F8 to get
+            // their terminal's own selection back did not ask to lose scrolling
+            // and would otherwise discover it by finding the transcript frozen.
+            // The replacement keys are on the persistent marker beside it, which
+            // outlives the six seconds; repeating them here would only cost the
+            // columns that the marker itself needs.
             notice: mouseOwned
                 ? "mouse captured — drag to select, right-click to copy"
-                : "mouse released — use your terminal's own selection · F8 to take it back",
+                : "mouse released — PgUp/PgDn scrolls now, the wheel went with it",
             seconds: 6
         )
         surface?.requestRender()
@@ -734,10 +844,16 @@ public final class ClientApp {
     /// dropping a PDF, leaves you with exactly the text you pasted plus a line
     /// saying why nothing was attached.
     ///
-    /// All-or-nothing per drop, because `ImageAttachmentLoader.resolveDrop` ranks
+    /// Three outcomes, not two, because `ImageAttachmentLoader.resolveDrop` ranks
     /// whole READINGS of the paste: `/Users/x/my pic.png` is either one file with a
-    /// space or two files, and only the disk can say which. Attaching half of a
-    /// reading would mean re-inserting the other half at a caret that has moved.
+    /// space or two files, and only the disk can say which. A rejection can
+    /// therefore mean either "this tokenization was wrong" — in which case nothing
+    /// may be attached and the raw paste goes back whole — or "this file cannot
+    /// ride this message", in which case the ones that CAN must be attached and
+    /// only the refused paths go back. ``readingResolved(_:candidateCount:)`` is
+    /// where those two are told apart; treating every rejection as the first is
+    /// how a drop of nine photos attached none of them and then said the ninth
+    /// had been "skipped".
     private func resolveDrop(token: UInt32, candidates: [[String]]) {
         // Taken before the hop: the raw text is the only copy of what the user
         // pasted, and the prompt forgets it the moment the drop is answered.
@@ -757,40 +873,143 @@ public final class ClientApp {
                 limits: limits,
                 alreadyLoaded: staged.map(Self.loadedImage)
             )
-            guard result.isCompleteSuccess else {
-                // A cancelled batch is a gesture the user took back, so it earns no
-                // complaint — but the text still goes back, because losing it would
-                // be the one failure this feature must never have.
-                let notice = result.wasCancelled
-                    ? ""
-                    : (result.rejected.first?.message ?? "nothing there to attach")
-                self.promptInput.resolveDrop(token: token, outcome: .rejected(rawText: rawText, notice: notice))
-                if !notice.isEmpty {
-                    self.post(notice: "not attached — \(sanitizeUntrustedText(collapseToOneLine(notice)))", seconds: 6)
+            defer { self.surface?.requestRender() }
+
+            if result.isCompleteSuccess {
+                let attached = self.stage(result.loaded)
+                let live = self.promptInput.resolveDrop(token: token, outcome: .attached(attached))
+                guard live else { self.reportAbandonedDrop(attached.count); return }
+                if attached.isEmpty {
+                    // Every path in the reading named something already staged. Not a
+                    // failure, and not a new chip either — say so, or a second drop of
+                    // the same file looks like it did nothing.
+                    self.post(notice: "already attached")
+                } else {
+                    self.post(notice: "attached \(attached.count) image\(attached.count == 1 ? "" : "s")")
                 }
-                self.surface?.requestRender()
                 return
             }
-            let attached = result.loaded.map { image in
-                self.attachmentCounter &+= 1
-                return PromptAttachment(
-                    id: self.attachmentCounter,
-                    path: image.path.string,
-                    name: image.displayName,
-                    byteCount: image.byteCount,
-                    image: ImageBlock(mediaType: image.mediaType, data: image.data)
+
+            // A resolved reading that hit a limit or named one non-image among
+            // several: attach what loaded and hand back ONLY the refused paths.
+            if !result.loaded.isEmpty,
+               Self.readingResolved(result, candidateCount: candidates.count) {
+                let attached = self.stage(result.loaded)
+                // The paths as the loader named them, one per line — not `rawText`,
+                // which is the whole paste and would put the attached files back as
+                // text beside their own chips.
+                let refusedText = result.rejected.map(\.path.string).joined(separator: "\n")
+                let live = self.promptInput.resolveDrop(
+                    token: token,
+                    outcome: .partial(attached: attached, text: refusedText)
                 )
+                guard live else { self.reportAbandonedDrop(attached.count); return }
+                self.post(notice: Self.partialNotice(attached: attached.count, refused: result.rejected), seconds: 6)
+                return
             }
-            self.promptInput.resolveDrop(token: token, outcome: .attached(attached))
-            if attached.isEmpty {
-                // Every path in the reading named something already staged. Not a
-                // failure, and not a new chip either — say so, or a second drop of
-                // the same file looks like it did nothing.
-                self.post(notice: "already attached")
-            } else {
-                self.post(notice: "attached \(attached.count) image\(attached.count == 1 ? "" : "s")")
+
+            // A cancelled batch is a gesture the user took back, so it earns no
+            // complaint — but the text still goes back, because losing it would
+            // be the one failure this feature must never have.
+            let notice = result.wasCancelled
+                ? ""
+                : (result.rejected.first?.message ?? "nothing there to attach")
+            let live = self.promptInput.resolveDrop(
+                token: token, outcome: .rejected(rawText: rawText, notice: notice))
+            guard live else { self.reportAbandonedDrop(0); return }
+            if !notice.isEmpty {
+                self.post(notice: "not attached — \(sanitizeUntrustedText(collapseToOneLine(notice)))", seconds: 6)
             }
-            self.surface?.requestRender()
+        }
+    }
+
+    /// A drop whose answer arrived after the prompt had moved on.
+    ///
+    /// `PromptInput.resolveDrop` applies nothing to a document that was cleared
+    /// under it, so this is the ONLY thing standing between the user and a message
+    /// that silently lost its picture while the status line congratulated them. It
+    /// says the opposite of what the success notice would have said.
+    private func reportAbandonedDrop(_ count: Int) {
+        guard count > 0 else { return }
+        post(
+            notice: "the prompt was cleared while it loaded — "
+                + "\(count) image\(count == 1 ? "" : "s") not attached · drop again",
+            seconds: 6
+        )
+    }
+
+    /// Whether a reading that produced rejections nonetheless RESOLVED — i.e. the
+    /// rejections mean "this file cannot be attached", not "this was the wrong
+    /// tokenization of the paste".
+    ///
+    /// Exactly two reasons are treated as evidence AGAINST the tokenization, and
+    /// only while an alternative reading exists:
+    ///
+    /// * `.missing` — nothing at that path. This is the signature of a bad split:
+    ///   `/Users/x/my pic.png` read as two tokens leaves `/Users/x/my`, which is
+    ///   not there. It is also what the whole-string reading produces when the
+    ///   drop really was several files.
+    /// * `.notARegularFile` — a directory, which is the other thing the leading
+    ///   half of a split filename tends to be.
+    ///
+    /// Every other reason — `.notAnImage`, `.tooLarge`, `.unreadable`, and both
+    /// limits — means a REAL FILE was found at that exact path and could not be
+    /// attached. A path that resolves to a file on disk is the strongest evidence
+    /// there is that the tokenization was right, so the reading is resolved and
+    /// the images beside it must be kept.
+    ///
+    /// The count check is not redundant: `DroppedPaths` offers the whole trimmed
+    /// string as a single path alongside the tokenized reading, so a
+    /// space-separated multi-file drop essentially always has two candidates and a
+    /// rule keyed on "was there only one reading" would refuse every one of them.
+    private static func readingResolved(
+        _ result: ImageAttachmentLoadResult,
+        candidateCount: Int
+    ) -> Bool {
+        if candidateCount <= 1 { return true }
+        return result.rejected.allSatisfy { rejection in
+            switch rejection.reason {
+            case .missing, .notARegularFile: return false
+            default: return true
+            }
+        }
+    }
+
+    /// The notice for a drop that partly attached.
+    ///
+    /// `ImageAttachmentRejection.message` says "skipped", which is written for the
+    /// all-or-nothing surfaces (`--image`, the REPL) where nothing else happened.
+    /// Here something else did happen — the rest are on the prompt — so the two
+    /// limit reasons are re-worded to say which file is missing from the message
+    /// about to be sent. Every other reason already names itself exactly.
+    private static func partialNotice(attached: Int, refused: [ImageAttachmentRejection]) -> String {
+        let head = "attached \(attached) image\(attached == 1 ? "" : "s")"
+        guard let first = refused.first else { return head }
+        let clause: String
+        switch first.reason {
+        case .countLimitReached(let limit):
+            clause = "\(first.displayName) not attached: at most \(limit) image\(limit == 1 ? "" : "s") per message"
+        case .totalBytesExceeded(let limit):
+            clause = "\(first.displayName) not attached: over the "
+                + "\(LoadedImage.formattedByteCount(limit)) total limit"
+        default:
+            clause = first.message
+        }
+        let more = refused.count > 1 ? " (+\(refused.count - 1) more)" : ""
+        return head + " — " + sanitizeUntrustedText(collapseToOneLine(clause)) + more
+    }
+
+    /// Turn loaded images into chips, minting an id for each.
+    private func stage(_ images: [LoadedImage]) -> [PromptAttachment] {
+        images.map { image in
+            attachmentCounter &+= 1
+            return PromptAttachment(
+                id: attachmentCounter,
+                path: image.path.string,
+                name: image.displayName,
+                byteCount: image.byteCount,
+                image: ImageBlock(mediaType: image.mediaType, data: image.data)
+            )
         }
     }
 
@@ -1688,6 +1907,41 @@ extension ClientApp: TerminalApp {
         // The diagnostics panel owns the keyboard while it is up — including over a
         // permission modal, which it can be opened on top of. Keyed off the HANDLE,
         // so a list that somehow exists without an overlay cannot eat every key.
+        // Keyboard scrolling sits with the other above-the-modal globals, for the
+        // same reason the WHEEL does: re-reading what a tool is about to do is
+        // exactly what you want while its approval modal is up. Below the modal
+        // branch — which returns unconditionally — a released mouse plus a modal
+        // left the transcript unscrollable by any means at all, which is the hole
+        // this whole mechanism exists to close, in its most important state.
+        // Safe here: the modal reads only its four select actions and already
+        // swallowed these keys, and the sidebar ignores them.
+        // Escape clears a live selection BEFORE it means abort. Two reasons, and the
+        // order is semantic rather than a preference: dismissing a highlight is the
+        // less destructive of the two readings, and it is the one the status line is
+        // advertising at that exact moment. Below Ctrl-C, always — a selection must
+        // never make the session harder to leave.
+        if selection.selection != nil, matchesKey(data, Key.escape) {
+            selection.clear()
+            surface?.requestRender()
+            return
+        }
+        // Through the decoder, not a raw byte compare: the framer delivers two fast
+        // Escapes as ONE `[esc, esc]` frame, which a byte compare against `[0x1b]`
+        // never matches — so the abort key did not get the fix the decoder did.
+        // `matchesKey` (not `.selectCancel`) deliberately: that action is also bound
+        // to Ctrl-C, which must keep meaning quit.
+        if matchesKey(data, Key.escape) { abort(); return }
+        // The keyboard scroll, and the LAST branch before the surface, so every
+        // modal, overlay and global key above keeps its own meaning for these
+        // bytes. It is what makes a released mouse — F8, or `--no-mouse` for the
+        // whole session — a real alternative rather than a one-way door: the wheel
+        // goes with the mouse, and until this existed nothing else could move the
+        // transcript.
+        if let request = keyboardScroll(data) {
+            scrollFromKeyboard(rows: request.rows, up: request.up, page: request.page)
+            return
+        }
+
         if diagnosticsHandle != nil {
             if isKeyRelease(data) { return }
             if let list = diagnosticsList,
@@ -1727,22 +1981,6 @@ extension ClientApp: TerminalApp {
             }
             return
         }
-        // Escape clears a live selection BEFORE it means abort. Two reasons, and the
-        // order is semantic rather than a preference: dismissing a highlight is the
-        // less destructive of the two readings, and it is the one the status line is
-        // advertising at that exact moment. Below Ctrl-C, always — a selection must
-        // never make the session harder to leave.
-        if selection.selection != nil, matchesKey(data, Key.escape) {
-            selection.clear()
-            surface?.requestRender()
-            return
-        }
-        // Through the decoder, not a raw byte compare: the framer delivers two fast
-        // Escapes as ONE `[esc, esc]` frame, which a byte compare against `[0x1b]`
-        // never matches — so the abort key did not get the fix the decoder did.
-        // `matchesKey` (not `.selectCancel`) deliberately: that action is also bound
-        // to Ctrl-C, which must keep meaning quit.
-        if matchesKey(data, Key.escape) { abort(); return }
         surface?.handleInput(data)
     }
 

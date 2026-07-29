@@ -406,6 +406,121 @@ struct WedgeSurfaceTests {
         await client.quit()
     }
 
+    @Test("The ^G panel re-fits when the terminal is resized under it, and keeps its selection")
+    func diagnosticsPanelRefitsOnResize() async throws {
+        // The panel's width is computed ONCE, from the terminal the ^G press
+        // happened on, and the driver's resize repaint is the only hook the app
+        // gets afterwards. The direction that matters is GROWING: the compositor
+        // clamps an overlay that is too wide for the screen, so a shrink looks
+        // after itself, but nothing widens an overlay again — a panel opened on a
+        // 40-column window stays 40 columns wide on a maximised one, with every
+        // row of the body still truncated to `http://127…` for the rest of the
+        // session.
+        //
+        // Reachable headlessly only because the capture target now adopts an
+        // injected resize the way the live target adopts a `SIGWINCH`; before that
+        // seam every resize path in this app was untestable by construction, which
+        // is why the re-fit shipped with no coverage at all.
+        let stub = try ExplainingServer(
+            routes: [
+                StubRoute("GET", "/sessions", 200, "OK", Self.sessionList),
+                StubRoute("GET", "/messages", 200, "OK", "[]"),
+                StubRoute("GET", "/events", 503, "Service Unavailable", "the runtime is restarting"),
+                StubRoute("POST", "/session", 201, "Created", Self.sessionRef),
+            ],
+            fallback: StubRoute("", "", 404, "Not Found", "")
+        )
+        stub.start()
+        defer { stub.stop() }
+
+        // Opened on a narrow window, watched on a wide emulator: the app lays out to
+        // 40 columns and paints into the left of a 220-column grid, so the replay
+        // never wraps a line the real screen did not wrap.
+        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, columns: 40, oracleColumns: 220)
+        // No hint to wait for: on a 40-column window the status line's key hints are
+        // the first thing truncated away, which is part of what makes this window
+        // worth testing on.
+        try? await Task.sleep(for: .milliseconds(800))
+        client.send([0x07])
+        #expect(await client.wait(for: "Connection & run state"), "screen:\n\(client.joined())")
+
+        client.send([0x1b, 0x5b, 0x42])   // down, onto the force-clear row
+        try? await Task.sleep(for: .milliseconds(300))
+        #expect(client.showingRow(with: ["→", "Force-clear the run"]), "screen:\n\(client.joined())")
+        // The panel fills the narrow window, and the body is truncated to fit it.
+        #expect(Self.panelWidths(client).contains(40), "screen:\n\(client.joined())")
+
+        client.resize(columns: 220, rows: 34)
+        try? await Task.sleep(for: .milliseconds(500))
+
+        // Re-laid out for the window it is now on, up to the panel's own maximum.
+        #expect(
+            Self.panelWidths(client).contains(70),
+            "the panel is still wearing the 40-column window it was opened on:\n\(client.joined())"
+        )
+        // And the selection came across BY VALUE, not by index: a rebuild that reset
+        // to row 0 would silently move the cursor off the destructive row — or, the
+        // other way round, onto it.
+        #expect(client.showingRow(with: ["→", "Force-clear the run"]), "screen:\n\(client.joined())")
+
+        await client.quit()
+    }
+
+    @Test("A resize never moves the ^G cursor ONTO the destructive row")
+    func diagnosticsPanelResizeKeepsCloseSelected() async throws {
+        // The mirror of the test above, and the direction that actually costs
+        // something. `rebuildDiagnosticsOverlayIfResized` restores the selection BY
+        // VALUE, and its own comment says losing it "is how a window drag turns
+        // 'Close' into a destructive lever, or the reverse" — but only the
+        // Force-clear→Force-clear direction was pinned. Replacing that restore with
+        // an unconditional `setSelectedIndex(1)`, so every resize arms the user's
+        // next Enter to discard the run, passed the entire suite.
+        let stub = try ExplainingServer(
+            routes: [
+                StubRoute("GET", "/sessions", 200, "OK", Self.sessionList),
+                StubRoute("GET", "/messages", 200, "OK", "[]"),
+                StubRoute("GET", "/events", 503, "Service Unavailable", "the runtime is restarting"),
+                StubRoute("POST", "/session", 201, "Created", Self.sessionRef),
+            ],
+            fallback: StubRoute("", "", 404, "Not Found", "")
+        )
+        stub.start()
+        defer { stub.stop() }
+
+        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, columns: 40, oracleColumns: 220)
+        try? await Task.sleep(for: .milliseconds(800))
+        client.send([0x07])
+        #expect(await client.wait(for: "Connection & run state"), "screen:\n\(client.joined())")
+
+        // Deliberately NO arrow key: the panel opens on "Close", which is where a
+        // resize has to leave it.
+        #expect(client.showingRow(with: ["→", "Close"]), "screen:\n\(client.joined())")
+
+        client.resize(columns: 220, rows: 34)
+        try? await Task.sleep(for: .milliseconds(500))
+
+        #expect(
+            client.showingRow(with: ["→", "Close"]),
+            "a resize moved the cursor off Close:\n\(client.joined())"
+        )
+        #expect(
+            !client.showingRow(with: ["→", "Force-clear the run"]),
+            "a resize armed the destructive row:\n\(client.joined())"
+        )
+
+        await client.quit()
+    }
+
+    /// The outer width of every complete box frame on screen, measured from its
+    /// top border — the one row whose length is exactly the overlay's own width.
+    private static func panelWidths(_ client: WedgeClient) -> [Int] {
+        client.screen().compactMap { row in
+            let trimmed = row.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("┌"), trimmed.hasSuffix("┐") else { return nil }
+            return trimmed.count
+        }
+    }
+
     @Test("Force-clear from the panel recovers a session whose run can never settle")
     func forceClearRecoversAWedgedSession() async throws {
         // The user's report, end to end, against a REAL runtime: a turn that never
@@ -467,6 +582,33 @@ struct WedgeSurfaceTests {
 
         #expect(await client.wait(for: "the run was cleared — you can send again"), "screen:\n\(client.joined())")
 
+        // The notice is the client talking to itself, and so is `markIdle()`. Swap
+        // `forceClearRun` for ANY other call that succeeds — `status`, say — and both
+        // still appear, the follow-up prompt is still echoed on screen (a 409 puts the
+        // very same string straight back in the prompt box), and the whole suite stays
+        // green while the server's run slot is still held. So the claim is measured
+        // where it is made: against the runtime this test already stands up.
+        let http = HTTPClient(eventLoopGroupProvider: .singleton)
+        let probe = ServerClient(baseURL: "http://127.0.0.1:\(port)", token: Self.token, http: http)
+        let listed = try await probe.listSessions()
+        let sessionID = try #require(listed.first?.id, "the client should have created a session")
+
+        /// Poll the server's own answer until it says `wanted`, or give up.
+        func serverRunning(reaches wanted: Bool, within attempts: Int) async -> Bool {
+            for _ in 0..<attempts {
+                if let status = try? await probe.status(sessionID: sessionID), status.running == wanted {
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            return false
+        }
+
+        #expect(
+            await serverRunning(reaches: false, within: 50),
+            "the server still holds the run slot — the panel's lever did not force-clear"
+        )
+
         // And the session genuinely works again — a claim the notice alone does
         // not make good on.
         try? await Task.sleep(for: .milliseconds(300))
@@ -474,10 +616,212 @@ struct WedgeSurfaceTests {
         try? await Task.sleep(for: .milliseconds(200))
         client.press()
         #expect(await client.wait(for: "after the clear"), "screen:\n\(client.joined())")
+        // Accepted by the SERVER, not merely restored into the prompt box: the freed
+        // slot is holding a second run.
+        #expect(
+            await serverRunning(reaches: true, within: 100),
+            "the follow-up prompt never started a run — the session is still wedged"
+        )
 
+        try await http.shutdown()
         await client.quit()
         serverTask.cancel()
         _ = try? await serverTask.value
+    }
+
+    @Test("A permission prompt the stream never delivered is recovered by the status poll")
+    func thePollRecoversALostPermissionPrompt() async throws {
+        // The one un-defended way an ask is lost: the drop-oldest broadcast buffer
+        // evicts the `permission_request` while the client stays CONNECTED. Nothing
+        // reconnects, so the `connected` reconcile — until the poll existed, the only
+        // caller of `GET /permissions` — is never re-run, and the run stays parked
+        // behind a modal that will never be drawn.
+        //
+        // Staged so the poll is the ONLY path that can produce the modal:
+        //  * `/events` delivers `connected(running: true)` once and then 503s, so
+        //    exactly one `connected` reconcile ever happens…
+        //  * …and its `GET /permissions` is answered EMPTY, which is precisely what
+        //    "the ask was evicted before we subscribed" looks like;
+        //  * the FIRST status poll — the one that fires the instant the run state
+        //    goes `running` — is answered 500, so it returns before the permission
+        //    branch and cannot race the connected reconcile for that empty body;
+        //  * the SECOND poll, one interval later, is the first call in the whole run
+        //    that can see `pendingPermissionIDs` at all.
+        let running = Self.sse([
+            .connected(protocolVersion: serverProtocolVersion, sessionID: "abc123", running: true)
+        ])
+        let ask = ServerEvent.permissionRequest(
+            id: "per_1", sessionID: "abc123", permission: "bash",
+            patterns: ["*"], always: [], metadata: ["command": .string("rm -rf /tmp/x")],
+            disableAlways: true
+        )
+        let permissionsJSON = String(decoding: try JSONEncoder().encode([ask]), as: UTF8.self)
+        let parkedStatus = SessionStatus(
+            sessionID: "abc123", running: true, pendingPermissionIDs: ["per_1"],
+            subscribers: 1, runStartedAt: nil
+        )
+        let statusJSON = String(decoding: try JSONEncoder().encode(parkedStatus), as: UTF8.self)
+        let stub = try ExplainingServer(
+            routes: [
+                StubRoute("GET", "/sessions", 200, "OK", Self.sessionList),
+                StubRoute("GET", "/messages", 200, "OK", "[]"),
+                StubRoute("GET", "/permissions", 200, "OK", "[]", times: 1),
+                StubRoute("GET", "/permissions", 200, "OK", permissionsJSON),
+                StubRoute("GET", "/status", 500, "Internal Server Error", "not yet", times: 1),
+                StubRoute("GET", "/status", 200, "OK", statusJSON),
+                StubRoute("GET", "/events", 200, "OK", running, times: 1),
+                StubRoute("GET", "/events", 503, "Service Unavailable", "the runtime went away"),
+                StubRoute("POST", "/session", 201, "Created", Self.sessionRef),
+            ],
+            fallback: StubRoute("", "", 404, "Not Found", "")
+        )
+        stub.start()
+        defer { stub.stop() }
+
+        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        #expect(await client.wait(for: "thinking…", timeout: .seconds(10)), "screen:\n\(client.joined())")
+        // The ask exists only on the server at this point; nothing has drawn a modal,
+        // and on the stream alone nothing ever would.
+        #expect(!client.showing("Permission required"), "too early:\n\(client.joined())")
+
+        #expect(await client.wait(for: "Permission required", timeout: .seconds(20)), "screen:\n\(client.joined())")
+        // The recovered ask is the real one, not a placeholder: it carries what the
+        // agent actually wants to run.
+        #expect(client.showing("rm -rf /tmp/x"), "screen:\n\(client.joined())")
+        await client.quit()
+    }
+
+    @Test("Pressing Enter is a repair action: a 409 re-reads the server and adopts its answer")
+    func aRefusedPromptReconcilesWithTheServer() async throws {
+        // The client-idle / server-busy direction, which has exactly one recovery in
+        // the whole file. `pollStatusIfDue()` opens with `guard store.runState ==
+        // .running` and `submit` only reaches the POST when the run state is NOT
+        // running, so in this state the periodic poll can never fire — the 409's
+        // `catch` is the only thing that ever asks the server anything, and until it
+        // does the client will keep offering a prompt box the server will keep
+        // refusing.
+        let idleFrame = Self.sse([
+            .connected(protocolVersion: serverProtocolVersion, sessionID: "abc123", running: false)
+        ])
+        let busyStatus = SessionStatus(
+            sessionID: "abc123", running: true, pendingPermissionIDs: [],
+            subscribers: 1, runStartedAt: "2026-07-29T05:57:44.948Z"
+        )
+        let statusJSON = String(decoding: try JSONEncoder().encode(busyStatus), as: UTF8.self)
+        let stub = try ExplainingServer(
+            routes: [
+                // Above `POST /session`, whose path prefix matches every POST the
+                // client makes.
+                StubRoute("POST", "/prompt", 409, "Conflict", "a turn is already running"),
+                StubRoute("GET", "/sessions", 200, "OK", Self.sessionList),
+                StubRoute("GET", "/messages", 200, "OK", "[]"),
+                StubRoute("GET", "/permissions", 200, "OK", "[]"),
+                StubRoute("GET", "/status", 200, "OK", statusJSON),
+                StubRoute("GET", "/events", 200, "OK", idleFrame, times: 1),
+                StubRoute("GET", "/events", 503, "Service Unavailable", "the runtime went away"),
+                StubRoute("POST", "/session", 201, "Created", Self.sessionRef),
+            ],
+            fallback: StubRoute("", "", 404, "Not Found", "")
+        )
+        stub.start()
+        defer { stub.stop() }
+
+        // The refusal is a four-second notice and every other notice in this file
+        // replaces it, so it is watched from the first frame rather than only while
+        // a `wait` for it happens to be running.
+        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, watching: ["Esc aborts it"])
+        try? await Task.sleep(for: .milliseconds(800))
+        // The premise: the client believes nothing is running, which is what makes
+        // the periodic poll unreachable.
+        #expect(!client.showing("thinking…"), "the client should believe it is idle:\n\(client.joined())")
+
+        client.type("are you there")
+        try? await Task.sleep(for: .milliseconds(300))
+        client.press()
+
+        #expect(await client.wait(for: "Esc aborts it"), "screen:\n\(client.joined())")
+        // Only reachable by adopting the server's snapshot from inside the 409 catch:
+        // no frame says a run is in flight, and no other code path asks.
+        #expect(await client.wait(for: "thinking…", timeout: .seconds(10)), "screen:\n\(client.joined())")
+        // And the refusal's other exit is on the same line, so the user can look at
+        // the run the server says exists. (The hint is also shown while the stream is
+        // down, so this rides along with the run-state claim rather than standing in
+        // for it.)
+        #expect(client.showing("^G: diagnostics"), "screen:\n\(client.joined())")
+        await client.quit()
+    }
+
+    @Test("Pressing Enter on a busy client brings the poll forward to the next tick")
+    func aRefusedPromptForcesThePollImmediately() async throws {
+        // The other half of "Enter is a repair action", on the client-BELIEVES-busy
+        // side: `submit` refuses synchronously and never reaches the POST, so the
+        // only thing the press can do is drag the authoritative poll forward.
+        // `lastStatusPollAt = .distantPast` is that, and it is what makes a user
+        // hammering the key in frustration the thing that unsticks a stale run state.
+        //
+        // Measured as a DEADLINE against the poll's own five-second interval: the
+        // correction has to land in well under one interval, which it cannot if the
+        // press does not reset the clock.
+        let running = Self.sse([
+            .connected(protocolVersion: serverProtocolVersion, sessionID: "abc123", running: true)
+        ])
+        let idleStatus = SessionStatus(
+            sessionID: "abc123", running: false, pendingPermissionIDs: [],
+            subscribers: 0, runStartedAt: nil
+        )
+        let statusJSON = String(decoding: try JSONEncoder().encode(idleStatus), as: UTF8.self)
+        let stub = try ExplainingServer(
+            routes: [
+                StubRoute("GET", "/sessions", 200, "OK", Self.sessionList),
+                StubRoute("GET", "/messages", 200, "OK", "[]"),
+                StubRoute("GET", "/permissions", 200, "OK", "[]"),
+                // The poll that fires the instant the run state goes `running` is
+                // answered 500 and adopts nothing. Without that, the client would
+                // correct itself before a key could be pressed and this would be
+                // measuring the ordinary poll rather than the press.
+                StubRoute("GET", "/status", 500, "Internal Server Error", "not yet", times: 1),
+                StubRoute("GET", "/status", 200, "OK", statusJSON),
+                StubRoute("GET", "/events", 200, "OK", running, times: 1),
+                StubRoute("GET", "/events", 503, "Service Unavailable", "the runtime went away"),
+                StubRoute("POST", "/session", 201, "Created", Self.sessionRef),
+            ],
+            fallback: StubRoute("", "", 404, "Not Found", "")
+        )
+        stub.start()
+        defer { stub.stop() }
+
+        // Both notices are watched from the FIRST frame, not from the moment a
+        // `wait` happens to be called. They are in a race with each other by
+        // construction — the refusal posts one, and the poll it forces replaces it
+        // about a tenth of a second later — so a needle that is only looked for
+        // while a `wait` is running is a needle that can be stepped on before it is
+        // seen. What this test is measuring is the SECOND one; the first is proven
+        // on its own in "A refused prompt names both ways out".
+        let client = WedgeClient(
+            baseURL: stub.baseURL, token: Self.token,
+            watching: ["the server says nothing is running"]
+        )
+        #expect(await client.wait(for: "thinking…", timeout: .seconds(10)), "screen:\n\(client.joined())")
+        // Let the first poll retire against the 500, so the NEXT one is scheduled a
+        // whole interval out and the press is the only thing that can pull it in.
+        try? await Task.sleep(for: .milliseconds(600))
+        #expect(!client.showing("the server says nothing is running"), "too early:\n\(client.joined())")
+
+        client.type("are you there")
+        try? await Task.sleep(for: .milliseconds(200))
+        let pressedAt = ContinuousClock.now
+        client.press()
+
+        #expect(
+            await client.wait(for: "the server says nothing is running", timeout: .seconds(20)),
+            "screen:\n\(client.joined())"
+        )
+        let elapsed = ContinuousClock.now - pressedAt
+        #expect(
+            elapsed < .seconds(2.5),
+            "the correction took \(elapsed) — an untouched five-second interval, so the press did not bring the poll forward"
+        )
+        await client.quit()
     }
 
     // MARK: The poll

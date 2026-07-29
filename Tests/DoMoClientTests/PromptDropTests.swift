@@ -203,4 +203,90 @@ struct PromptDropTests {
         #expect(input.text == "look")
         #expect(input.attachments.count == 1)
     }
+
+    // MARK: Enter while a drop is still being read
+
+    @Test("Enter is refused while a drop is unanswered, and the text is kept")
+    func submitWaitsForAPendingDrop() {
+        // THE WINDOW. A drop swallows the paste and is answered one whole
+        // multi-megabyte read later. Sending in between used to clear
+        // `pendingDrops`, which made the answer stale — the images never reached
+        // the prompt, the model got a message with no picture in it, and the
+        // status line said "attached 1 image" anyway.
+        let input = PromptInput()
+        input.focused = true
+        var submitted: [(String, [PromptAttachment])] = []
+        var deferrals = 0
+        var token: UInt32?
+        input.onSubmit = { text, attachments in submitted.append((text, attachments)) }
+        input.onDrop = { received, _ in token = received }
+        input.onSubmitDeferredForDrop = { deferrals += 1 }
+
+        input.handleInput(paste("/tmp/shot.png"))
+        let issued = try! #require(token)
+        input.handleInput(Array("describe this".utf8))
+        input.handleInput([0x0d])   // Enter, mid-read
+
+        #expect(submitted.isEmpty, "a message was sent while its picture was still loading")
+        #expect(deferrals == 1, "the refusal was silent")
+        #expect(input.text == "describe this", "the typed text was destroyed by the refusal")
+
+        // The answer is still LIVE, because the send did not clear the token.
+        #expect(input.resolveDrop(token: issued, outcome: .attached([attachment(1, "/tmp/shot.png", "shot.png")])))
+        #expect(input.attachments.map(\.name) == ["shot.png"])
+
+        // And the very next Enter sends the whole thing.
+        input.handleInput([0x0d])
+        #expect(submitted.count == 1)
+        #expect(submitted.first?.0 == "describe this")
+        #expect(submitted.first?.1.count == 1, "the image did not ride the message")
+    }
+
+    @Test("A drop answered after the prompt was cleared reports that it was NOT applied")
+    func abandonedDropIsReportedAsSuch() {
+        // The half of the window that survives the Enter guard: a session opened
+        // under the drop clears the prompt. `resolveDrop` must say `false` so the
+        // app cannot post "attached 1 image" about a chip that does not exist.
+        let input = PromptInput()
+        var token: UInt32?
+        input.onDrop = { received, _ in token = received }
+        input.handleInput(paste("/tmp/shot.png"))
+        let issued = try! #require(token)
+
+        input.clear()
+        let live = input.resolveDrop(
+            token: issued, outcome: .attached([attachment(1, "/tmp/shot.png", "shot.png")]))
+        #expect(!live, "a stale answer claimed it had been applied")
+        #expect(input.attachments.isEmpty)
+    }
+
+    @Test("A live answer reports that it WAS applied")
+    func liveDropReportsLive() {
+        let input = PromptInput()
+        var token: UInt32?
+        input.onDrop = { received, _ in token = received }
+        input.handleInput(paste("/tmp/shot.png"))
+        #expect(input.resolveDrop(
+            token: try! #require(token),
+            outcome: .attached([attachment(1, "/tmp/shot.png", "shot.png")])
+        ))
+    }
+
+    @Test("A partial answer stages the chips and puts back only the refused paths")
+    func partialOutcomeKeepsWhatLoaded() {
+        let input = PromptInput()
+        var token: UInt32?
+        input.onDrop = { received, _ in token = received }
+        input.handleInput(paste("/tmp/a.png /tmp/notes.txt"))
+
+        #expect(input.resolveDrop(
+            token: try! #require(token),
+            outcome: .partial(
+                attached: [attachment(1, "/tmp/a.png", "a.png")],
+                text: "/tmp/notes.txt"
+            )
+        ))
+        #expect(input.attachments.map(\.name) == ["a.png"])
+        #expect(input.text == "/tmp/notes.txt", "the refused path did not come back as text")
+    }
 }

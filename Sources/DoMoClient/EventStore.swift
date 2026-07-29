@@ -122,6 +122,12 @@ public final class EventStore {
     /// ``seed(_:)``s its history and attaches its event stream.
     public func select(_ sessionID: String?) {
         selectedSessionID = sessionID
+        // Cleared HERE and not in `clearTranscript()`, which a re-seed also calls:
+        // carrying a learned classification across a reconnect is the entire point
+        // of the map, and resetting it there wiped it a line before the lookup.
+        // Across a SESSION switch it must go — the same words in another session are
+        // another failure.
+        kindsByFailureText = [:]
         clearTranscript()
         // Cleared HERE and not in `clearTranscript`, which `seed(_:)` also calls:
         // the path belongs to the session, and a re-seed of the same session must
@@ -175,7 +181,14 @@ public final class EventStore {
                 // it cannot know. A LIVE failure keeps its kind — it comes through
                 // the notice frame, not through here.
                 if let failure = assistant.failure, !failure.isCancellation {
-                    appendError(ErrorPresentation.rows(label: nil, message: failure.message))
+                    // A kind this session already learned LIVE for these exact words
+                    // is not an invention — it is the classification the runtime
+                    // sent, being carried across the re-seed that would otherwise
+                    // drop it. Absent that, `nil` and the honest generic headline.
+                    appendError(ErrorPresentation.rows(
+                        label: kindsByFailureText[failure.message],
+                        message: failure.message
+                    ))
                 }
             case .tool(let result):
                 // History carries no arguments (the tool-result message has only the
@@ -243,10 +256,23 @@ public final class EventStore {
             // does not push the conversation up the screen.
             switch notice.level {
             case .error:
-                appendError(ErrorPresentation.rows(
-                    label: notice.kind,
-                    message: Self.noticeBody(notice)
-                ))
+                let body = Self.noticeBody(notice)
+                // Remember the taxonomy against the words it came with.
+                //
+                // The JSONL stores a failure as a STRING and a stop reason — the kind
+                // was never part of that shape — so a re-seed rebuilds this same row
+                // from history with `label: nil` and it degrades to the generic
+                // "Something went wrong". The stream re-seeds on every reconnect, so
+                // "did I blow the context window?" was answered once and then
+                // silently un-answered by the next blip. Keyed on the message text
+                // because that is precisely what survives to the seeded row.
+                if let kind = notice.kind, !body.isEmpty {
+                    if kindsByFailureText.count >= Self.rememberedKindLimit {
+                        kindsByFailureText.removeAll(keepingCapacity: true)
+                    }
+                    kindsByFailureText[body] = kind
+                }
+                appendError(ErrorPresentation.rows(label: notice.kind, message: body))
             case .warning, .info:
                 lastNotice = notice
                 onNotice?(notice)
@@ -588,6 +614,17 @@ public final class EventStore {
         streamingAssistantIndex = nil
         streamingReasoningIndex = nil
     }
+
+    /// Kinds learned from live notices, keyed by the failure text they arrived with,
+    /// so a re-seed can restore a classification the persisted history cannot carry.
+    /// Per-session: cleared with the transcript, because a message is only the same
+    /// failure within the session that produced it.
+    private var kindsByFailureText: [String: String] = [:]
+
+    /// A bound, so a session that fails in a new way every turn cannot grow this
+    /// without limit. Dropping the whole map on overflow costs a generic headline
+    /// after a re-seed, which is exactly the behaviour that existed before it.
+    private static let rememberedKindLimit = 64
 
     private func clearTranscript() {
         // Fresh data is a sign of life: a re-seed that did NOT reset this would

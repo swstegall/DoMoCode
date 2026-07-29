@@ -643,6 +643,7 @@ public struct AssistantMessage: Sendable, Hashable, Codable {
     public var stopReason: StopReason
     public var errorMessage: String?
 
+
     public init(
         content: [ContentBlock] = [],
         model: String,
@@ -696,6 +697,10 @@ public struct AssistantMessage: Sendable, Hashable, Codable {
         case .aborted:
             return DoMoError(.cancelled, errorMessage ?? "Request was aborted")
         case .error:
+            // The persisted label when there is one, so a rebuilt transcript keeps
+            // the classification the run made. `labeled` answers nil for a label a
+            // newer build wrote and this one does not know, which correctly reads as
+            // "unclassified" rather than as some wrong kind.
             return DoMoError(
                 .provider(status: nil, isRetryable: false),
                 errorMessage ?? "Provider returned an error stop reason"

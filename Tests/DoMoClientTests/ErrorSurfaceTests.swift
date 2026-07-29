@@ -344,4 +344,38 @@ struct ErrorSurfaceTests {
         let huge = ServerClient.errorBody(Data(String(repeating: "z", count: 10_000).utf8))
         #expect((huge?.count ?? 0) <= ServerClient.errorBodyCharacterCap + 1)
     }
+
+    @Test("A re-seed keeps a classification the persisted history cannot carry")
+    @MainActor
+    func reSeedKeepsTheKindLearnedLive() {
+        // The stream re-seeds on every reconnect, and the JSONL stores a failure as
+        // a string plus a stop reason — the kind was never part of that shape. So a
+        // classified row was answered once and then silently un-answered by the next
+        // blip: "The conversation no longer fits the context window" degraded to
+        // "Something went wrong", losing the one sentence the user needed.
+        let store = EventStore()
+        store.select("s1")
+        let text = "stream chat completions: HTTP 400: This model's maximum context length is 128000 tokens"
+        store.apply(.notice(ServerNotice(
+            level: .error,
+            code: "provider_error",
+            text: text,
+            kind: DoMoError.Kind.contextOverflow.label
+        )))
+        #expect(store.transcript.contains { item in
+            if case .error(let headline, _, _) = item { return headline.contains("context window") }
+            return false
+        }, "the live row lost its classification: \(store.transcript)")
+
+        // The same failure coming back as persisted history, exactly as a reconnect
+        // replays it.
+        store.seed([
+            .user(UserMessage(content: [.text("summarise everything")])),
+            .assistant(AssistantMessage(content: [], model: "m", stopReason: .error, errorMessage: text)),
+        ])
+        #expect(store.transcript.contains { item in
+            if case .error(let headline, _, _) = item { return headline.contains("context window") }
+            return false
+        }, "the re-seed dropped the kind it had already been told: \(store.transcript)")
+    }
 }

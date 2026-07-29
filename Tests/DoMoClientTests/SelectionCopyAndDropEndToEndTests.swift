@@ -108,6 +108,34 @@ private enum Term {
     static func rightPress(column: Int, row: Int) -> [UInt8] { press(column: column, row: row, button: 2) }
     static let f8 = Array("\u{1b}[19~".utf8)
     static let escape: [UInt8] = [0x1b]
+
+    /// `ESC [ M` + three bytes biased by 32 — the pre-SGR encoding a terminal
+    /// falls back to when it does not answer `?1006h`.
+    static func x10(_ code: Int, column: Int, row: Int) -> [UInt8] {
+        [0x1b, 0x5b, 0x4d, UInt8(code + 32), UInt8(column + 33), UInt8(row + 33)]
+    }
+    static func x10Press(column: Int, row: Int) -> [UInt8] { x10(0, column: column, row: row) }
+    static func x10Drag(column: Int, row: Int) -> [UInt8] { x10(32, column: column, row: row) }
+    /// X10 has no release code of its own: it sends button bits `3`, which the
+    /// decoder reports as `.release` with `.none` for the button.
+    static func x10Release(column: Int, row: Int) -> [UInt8] { x10(3, column: column, row: row) }
+    static func x10RightPress(column: Int, row: Int) -> [UInt8] { x10(2, column: column, row: row) }
+
+    /// A wheel-up report over a cell, the way `?1006h` spells it.
+    static func wheelUp(column: Int, row: Int) -> [UInt8] {
+        Array("\u{1b}[<64;\(column + 1);\(row + 1)M".utf8)
+    }
+    static func wheelDown(column: Int, row: Int) -> [UInt8] {
+        Array("\u{1b}[<65;\(column + 1);\(row + 1)M".utf8)
+    }
+
+    static let pageUp = Array("\u{1b}[5~".utf8)
+    static let pageDown = Array("\u{1b}[6~".utf8)
+    /// The xterm/kitty/iTerm2 spelling. Byte-distinct from the bare `ESC [ A`
+    /// that recalls prompt history, which is the whole reason it is safe to bind.
+    static let shiftUp = Array("\u{1b}[1;2A".utf8)
+    static let shiftDown = Array("\u{1b}[1;2B".utf8)
+    static let up = Array("\u{1b}[A".utf8)
     static func paste(_ text: String) -> [UInt8] {
         Array("\u{1b}[200~\(text)\u{1b}[201~".utf8)
     }
@@ -340,9 +368,16 @@ struct SelectionCopyAndDropEndToEndTests {
             }
             input.yield(Term.rightPress(column: spot.column, row: spot.row))
             _ = await self.waitUntil { !clipboard.recorded.isEmpty }
+            // The highlight goes with the copy — it has served its purpose, and
+            // leaving it up invites a second right-click that copies the same
+            // thing again. Waited for HERE, inside the run, because the frame is
+            // only repainted while the client is alive.
+            _ = await self.waitUntil { !self.transcriptHasHighlight(target) }
         }
 
         #expect(clipboard.recorded == [needle], "the clipboard got \(clipboard.recorded)")
+        #expect(!transcriptHasHighlight(target), "the highlight outlived the copy")
+        #expect(!screenHas(target, "Esc: clear selection"), "the selection outlived the copy")
         // The user is told it happened; a silent copy is indistinguishable from a
         // dead right-click.
         #expect(screenHas(target, "copied 1 line"))
@@ -507,6 +542,15 @@ struct SelectionCopyAndDropEndToEndTests {
             input.yield(Term.f8)
             _ = await self.waitUntil { self.screenHas(target, "mouse released") }
             #expect(self.screenHas(target, "F8: capture mouse"))
+            // The PERSISTENT marker, not the six-second notice. It is spelled
+            // "mouse: released" precisely so the two can be told apart on the
+            // page: while they shared a spelling, deleting the marker changed
+            // nothing any test could see, and a user who let the notice lapse had
+            // no way to tell which mode they were in.
+            #expect(self.screenHas(target, "mouse: released"), "no persistent mouse-mode marker")
+            // The wheel goes with the mouse, and the notice has to say so — plus
+            // name what replaces it, or F8 is a one-way door out of scrolling.
+            #expect(self.screenHas(target, "PgUp/PgDn"), "the F8 notice did not name the replacement")
             // With the mouse released a stray report — one already in the pipe
             // when F8 was pressed — must not select anything.
             input.yield(Term.press(column: 60, row: 3))
@@ -855,8 +899,18 @@ struct SelectionCopyAndDropEndToEndTests {
         _ = await clientTask.result
         await FullScreenClientGate.shared.leave()
 
-        #expect(after.contains { $0.contains("attachments too large") }, "no notice:\n\(after.joined(separator: "\n"))")
-        #expect(after.contains { $0.contains("The server refused the message as too large") })
+        // Asserted on the PERSISTENT row, not on the transient notice. `post(notice:)`
+        // is a single slot with a TTL and several sources, so any other event inside
+        // its window replaces it — here the stub's 404 `/events` reconnects and posts
+        // "the session is live again" over it. That is the design working as intended
+        // rather than a defect: a refusal the user has to act on gets a scrollable
+        // transcript row with strictly more detail, which is precisely why the error
+        // surface stopped relying on a message that evaporates after four seconds.
+        #expect(
+            after.contains { $0.contains("The server refused the message as too large") },
+            "no persistent row:\n\(after.joined(separator: "\n"))"
+        )
+        #expect(after.contains { $0.contains("HTTP 413") })
         // Both halves of the message are back on the prompt.
         #expect(after.contains { $0.contains("look at this") }, "the text was destroyed by the refusal")
         #expect(after.contains { $0.contains("huge.png") }, "the chip was destroyed by the refusal")
@@ -888,5 +942,527 @@ struct SelectionCopyAndDropEndToEndTests {
             return user.content.compactMap { if case .image(let image) = $0 { return image } else { return nil } }
         }
         #expect(images.count == 2, "the model saw \(images.count) images")
+    }
+
+    @Test("Dropping the same file twice says so instead of claiming a new chip")
+    func reDroppingSaysAlreadyAttached() async throws {
+        // A duplicate is neither a success nor a failure, and the two wrong
+        // answers are both worse than the right one: "attached 0 images" reads as
+        // a bug, and silence reads as a dead gesture.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let file = dirs.files.appendingPathComponent("twice.png")
+        try Self.onePixelPNG.write(to: file)
+
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "ack")
+        let (serverTask, port) = await startServer(server)
+        var after: [String] = []
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Term.paste(file.path))
+            _ = await self.waitUntil { self.screenHas(target, "attached 1 image") }
+            input.yield(Term.paste(file.path))
+            _ = await self.waitUntil { self.screenHas(target, "already attached") }
+            after = self.oracle(target).screen
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        #expect(after.contains { $0.contains("already attached") }, "screen:\n\(after.joined(separator: "\n"))")
+        #expect(after.contains { $0.contains("twice.png") }, "the original chip was destroyed by the re-drop")
+        #expect(!after.contains { $0.contains(file.path) }, "the re-dropped path leaked into the prompt as text")
+    }
+
+    // MARK: A limit refuses one file, not the whole drop
+
+    /// The images the gateway was asked to run with, newest turn first.
+    private func imageParts(_ seen: SeenMessages) -> [ImageBlock] {
+        seen.messages.flatMap { message -> [ImageBlock] in
+            guard case .user(let user) = message else { return [] }
+            return user.content.compactMap { if case .image(let image) = $0 { return image } else { return nil } }
+        }
+    }
+
+    @Test("Nine images attach eight and hand back only the ninth path")
+    func countLimitKeepsWhatLoaded() async throws {
+        // `ImageAttachmentLimits.default.maximumCount` is 8. Refusing the ninth is
+        // correct; throwing away the other eight — which is what a bare
+        // `guard result.isCompleteSuccess` did — is not, and the notice said
+        // "skipped", which tells the user the rest were kept.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        var paths: [String] = []
+        for index in 1...9 {
+            let file = dirs.files.appendingPathComponent("n\(index).png")
+            try Self.onePixelPNG.write(to: file)
+            paths.append(file.path)
+        }
+
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "got it")
+        let (serverTask, port) = await startServer(server)
+        var staged: [String] = []
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Term.paste(paths.joined(separator: " ")))
+            _ = await self.waitUntil { self.screenHas(target, "attached 8 images") }
+            staged = self.oracle(target).screen
+            input.yield([0x0d])
+            _ = await self.waitUntil { self.screenHas(target, "got it") }
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        let page = staged.joined(separator: "\n")
+        // The notice names what HAPPENED: eight on, one off, and why.
+        #expect(staged.contains { $0.contains("attached 8 images") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("n9.png not attached") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("at most 8 images per message") }, "screen:\n\(page)")
+        // The chips are real — the eighth one is on the page (as a chip or under
+        // the "+N more" overflow, which only exists because chips were staged).
+        #expect(staged.contains { $0.contains("n1.png") || $0.contains("more") }, "no chips at all:\n\(page)")
+        // Only the refused path came back as text, and it did come back.
+        #expect(staged.contains { $0.contains(paths[8]) }, "the refused path was eaten:\n\(page)")
+        #expect(!staged.contains { $0.contains(paths[0]) }, "an ATTACHED path was also typed in as text")
+        // And eight images actually rode the message.
+        #expect(imageParts(seen).count == 8, "the model saw \(imageParts(seen).count) images")
+    }
+
+    @Test("A file over the per-image limit is refused alone; the rest attach")
+    func perImageByteLimitKeepsWhatLoaded() async throws {
+        // 5 MiB per image. The oversized file is dropped FIRST so the small one
+        // behind it is the thing that must survive the refusal.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let big = dirs.files.appendingPathComponent("big.png")
+        var bytes = Self.onePixelPNG
+        bytes.append(Data(repeating: 0x41, count: (6 << 20)))
+        try bytes.write(to: big)
+        let small = dirs.files.appendingPathComponent("small.png")
+        try Self.onePixelPNG.write(to: small)
+
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "got it")
+        let (serverTask, port) = await startServer(server)
+        var staged: [String] = []
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Term.paste("\(big.path) \(small.path)"))
+            _ = await self.waitUntil { self.screenHas(target, "attached 1 image") }
+            staged = self.oracle(target).screen
+            input.yield([0x0d])
+            _ = await self.waitUntil { self.screenHas(target, "got it") }
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        let page = staged.joined(separator: "\n")
+        #expect(staged.contains { $0.contains("attached 1 image") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("over the 5.0 MB limit") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("small.png") }, "the small image was thrown away with the big one")
+        #expect(staged.contains { $0.contains(big.path) }, "the refused path was eaten:\n\(page)")
+        #expect(imageParts(seen).count == 1, "the model saw \(imageParts(seen).count) images")
+    }
+
+    @Test("A file that would blow the total budget is refused alone; the rest attach")
+    func totalByteLimitKeepsWhatLoaded() async throws {
+        // 10 MiB total. Three 4 MiB images: two fit, the third does not, and its
+        // rejection is restated in the budget's terms rather than the per-image
+        // one — which is exactly the case the ambiguous-reading rule must not
+        // treat as a bad tokenization.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        var paths: [String] = []
+        for index in 1...3 {
+            let file = dirs.files.appendingPathComponent("b\(index).png")
+            var bytes = Self.onePixelPNG
+            bytes.append(Data(repeating: UInt8(0x40 + index), count: (4 << 20)))
+            try bytes.write(to: file)
+            paths.append(file.path)
+        }
+
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "got it")
+        let (serverTask, port) = await startServer(server)
+        var staged: [String] = []
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Term.paste(paths.joined(separator: " ")))
+            _ = await self.waitUntil { self.screenHas(target, "attached 2 images") }
+            staged = self.oracle(target).screen
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        // Not sent: eight megabytes of base64 across the wire proves nothing this
+        // test is about, and `countLimitKeepsWhatLoaded` already pins that the
+        // staged chips reach the model.
+        let page = staged.joined(separator: "\n")
+        #expect(staged.contains { $0.contains("attached 2 images") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("b3.png not attached") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("total limit") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains(paths[2]) }, "the refused path was eaten:\n\(page)")
+    }
+
+    @Test("A .txt among two photos is handed back alone, and the photos attach")
+    func aNonImageAmongImagesRefusesOnlyItself() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let first = dirs.files.appendingPathComponent("p1.png")
+        let second = dirs.files.appendingPathComponent("p2.png")
+        try Self.onePixelPNG.write(to: first)
+        try Self.onePixelPNG.write(to: second)
+        let notes = dirs.files.appendingPathComponent("notes.txt")
+        try "hello".write(to: notes, atomically: true, encoding: .utf8)
+
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "got it")
+        let (serverTask, port) = await startServer(server)
+        var staged: [String] = []
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Term.paste("\(first.path) \(second.path) \(notes.path)"))
+            _ = await self.waitUntil { self.screenHas(target, "attached 2 images") }
+            staged = self.oracle(target).screen
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        let page = staged.joined(separator: "\n")
+        #expect(staged.contains { $0.contains("attached 2 images") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("is not a supported image") }, "screen:\n\(page)")
+        #expect(staged.contains { $0.contains("p1.png") })
+        #expect(staged.contains { $0.contains(notes.path) }, "the .txt path was eaten:\n\(page)")
+    }
+
+    @Test("A path that is not there makes the whole reading ambiguous, and it all comes back")
+    func aMissingPathKeepsTheDropAllOrNothing() async throws {
+        // The other half of the rule, and the reason it is written in terms of the
+        // REASON rather than "did anything load". `missing` is the signature of a
+        // bad split — `/Users/x/my pic.png` read as two tokens leaves
+        // `/Users/x/my`, which is not there — so a reading that produced one must
+        // not be trusted enough to attach the files beside it and re-spell the
+        // rest. Everything goes back exactly as pasted.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let real = dirs.files.appendingPathComponent("real.png")
+        try Self.onePixelPNG.write(to: real)
+        let ghost = dirs.files.appendingPathComponent("ghost.png").path
+        let spelling = "\(real.path) \(ghost)"
+
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "ack")
+        let (serverTask, port) = await startServer(server)
+        var after: [String] = []
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Term.paste(spelling))
+            _ = await self.waitUntil { self.screenHas(target, "no such file") }
+            after = self.oracle(target).screen
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        let page = after.joined(separator: "\n")
+        #expect(after.contains { $0.contains("not attached") }, "screen:\n\(page)")
+        #expect(after.contains { $0.contains("no such file") }, "screen:\n\(page)")
+        // No chip: the chip row is the only thing on the page that carries 📎.
+        #expect(!after.contains { $0.contains("📎") }, "an ambiguous reading attached something:\n\(page)")
+        #expect(after.contains { $0.contains(real.path) }, "the paste did not come back whole:\n\(page)")
+        #expect(after.contains { $0.contains(ghost) }, "the paste did not come back whole:\n\(page)")
+    }
+
+    // MARK: Enter while a drop is still being read
+
+    @Test("A message never reaches the model claiming an image it does not carry")
+    func sendingDuringADropNeverLosesTheImage() async throws {
+        // The window: `handleSubmit` used to clear `pendingDrops`, which made the
+        // loader's answer stale — so the drop's images were discarded, the message
+        // went out with no image part in it, and the status line said "attached 1
+        // image" anyway. A multi-megabyte file makes the window wide enough to
+        // walk into on the first try, which is how it was found on a real pty.
+        //
+        // The assertion is the INVARIANT rather than the race: whichever side wins,
+        // no user message may reach the gateway without the picture it claims.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let file = dirs.files.appendingPathComponent("shot.png")
+        var bytes = Self.onePixelPNG
+        bytes.append(Data(repeating: 0x42, count: (4 << 20)))
+        try bytes.write(to: file)
+
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "got it")
+        let (serverTask, port) = await startServer(server)
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            // Paste, type and Enter in one go, with nothing awaited in between:
+            // the read is `@concurrent` and has to hop off and back, so these
+            // frames are handled while it is still going.
+            input.yield(Term.paste(file.path))
+            input.yield(Array("describe this".utf8))
+            input.yield([0x0d])
+            // Either the deferral held the message (the chip is now on the prompt)
+            // or the send already went through with the image.
+            _ = await self.waitUntil { self.screenHas(target, "shot.png") || !seen.messages.isEmpty }
+            // Whatever happened above, Enter now sends anything still in the box.
+            input.yield([0x0d])
+            // Waited on the GATEWAY rather than on the reply appearing: what is
+            // being tested is what crossed the wire, and painting a reply behind a
+            // multi-megabyte base64 body is a different (slow) question.
+            _ = await self.waitUntil { !seen.messages.isEmpty }
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        let users = seen.messages.compactMap { message -> UserMessage? in
+            if case .user(let user) = message { return user } else { return nil }
+        }
+        #expect(!users.isEmpty, "nothing was ever sent")
+        for user in users {
+            let hasImage = user.content.contains { if case .image = $0 { return true } else { return false } }
+            #expect(hasImage, "a message reached the model with no image: \(user.content)")
+        }
+    }
+
+    // MARK: Scrolling from the keyboard
+
+    /// A reply tall enough that the transcript viewport cannot hold it.
+    ///
+    /// Three-digit row numbers so `SCROLLROW-030` cannot also match
+    /// `SCROLLROW-3`, which is what makes "is this row on the page" a real test.
+    private nonisolated static func tallReply(_ count: Int = 60) -> String {
+        (1...count).map { index in
+            let digits = String(index)
+            return "SCROLLROW-" + String(repeating: "0", count: max(0, 3 - digits.count)) + digits
+        }.joined(separator: "\n")
+    }
+
+    @Test("PgUp and PgDn scroll the transcript, and go on working with the mouse released")
+    func keyboardScrollSurvivesAReleasedMouse() async throws {
+        // F8 (and `--no-mouse`, which ships the same state permanently) hands the
+        // pointer back to the terminal, and the wheel goes with it. Before this
+        // there was no other way to move the transcript at all: `scrollOffset` was
+        // written in exactly one place, inside `handleMouse`, behind
+        // `guard mouseOwned` — while the status line went on advertising a scroll
+        // that no gesture on the machine could perform.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, replyFor: { _ in Self.tallReply() })
+        let (serverTask, port) = await startServer(server)
+        var beforeScroll: [String] = []
+        var afterPageUp: [String] = []
+        var afterPageDown: [String] = []
+
+        let target = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Array("go".utf8))
+            input.yield([0x0d])
+            _ = await self.waitUntil { self.locate(target, "SCROLLROW-060") != nil }
+
+            // Release the mouse FIRST, so nothing below can be doing its work
+            // through the wheel path.
+            input.yield(Term.f8)
+            _ = await self.waitUntil { self.screenHas(target, "mouse: released") }
+            beforeScroll = self.oracle(target).screen
+
+            input.yield(Term.pageUp)
+            _ = await self.waitUntil { self.locate(target, "SCROLLROW-030") != nil }
+            afterPageUp = self.oracle(target).screen
+
+            input.yield(Term.pageDown)
+            _ = await self.waitUntil { self.locate(target, "SCROLLROW-060") != nil }
+            afterPageDown = self.oracle(target).screen
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        #expect(beforeScroll.contains { $0.contains("SCROLLROW-060") }, "the transcript was not at the tail")
+        #expect(!beforeScroll.contains { $0.contains("SCROLLROW-030") }, "the viewport was not full")
+        // The page turned, with the mouse released.
+        #expect(afterPageUp.contains { $0.contains("SCROLLROW-030") }, "PgUp did not scroll:\n\(afterPageUp.joined(separator: "\n"))")
+        #expect(!afterPageUp.contains { $0.contains("SCROLLROW-060") }, "PgUp did not move the viewport")
+        // And the status line names the key rather than a gesture that is gone.
+        #expect(afterPageUp.contains { $0.contains("PgDn to follow") }, "screen:\n\(afterPageUp.joined(separator: "\n"))")
+        // PgDn comes back to the tail.
+        #expect(afterPageDown.contains { $0.contains("SCROLLROW-060") }, "PgDn did not follow again")
+        // The keys were never typed into the prompt.
+        #expect(!screenHas(target, "[5~"))
+        #expect(!screenHas(target, "[6~"))
+    }
+
+    @Test("Shift+↑ scrolls a row and does not steal prompt history")
+    func shiftArrowScrollsWithoutEatingHistory() async throws {
+        // The bare arrows recall history at the boundary rows and must keep doing
+        // it. `ESC [ 1 ; 2 A` and `ESC [ A` are different byte sequences and the
+        // decoder tells them apart — which is the whole reason this binding is
+        // safe, and is checked here rather than assumed.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, replyFor: { _ in Self.tallReply() })
+        let (serverTask, port) = await startServer(server)
+        let sent = "HISTORYWORD"
+        var afterShiftUp: [String] = []
+        var afterPlainUp: [String] = []
+
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Array(sent.utf8))
+            input.yield([0x0d])
+            _ = await self.waitUntil { self.locate(target, "SCROLLROW-060") != nil }
+
+            // Four Shift+Ups: one row each, so the tail row leaves the viewport.
+            for _ in 0..<4 { input.yield(Term.shiftUp) }
+            _ = await self.waitUntil { self.screenHas(target, "↑ 4 rows") }
+            afterShiftUp = self.oracle(target).screen
+
+            // A bare Up on the same empty prompt still recalls history.
+            input.yield(Term.up)
+            _ = await self.waitUntil { self.promptRows(target).contains { $0.contains(sent) } }
+            afterPlainUp = self.oracle(target).screen
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        #expect(afterShiftUp.contains { $0.contains("↑ 4 rows") }, "Shift+↑ did not scroll:\n\(afterShiftUp.joined(separator: "\n"))")
+        // The prompt is untouched: no history recall, and no escape gibberish.
+        let promptAfterShift = Array(afterShiftUp.suffix(3))
+        #expect(!promptAfterShift.contains { $0.contains(sent) }, "Shift+↑ recalled history")
+        #expect(!promptAfterShift.contains { $0.contains("[1;2A") }, "Shift+↑ was typed into the prompt")
+        // The positive control: the bare arrow still does its job.
+        #expect(Array(afterPlainUp.suffix(3)).contains { $0.contains(sent) }, "the bare ↑ stopped recalling history")
+    }
+
+    /// The prompt's rows — the bottom three at this size (a bordered single-line
+    /// editor), which is where a history recall would land.
+    private func promptRows(_ target: CaptureTarget) -> [String] {
+        Array(oracle(target).screen.suffix(3))
+    }
+
+    // MARK: Gestures the decoder really produces
+
+    @Test("An X10 release ends the drag, so a stray motion cannot extend it")
+    func x10ReleaseEndsTheDrag() async throws {
+        // A terminal that does not answer `?1006h` sends the pre-SGR encoding,
+        // which has no release code: it reports button bits `3`, decoded as
+        // `.release` with `.none` for the button. Without that arm the drag never
+        // ends, and the next motion report — one already in the pipe, or a pointer
+        // crossing the window — silently grows the selection past what the user
+        // highlighted, so the clipboard holds more than the screen showed.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, replyFor: { _ in "X10ANCHOR TAILWORD" })
+        let (serverTask, port) = await startServer(server)
+        let clipboard = RecordingClipboard()
+
+        _ = await runClient(port: port, clipboard: clipboard, lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Array("go".utf8))
+            input.yield([0x0d])
+            _ = await self.waitUntil { self.locate(target, "X10ANCHOR TAILWORD") != nil }
+            guard let spot = self.locate(target, "X10ANCHOR") else { return }
+
+            input.yield(Term.x10Press(column: spot.column, row: spot.row))
+            input.yield(Term.x10Drag(column: spot.column + 9, row: spot.row))
+            input.yield(Term.x10Release(column: spot.column + 9, row: spot.row))
+            _ = await self.waitUntil {
+                self.oracle(target).cell(col: spot.column, row: spot.row)?.style.inverse == true
+            }
+            // A motion report AFTER the release. The controller documents that a
+            // stray one must not resurrect a finished selection — which it can
+            // only honour if the release was seen at all.
+            input.yield(Term.x10Drag(column: spot.column + 18, row: spot.row))
+            input.yield(Term.x10RightPress(column: spot.column, row: spot.row))
+            _ = await self.waitUntil { !clipboard.recorded.isEmpty }
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        #expect(clipboard.recorded == ["X10ANCHOR"], "the clipboard got \(clipboard.recorded)")
+    }
+
+    @Test("A press is routed to the pane it lands in, not to the transcript")
+    func aPressIsRoutedToItsOwnPane() async throws {
+        // The pane window is what keeps a drag inside the column it started in.
+        // Routed wrongly, a sidebar press is clamped into the transcript's columns
+        // and collapses to nothing — so the gesture copies neither pane.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, reply: "ack")
+        let (serverTask, port) = await startServer(server)
+        let clipboard = RecordingClipboard()
+
+        _ = await runClient(port: port, clipboard: clipboard, lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            // The sidebar's own header row, which lives in columns 0..<17 of row 0
+            // — a region the transcript never occupies.
+            input.yield(Term.press(column: 0, row: 0))
+            input.yield(Term.drag(column: 17, row: 0))
+            input.yield(Term.release(column: 17, row: 0))
+            _ = await self.waitUntil { self.oracle(target).cell(col: 0, row: 0)?.style.inverse == true }
+            input.yield(Term.rightPress(column: 0, row: 0))
+            _ = await self.waitUntil { !clipboard.recorded.isEmpty }
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        #expect(clipboard.recorded == ["Sessions (n: new)"], "the clipboard got \(clipboard.recorded)")
+    }
+
+    @Test("A scroll restarts the click run, so the next click is not a double-click")
+    func scrollingRestartsTheClickRun() async throws {
+        // A click in the same cell before and after a scroll is a click on two
+        // different pieces of text; expanding the second one to a word would take
+        // a word the user never pointed at.
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let seen = SeenMessages()
+        let server = makeServer(dirs, seen: seen, replyFor: { _ in "CLICKRUN alpha SECONDWORD" })
+        let (serverTask, port) = await startServer(server)
+        var doubleClickHighlighted = false
+        var afterScrollHighlighted = true
+
+        _ = await runClient(port: port, clipboard: RecordingClipboard(), lifecycle: RecordingLifecycle()) { input, target in
+            await self.settle(target)
+            input.yield(Array("go".utf8))
+            input.yield([0x0d])
+            _ = await self.waitUntil { self.locate(target, "SECONDWORD") != nil }
+            guard let control = self.locate(target, "CLICKRUN"),
+                  let scrolled = self.locate(target, "SECONDWORD") else { return }
+
+            // The positive control: two presses in the same cell DO take the word,
+            // which is what makes the negative below mean anything.
+            input.yield(Term.press(column: control.column, row: control.row))
+            input.yield(Term.press(column: control.column, row: control.row))
+            _ = await self.waitUntil { self.transcriptHasHighlight(target) }
+            doubleClickHighlighted = self.transcriptHasHighlight(target)
+
+            input.yield(Term.escape)
+            _ = await self.waitUntil { !self.transcriptHasHighlight(target) }
+
+            // The same two presses with a scroll between them — on a DIFFERENT
+            // cell, because `Escape` clears the selection and deliberately does
+            // not touch the click run, so re-using the control's cell would carry
+            // its count into this half and prove nothing. The wheel-down at the
+            // tail moves no rows, so the only difference is the click run itself.
+            input.yield(Term.press(column: scrolled.column, row: scrolled.row))
+            input.yield(Term.wheelDown(column: scrolled.column, row: scrolled.row))
+            input.yield(Term.press(column: scrolled.column, row: scrolled.row))
+            // A keystroke after the reports, waited on: frames are handled in
+            // order, so seeing this proves the presses were handled and painted.
+            input.yield(Array("ZQX".utf8))
+            _ = await self.waitUntil { self.screenHas(target, "ZQX") }
+            afterScrollHighlighted = self.transcriptHasHighlight(target)
+        }
+        serverTask.cancel()
+        _ = try? await serverTask.value
+
+        #expect(doubleClickHighlighted, "a double-click did not take the word — the control failed")
+        #expect(!afterScrollHighlighted, "a click after a scroll still counted as a double-click")
     }
 }

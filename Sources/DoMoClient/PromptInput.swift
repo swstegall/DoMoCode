@@ -58,6 +58,13 @@ final class PromptInput: @MainActor Focusable {
     /// value — the answer cannot be synchronous.
     var onDrop: ((_ token: UInt32, _ candidates: [[String]]) -> Void)?
 
+    /// Fired when Enter was REFUSED because a drop is still being read.
+    ///
+    /// The prompt has no status line of its own, so the refusal would otherwise be
+    /// a keypress that visibly does nothing — which is exactly how a user concludes
+    /// the client has frozen and hammers the key.
+    var onSubmitDeferredForDrop: (() -> Void)?
+
     private(set) var attachments: [PromptAttachment] = []
 
     /// Drops handed to the app and not yet answered, each holding the RAW pasted
@@ -195,6 +202,17 @@ final class PromptInput: @MainActor Focusable {
         /// drop hook. `notice` is the app's to display; the prompt has no status
         /// line of its own.
         case rejected(rawText: String, notice: String)
+        /// The reading RESOLVED, and part of it attached: `attached` is staged as
+        /// chips and `text` — the paths that were refused, and only those — goes
+        /// back into the document.
+        ///
+        /// Distinct from `.rejected` because it is not a failed reading of the
+        /// paste: the tokenization was right, and the files that could not be
+        /// attached are named by the app's notice. Distinct from `.attached`
+        /// because something DID have to go back as text, and `.attached` has no
+        /// way to say so. Folding either of those two into a single case is how a
+        /// drop of nine photos ended up attaching none of them.
+        case partial(attached: [PromptAttachment], text: String)
     }
 
     /// Mint a token for a drop about to be handed to the app, remembering the raw
@@ -214,16 +232,42 @@ final class PromptInput: @MainActor Focusable {
     func pendingDropText(for token: UInt32) -> String? { pendingDrops[token] }
 
     /// Apply the app's answer to a drop.
-    func resolveDrop(token: UInt32, outcome: DropOutcome) {
-        guard pendingDrops.removeValue(forKey: token) != nil else { return }
+    ///
+    /// - Returns: whether the token was still LIVE. `false` means the drop was
+    ///   abandoned while it was being read — the prompt was cleared, or a session
+    ///   was opened under it — and NOTHING was applied. The caller has to know:
+    ///   posting "attached 1 image" after a `false` is a claim that the message
+    ///   the user is about to send carries a picture it does not carry, which is
+    ///   worse than any error, because it is silent.
+    @discardableResult
+    func resolveDrop(token: UInt32, outcome: DropOutcome) -> Bool {
+        guard pendingDrops.removeValue(forKey: token) != nil else { return false }
         switch outcome {
         case .attached(let resolved):
             for attachment in resolved { addAttachment(attachment) }
         case .rejected(let rawText, _):
-            let clean = Self.sanitizedForInsertion(rawText)
-            guard !clean.isEmpty else { return }
-            editor.insertTextAtCursor(clean)
+            insertAsText(rawText)
+        case .partial(let resolved, let text):
+            for attachment in resolved { addAttachment(attachment) }
+            insertAsText(text)
         }
+        return true
+    }
+
+    /// Put foreign text back into the document, control characters stripped — the
+    /// one filter `onPaste` short-circuited.
+    ///
+    /// Anchored at the END, on its own line, exactly as ``restore(_:attachments:)``
+    /// is and for the same reason: this text arrives ASYNCHRONOUSLY, after a
+    /// filesystem round trip, by which time the caret is wherever the user has since
+    /// typed. Inserting there spliced a refused path into the middle of the sentence
+    /// being written — "abc/tmp/notes.txtdef" out of "abcdef" — and the `.partial`
+    /// case made that a routine, non-error path rather than a rare one.
+    private func insertAsText(_ text: String) {
+        let clean = Self.sanitizedForInsertion(text)
+        guard !clean.isEmpty else { return }
+        let existing = editor.getExpandedText()
+        editor.setText(existing.isEmpty ? clean : existing + "\n" + clean)
     }
 
     /// How many chip rows the last `height(forWidth:maxRows:)` call budgeted.
@@ -378,10 +422,35 @@ final class PromptInput: @MainActor Focusable {
 
     // MARK: Submit
 
+    /// Submit, unless a dropped file is still being read.
+    ///
+    /// THE WINDOW THIS CLOSES. Dropping a file hands a token to the app and
+    /// swallows the paste; the answer comes back one multi-megabyte read later.
+    /// Clearing `pendingDrops` here — which is what the send does — made that
+    /// answer stale, so `resolveDrop` discarded it: the images never reached the
+    /// prompt, the message went to the model with no picture in it, and the status
+    /// line said "attached 1 image" anyway. The whole read is the window, not the
+    /// 4 KiB sniff, and a 2 MiB screenshot is enough to hit it on the first try.
+    ///
+    /// Refusing is the only answer that cannot lose anything. Sending without the
+    /// images sends a message the user did not write; waiting for the read on the
+    /// render loop freezes the UI for the length of it; and attaching them to the
+    /// NEXT message puts a picture on a message it was not meant for. So Enter
+    /// puts the text back, says why, and works on the next press — which is
+    /// milliseconds later, because the read is already running.
+    ///
+    /// The restore is `restore(_:)`, the same path a refused send uses: `Editor`
+    /// clears itself BEFORE `onSubmit` runs, so the argument is the only surviving
+    /// copy of what was typed.
     private func handleSubmit(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let pending = attachments
         guard !trimmed.isEmpty || !pending.isEmpty else { return }
+        guard pendingDrops.isEmpty else {
+            restore(trimmed)
+            onSubmitDeferredForDrop?()
+            return
+        }
         attachments = []
         pendingDrops = [:]
         if !trimmed.isEmpty {
