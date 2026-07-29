@@ -426,6 +426,146 @@ struct ServerRuntimeForceClearTests {
                 "the transcript changed shape when the abandoned run settled: \(recovered.count) -> \(after.count)")
     }
 
+    /// The transcript steal above is only half closed by walking from the live
+    /// harness's tip, because `forceClearRun` **itself** re-derives a tip from the
+    /// file: it rebuilds the session state from `AgentHarness.open`, whose leaf is
+    /// the file's last entry. So the second press of the lever hands the live
+    /// session the abandoned run's dead branch — and it is durable, because every
+    /// later run is then appended as a child of that branch. The recovered turn is
+    /// gone from the model's *context*, not merely from the rendering.
+    ///
+    /// This is the reviewer's measured sequence, verbatim: park A, force-clear,
+    /// B completes, A settles and appends, force-clear AGAIN, run C.
+    @Test("A second force-clear cannot re-anchor the live session onto the abandoned run's dead branch")
+    func secondForceClearCannotRebaseTheLiveSession() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        // Turn 1 (run A) parks on the tool; every later turn answers with text.
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true)
+
+        // The recovered run takes the freed slot and completes fully.
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+
+        // The abandoned run settles and appends; its tail is now the FILE's leaf.
+        let entriesBeforeARan = Self.entryCount(at: session.path)
+        tool.releaseOne()
+        #expect(await eventually { Self.entryCount(at: session.path) > entriesBeforeARan },
+                "run A never wrote to the session file — the premise of this test changed")
+        try await Task.sleep(for: .milliseconds(300))
+
+        // The lever pressed a second time — on a session that is now perfectly idle,
+        // which the suite already advertises as a safe thing to do.
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == false,
+                "the second press claimed something was held on an idle session")
+
+        try await runtime.startRun(sessionID: session.id, prompt: "C", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "run C never settled")
+
+        let messages = try await runtime.messages(sessionID: session.id)
+        // The linear root→leaf path IS the parent chain, so this single equality says
+        // both "B survived" and "C was appended as a child of B, not of the dead
+        // branch" — a rebase would read ["A", "C"].
+        #expect(Self.userPrompts(messages) == ["A", "B", "C"],
+                "the live branch was re-anchored onto the abandoned run: \(Self.userPrompts(messages))")
+        #expect(messages.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
+                "the recovered run's answer is gone from the context every later run is built from")
+        #expect(!messages.contains { if case .tool = $0 { true } else { false } },
+                "the abandoned run's tool result is on the live branch")
+    }
+
+    /// The same re-anchoring, in the case the "nothing was held" guard does not
+    /// cover: the second force-clear happens while a *later*, healthy run is holding
+    /// the slot, so the state genuinely is rebuilt — and the replacement harness must
+    /// be pinned to the live tip rather than to the file's last entry.
+    ///
+    /// Only `AgentHarness.open(path:configuration:leaf:)` closes this one.
+    @Test("A force-clear that really rebuilds the state pins the replacement to the live tip")
+    func forceClearPinsTheReplacementToTheLiveTip() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        // Turn 1 (run A) and turn 3 (run C) park; turn 2 and turn 4+ answer with text.
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1, 3]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true)
+
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+
+        // A third run takes the slot and parks, so the second force-clear below has
+        // something real to clear.
+        try await runtime.startRun(sessionID: session.id, prompt: "C", attachments: [])
+        #expect(await eventually { tool.parkedCount == 2 }, "run C never reached the tool")
+
+        // Now the abandoned run A settles and moves the FILE's leaf onto its branch.
+        let entriesBeforeARan = Self.entryCount(at: session.path)
+        tool.releaseOne()
+        #expect(await eventually { Self.entryCount(at: session.path) > entriesBeforeARan },
+                "run A never wrote to the session file — the premise of this test changed")
+        try await Task.sleep(for: .milliseconds(300))
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true,
+                "run C was not reported as held")
+
+        try await runtime.startRun(sessionID: session.id, prompt: "D", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "run D never settled")
+
+        let messages = try await runtime.messages(sessionID: session.id)
+        #expect(Self.userPrompts(messages) == ["A", "B", "C", "D"],
+                "the rebuilt harness adopted the file's leaf: \(Self.userPrompts(messages))")
+        #expect(messages.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
+                "the recovered run's answer is gone from the context every later run is built from")
+        #expect(!messages.contains { if case .tool = $0 { true } else { false } },
+                "the abandoned run's tool result is on the live branch")
+    }
+
+    /// Nothing held means nothing to clear, and rebuilding the state anyway is not
+    /// merely wasted work: re-opening the file is exactly how the abandoned run's
+    /// branch gets adopted (see the two tests above). So an idle force-clear must not
+    /// read the session file at all.
+    ///
+    /// Removing the file is a probe for that, not a scenario: with the file gone, any
+    /// re-open of it fails loudly, so this is a deterministic assertion on "did it
+    /// touch the file" rather than a timing measurement.
+    @Test("Force-clearing an idle session does not rebuild its harness from the file")
+    func forceClearOnAnIdleSessionDoesNotRebuildTheHarness() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = makeRuntime(dirs, tools: [], streamFn: Self.streamFn(toolCallTurns: []))
+        let session = try await runtime.createSession()
+
+        try await runtime.startRun(sessionID: session.id, prompt: "hi", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the run never settled")
+
+        try FileManager.default.removeItem(atPath: session.path)
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == false,
+                "an idle force-clear re-opened the session file")
+    }
+
+    /// The user prompts along a rendered transcript, in order.
+    private static func userPrompts(_ messages: [Message]) -> [String] {
+        messages.compactMap { if case .user(let user) = $0 { user.text } else { nil } }
+    }
+
     /// And this one is the sink. `startRun` used to hand the run `session.sink`
     /// itself, and `forceClearRun` deliberately carries that same object into the
     /// replacement state — so the `finishRun` token guard protected the SLOT and
@@ -537,12 +677,19 @@ struct ServerRuntimeForceClearTests {
     func forceClearParsesOffTheActor() async throws {
         let dirs = try Dirs()
         defer { dirs.cleanUp() }
-        let runtime = makeRuntime(dirs, tools: [], streamFn: Self.streamFn(toolCallTurns: []))
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
 
         let big = try await runtime.createSession()
         let other = try await runtime.createSession()
+        // The lever only rebuilds a state when something is actually holding one, so
+        // park a run first — and pad only afterwards, so the run's own context build
+        // stays cheap and the whole parse cost lands where this test measures it.
+        try await runtime.startRun(sessionID: big.id, prompt: "go", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
         // Lines the tolerant bulk read must decode and reject: enough of them that
-        // the parse dominates any scheduling noise, no run required.
+        // the parse dominates any scheduling noise.
         try Self.padWithUnparseableEntries(at: big.path, lines: 100_000)
 
         let parseDuration = Mutex(Duration.zero)

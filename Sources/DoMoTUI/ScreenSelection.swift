@@ -219,26 +219,6 @@ private nonisolated let selectionClose = "\u{1b}[27m\u{1b}[0m"
 /// two drifting apart is a test failure rather than a silent regression.
 private nonisolated let caretMarkerSequence = "\u{1b}_pi:c\u{07}"
 
-/// Where the LAST thing ``highlightColumns(_:from:to:width:)`` emitted went, so a
-/// zero-width cluster can follow it into the same segment.
-///
-/// A zero-width cluster decorates the cluster in front of it, and Swift already
-/// merged it into that cluster whenever the two form one grapheme — so a cluster
-/// that measures zero and stands ALONE only ever follows a C0 control (grapheme
-/// break GB4) or begins the row. Appending it to whichever segment received its
-/// neighbour reproduces the row's own adjacency exactly; when the neighbour was an
-/// escape that the span SUPPRESSED, or there was no neighbour at all, the mark has
-/// nothing left to decorate and is dropped. Both cost zero columns, and both are
-/// what keeps an inserted SGR's final `m` from being eaten by a following mark.
-private nonisolated enum ZeroWidthSink {
-    case none
-    case before
-    case middle
-    case after
-    /// The neighbour was an in-span style escape, which is not re-emitted.
-    case suppressed
-}
-
 /// Reverse video, RE-stated, used inside the span purely as a zero-width grapheme
 /// break.
 ///
@@ -251,20 +231,181 @@ private nonisolated enum ZeroWidthSink {
 /// painting back into the gap restores the break for zero visible columns, and it
 /// cannot stripe the selection the way replaying the row's own `ESC[0m` would,
 /// because it turns reverse video on where reverse video is already on.
+///
+/// It is a CANDIDATE, never a guarantee: its own trailing `m` is itself fusable —
+/// an emoji modifier such as U+1F3FB is `Extend` and swallows it — so
+/// ``assembleRow(_:width:)`` only keeps the break when re-measuring says it worked.
 private nonisolated let selectionGraphemeBreak = "\u{1b}[7m"
 
-/// Whether `next`, appended directly after `previous`, would fuse into a single
-/// grapheme cluster.
+/// One unit of the row ``highlightColumns(_:from:to:width:)`` is assembling: some
+/// literal text, and the number of visible columns that text is ACCOUNTABLE for.
 ///
-/// Two printable ASCII clusters never fuse (no ASCII scalar is Extend, ZWJ,
-/// SpacingMark or a Regional Indicator), which is the fast path for every ordinary
-/// row; anything else is decided by asking Swift, since Swift's segmenter is the
-/// authority the rest of this file measures against.
-private nonisolated func fusesWithPreceding(_ previous: Character, _ next: Character) -> Bool {
-    if previous.isASCII, next.isASCII { return false }
-    var probe = String(previous)
-    probe.append(next)
-    return probe.count == 1
+/// Splitting the row into pieces with a declared column cost is what lets the
+/// assembler check the width invariant by MEASUREMENT instead of by argument. Every
+/// earlier attempt at this function reasoned about which scalars can fuse with an
+/// inserted escape's final byte, and every such argument has been wrong in a way
+/// that ended somebody's session.
+private nonisolated struct RowPiece {
+    /// The bytes to emit.
+    var text: String
+    /// How many terminal columns `text` must add to the row.
+    var columns: Int
+    /// Whether ``selectionGraphemeBreak`` may be inserted in front of `text` to
+    /// undo a fusion. Only true inside the span, where reverse video is already on
+    /// and re-stating it paints nothing; outside the span the same escape would
+    /// smear the highlight across the rest of the row.
+    var breakable: Bool
+
+    init(_ text: String, columns: Int = 0, breakable: Bool = false) {
+        self.text = text
+        self.columns = columns
+        self.breakable = breakable
+    }
+}
+
+/// Where a piece ends in an assembled row: the offset in UNICODE SCALARS, and the
+/// number of columns everything up to there is declared to occupy.
+///
+/// Scalars, not `Character`s, because a `Character` boundary is exactly the thing
+/// concatenation can destroy — and a piece boundary that is no longer a character
+/// boundary is the fusion this file exists to survive. A scalar offset is stable
+/// under concatenation, so it can name the place where a boundary was SUPPOSED to be.
+private nonisolated struct PieceBoundary {
+    var offset: Int
+    var width: Int
+}
+
+/// Whether one left-to-right scan of `text` — the same scan ``visibleWidth(_:)``
+/// performs — reaches every boundary in `boundaries` exactly, and carries exactly
+/// the declared width when it gets there.
+///
+/// This is the whole width invariant, checked in a single O(`text`) pass against the
+/// FINISHED string rather than against a chain of prefixes. It fails, correctly, on
+/// both of the ways a concatenation can lie:
+///
+///   * a boundary that the scan steps OVER means two pieces fused into one cluster,
+///     or a piece was swallowed into an escape that only became recognisable once the
+///     next piece supplied its final byte;
+///   * a boundary the scan lands on with the wrong running width means the pieces so
+///     far do not occupy the columns they claimed.
+private nonisolated func scanReachesEveryBoundary(_ text: String, _ boundaries: [PieceBoundary]) -> Bool {
+    let chars = Array(text)
+    var offset = 0
+    var width = 0
+    var index = 0
+    var next = 0
+
+    func settleBoundaries() -> Bool {
+        while next < boundaries.count, boundaries[next].offset <= offset {
+            guard boundaries[next].offset == offset, boundaries[next].width == width else { return false }
+            next += 1
+        }
+        return true
+    }
+
+    while index < chars.count {
+        guard settleBoundaries() else { return false }
+        if let length = ansiEscapeLength(in: chars, at: index) {
+            for step in index..<(index + length) { offset += chars[step].unicodeScalars.count }
+            index += length
+            continue
+        }
+        offset += chars[index].unicodeScalars.count
+        width += graphemeWidth(chars[index])
+        index += 1
+    }
+    guard settleBoundaries() else { return false }
+    return next == boundaries.count
+}
+
+/// Concatenate `pieces`, keeping the running measured width equal to the running
+/// declared width at EVERY piece boundary.
+///
+/// Appending to a string is not a local operation in this domain. Swift re-segments
+/// graphemes across the join, so a cluster can fuse with the one before it and cost
+/// two columns less than it did; and ``ansiEscapeLength(in:at:)`` re-scans, so a
+/// byte can complete — or, by being swallowed into a cluster, un-complete — an
+/// escape and move the width by the whole length of that escape. Both directions
+/// are reachable from a row a hostile program can paint.
+///
+/// The ordinary row needs no repair, so the plain concatenation is tried first and
+/// VERIFIED by ``scanReachesEveryBoundary(_:_:)`` — one linear pass, and a stronger
+/// statement than the fallback makes, since it pins every piece to its own columns
+/// in the finished string.
+///
+/// When that fails, each piece is offered to the row in order of decreasing
+/// fidelity, and the first candidate whose MEASURED effect is exactly
+/// `piece.columns` wins:
+///
+///   1. the piece itself;
+///   2. inside the span, ``selectionGraphemeBreak`` then the piece;
+///   3. one blank per column the piece owed — the same repair the straddle loop
+///      already uses, and the only one that keeps the column count by construction;
+///   4. nothing at all, for a piece that owes no columns (a style escape or a
+///      zero-width mark), which costs the row nothing.
+///
+/// The returned string therefore satisfies `visibleWidth(result) == accepted`, where
+/// `accepted` is at most the sum of the declared columns — so the result can be
+/// SHORT (only if every candidate for some piece failed) but never OVER-wide.
+/// `nil` reports that shortfall so the caller can fall back to the untouched row.
+private nonisolated func assembleRow(_ pieces: [RowPiece], width: Int) -> String? {
+    var naive = ""
+    var boundaries: [PieceBoundary] = []
+    var offset = 0
+    var declared = 0
+    boundaries.reserveCapacity(pieces.count)
+    for piece in pieces {
+        naive += piece.text
+        offset += piece.text.unicodeScalars.count
+        declared += piece.columns
+        boundaries.append(PieceBoundary(offset: offset, width: declared))
+    }
+    if declared == width, scanReachesEveryBoundary(naive, boundaries) { return naive }
+
+    var result = ""
+    var measured = 0
+    for piece in pieces {
+        let target = measured + piece.columns
+        if visibleWidth(result + piece.text) == target {
+            result += piece.text
+            measured = target
+            continue
+        }
+        if piece.breakable, visibleWidth(result + selectionGraphemeBreak + piece.text) == target {
+            result += selectionGraphemeBreak + piece.text
+            measured = target
+            continue
+        }
+        if piece.columns > 0 {
+            let blanks = String(repeating: " ", count: piece.columns)
+            if visibleWidth(result + blanks) == target {
+                result += blanks
+                measured = target
+                continue
+            }
+        }
+        // Nothing that keeps the count fits. Dropping the piece keeps
+        // `visibleWidth(result) == measured` true, which is what makes an over-wide
+        // row impossible; the columns it owed are simply missing, and the guard
+        // below turns that into an unhighlighted row rather than a wrong one.
+    }
+    // The total safety net, and deliberately a re-MEASUREMENT of the finished
+    // string rather than a check of `measured`: it is the one statement here that
+    // does not depend on the loop above being right, and it turns "the highlighted
+    // row is exactly `width` columns" into a fact about the returned value instead
+    // of a claim about the code that built it.
+    //
+    // No input reaches it today. Candidate 3 cannot fail — a blank is neither an
+    // `Extend`, a `ZWJ`, a `SpacingMark` nor a CSI/OSC terminator, so appending one
+    // can neither fuse with the cluster before it nor complete an escape — and
+    // candidate 4 always succeeds for a piece that owes nothing, so `measured`
+    // always reaches `width`. That argument is exactly the kind that has been wrong
+    // three times in this function, which is why the check is here rather than in a
+    // comment: it costs one linear pass and it removes the argument from the safety
+    // property. `differentialFuzzAgainstTheWidthInvariant` asserts the fallback does
+    // NOT fire, so if the ladder above ever regresses the loss shows up as a test
+    // failure rather than as a silently unhighlighted row.
+    return visibleWidth(result) == width ? result : nil
 }
 
 /// `line` with visible columns `from..<to` rendered in reverse video, in EXACTLY
@@ -273,8 +414,19 @@ private nonisolated func fusesWithPreceding(_ previous: Character, _ next: Chara
 /// The width invariance is not a nicety. `AltScreenCore.frame` throws on any row
 /// wider than the terminal, and the driver escalates that throw to ending the
 /// session — so a highlight that added a column would kill the user's session the
-/// first time they dragged across a CJK glyph. Every branch below is written to
-/// keep the sum `a + (b - a) + (width - b)` exact.
+/// first time they dragged across a CJK glyph.
+///
+/// It is held by MEASUREMENT, not by argument. The row is decomposed into
+/// ``RowPiece``s that each declare the columns they owe, and ``assembleRow(_:width:)``
+/// re-measures after every append and repairs — with a grapheme break, or with
+/// blanks, or by dropping a piece that owes nothing — whenever the measurement
+/// disagrees. If the finished row still does not measure exactly `width`, the
+/// UNTOUCHED `line` is returned. Losing the highlight on a pathological row is a
+/// cosmetic glitch; returning an over-wide one ends the session, so no residual case
+/// is left to an argument about which scalars fuse with which. Earlier versions of
+/// this function made exactly that argument — that only zero-width scalars can fuse
+/// with an inserted `ESC[7m`'s trailing `m` — and it is false: every emoji skin-tone
+/// modifier (U+1F3FB…U+1F3FF) is `Extend`, measures two columns, and swallows it.
 ///
 /// The highlighted middle is re-emitted as PLAIN text wrapped in `ESC[7m … ESC[27m`
 /// rather than styled in place, because a row's own `ESC[0m` — and every dimmed
@@ -289,13 +441,15 @@ private nonisolated func fusesWithPreceding(_ previous: Character, _ next: Chara
 /// that column. That is the only construction that both preserves the width and
 /// keeps the highlight boundary where the user put it.
 ///
-/// A ZERO-WIDTH cluster follows whatever cluster it followed in `line`, or is
-/// dropped when that neighbour did not survive the split (see ``ZeroWidthSink``).
-/// Splicing one anywhere else would be a WIDTH bug, not a cosmetic one: a bare
-/// combining mark placed straight after `ESC[7m` merges with that final `m` into
-/// a single `Character`, ``ansiEscapeLength(in:at:)`` stops recognising the
-/// escape, and the scanner swallows the text after it — the row then measures
-/// short and the frame paints stale glyphs at the right of the line.
+/// A ZERO-WIDTH cluster rides in the segment that owns the column it sits at, like
+/// every other cluster — and is DROPPED when, and only when, the assembler measures
+/// that keeping it changed the row's width. That is the case a bare combining mark
+/// at the head of the span hits: placed straight after the inserted `ESC[7m` it
+/// merges with that final `m` into a single `Character`,
+/// ``ansiEscapeLength(in:at:)`` stops recognising the escape, and the scanner
+/// swallows the text after it — the row then measures short and the frame paints
+/// stale glyphs at the right of the line. Dropping it costs no columns, which is
+/// why it is the right repair for a cluster that owes none.
 ///
 /// The APC ``cursorMarker`` is carried in the segment that owns its column rather
 /// than replayed with the entering styles. It is a POSITION, not a style:
@@ -317,9 +471,9 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
     guard spanEnd > spanStart else { return line }
 
     let chars = Array(line)
-    var before = ""
-    var middle = ""
-    var after = ""
+    var beforePieces: [RowPiece] = []
+    var middlePieces: [RowPiece] = []
+    var afterPieces: [RowPiece] = []
     var beforeWidth = 0
     var middleWidth = 0
     var afterWidth = 0
@@ -328,20 +482,25 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
     var entering = ""
     var column = 0
     var index = 0
-    /// Which segment the previous emitted item landed in — see ``ZeroWidthSink``.
-    var lastSink = ZeroWidthSink.none
 
-    /// Append a PRINTABLE cluster to the span, keeping the grapheme break the
-    /// suppressed escapes used to provide (see ``selectionGraphemeBreak``). Only
-    /// ever called with a cluster of non-zero width, which is what makes inserting
-    /// an escape here safe: a cluster that could fuse with the break's trailing `m`
-    /// would have to start with an Extend, a ZWJ or a SpacingMark, and every one of
-    /// those measures zero and is routed elsewhere.
-    func appendToSpan(_ character: Character) {
-        if let previous = middle.last, fusesWithPreceding(previous, character) {
-            middle += selectionGraphemeBreak
+    /// File `text` in the segment that owns visible column `covered`, and charge it
+    /// `columns` cells of that segment's budget.
+    ///
+    /// One routing rule for escapes, printable clusters, zero-width clusters and
+    /// straddle blanks alike: the column decides, nothing else. Whether a piece can
+    /// actually be written where it lands is not decided here — that is
+    /// ``assembleRow(_:width:)``'s job, and it decides it by measuring.
+    func emit(_ text: String, columns: Int, at covered: Int) {
+        if covered < spanStart {
+            beforePieces.append(RowPiece(text, columns: columns))
+            beforeWidth += columns
+        } else if covered < spanEnd {
+            middlePieces.append(RowPiece(text, columns: columns, breakable: true))
+            middleWidth += columns
+        } else {
+            afterPieces.append(RowPiece(text, columns: columns))
+            afterWidth += columns
         }
-        middle.append(character)
     }
 
     while index < chars.count {
@@ -351,24 +510,12 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
             // replayed with `entering`: it rides in the segment that owns its
             // column and stays at exactly the column it marked.
             let isCaretMarker = code == caretMarkerSequence
-            if column < spanStart {
-                before += code
-                lastSink = .before
-                if !isCaretMarker { entering += code }
-            } else if column < spanEnd {
-                // Escapes inside the span are suppressed (the span is plain) but
-                // still count towards the style the tail inherits.
-                if isCaretMarker {
-                    middle += code
-                    lastSink = .middle
-                } else {
-                    entering += code
-                    lastSink = .suppressed
-                }
-            } else {
-                after += code
-                lastSink = .after
-            }
+            // Escapes INSIDE the span are suppressed — the span is re-emitted plain
+            // so a colour of its own cannot stripe the highlight — but everything
+            // before the tail still counts towards the style the tail inherits.
+            let suppressed = column >= spanStart && column < spanEnd && !isCaretMarker
+            if !suppressed { emit(code, columns: 0, at: column) }
+            if column < spanEnd, !isCaretMarker { entering += code }
             index += length
             continue
         }
@@ -386,47 +533,22 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
         let clusterStart = column
         let clusterEnd = column + clusterWidth
 
-        if clusterWidth == 0 {
-            // It decorates the cluster BEFORE it, wherever that went. Not the
-            // column it nominally sits at: a zero-width cluster spliced to the
-            // head of a segment lands straight after an escape this function
-            // inserted, merges with that escape's final byte, and takes the
-            // escape — and the width of everything after it — with it.
-            switch lastSink {
-            case .before: before.append(character)
-            case .middle: middle.append(character)
-            case .after: after.append(character)
-            case .none, .suppressed: break
-            }
-        } else if clusterEnd <= spanStart {
-            before.append(character)
-            beforeWidth += clusterWidth
-            lastSink = .before
-        } else if clusterStart >= spanStart, clusterEnd <= spanEnd {
-            appendToSpan(character)
-            middleWidth += clusterWidth
-            lastSink = .middle
-        } else if clusterStart >= spanEnd, clusterEnd <= width {
-            after.append(character)
-            afterWidth += clusterWidth
-            lastSink = .after
+        // Whether the cluster lies wholly inside ONE of the three column ranges
+        // `[0, spanStart)`, `[spanStart, spanEnd)`, `[spanEnd, width)`. A zero-width
+        // cluster always does — it covers no columns at all.
+        let fitsOneSegment =
+            clusterWidth == 0
+            || clusterEnd <= spanStart
+            || (clusterStart >= spanStart && clusterEnd <= spanEnd)
+            || (clusterStart >= spanEnd && clusterEnd <= width)
+
+        if fitsOneSegment {
+            emit(String(character), columns: clusterWidth, at: clusterStart)
         } else {
             // Straddles a boundary. Blank each column it covered, in whichever
             // segment owns that column, so no segment loses or gains a cell.
             for covered in clusterStart..<Swift.min(clusterEnd, width) {
-                if covered < spanStart {
-                    before += " "
-                    beforeWidth += 1
-                    lastSink = .before
-                } else if covered < spanEnd {
-                    appendToSpan(" ")
-                    middleWidth += 1
-                    lastSink = .middle
-                } else {
-                    after += " "
-                    afterWidth += 1
-                    lastSink = .after
-                }
+                emit(" ", columns: 1, at: covered)
             }
         }
 
@@ -436,14 +558,23 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
 
     // A row shorter than the page: the missing cells are genuinely at the right
     // of each segment, so appending is correct here and only here.
-    before += String(repeating: " ", count: Swift.max(0, spanStart - beforeWidth))
-    middle += String(repeating: " ", count: Swift.max(0, (spanEnd - spanStart) - middleWidth))
-    after += String(repeating: " ", count: Swift.max(0, (width - spanEnd) - afterWidth))
+    let beforePad = Swift.max(0, spanStart - beforeWidth)
+    let middlePad = Swift.max(0, (spanEnd - spanStart) - middleWidth)
+    let afterPad = Swift.max(0, (width - spanEnd) - afterWidth)
 
+    var pieces = beforePieces
+    pieces.append(RowPiece(String(repeating: " ", count: beforePad), columns: beforePad))
+    pieces.append(RowPiece(selectionOpen))
+    pieces += middlePieces
+    pieces.append(RowPiece(String(repeating: " ", count: middlePad), columns: middlePad, breakable: true))
+    pieces.append(RowPiece(selectionClose))
     // A span that runs to the edge of the page has no tail to restyle, so the
     // carried escapes are dropped rather than emitted after the last cell.
-    let tail = spanEnd < width ? entering + after : after
-    return before + selectionOpen + middle + selectionClose + tail
+    if spanEnd < width { pieces.append(RowPiece(entering)) }
+    pieces += afterPieces
+    pieces.append(RowPiece(String(repeating: " ", count: afterPad), columns: afterPad))
+
+    return assembleRow(pieces, width: width) ?? line
 }
 
 /// Every row of `lines` with its selected span highlighted.

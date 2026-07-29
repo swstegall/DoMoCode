@@ -4,13 +4,21 @@
 // The selection model, asserted through the public API only — no `@testable`, so
 // this suite builds and runs in release exactly as it does in debug.
 //
-// Two of these tests are load-bearing rather than descriptive:
+// Three of these tests are load-bearing rather than descriptive:
 //
 //  * WIDTH INVARIANCE. `AltScreenCore.frame` throws on a row wider than the
 //    terminal and the driver escalates that to ending the session, so a highlight
 //    that added one column would hang up on the user the first time they dragged
 //    across a CJK glyph. The property is swept over every (from, to) pair on a
-//    table of styled, wide and zero-width rows.
+//    table of styled, wide and zero-width rows, and again over a seeded corpus of
+//    generated ones. Over-wide and under-wide are asserted SEPARATELY: only one of
+//    them ends the session, and a shared failure message hides which happened.
+//  * COLUMN POSITION. Width alone is too weak. The per-segment trailing padding
+//    silently repairs a miscount into a row that is still exactly `width` columns
+//    with every later column shifted one to the left, and a mutant that did
+//    exactly that once passed every test in this file. So the reverse-video run is
+//    measured against the span it claims to cover, and a table of rows asserts the
+//    EXACT plain text a highlight produces, column for column.
 //  * STREAM SHAPE. A terminal selects a stream, not a rectangle. Getting this
 //    wrong is not a cosmetic difference: it turns a copied paragraph into a column
 //    of fragments.
@@ -106,6 +114,13 @@ struct ScreenSelectionTests {
     /// break GB4), which is why every earlier fixture missed the class: writing
     /// `"e\u{0301}cole"` in source produces `é`, a single width-1 cluster, and never
     /// exercises a bare mark at a segment boundary at all.
+    ///
+    /// The tail of the table carries TAB and the emoji skin-tone modifier. Those two
+    /// were absent for exactly one review cycle, and in that cycle a fix shipped that
+    /// made rows over-wide — the failure this whole file exists to prevent — with
+    /// every test still green. `cursorMarker` is `@MainActor`, which is why this and
+    /// its callers are.
+    @MainActor
     private func styledRows(width: Int) -> [String] {
         let raw = [
             "let total = count + 1",
@@ -133,11 +148,28 @@ struct ScreenSelectionTests {
             // of two clusters worth four.
             "✅\u{200d}\(escape)[31m✅ fuse",
             "👩‍👩‍👧‍👦\u{200d}\(escape)[2m👩‍👩‍👧‍👦 zwj",
+            // TAB. `graphemeWidth` gives it three columns (pi's fixed `tabColumnWidth`),
+            // so it is the cheapest way to make a cluster straddle BOTH span edges at
+            // once, and it is a C0 control, so it leaves the cluster after it standing
+            // alone where a printable base would have absorbed it.
+            "col\tafter\ttab 漢",
+            // A LONE emoji skin-tone modifier. U+1F3FB is grapheme-break class Extend
+            // and measures TWO columns, so it fuses with the trailing `m` of any
+            // escape this function inserts in front of it — including the `ESC[7m`
+            // that exists to prevent exactly that. Nothing here may reason its way
+            // around it; it has to be measured.
+            "\u{1F3FB}orphan modifier abc",
+            "a\t\u{1F3FB} tab then modifier",
+            "\(escape)]8;;https://e.co\u{07}x\(escape)]8;;\u{07}\u{1F3FB}y modifier",
+            // The APC caret marker mid-row, so the corpus exercises the one escape
+            // that is CARRIED rather than replayed.
+            "ab" + cursorMarker + "cd 漢 \u{1F3FB} tail",
         ]
         return raw.map { padToWidth($0, width) }
     }
 
     @Test("Highlighting preserves every row's exact visible width, for every span")
+    @MainActor
     func widthInvariance() {
         let width = 40
         for row in styledRows(width: width) {
@@ -145,6 +177,17 @@ struct ScreenSelectionTests {
             for from in 0...width {
                 for to in from...width {
                     let decorated = highlightColumns(row, from: from, to: to, width: width)
+                    // Stated in BOTH directions on purpose. An over-wide row is a
+                    // thrown `AltScreenCore.overWide` and an ended session; an
+                    // under-wide one is stale glyphs at the right of the line. They
+                    // are not the same bug and must not share one failure message.
+                    #expect(
+                        visibleWidth(decorated) <= width,
+                        """
+                        from \(from) to \(to) is OVER-WIDE at \(visibleWidth(decorated)) \
+                        — this ends the session — on \(String(reflecting: row))
+                        """
+                    )
                     #expect(
                         visibleWidth(decorated) == width,
                         "from \(from) to \(to) measured \(visibleWidth(decorated)) on \(String(reflecting: row))"
@@ -169,55 +212,220 @@ struct ScreenSelectionTests {
         }
     }
 
+    /// A deterministic xorshift, so a corpus failure is a reproducible bug report
+    /// rather than a flake somebody reruns until it goes away.
+    private struct SeededRandom {
+        private var state: UInt64 = 0x2545_F491_4F6C_DD1D
+
+        mutating func next() -> UInt64 {
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            return state
+        }
+
+        mutating func pick<T>(_ values: [T]) -> T { values[Int(next() % UInt64(values.count))] }
+    }
+
+    /// Rows whose OWN escapes are already broken are not this function's problem.
+    ///
+    /// An ASCII scalar that has absorbed a following combining scalar is precisely
+    /// what TextWidth.swift documents as impossible ("ESC never joins a following
+    /// scalar"), and such a row is mismeasured before `highlightColumns` ever sees
+    /// it — the renderer paints it wrong with or without a selection.
+    private func rowIsWellFormed(_ row: String) -> Bool {
+        !row.contains { character in
+            character.unicodeScalars.count > 1 && (character.unicodeScalars.first?.isASCII ?? false)
+        }
+    }
+
+    /// `count` generated rows of exactly `width` columns, each a concatenation of
+    /// `atoms`, padded and filtered.
+    private func generatedRows(atoms: [String], width: Int, attempts: Int) -> [String] {
+        var random = SeededRandom()
+        var rows: [String] = []
+        for _ in 0..<attempts {
+            var raw = ""
+            for _ in 0..<(Int(random.next() % 8) + 1) { raw += random.pick(atoms) }
+            let row = padToWidth(raw, width)
+            guard visibleWidth(row) == width, rowIsWellFormed(row) else { continue }
+            rows.append(row)
+        }
+        return rows
+    }
+
     @Test("Width invariance holds over a generated corpus of adversarial rows")
+    @MainActor
     func widthInvarianceOverGeneratedRows() {
         // The hand-written fixtures above are a table of cases someone thought of.
         // This is the same property over rows assembled from the pieces that break
-        // it — bare marks, ZWJ, default-ignorables, wide glyphs, every escape form,
-        // and raw controls — in every order, from a FIXED seed so a failure is
-        // reproducible rather than a flake.
+        // it — bare marks, ZWJ, default-ignorables, wide glyphs, TAB, emoji skin-tone
+        // modifiers, every escape form, and raw controls — in every order, from a
+        // FIXED seed so a failure is reproducible rather than a flake.
+        //
+        // `\t` and `\u{1F3FB}` are load-bearing entries, not decoration. Without them
+        // this corpus passed on an implementation that made 59 of 408,000 sampled
+        // rows OVER-wide; with them it fails on that implementation in the first few
+        // hundred rows.
         let atoms = [
             "a", "b", " ", "漢", "✅", "👩‍👩‍👧‍👦", "\u{0301}", "\u{200d}", "\u{2064}",
             "\(escape)[0m", "\(escape)[2m", "\(escape)[31m", "\(escape)]8;;u\u{07}",
             "\(escape)]8;;\u{07}", "\u{07}", "\(escape)[K", escape,
+            "\t", "\u{1F3FB}", "\u{1F3FF}", "😀", cursorMarker,
         ]
-        var seed: UInt64 = 0x2545_F491_4F6C_DD1D
-        func nextRandom() -> UInt64 {
-            seed ^= seed << 13
-            seed ^= seed >> 7
-            seed ^= seed << 17
-            return seed
-        }
         let width = 12
-        var rowsChecked = 0
-        for _ in 0..<400 {
-            var raw = ""
-            for _ in 0..<(Int(nextRandom() % 8) + 1) {
-                raw += atoms[Int(nextRandom() % UInt64(atoms.count))]
-            }
-            let row = padToWidth(raw, width)
-            guard visibleWidth(row) == width else { continue }
-            // Skip rows whose OWN escapes are already broken. An ASCII scalar that
-            // has absorbed a following combining scalar is precisely what
-            // TextWidth.swift documents as impossible ("ESC never joins a following
-            // scalar"), and such a row is mismeasured before `highlightColumns` ever
-            // sees it — the renderer paints it wrong with or without a selection.
-            let wellFormed = !row.contains { character in
-                character.unicodeScalars.count > 1 && (character.unicodeScalars.first?.isASCII ?? false)
-            }
-            guard wellFormed else { continue }
-            rowsChecked += 1
+        let rows = generatedRows(atoms: atoms, width: width, attempts: 700)
+        for row in rows {
             for from in 0...width {
                 for to in from...width {
+                    let decorated = highlightColumns(row, from: from, to: to, width: width)
+                    let measured = visibleWidth(decorated)
+                    // Split in two so the log names the failure. Over-wide is the
+                    // one that ends the session.
+                    #expect(
+                        measured <= width,
+                        """
+                        from \(from) to \(to) is OVER-WIDE at \(measured) — this ends the session — \
+                        on \(String(reflecting: row))
+                        """
+                    )
+                    #expect(
+                        measured >= width,
+                        "from \(from) to \(to) is UNDER-wide at \(measured) on \(String(reflecting: row))"
+                    )
+                }
+            }
+        }
+        #expect(rows.count > 150, "the corpus filtered itself away: only \(rows.count) rows survived")
+    }
+
+    @Test("Differential fuzz: every generated row keeps its width and its span boundaries")
+    @MainActor
+    func differentialFuzzAgainstTheWidthInvariant() {
+        // The corpus above sweeps the WIDTH of the whole row. Total width alone is
+        // too weak on its own: the per-segment trailing padding repairs a miscount
+        // into a row that is still exactly `width` columns with every later column
+        // shifted one to the left, and a mutant that did precisely that passed every
+        // test in this file. So this sweep also pins the two span boundaries by
+        // measuring the reverse-video run, which is the text between the columns
+        // `from` and `to` and nothing else.
+        //
+        // The atoms here are deliberately WELL-FORMED — no bare `ESC`, no bare `BEL`,
+        // no orphan skin-tone modifier — because on those the assembler is entitled
+        // to blank a cluster it cannot place, and this sweep additionally asserts
+        // that it never has to: the un-highlighted fallback must not fire, and the
+        // highlight brackets must always be present.
+        let atoms = [
+            "a", "b", "z", " ", "漢", "字", "✅", "😀", "👩‍👩‍👧‍👦", "\t",
+            "\u{0301}", "\u{200d}", "\u{2064}",
+            "\(escape)[0m", "\(escape)[2m", "\(escape)[31m", "\(escape)[K",
+            "\(escape)]8;;u\u{07}", "\(escape)]8;;\u{07}", cursorMarker,
+        ]
+        let width = 14
+        let rows = generatedRows(atoms: atoms, width: width, attempts: 500)
+        var samples = 0
+        for row in rows {
+            for from in 0..<width {
+                for to in (from + 1)...width {
+                    samples += 1
                     let decorated = highlightColumns(row, from: from, to: to, width: width)
                     #expect(
                         visibleWidth(decorated) == width,
                         "from \(from) to \(to) measured \(visibleWidth(decorated)) on \(String(reflecting: row))"
                     )
+                    #expect(
+                        decorated != row,
+                        "from \(from) to \(to) fell back to the unhighlighted row on \(String(reflecting: row))"
+                    )
+                    let run = reverseVideoRun(of: decorated)
+                    #expect(run != nil, "from \(from) to \(to) lost its brackets on \(String(reflecting: row))")
+                    #expect(
+                        visibleWidth(run ?? "") == to - from,
+                        """
+                        from \(from) to \(to) highlighted \(visibleWidth(run ?? "")) columns \
+                        on \(String(reflecting: row))
+                        """
+                    )
                 }
             }
         }
-        #expect(rowsChecked > 150, "the corpus filtered itself away: only \(rowsChecked) rows survived")
+        #expect(samples > 20_000, "the differential sweep shrank to \(samples) samples")
+    }
+
+    @Test("The plain text of a highlighted row keeps every column exactly where it was")
+    @MainActor
+    func plainTextKeepsEveryColumnWhereItWas() {
+        // Width invariance is necessary and not sufficient: a highlight can hold the
+        // total and still slide every column after the span one place to the left.
+        // These are hand-computed, column by column, over exactly the atoms that make
+        // the width invariance hard — TAB, an emoji skin-tone modifier, ZWJ
+        // sequences, U+2064, an OSC-8 hyperlink pair, the APC caret marker, an SGR
+        // run and wide CJK.
+        //
+        // `plain` is the whole row with escapes removed; `run` is the text the
+        // terminal paints in reverse video, which is where the span boundaries show.
+        let tabRow = padToWidth("ab\tcd", 16)
+        let modifierRow = padToWidth("\u{1F3FB}abc", 16)
+        let ignorableRow = padToWidth("a\u{2064}\u{0301}b漢✅", 16)
+        let linkRow = padToWidth("\(escape)]8;;https://e.co\u{07}link\(escape)]8;;\u{07} zz", 16)
+        let caretRow = padToWidth("ab" + cursorMarker + "cd", 16)
+        let sgrRow = padToWidth("\(escape)[31mred\(escape)[0m plain", 16)
+        let cjkRow = padToWidth("漢字テスト", 16)
+        let zwjRow = padToWidth("👩‍👩‍👧‍👦\u{200d}\(escape)[2m👩‍👩‍👧‍👦 z", 16)
+
+        let cases: [(row: String, from: Int, to: Int, plain: String, run: String)] = [
+            // TAB is three columns, so a span ending at 4 cuts it: columns 2 and 3
+            // are blanked inside the highlight and column 4 outside it, and `cd`
+            // stays at columns 5 and 6 where it started.
+            (tabRow, 0, 4, "ab   cd         ", "ab  "),
+            // A span clear of the tab leaves the tab itself in the row — the
+            // character, not three spaces, so the clipboard still sees a tab.
+            (tabRow, 5, 7, "ab\tcd         ", "cd"),
+            // A span that lands exactly on the tab's own columns keeps it whole.
+            (tabRow, 2, 5, "ab\tcd         ", "\t"),
+            // An orphan skin-tone modifier fuses with the `m` of the inserted
+            // `ESC[7m` — and with the `m` of a second `ESC[7m` inserted to break it —
+            // so it is blanked. Two columns in, two columns out, `abc` unmoved.
+            (modifierRow, 0, 2, "  abc           ", "  "),
+            (modifierRow, 0, 5, "  abc           ", "  abc"),
+            // U+2064 and the bare combining acute both SURVIVE: they cost no columns
+            // and they do not fuse with the escape in front of them, so nothing is
+            // gained by dropping them. `漢` straddles column 3 and is blanked.
+            (ignorableRow, 0, 3, "a\u{2064}\u{0301}b  ✅          ", "a\u{2064}\u{0301}b "),
+            (ignorableRow, 1, 4, "a\u{2064}\u{0301}b漢✅          ", "\u{2064}\u{0301}b漢"),
+            (linkRow, 1, 5, "link zz         ", "ink "),
+            // The caret marker rides inside the span, still between `b` and `c`.
+            (caretRow, 1, 4, "abcd            ", "b" + cursorMarker + "cd"),
+            (sgrRow, 2, 8, "red plain       ", "d plai"),
+            // `漢` straddles the left edge: column 0 is blanked outside the highlight
+            // and column 1 inside it, and `字テスト` never moves.
+            (cjkRow, 1, 6, "  字テスト      ", " 字テ"),
+            // The trailing ZWJ on the first family would fuse it with the second the
+            // moment the SGR between them is suppressed; the inserted break keeps
+            // them two clusters and eight columns.
+            (zwjRow, 0, 8, "👩‍👩‍👧‍👦\u{200d}👩‍👩‍👧‍👦 z          ", "👩‍👩‍👧‍👦\u{200d}\(escape)[7m👩‍👩‍👧‍👦 z  "),
+        ]
+
+        for (row, from, to, plain, run) in cases {
+            #expect(visibleWidth(row) == 16, "fixture \(String(reflecting: row)) is not 16 columns")
+            let decorated = highlightColumns(row, from: from, to: to, width: 16)
+            #expect(visibleWidth(decorated) == 16, "from \(from) to \(to) on \(String(reflecting: row))")
+            #expect(
+                strippingANSI(decorated) == plain,
+                """
+                from \(from) to \(to) on \(String(reflecting: row)) gave \
+                \(String(reflecting: strippingANSI(decorated)))
+                """
+            )
+            #expect(
+                reverseVideoRun(of: decorated) == run,
+                """
+                from \(from) to \(to) on \(String(reflecting: row)) highlighted \
+                \(String(reflecting: reverseVideoRun(of: decorated) ?? "nil"))
+                """
+            )
+            #expect(visibleWidth(run) == to - from, "the fixture's own run is not \(to - from) columns")
+        }
     }
 
     @Test("Suppressing the span's own escapes must not fuse two emoji into one cluster")

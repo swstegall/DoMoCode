@@ -494,12 +494,32 @@ public actor ServerRuntime {
     /// - **The transcript.** Its ``DoMoHarness/SessionPersistenceSink`` still writes
     ///   to the same JSONL file, and the file's leaf is "last entry wins", so a late
     ///   append moves the file leaf onto the dead branch. Every live read therefore
-    ///   walks back from the *live harness's* tip instead — see ``messages(sessionID:)``.
-    ///   The residual hazard is a cold re-open in a **later process** (the live
-    ///   harness's tip died with this one), which lands on the abandoned branch;
-    ///   closing that needs an `AgentHarness.open(path:configuration:leaf:)` seam
-    ///   this module does not own, and the recovered turn is still on disk and
-    ///   reachable via ``children(sessionID:parent:)``, not lost.
+    ///   walks back from the *live harness's* tip instead — see ``messages(sessionID:)``
+    ///   — and the replacement harness below is opened **pinned to that same live
+    ///   tip**, never to the file's. Both halves are required: reading around the
+    ///   file leaf achieves nothing if this method re-derives one. A press of this
+    ///   lever after the abandoned run has settled would otherwise re-anchor the
+    ///   session onto the dead branch, and because every later turn is then appended
+    ///   as a child of it, the recovered turn leaves the model's *context* and not
+    ///   merely the rendering. It is also why nothing is replaced when nothing was
+    ///   held (below): a press on an idle session was enough to do it, and this is
+    ///   documented as a safe thing to do.
+    ///
+    ///   Two residuals, both stated plainly because the first version of this
+    ///   comment claimed a coverage it did not have:
+    ///
+    ///   1. A genuinely **cold** re-open — a later process, where the live tip died
+    ///      with the one that held it and the file is all there is. Distinguishing
+    ///      the abandoned branch there is a session-format change. The recovered
+    ///      turn is still on disk and reachable via ``children(sessionID:parent:)``,
+    ///      not lost.
+    ///   2. The live tip is read immediately before the re-open, which parses the
+    ///      whole file off-actor; a doomed run that persists a message *during* that
+    ///      parse leaves it off the branch this clear pins. That tail belongs to the
+    ///      run being abandoned, which is the tail this lever exists to walk away
+    ///      from, and closing the window exactly would need the harness to be able
+    ///      to stop writing on command — which is precisely what a wedged run
+    ///      cannot be made to do.
     ///
     /// It is **atomic**: the replacement harness is opened before anything is
     /// cancelled or drained, so a failure to re-open the session file leaves the
@@ -516,14 +536,43 @@ public actor ServerRuntime {
     @discardableResult
     public func forceClearRun(sessionID: String) async throws -> Bool {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        let path = await session.harness.sessionFilePath
+        // Read synchronously, before the first suspension, so "was anything held"
+        // cannot be answered from a stale snapshot.
+        guard session.runTask != nil || !session.pending.isEmpty else {
+            // Nothing to free. Replacing the state anyway is not harmlessly wasted
+            // work: rebuilding a harness means re-opening the file, and an earlier
+            // force-clear's abandoned run may since have moved the file's leaf onto
+            // its dead branch — so a press on an *idle* session was enough to
+            // re-anchor the live session there for good. Say nothing was held, touch
+            // nothing.
+            //
+            // The terminal frame is still sent: a client only presses this because
+            // it believes a run is in flight, and its run state is edge-triggered,
+            // so the frame is what un-pins the spinner it is sitting on.
+            session.sink.broadcast(.agentEnd(reason: "aborted"))
+            return false
+        }
+        // Both reads on the SAME harness object, so a replacement landing between
+        // them cannot pair one state's path with another's tip.
+        let harness = session.harness
+        let path = await harness.sessionFilePath
+        // The branch this session is actually on. The doomed run keeps its own
+        // persistence sink over `path`, and the file's leaf is "last entry wins", so
+        // the file is not an authority on the live branch — this harness is.
+        let liveLeaf = await harness.currentLeafID
         // Opened FIRST, while nothing has been mutated yet — and OFF this actor,
         // because it parses the whole session file and this lever is pulled exactly
         // when the runtime is already unhealthy and every other session's calls are
         // the last thing that should queue behind it.
+        //
+        // `leaf:` refuses a tip that is not in the file rather than falling back to
+        // the file's own, so the replacement cannot silently land on another branch;
+        // a refusal leaves the session untouched and the call retryable, which is the
+        // same stance as any other failure to re-open.
         let fresh = try await Self.reopen(
             path: path,
-            configuration: harnessConfiguration(sessionID: sessionID)
+            configuration: harnessConfiguration(sessionID: sessionID),
+            leaf: liveLeaf
         )
         // Re-check after the suspensions above: a concurrent shutdown or a
         // concurrent force-clear must win rather than be clobbered by a state built
@@ -532,7 +581,6 @@ public actor ServerRuntime {
         guard let current = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         guard current === session else { return false }
 
-        let held = session.runTask != nil || !session.pending.isEmpty
         // Silence the doomed run BEFORE the swap, so there is no window in which it
         // can emit into a sink the replacement state already owns.
         session.runSink?.detach()
@@ -543,7 +591,7 @@ public actor ServerRuntime {
         // edge-triggered, so without this it stays pinned on "thinking…". Sent on
         // the raw sink — this frame is the runtime's, not the abandoned run's.
         session.sink.broadcast(.agentEnd(reason: "aborted"))
-        return held
+        return true
     }
 
     /// The server's authoritative view of one session — see ``SessionStatus``.
@@ -625,8 +673,17 @@ public actor ServerRuntime {
     /// which branch this session is actually on; the file is only the authority on
     /// what is on it.
     public func messages(sessionID: String) async throws -> [Message] {
-        let location = try await readLocation(sessionID)
-        return try await Self.loadMessages(at: location.path, from: location.leaf)
+        switch try await readLocation(sessionID) {
+        case .live(let path, let tip):
+            // An empty tip is an empty branch, not "ask the file": the harness will
+            // append its next entry as a root, so answering with whatever branch the
+            // file happens to end on would render a conversation this session is not
+            // on and is not about to continue.
+            guard let tip else { return [] }
+            return try await Self.loadMessages(at: path, from: tip)
+        case .file(let path):
+            return try await Self.loadMessages(at: path, from: nil)
+        }
     }
 
     /// The direct children of a node (or of the tree roots when `parent` is nil),
@@ -641,24 +698,32 @@ public actor ServerRuntime {
         try await Self.loadChildren(at: try await sessionPath(sessionID), parent: parent)
     }
 
-    /// Which file to read, and which tip to walk back from — `nil` meaning "the
-    /// file's own leaf", the only answer available for a session that is not live.
-    private struct ReadLocation {
-        let path: FilePath
-        let leaf: String?
+    /// Which file to read, and on whose authority the tip is chosen.
+    ///
+    /// Two cases rather than one optional tip, because `nil` would have to mean two
+    /// different things — "this live branch is empty" and "nobody is live, so use
+    /// the file's leaf" — and the difference is exactly what the force-clear hazard
+    /// turns on.
+    private enum ReadLocation {
+        /// A live session: walk from the harness's own tip. `tip == nil` is an empty
+        /// branch, not an invitation to consult the file.
+        case live(path: FilePath, tip: String?)
+        /// A session that is only a file. Its own leaf is the only answer there is.
+        case file(path: FilePath)
     }
 
     private func readLocation(_ id: String) async throws -> ReadLocation {
         guard let session = sessions[id] else {
-            return ReadLocation(
-                path: try await Self.locate(id: id, cwd: config.cwd, sessionDirectory: config.sessionDirectory),
-                leaf: nil
-            )
+            return .file(path: try await Self.locate(
+                id: id,
+                cwd: config.cwd,
+                sessionDirectory: config.sessionDirectory
+            ))
         }
         // Both reads on the SAME harness object, so a replacement landing between
         // them cannot pair one state's path with another's leaf.
         let harness = session.harness
-        return ReadLocation(path: await harness.sessionFilePath, leaf: await harness.currentLeafID)
+        return .live(path: await harness.sessionFilePath, tip: await harness.currentLeafID)
     }
 
     @concurrent
@@ -683,6 +748,19 @@ public actor ServerRuntime {
         configuration: AgentHarness.Configuration
     ) async throws -> AgentHarness {
         try AgentHarness.open(path: path, configuration: configuration)
+    }
+
+    /// Re-open a session file off this actor, continuing from `leaf` rather than
+    /// from the file's last entry — see ``forceClearRun(sessionID:)``. A separate
+    /// entry point rather than an optional parameter on the one above, so "which
+    /// tip" is always a decision a caller made rather than a default it inherited.
+    @concurrent
+    private static func reopen(
+        path: FilePath,
+        configuration: AgentHarness.Configuration,
+        leaf: String?
+    ) async throws -> AgentHarness {
+        try AgentHarness.open(path: path, configuration: configuration, leaf: leaf)
     }
 
     /// Read a session file's header id off this actor.

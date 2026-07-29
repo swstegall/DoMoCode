@@ -192,23 +192,31 @@ public func runAgentLoop(
             // `Hashable` conformance is unordered, so two spellings of the same
             // object compare equal.
             //
-            // Two kinds of turn are not counted and clear the streak, both for
-            // the same reason: they END the inner loop, so there is no runaway
-            // to catch. A turn with NO tool calls, and a turn whose batch asked
-            // to `terminate`, both set `hasMoreToolCalls = false`; the loop can
-            // only continue past them if steering or a follow-up injected new
-            // work, which is an embedder or a human deciding to keep going.
-            // Skipping the terminating batch also keeps the reason honest: the
-            // run ended the way a tool asked it to, so it settles
-            // `.terminatedByTool` at the bottom rather than being reported as a
-            // runaway. (`terminate` is deliberately not part of
+            // EVERY turn that did tool work counts, with exactly one exception:
+            // a turn with NO tool calls, which clears the streak. That turn is
+            // not a repetition of anything — its "repetition" would be that it
+            // did no tool work at all — and letting a run stop with
+            // `.noProgress` for that reads as a bug.
+            //
+            // A turn whose batch asked to `terminate` is NOT an exception. It
+            // counts like any other, and `terminate` decides only the REASON:
+            // at the limit the run settles `.terminatedByTool` instead of
+            // `.noProgress`, so the run is reported as ending the way a tool
+            // asked it to. That is what the honest-reason requirement actually
+            // needs (`terminate` is deliberately not part of
             // ``TurnToolSignature`` — it is not model-visible work — so a
-            // `finish`-style tool that reports the same output every call would
-            // otherwise trip the guard on the very turn it stopped the run, and
-            // flip print mode's exit code from 0 to 3.) Counting a tool-free
-            // turn would also let a run stop with `.noProgress` when its
-            // "repetition" is that it did no tool work at all, which reads as a
-            // bug.
+            // `finish`-style tool reporting the same output every call would
+            // otherwise be called a runaway on the very turn it stopped the run,
+            // flipping print mode's exit code from 0 to 3). SKIPPING the guard
+            // on such a turn would go much further and reset the streak, which
+            // fails OPEN: a terminating tool plus any external message source
+            // (steering, or a follow-up queue that always resumes) clears the
+            // streak every turn or every other turn and disables the guard for
+            // the whole run — unbounded, since `maxTurns` ships as `nil`. That
+            // is precisely the embedder-disableable path the steering rule below
+            // exists to prevent, so it is closed BY CONSTRUCTION here: the
+            // counting branch has no case analysis to get wrong, and `terminate`
+            // is read only when choosing which reason to settle.
             //
             // Steering, by contrast, is NOT a reset. The rule fires on repeated
             // tool work whether or not a human is typing, and that is deliberate
@@ -228,8 +236,8 @@ public func runAgentLoop(
             // Checked after `turn_end` so the turn the user can see is complete
             // before the run settles, and before `shouldStopAfterTurn`, matching
             // the design. Note the hook is NOT consulted on the turn that trips
-            // the guard: the run has already been decided, so `.noProgress` wins
-            // the reason over `.stoppedByHook`.
+            // the guard: the run has already been decided, so the guard's reason
+            // wins over `.stoppedByHook`.
             //
             // `nil` is the ONLY disable. Anything else clamps UP to 2 rather
             // than switching off, because this is the only bound on a run once
@@ -241,7 +249,7 @@ public func runAgentLoop(
             // `limit >= 2` the streak below can only reach `limit` through the
             // `+= 1` branch, so exactly `limit` identical turns run and
             // `limit - 1` never stops the run.
-            if let requestedLimit = config.noProgressLimit, !toolCalls.isEmpty, !lastBatchTerminated {
+            if let requestedLimit = config.noProgressLimit, !toolCalls.isEmpty {
                 let limit = max(2, requestedLimit)
                 let signature = TurnToolSignature(calls: toolCalls, results: toolResults)
                 if signature == lastSignature {
@@ -251,7 +259,7 @@ public func runAgentLoop(
                     repeatedTurns = 1
                 }
                 if repeatedTurns >= limit {
-                    return await settle(.noProgress)
+                    return await settle(lastBatchTerminated ? .terminatedByTool : .noProgress)
                 }
             } else {
                 lastSignature = nil

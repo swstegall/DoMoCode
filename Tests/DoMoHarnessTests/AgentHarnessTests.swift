@@ -409,6 +409,106 @@ struct AgentHarnessTests {
         #expect(await resumed.currentLeafID == live.currentLeafID)
     }
 
+    /// The file is not an authority on which branch a session is on when two
+    /// harnesses share it, because its leaf is "last entry wins". `ServerRuntime`
+    /// force-clears a wedged run by re-opening the file while the run it abandoned
+    /// is still alive over the same file, so the abandoned run's eventual append
+    /// becomes that last entry — and a file-derived tip silently moves the session
+    /// onto the dead branch, taking the recovered turn out of the context of every
+    /// later turn. `open(path:configuration:leaf:)` is how a caller that still holds
+    /// the live tip says so.
+    @Test("open(leaf:) continues from the caller's tip, not from the file's last entry")
+    func openPinnedToALeafIgnoresTheFileLeaf() async throws {
+        let dir = makeSessionDirectory()
+        let responder = ScriptedResponder([assistant("one"), assistant("two"), assistant("side")])
+        let live = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: dir,
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "live"))
+        )
+        _ = try await live.run(prompt: "first")
+        let path = await live.sessionFilePath
+
+        // A second harness over the SAME file, forked off the tip as it stood — the
+        // shape force-clear leaves behind.
+        let abandoned = try AgentHarness.open(
+            path: path,
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "dead"))
+        )
+        _ = try await live.run(prompt: "second")
+        let liveLeaf = await live.currentLeafID
+        // …and now the abandoned one settles, appending the file's new last entry on
+        // a branch of its own.
+        _ = try await abandoned.run(prompt: "stale")
+        #expect(await abandoned.currentLeafID != liveLeaf, "both harnesses stayed on one branch")
+
+        let fileLeafed = try AgentHarness.open(
+            path: path,
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "f"))
+        )
+        #expect(
+            try await fileLeafed.contextMessages().contains(.user("stale")),
+            "the file's leaf stopped landing on the abandoned branch — the premise of this seam changed"
+        )
+        #expect(!(try await fileLeafed.contextMessages().contains(.user("second"))))
+
+        let pinned = try AgentHarness.open(
+            path: path,
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "p")),
+            leaf: liveLeaf
+        )
+        #expect(await pinned.currentLeafID == liveLeaf)
+        #expect(try await pinned.contextMessages() == (try await live.contextMessages()),
+                "the pinned harness did not reconstruct the live branch")
+        #expect(!(try await pinned.contextMessages().contains(.user("stale"))),
+                "the pinned harness adopted the abandoned branch anyway")
+    }
+
+    @Test("open(leaf: nil) pins an empty tip rather than falling back to the file's")
+    func openPinnedToNilIsAnEmptyTip() async throws {
+        let responder = ScriptedResponder([assistant("one")])
+        let live = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "live"))
+        )
+        _ = try await live.run(prompt: "first")
+        let path = await live.sessionFilePath
+
+        let pinned = try AgentHarness.open(
+            path: path,
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "p")),
+            leaf: nil
+        )
+        #expect(await pinned.currentLeafID == nil)
+        #expect(try await pinned.contextMessages().isEmpty,
+                "leaf: nil was treated as \"use the file's leaf\"")
+    }
+
+    /// Refused at construction rather than at the first read: a harness whose tip is
+    /// not in its file can neither build a context nor persist a child, and falling
+    /// back to the file's leaf would be exactly the branch switch this entry point
+    /// exists to prevent.
+    @Test("open(leaf:) refuses a tip that is not in the file")
+    func openPinnedToAnAbsentLeafThrows() async throws {
+        let responder = ScriptedResponder([assistant("one")])
+        let live = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "live"))
+        )
+        _ = try await live.run(prompt: "first")
+        let path = await live.sessionFilePath
+
+        #expect(throws: DoMoError.self) {
+            try AgentHarness.open(
+                path: path,
+                configuration: self.configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "p")),
+                leaf: "not-an-entry-in-this-file"
+            )
+        }
+    }
+
     // MARK: - Compaction integration
 
     @Test("compaction fires before a turn when the last assistant usage crosses the threshold")
@@ -462,6 +562,53 @@ struct AgentHarnessTests {
         }
         #expect(first.text.contains("SUMMARY"))
         #expect(first.text.contains("compacted into the following summary"))
+    }
+
+    /// The other half of "an empty tip is an empty branch": the pre-turn compaction
+    /// check measures a path too, and resolving a `nil` tip there would summarize a
+    /// conversation this harness is not on and then anchor the checkpoint it writes
+    /// at the root — a second way for a pinned harness to be pulled onto the file's
+    /// branch. Only ``AgentHarness/open(path:configuration:leaf:)`` can produce this
+    /// state (an empty tip over a written file), which is why it went unnoticed.
+    @Test("a harness pinned to an empty tip does not compact the file's branch")
+    func compactionSkipsAnEmptyTip() async throws {
+        let dir = makeSessionDirectory()
+        let text = String(repeating: "a", count: 40)
+        let responder = ScriptedResponder([
+            assistant(text, usageInput: 5000),
+            assistant(text, usageInput: 5000),
+            assistant(text, usageInput: 5000),
+        ])
+        let live = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: dir,
+            configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "live"))
+        )
+        let user = String(repeating: "b", count: 40)
+        _ = try await live.run(prompt: user)
+        _ = try await live.run(prompt: user)
+        let path = await live.sessionFilePath
+
+        let spy = SummarizerSpy(text: "SUMMARY")
+        let pinned = try AgentHarness.open(
+            path: path,
+            configuration: configuration(
+                streamFn: responder.fn(),
+                summarizer: spy.fn(),
+                compaction: CompactionSettings(enabled: true, reserveTokens: 100, keepRecentTokens: 25),
+                contextWindow: 1000,
+                ids: SequentialIDs(prefix: "p")
+            ),
+            leaf: nil
+        )
+        _ = try await pinned.run(prompt: "fresh")
+
+        #expect(spy.recorded.isEmpty, "the empty-tip harness compacted a branch it is not on")
+        let recorded = try entries(of: path)
+        #expect(!recorded.contains { if case .compaction = $0.payload { true } else { false } },
+                "a compaction checkpoint was written for a branch the harness is not on")
+        // And its own turn really did land, as a new root.
+        #expect(try await pinned.contextMessages().first == .user("fresh"))
     }
 
     @Test("compaction does not fire when disabled even over a tiny window")

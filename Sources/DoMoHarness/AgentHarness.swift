@@ -203,6 +203,53 @@ public actor AgentHarness {
         return AgentHarness(store: store, leaf: tree.leafID, configuration: configuration)
     }
 
+    /// Opens an existing session file and continues from a tip the **caller**
+    /// supplies, instead of recovering one from the file's last entry.
+    ///
+    /// ``open(path:configuration:)`` reconstructs the tip exactly as the store does
+    /// — last entry wins — which is the right answer for a cold resume and the
+    /// wrong one whenever a *live* harness already knows which branch the session
+    /// is on. Two harnesses can share a file: `ServerRuntime.forceClearRun` walks
+    /// away from a wedged run whose harness cannot be stopped and keeps its own
+    /// persistence sink over the same file, so when that run eventually settles its
+    /// late append becomes the file's last entry. Re-deriving a tip from the file
+    /// at that point silently moves the session onto the abandoned run's dead
+    /// branch, and because every later turn is then appended as a child of it, the
+    /// recovered turn disappears from the model's context and not merely from the
+    /// rendering. The live harness's own ``currentLeafID`` is the only authority on
+    /// the branch a session is actually on; the file is the authority only on what
+    /// is written to it.
+    ///
+    /// - Parameter leaf: The entry to continue from, which must be present in the
+    ///   file — an absent tip is refused rather than quietly downgraded to the
+    ///   file's own leaf, because that downgrade *is* the branch switch this entry
+    ///   point exists to prevent. `nil` pins an **empty** tip (a session whose live
+    ///   branch has nothing on it yet); it does not mean "use the file's".
+    public static func open(
+        path: FilePath,
+        configuration: Configuration,
+        leaf: String?
+    ) throws -> AgentHarness {
+        let store = try JSONLSessionStore.open(
+            path: path,
+            now: configuration.now,
+            entryIDFactory: configuration.entryIDFactory
+        )
+        // Checked here rather than trusted: a harness whose tip is not in its file
+        // cannot build a context or persist a child, and every read of it would
+        // throw far from the call that chose the tip.
+        if let leaf {
+            let tree = try SessionTree.load(from: store)
+            guard tree.entry(withID: leaf) != nil else {
+                throw DoMoError(
+                    .file(path: path, errno: nil),
+                    "Cannot open a session pinned to an entry that is not in the file: \(leaf)"
+                )
+            }
+        }
+        return AgentHarness(store: store, leaf: leaf, configuration: configuration)
+    }
+
     /// Forks the active path into a new session file whose header names this
     /// session as its parent, returning a harness over the fork.
     ///
@@ -310,7 +357,17 @@ public actor AgentHarness {
     }
 
     private func buildContextMessages() throws -> [Message] {
-        try ContextBuilder.buildContext(SessionTree.load(from: store), from: leaf)
+        // An empty tip means an empty branch — NOT "ask the file". The resolvers
+        // below read `nil` as "start from the file's leaf", which is right for a
+        // cold read of a file and wrong for a harness that knows its own branch has
+        // nothing on it: ``persistMessage(_:)`` writes the next entry with
+        // `parentId: leaf`, i.e. as a new root, so a context resolved from someone
+        // else's leaf would seed a turn with a conversation this branch is not on
+        // and then answer it in a different place. Same-answering for every harness
+        // that could exist before ``open(path:configuration:leaf:)`` (a `nil` tip
+        // only ever came with an empty file); load-bearing for the ones that can now.
+        guard let leaf else { return [] }
+        return try ContextBuilder.buildContext(SessionTree.load(from: store), from: leaf)
     }
 
     // MARK: - Compaction
@@ -356,8 +413,12 @@ public actor AgentHarness {
     /// older than the recent budget yields no preparation and nothing is written.
     private func compactIfNeeded() async throws {
         guard configuration.compaction.enabled else { return }
+        // Same reason as ``buildContextMessages()``: an empty tip is an empty branch,
+        // and resolving `nil` here would measure — and then summarize — a path this
+        // harness is not on, anchoring the checkpoint it writes at the root.
+        guard let tip = leaf else { return }
         let tree = try SessionTree.load(from: store)
-        let pathEntries = try tree.pathToRootOrCompaction(from: leaf)
+        let pathEntries = try tree.pathToRootOrCompaction(from: tip)
         let messages = ContextBuilder.messages(for: pathEntries)
         let estimate = estimateContextTokens(messages)
         guard

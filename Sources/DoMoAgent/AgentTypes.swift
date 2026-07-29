@@ -296,8 +296,13 @@ public struct AgentLoopConfig: Sendable {
     /// ``maxTurns`` is `nil`, so an over-strict or nonsensical setting must make
     /// the guard stricter-but-sane rather than absent.
     ///
-    /// A turn whose tools asked to terminate is exempt: the run is ending the
-    /// way it was asked to, and settles ``RunStopReason/terminatedByTool``.
+    /// A turn whose tools asked to terminate still COUNTS toward the limit — it
+    /// is not exempt, because a terminating tool plus a host that keeps queueing
+    /// messages would otherwise clear the streak every turn and switch the guard
+    /// off for the whole run. `terminate` decides only the REASON: at the limit
+    /// such a run settles ``RunStopReason/terminatedByTool`` rather than
+    /// ``RunStopReason/noProgress``, so it is reported as ending the way it was
+    /// asked to. Only a turn with NO tool calls clears the streak.
     public var noProgressLimit: Int? = 12
 
     /// Before-execution hook; see ``BeforeToolCallHook``.
@@ -376,9 +381,13 @@ public enum RunStopReason: Sendable, Hashable {
     /// ``AgentLoopConfig/shouldStopAfterTurn`` returned `true`.
     case stoppedByHook
     /// Every tool in the final batch set ``AgentToolResult/terminate``.
+    ///
+    /// Also the reason when the ``AgentLoopConfig/noProgressLimit`` guard trips
+    /// on a turn whose batch terminated: the run is still bounded there, but a
+    /// run that ended the way a tool asked it to is not a runaway.
     case terminatedByTool
     /// ``AgentLoopConfig/noProgressLimit`` consecutive turns made the SAME tool
-    /// calls and got the SAME results.
+    /// calls and got the SAME results, and the last of them did not terminate.
     ///
     /// Distinct from ``maxTurnsReached``: a turn budget says "you have had
     /// enough time", this says "you are not getting anywhere", and only the
