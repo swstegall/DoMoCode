@@ -62,6 +62,58 @@ struct ScrollAndToolStateTests {
         #expect(ClientLayout(width: 10, height: 1).transcriptHeight == 0)
     }
 
+    @Test("The prompt's current height moves the footer boundary the mouse hit-tests")
+    func promptRowsDriveTheFooterHitTest() {
+        // The footer stopped being two rows the moment the prompt learned to grow. A
+        // hit test against a nominal 2-row footer would send a wheel meant for the
+        // transcript into the prompt (or the reverse) by exactly however many rows
+        // the user has typed.
+        let layout = ClientLayout(width: 100, height: 24, promptRows: 5)
+        #expect(layout.mainFooterRows == 6)
+        #expect(layout.transcriptHeight == 18)
+        #expect(layout.pane(atColumn: 60, row: 17) == .transcript)
+        #expect(layout.pane(atColumn: 60, row: 18) == .mainFooter)
+        #expect(layout.pane(atColumn: 60, row: 23) == .mainFooter)
+        #expect(layout.pane(atColumn: 0, row: 23) == .sidebar)
+
+        // The default is the old geometry, so nothing that never asks for a taller
+        // prompt sees a change.
+        #expect(ClientLayout(width: 100, height: 24).transcriptHeight == 22)
+    }
+
+    @Test("The prompt-height cap never starves the transcript to nothing")
+    func promptRowCapNeverStarvesTheTranscript() {
+        // `Fixed.measure` returns its basis unconditionally and the flexible
+        // transcript gets only what is left, so an uncapped prompt takes the
+        // transcript to zero rows and then overruns the rect. This cap is the only
+        // thing between a long paste and that.
+        for height in 4...60 {
+            let cap = ClientLayout.promptRowCap(for: height)
+            #expect(cap >= 1, "h=\(height)")
+            let layout = ClientLayout(width: 80, height: height, promptRows: cap)
+            #expect(layout.transcriptHeight >= 1, "h=\(height) cap=\(cap) starved the transcript")
+        }
+        for height in 0...3 {
+            let cap = ClientLayout.promptRowCap(for: height)
+            #expect(cap >= 1, "h=\(height)")
+            #expect(ClientLayout(width: 80, height: height, promptRows: cap).transcriptHeight >= 0)
+        }
+    }
+
+    @Test("A prompt asked for more rows than the cap allows is held to the cap")
+    func promptHeightHonoursTheCap() {
+        let input = PromptInput()
+        input.focused = true
+        for _ in 0..<40 { input.handleInput([0x0a]) }   // 41 logical lines
+        for height in [10, 24, 40, 60] {
+            let cap = ClientLayout.promptRowCap(for: height)
+            let rows = input.height(forWidth: 60, maxRows: cap)
+            #expect(rows <= cap, "h=\(height)")
+            #expect(input.render(width: 60).count == rows, "h=\(height)")
+            #expect(ClientLayout(width: 80, height: height, promptRows: rows).transcriptHeight >= 1)
+        }
+    }
+
     // MARK: Transcript scrolling
 
     /// Place the view into a viewport and return the painted rows.

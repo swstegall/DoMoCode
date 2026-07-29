@@ -254,7 +254,13 @@ public struct JSONLSessionStore: SessionStorage {
     /// Mirrors pi's scheme: strip one leading separator, replace path separators
     /// and the Windows drive colon with `-`, and wrap in `--…--` so the encoded
     /// name is visually distinct from a real path segment.
-    static func sanitizedDirectoryName(forCwd cwd: String) -> String {
+    ///
+    /// `public` because it is not really a session-store detail: it is the name of
+    /// the WORKSPACE's directory, and anything else that wants to keep per-workspace
+    /// state beside the sessions (the client's prompt history, for one) has to land
+    /// in the same directory. Re-deriving it would produce a near-miss twin the
+    /// first time either copy was touched.
+    public static func sanitizedDirectoryName(forCwd cwd: String) -> String {
         var stripped = Substring(cwd)
         if let first = stripped.first, first == "/" || first == "\\" {
             stripped = stripped.dropFirst()

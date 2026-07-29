@@ -6,8 +6,10 @@
 // itself (layout + alt-screen diff + cursor) is covered by DoMoTUI's oracle
 // tests; here the concern is the client's own formatting and input handling.
 
+import DoMoLLM
 import DoMoServer
 import DoMoTUI
+import Foundation
 import Testing
 
 @testable import DoMoClient
@@ -83,14 +85,18 @@ struct ClientViewTests {
         let input = PromptInput()
         input.focused = true
         var submitted: String?
-        input.onSubmit = { submitted = $0 }
+        input.onSubmit = { text, _ in submitted = text }
 
         for byte in Array("hey".utf8) { input.handleInput([byte]) }
         #expect(input.text == "hey")
 
-        let line = input.render(width: 40)[0]
-        #expect(line.contains("hey"))
-        #expect(line.contains(cursorMarker))   // caret at the end while focused
+        // Row 0 is the editor's top rule now, not the text — the input grew from a
+        // single line into a bordered box. The text lives between the rules.
+        _ = input.height(forWidth: 40, maxRows: 8)
+        let lines = input.render(width: 40)
+        #expect(lines.count == 3)
+        #expect(lines[1].contains("hey"))
+        #expect(lines[1].contains(cursorMarker))   // caret at the end while focused
 
         input.handleInput([0x7f])               // backspace
         #expect(input.text == "he")
@@ -104,7 +110,7 @@ struct ClientViewTests {
     func promptInputEmptyNoSubmit() {
         let input = PromptInput()
         var submitted: String?
-        input.onSubmit = { submitted = $0 }
+        input.onSubmit = { text, _ in submitted = text }
         input.handleInput([0x0d])       // Enter on empty
         #expect(submitted == nil)
     }
@@ -158,4 +164,273 @@ struct ClientViewTests {
         #expect(!joined.contains("l0"))   // the head scrolled off
         #expect(!joined.contains("l1"))
     }
+
+    // MARK: The multi-line prompt
+
+    /// Ctrl+J — the newline binding guaranteed on every terminal.
+    private static let ctrlJ: [UInt8] = [0x0a]
+    /// Alt/Option+Enter, `ESC \r`.
+    private static let altEnter: [UInt8] = [0x1b, 0x0d]
+    private static let enter: [UInt8] = [0x0d]
+
+    private func type(_ input: PromptInput, _ text: String) {
+        for byte in Array(text.utf8) { input.handleInput([byte]) }
+    }
+
+    private func attachment(_ id: UInt32, _ name: String, bytes: Int = 2048) -> PromptAttachment {
+        PromptAttachment(
+            id: id,
+            path: "/tmp/\(name)",
+            name: name,
+            byteCount: bytes,
+            image: ImageBlock(mediaType: "image/png", data: Data([0x89, 0x50, 0x4e, 0x47]))
+        )
+    }
+
+    @Test("The prompt grows a row per line instead of staying one row tall")
+    func promptInputGrowsWithNewlines() {
+        let input = PromptInput()
+        input.focused = true
+        #expect(input.height(forWidth: 40, maxRows: 8) == 3)   // 2 rules + 1 empty row
+
+        type(input, "a")
+        input.handleInput(Self.ctrlJ)
+        type(input, "b")
+        #expect(input.text == "a\nb")
+        #expect(input.height(forWidth: 40, maxRows: 8) == 4)
+        #expect(input.render(width: 40).count == 4)
+    }
+
+    @Test("Enter submits; Ctrl+J and Alt+Enter insert a newline")
+    func promptInputEnterSubmitsCtrlJAndAltEnterDoNot() {
+        let input = PromptInput()
+        input.focused = true
+        var submitted: [String] = []
+        input.onSubmit = { text, _ in submitted.append(text) }
+
+        type(input, "a")
+        input.handleInput(Self.ctrlJ)
+        type(input, "b")
+        input.handleInput(Self.altEnter)
+        type(input, "c")
+        #expect(input.text == "a\nb\nc", "neither newline binding may submit")
+        #expect(submitted.isEmpty)
+
+        input.handleInput(Self.enter)
+        #expect(submitted == ["a\nb\nc"])
+        #expect(input.text.isEmpty)
+    }
+
+    @Test("A pasted newline is inserted and never submits")
+    func promptInputPastedNewlineInsertsAndNeverSubmits() {
+        let input = PromptInput()
+        input.focused = true
+        var submitted: [String] = []
+        input.onSubmit = { text, _ in submitted.append(text) }
+
+        // Exactly the shape `TerminalDriver.dispatch` re-wraps a `.paste` into.
+        input.handleInput(Array("\u{1b}[200~one\ntwo\u{1b}[201~".utf8))
+        #expect(input.text == "one\ntwo")
+        #expect(submitted.isEmpty, "a paste carries no intent to send")
+        #expect(input.height(forWidth: 40, maxRows: 8) == 4)
+    }
+
+    @Test("A long line wraps and grows the box instead of scrolling sideways")
+    func promptInputWrapsInsteadOfScrollingHorizontally() {
+        let input = PromptInput()
+        input.focused = true
+        // Twenty words, well past a 20-column pane.
+        type(input, String(repeating: "ab ", count: 20).trimmingCharacters(in: .whitespaces))
+
+        let rows = input.height(forWidth: 20, maxRows: 10)
+        let lines = input.render(width: 20)
+        #expect(rows > 3, "the box has to grow — the old input showed only the tail")
+        #expect(lines.count == rows)
+        #expect(lines.allSatisfy { visibleWidth($0) <= 20 })
+        // The BEGINNING of the text is on screen. The single-line input showed the
+        // tail and nothing else, which is the whole complaint.
+        #expect(lines[1].hasPrefix("ab ab"))
+    }
+
+    @Test("The prompt stops growing at its cap and scrolls inside instead")
+    func promptInputHeightIsCappedAndScrollsInternally() {
+        let input = PromptInput()
+        input.focused = true
+        for index in 0..<40 {
+            type(input, "line\(index)")
+            input.handleInput(Self.ctrlJ)
+        }
+        #expect(input.height(forWidth: 40, maxRows: 6) == 6)
+        let lines = input.render(width: 40)
+        #expect(lines.count == 6)
+        #expect(lines[0].contains("↑"), "the top rule doubles as the scroll affordance")
+        #expect(lines.contains { $0.contains(cursorMarker) }, "the caret stays on screen")
+    }
+
+    @Test("The placeholder shows only on an empty, unfocused prompt")
+    func promptInputPlaceholderOnlyWhenEmptyAndUnfocused() {
+        let input = PromptInput()
+        input.focused = false
+        _ = input.height(forWidth: 60, maxRows: 8)
+        #expect(input.render(width: 60).contains { $0.contains("Enter to send") })
+
+        input.focused = true
+        _ = input.height(forWidth: 60, maxRows: 8)
+        let focusedLines = input.render(width: 60)
+        #expect(!focusedLines.contains { $0.contains("Enter to send") })
+        #expect(focusedLines.contains { $0.contains(cursorMarker) })
+    }
+
+    @Test("Measuring and painting agree at the same width, at every size")
+    func promptInputMeasureAndPlaceAgreeAtTheSameWidth() {
+        for width in [12, 20, 37, 80, 120] {
+            for maxRows in 1...10 {
+                let input = PromptInput()
+                input.focused = true
+                type(input, "the quick brown fox jumps over the lazy dog")
+                input.handleInput(Self.ctrlJ)
+                type(input, "and then it does it again, at length, with feeling")
+
+                let rows = input.height(forWidth: width, maxRows: maxRows)
+                let lines = input.render(width: width)
+                #expect(rows <= maxRows, "w=\(width) maxRows=\(maxRows)")
+                #expect(lines.count == rows, "measure/paint disagree at w=\(width) maxRows=\(maxRows)")
+                #expect(
+                    lines.allSatisfy { visibleWidth($0) <= width },
+                    "over-wide line at w=\(width) maxRows=\(maxRows)"
+                )
+            }
+        }
+    }
+
+    // MARK: Prompt history
+
+    @Test("Up walks back through history and Down brings the draft back")
+    func promptHistoryUpRecallsAndDownRestoresTheDraft() {
+        let input = PromptInput()
+        input.focused = true
+        input.seedHistory(["first", "second"])   // oldest first, as it comes off disk
+        type(input, "draft")
+        _ = input.height(forWidth: 40, maxRows: 8)
+
+        input.handleInput([0x01])                // Ctrl+A: to the start of the line
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "second")
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "first")
+        input.handleInput(ArrowKeys.down)
+        #expect(input.text == "second")
+        input.handleInput(ArrowKeys.down)
+        #expect(input.text == "draft", "the in-progress draft has to survive the trip")
+    }
+
+    @Test("Seeded history arrives newest-first in the editor")
+    func seededHistoryLandsNewestFirstInTheEditor() {
+        let input = PromptInput()
+        input.focused = true
+        input.seedHistory(["oldest", "middle", "newest"])
+        _ = input.height(forWidth: 40, maxRows: 8)
+
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "newest")
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "middle")
+    }
+
+    @Test("Away from the edge rows the arrows move the caret, not the history")
+    func promptHistoryArrowsMoveTheCaretAwayFromTheEdges() {
+        let input = PromptInput()
+        input.focused = true
+        input.seedHistory(["old"])
+        type(input, "a")
+        input.handleInput(Self.ctrlJ)
+        type(input, "b")
+        input.handleInput(Self.ctrlJ)
+        type(input, "c")
+        _ = input.height(forWidth: 40, maxRows: 8)
+        #expect(input.text == "a\nb\nc")
+
+        // From the LAST row: Up walks the caret up a visual line, twice, before the
+        // first row is even reached.
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "a\nb\nc")
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "a\nb\nc", "arriving on the first row is still a caret move")
+        // On the first row but mid-line, Up is "go to the start of the line" — the
+        // one documented divergence from a literal reading of "Up at the top row
+        // recalls". It is what makes Up usable on a long first line, and history is
+        // still exactly one more Up away.
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "a\nb\nc", "mid-line on the first row, Up moves to column 0")
+        // Only now, at column 0 of the first visual row, does Up mean history.
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "old")
+
+        // And Down at the last row, while not browsing, is a caret move.
+        input.handleInput(ArrowKeys.down)   // leaves history: back to the draft
+        input.handleInput(ArrowKeys.down)
+        #expect(input.text == "a\nb\nc")
+    }
+
+    // MARK: Attachment chips (the seam the drag-and-drop work fills in)
+
+    @Test("A submit carries the staged attachments out and clears them")
+    func promptInputSubmitCarriesAndClearsAttachments() {
+        let input = PromptInput()
+        input.focused = true
+        let bare = input.height(forWidth: 40, maxRows: 8)
+
+        input.addAttachment(attachment(1, "a.png"))
+        #expect(input.height(forWidth: 40, maxRows: 8) == bare + 1)
+        #expect(input.render(width: 40).contains { $0.contains("a.png") })
+
+        var got: (String, [PromptAttachment])?
+        input.onSubmit = { text, attachments in got = (text, attachments) }
+        type(input, "go")
+        input.handleInput(Self.enter)
+        #expect(got?.0 == "go")
+        #expect(got?.1.map(\.id) == [1])
+        #expect(input.attachments.isEmpty)
+    }
+
+    @Test("Backspace on an empty document pops the newest chip")
+    func promptInputBackspacePopsAChip() {
+        let input = PromptInput()
+        input.focused = true
+        input.addAttachment(attachment(1, "a.png"))
+        input.addAttachment(attachment(2, "b.png"))
+        #expect(input.attachments.count == 2)
+
+        input.handleInput([0x7f])
+        #expect(input.attachments.map(\.id) == [1])
+
+        // With text in the box the keystroke belongs to the editor again.
+        type(input, "x")
+        input.handleInput([0x7f])
+        #expect(input.text.isEmpty)
+        #expect(input.attachments.map(\.id) == [1], "the chip survives a backspace that had text to eat")
+    }
+
+    @Test("A drop resolution only applies while its token is live")
+    func promptInputResolvesADropOnceAndOnlyOnce() {
+        let input = PromptInput()
+        input.focused = true
+        let token = input.beginDrop()
+        input.resolveDrop(token: token, outcome: .attached([attachment(7, "shot.png")]))
+        #expect(input.attachments.map(\.id) == [7])
+        // A second answer for the same token is stale — the document has moved on.
+        input.resolveDrop(token: token, outcome: .attached([attachment(8, "other.png")]))
+        #expect(input.attachments.map(\.id) == [7])
+
+        // A rejection puts the raw text back verbatim rather than eating it.
+        let second = input.beginDrop()
+        input.resolveDrop(token: second, outcome: .rejected(rawText: "/tmp/notanimage.txt", notice: "nope"))
+        #expect(input.text == "/tmp/notanimage.txt")
+    }
+}
+
+/// The arrow-key byte sequences, named once.
+private enum ArrowKeys {
+    static let up: [UInt8] = Array("\u{1b}[A".utf8)
+    static let down: [UInt8] = Array("\u{1b}[B".utf8)
 }

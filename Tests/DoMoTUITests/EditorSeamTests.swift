@@ -116,6 +116,28 @@ struct EditorSeamBehaviourTests {
         #expect(editor.render(width: 20).count == 42)
     }
 
+    @Test("PageDown moves by the VISIBLE cap, not by the terminal's third")
+    func pageScrollFollowsTheCap() {
+        // Both copies of `max(5, rows * 0.3)` became `visibleLineCap`. If the page
+        // keys had kept the old formula, a prompt pinned to 3 rows on a 40-row
+        // terminal would page by 12 — straight past everything on screen.
+        let editor = defaultEditor(rows: 40)
+        editor.setText((1...60).map { "line \($0)" }.joined(separator: "\n"))
+        editor.maxVisibleLines = 2
+        editor.showBorders = false
+        _ = editor.render(width: 20)          // establishes the layout width
+
+        // Cursor starts at the end of the document after setText; page UP by the cap.
+        let (startLine, _) = editor.getCursor()
+        editor.handleInput(Array("\u{1b}[5~".utf8))   // PageUp
+        let (afterUp, _) = editor.getCursor()
+        #expect(startLine - afterUp == 2, "paged by the cap, not by max(5, 40*0.3)=12")
+
+        editor.handleInput(Array("\u{1b}[6~".utf8))   // PageDown
+        let (afterDown, _) = editor.getCursor()
+        #expect(afterDown == startLine)
+    }
+
     @Test("A degenerate maxVisibleLines still renders one line rather than trapping")
     func degenerateCapIsClamped() {
         let editor = defaultEditor()

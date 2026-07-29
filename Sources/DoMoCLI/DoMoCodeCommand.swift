@@ -602,7 +602,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 target: target,
                 input: input,
                 resize: resize,
-                lifecycle: lifecycle
+                lifecycle: lifecycle,
+                // Prompt history is keyed by WORKSPACE and lands beside that
+                // workspace's sessions. Under `--url` the key is the LOCAL
+                // invocation directory — the remote runtime's cwd is not knowable
+                // client-side — so two remote workspaces driven from the same local
+                // directory share one history file.
+                promptHistoryPath: PromptHistoryStore.defaultPath(
+                    sessionDirectory: configuration.sessionDirectory,
+                    cwd: workingDirectory.string
+                )
             )
         } catch {
             serverTask?.cancel()

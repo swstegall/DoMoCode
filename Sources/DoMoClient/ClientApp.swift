@@ -61,11 +61,48 @@ public final class ClientApp {
     private var notice: String?
     private var noticeExpiry: Date?
 
+    // MARK: The one shared stored-property block
+    //
+    // Every area that adds state to this class adds it HERE, together, declared once.
+    // Four separate waves land in this file; four separate `private var` clusters is
+    // how two of them end up with overlapping copies of the same fact (a prompt
+    // height, a mouse-owned flag) and how the copies drift.
+
+    /// The prompt's height in the frame MOST RECENTLY BUILT.
+    ///
+    /// `handleMouse` runs between frames and has to hit-test the geometry the user is
+    /// actually looking at. Recomputing it there would render the editor a third time
+    /// per event and — worse — could disagree with what is on screen, which is the
+    /// exact failure `ClientLayout` exists to prevent.
+    private var promptRows = 1
+    /// Where prompt history is persisted, or nil when the client is running without
+    /// a workspace to key it on.
+    private let historyStore: PromptHistoryStore?
+    /// Where a copy goes. `NoClipboardSink` is a real answer, not a fallback: over
+    /// ssh there may genuinely be no clipboard to write to.
+    private let clipboard: any ClipboardSink
+    /// The multiplexer wrapping this terminal, which decides how an OSC 52 must be
+    /// escaped to reach the outer terminal at all.
+    private let multiplexer: TerminalMultiplexer
+    /// Whether the app currently owns mouse reporting. Toggling it off hands
+    /// drag-select back to the terminal's own selection.
+    private var mouseOwned: Bool
+
     private static let ctrlC: [UInt8] = [0x03]
     private static let escape: [UInt8] = [0x1b]
 
-    public init(client: ServerClient) {
+    public init(
+        client: ServerClient,
+        historyStore: PromptHistoryStore? = nil,
+        clipboard: any ClipboardSink = NoClipboardSink(),
+        multiplexer: TerminalMultiplexer = .none,
+        mouseOwned: Bool = true
+    ) {
         self.client = client
+        self.historyStore = historyStore
+        self.clipboard = clipboard
+        self.multiplexer = multiplexer
+        self.mouseOwned = mouseOwned
     }
 
     // MARK: Run
@@ -81,6 +118,12 @@ public final class ClientApp {
     ) async throws {
         focus.register(sidebar)
         focus.register(promptInput)
+        // `FocusRing.register` focuses only the FIRST registration, which is the
+        // sidebar — so the client came up with the caret in the wrong pane and every
+        // arrow key drove the session list instead of the text you were writing. The
+        // prompt is where a user starts, and now that the arrows walk prompt history
+        // it is also where they are most likely to be pressed first.
+        focus.setCurrent(promptInput)
         detectGraphics()
 
         let surface = ScreenSurface(target: target, focus: focus) { [weak self] in
@@ -92,7 +135,14 @@ public final class ClientApp {
             self?.reconcilePermissionOverlay()
             self?.surface?.requestRender()
         }
-        promptInput.onSubmit = { [weak self] text in self?.submit(text) }
+        promptInput.onSubmit = { [weak self] text, attachments in self?.submit(text, attachments) }
+        // Persist off the render loop. The store is an actor, so the write cannot
+        // race the startup load and cannot stall the frame that just accepted the
+        // keystroke.
+        promptInput.onHistoryAdd = { [weak self] entry in
+            guard let store = self?.historyStore else { return }
+            Task { await store.append(entry) }
+        }
         sidebar.onSelect = { [weak self] id in self?.openSession(id) }
         sidebar.onNew = { [weak self] in self?.newSession() }
 
@@ -137,11 +187,22 @@ public final class ClientApp {
         transcriptView.running = store.runState == .running
         statusBar.text = statusText()
 
-        let layout = ClientLayout(width: width, height: height)
+        let sidebarWidth = ClientLayout.sidebarWidth(for: width)
+        // The width the input will ACTUALLY be placed at: `Row` gives the flexible
+        // main column `width - sidebarWidth`, and `Column` stretches every child to
+        // the full content width. Measuring at any other width wraps differently than
+        // it paints, and the editor's first/last-visual-line tests — the ones that
+        // decide whether an arrow recalls history or moves the caret — are computed
+        // against the last width it rendered at.
+        let inputWidth = max(0, width - sidebarWidth)
+        promptRows = inputWidth > 0
+            ? promptInput.height(forWidth: inputWidth, maxRows: ClientLayout.promptRowCap(for: height))
+            : 1
+        let layout = ClientLayout(width: width, height: height, promptRows: promptRows)
         let main = Column([
             Flexible(1, TranscriptNode(view: transcriptView, capabilities: graphicsCapabilities, cell: cellSize)),
-            Fixed(.absolute(1), statusBar.layout),
-            Fixed(.absolute(1), promptInput.layout),
+            Fixed(.absolute(ClientLayout.statusRows), statusBar.layout),
+            Fixed(.absolute(layout.promptRows), promptInput.layout),
         ])
         return Row([
             Fixed(.absolute(layout.sidebarWidth), sidebar.layout),
@@ -191,6 +252,13 @@ public final class ClientApp {
         } else {
             parts.append("Tab: pane")
             parts.append("Enter: send")
+            // The working newline bindings, not the one a user will reach for first.
+            // Shift+Enter is byte-identical to Enter unless the terminal volunteers a
+            // CSI-u report, and this package never negotiates the Kitty keyboard
+            // protocol that would ask for one — so advertising Shift+Enter would be
+            // advertising a key that submits.
+            parts.append("Alt+↵/^J: newline")
+            parts.append("↑/↓: history")
             parts.append("Esc: abort")
             parts.append("^C: quit")
         }
@@ -252,7 +320,7 @@ public final class ClientApp {
     private func handleMouse(_ event: MouseEvent) {
         guard event.kind == .scrollUp || event.kind == .scrollDown else { return }
         guard let target = surface?.target else { return }
-        let layout = ClientLayout(width: target.columns, height: target.rows)
+        let layout = ClientLayout(width: target.columns, height: target.rows, promptRows: promptRows)
         // Ctrl-wheel pages, matching the convention of a viewport that has no
         // separate page keys.
         let step = event.ctrl ? max(1, layout.transcriptHeight - 1) : 3
@@ -273,6 +341,12 @@ public final class ClientApp {
     // MARK: Session lifecycle
 
     private func bootstrap() async {
+        // Prompt history first, and off the render loop: it is a local file read, it
+        // is what the very first Up will want, and it must not be behind a network
+        // round trip to the runtime.
+        if let historyStore {
+            promptInput.seedHistory(await historyStore.load())
+        }
         let sessions = (try? await client.listSessions()) ?? []
         store.setSessions(sessions)
         if let first = sessions.first {
@@ -416,16 +490,16 @@ public final class ClientApp {
     /// synchronous one for the common case, which can put the text back in the same
     /// main-actor turn as the keystroke; and a `catch` for every remaining race, which
     /// restores it too.
-    private func submit(_ text: String) {
+    private func submit(_ text: String, _ attachments: [PromptAttachment]) {
         guard let id = store.selectedSessionID else {
-            promptInput.restore(text)
+            promptInput.restore(text, attachments: attachments)
             post(notice: "no session is open")
             return
         }
         // The client's view of run state is racy against the server's, so this is an
         // optimisation of the common case, not the guarantee — the catch below is.
         if store.runState == .running {
-            promptInput.restore(text)
+            promptInput.restore(text, attachments: attachments)
             post(notice: "a turn is already running — Esc to abort it, or wait")
             return
         }
@@ -436,12 +510,17 @@ public final class ClientApp {
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
+                // The attachments ride along here once the image wire lands. Nothing
+                // can stage one yet — `PromptInput.attachments` has no producer — so
+                // there is no path today on which dropping them loses anything; the
+                // named parameter exists so the producer and the wire arrive together
+                // rather than the producer arriving first and silently discarding.
                 try await self.client.sendPrompt(sessionID: id, prompt: text)
             } catch ServerClientError.unexpectedStatus(409, _, _) {
-                self.promptInput.restore(text)
+                self.promptInput.restore(text, attachments: attachments)
                 self.post(notice: "a turn is already running — Esc to abort it, or wait")
             } catch {
-                self.promptInput.restore(text)
+                self.promptInput.restore(text, attachments: attachments)
                 self.post(notice: "could not send — the message was put back")
             }
         }

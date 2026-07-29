@@ -10,6 +10,7 @@ import AsyncHTTPClient
 import DoMoCore
 import DoMoTUI
 import DoMoTermIO
+import SystemPackage
 
 /// The terminal state the full-screen client requires, as one named thing.
 ///
@@ -30,9 +31,13 @@ import DoMoTermIO
 ///
 /// A caller that wants a scripted, headless lifecycle still injects its own into
 /// ``runFullScreenClient(baseURL:token:target:input:resize:lifecycle:)``.
+///
+/// `enableMouse` is the one genuine caller choice: a user who wants their
+/// terminal's own selection back asks for it, and the app then never claims the
+/// mouse at all.
 @MainActor
-public func fullScreenClientLifecycle() -> TerminalLifecycle {
-    TerminalLifecycle(useAlternateScreen: true, enableMouse: true)
+public func fullScreenClientLifecycle(enableMouse: Bool = true) -> TerminalLifecycle {
+    TerminalLifecycle(useAlternateScreen: true, enableMouse: enableMouse)
 }
 
 /// Run the two-pane full-screen client against a `domo serve` runtime at
@@ -49,11 +54,21 @@ public func runFullScreenClient(
     target: any RenderTarget,
     input: AsyncStream<[UInt8]>,
     resize: AsyncStream<TerminalSize>,
-    lifecycle: any TerminalLifecycleControl
+    lifecycle: any TerminalLifecycleControl,
+    promptHistoryPath: FilePath? = nil,
+    clipboard: any ClipboardSink = NoClipboardSink(),
+    multiplexer: TerminalMultiplexer = .none,
+    mouseOwned: Bool = true
 ) async throws {
     let http = HTTPClient(eventLoopGroupProvider: .singleton)
     let client = ServerClient(baseURL: baseURL, token: token, http: http)
-    let app = ClientApp(client: client)
+    let app = ClientApp(
+        client: client,
+        historyStore: promptHistoryPath.map { PromptHistoryStore(path: $0) },
+        clipboard: clipboard,
+        multiplexer: multiplexer,
+        mouseOwned: mouseOwned
+    )
     do {
         try await app.run(target: target, input: input, resize: resize, lifecycle: lifecycle)
     } catch {
