@@ -24,6 +24,9 @@ public enum EnvName {
     public static let timeoutMS = "DOMOCODE_TIMEOUT_MS"
     public static let streamTimeoutMS = "DOMOCODE_STREAM_TIMEOUT_MS"
     public static let maxRetries = "DOMOCODE_MAX_RETRIES"
+    public static let retryBaseMS = "DOMOCODE_RETRY_BASE_MS"
+    public static let retryMaxMS = "DOMOCODE_RETRY_MAX_MS"
+    public static let retryBudgetMS = "DOMOCODE_RETRY_BUDGET_MS"
     public static let configDir = "DOMOCODE_CONFIG_DIR"
     public static let sessionDir = "DOMOCODE_SESSION_DIR"
     public static let logLevel = "DOMOCODE_LOG_LEVEL"
@@ -54,6 +57,9 @@ public struct Settings: Sendable, Hashable, Codable {
     public var timeoutMS: Int?
     public var streamTimeoutMS: Int?
     public var maxRetries: Int?
+    public var retryBaseMS: Int?
+    public var retryMaxMS: Int?
+    public var retryBudgetMS: Int?
     public var logLevel: String?
     public var offline: Bool?
     public var sessionDir: String?
@@ -75,6 +81,9 @@ public struct Settings: Sendable, Hashable, Codable {
         timeoutMS: Int? = nil,
         streamTimeoutMS: Int? = nil,
         maxRetries: Int? = nil,
+        retryBaseMS: Int? = nil,
+        retryMaxMS: Int? = nil,
+        retryBudgetMS: Int? = nil,
         logLevel: String? = nil,
         offline: Bool? = nil,
         sessionDir: String? = nil,
@@ -90,6 +99,9 @@ public struct Settings: Sendable, Hashable, Codable {
         self.timeoutMS = timeoutMS
         self.streamTimeoutMS = streamTimeoutMS
         self.maxRetries = maxRetries
+        self.retryBaseMS = retryBaseMS
+        self.retryMaxMS = retryMaxMS
+        self.retryBudgetMS = retryBudgetMS
         self.logLevel = logLevel
         self.offline = offline
         self.sessionDir = sessionDir
@@ -107,6 +119,9 @@ public struct Settings: Sendable, Hashable, Codable {
         case timeoutMS = "timeoutMs"
         case streamTimeoutMS = "streamTimeoutMs"
         case maxRetries
+        case retryBaseMS = "retryBaseMs"
+        case retryMaxMS = "retryMaxMs"
+        case retryBudgetMS = "retryBudgetMs"
         case logLevel
         case offline
         case sessionDir
@@ -178,6 +193,13 @@ public struct ResolvedConfiguration: Sendable {
     public var timeout: Duration
     public var streamTimeout: Duration
     public var maxRetries: Int
+    /// First retry backoff; each further attempt doubles it before jitter.
+    public var retryBaseDelay: Duration
+    /// Backoff ceiling, which also caps a server-supplied `Retry-After`.
+    public var retryMaxDelay: Duration
+    /// Total time one request may spend asleep between retries. `nil` disables
+    /// the budget; `DOMOCODE_RETRY_BUDGET_MS=0` is how an operator spells that.
+    public var retryDelayBudget: Duration?
     public var configDirectory: FilePath
     public var sessionDirectory: FilePath
     public var logLevel: Logger.Level
@@ -196,6 +218,9 @@ public struct ResolvedConfiguration: Sendable {
         timeout: Duration,
         streamTimeout: Duration,
         maxRetries: Int,
+        retryBaseDelay: Duration = ResolvedConfiguration.defaultRetryBaseDelay,
+        retryMaxDelay: Duration = ResolvedConfiguration.defaultRetryMaxDelay,
+        retryDelayBudget: Duration? = ResolvedConfiguration.defaultRetryDelayBudget,
         configDirectory: FilePath,
         sessionDirectory: FilePath,
         logLevel: Logger.Level,
@@ -212,6 +237,9 @@ public struct ResolvedConfiguration: Sendable {
         self.timeout = timeout
         self.streamTimeout = streamTimeout
         self.maxRetries = maxRetries
+        self.retryBaseDelay = retryBaseDelay
+        self.retryMaxDelay = retryMaxDelay
+        self.retryDelayBudget = retryDelayBudget
         self.configDirectory = configDirectory
         self.sessionDirectory = sessionDirectory
         self.logLevel = logLevel
@@ -226,7 +254,18 @@ public struct ResolvedConfiguration: Sendable {
     public static let defaultAuthScheme = "Bearer"
     public static let defaultTimeout = Duration.milliseconds(600_000)
     public static let defaultStreamTimeout = Duration.milliseconds(30_000)
-    public static let defaultMaxRetries = 3
+    /// Ten, not three. A busy or overloaded provider is the one failure that
+    /// reliably clears on its own, and giving up after three attempts turns a
+    /// provider's bad ninety seconds into a failed turn the user has to retype.
+    /// The schedule is exponential from ``defaultRetryBaseDelay``, capped at
+    /// ``defaultRetryMaxDelay`` and half-jittered, with
+    /// ``defaultRetryDelayBudget`` as the total-sleep ceiling; a failure before
+    /// the gateway ever answered keeps its own far smaller budget
+    /// (``DoMoLLM/LiteLLMClient/Configuration/maxPreConnectRetries``).
+    public static let defaultMaxRetries = 10
+    public static let defaultRetryBaseDelay = Duration.seconds(1)
+    public static let defaultRetryMaxDelay = Duration.seconds(60)
+    public static let defaultRetryDelayBudget: Duration? = .seconds(300)
     public static let defaultLogLevel = Logger.Level.warning
 
     /// The `LiteLLMClient` configuration this resolves to. The one place the CLI
@@ -238,6 +277,9 @@ public struct ResolvedConfiguration: Sendable {
             authHeaderName: authHeaderName,
             authScheme: authScheme,
             maxRetries: maxRetries,
+            baseRetryDelay: retryBaseDelay,
+            maxRetryDelay: retryMaxDelay,
+            retryDelayBudget: retryDelayBudget,
             timeout: timeout
         )
     }
@@ -293,6 +335,22 @@ extension ResolvedConfiguration {
         let maxRetries = try retries(
             environment[EnvName.maxRetries], project?.maxRetries ?? user?.maxRetries
         )
+        let retryBaseDelay = try durationMS(
+            environment[EnvName.retryBaseMS], project?.retryBaseMS ?? user?.retryBaseMS,
+            name: EnvName.retryBaseMS, default: defaultRetryBaseDelay
+        )
+        let retryMaxDelay = try durationMS(
+            environment[EnvName.retryMaxMS], project?.retryMaxMS ?? user?.retryMaxMS,
+            name: EnvName.retryMaxMS, default: defaultRetryMaxDelay
+        )
+        // A budget of zero is "no budget", not "never sleep": a zero ceiling
+        // would make every computed delay overshoot it and silently disable
+        // retrying altogether, which is not what an operator typing 0 means.
+        let retryBudget = try durationMS(
+            environment[EnvName.retryBudgetMS], project?.retryBudgetMS ?? user?.retryBudgetMS,
+            name: EnvName.retryBudgetMS, default: defaultRetryDelayBudget ?? .zero
+        )
+        let retryDelayBudget: Duration? = retryBudget == .zero ? nil : retryBudget
 
         let logLevel =
             (environment[EnvName.logLevel].flatMap(Logger.Level.init(caseInsensitive:)))
@@ -333,6 +391,9 @@ extension ResolvedConfiguration {
             timeout: timeout,
             streamTimeout: streamTimeout,
             maxRetries: maxRetries,
+            retryBaseDelay: retryBaseDelay,
+            retryMaxDelay: retryMaxDelay,
+            retryDelayBudget: retryDelayBudget,
             configDirectory: configDirectory,
             sessionDirectory: sessionDirectory,
             logLevel: logLevel,

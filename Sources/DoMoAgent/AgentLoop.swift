@@ -47,9 +47,45 @@ public func runAgentLoop(
     var transcript = context.messages
     var produced: [Message] = []
 
-    func settle(_ reason: RunStopReason) async -> AgentRunResult {
+    /// Ends the run: reports the failure if there is one, closes the stream, and
+    /// returns the result.
+    ///
+    /// The `failure` contract — only ``RunStopReason/errored`` carries one, and a
+    /// cancellation never does — is enforced HERE rather than at the call
+    /// sites, because every ending in this function funnels through this one
+    /// place. That makes the invariant hold by construction: a future
+    /// `settle(.completed, failure: x)` cannot produce a result that contradicts
+    /// its own stop reason, and there is no case analysis anywhere else to get
+    /// wrong.
+    ///
+    /// The notice is emitted BEFORE `agent_end` and only when a failure is
+    /// actually carried, so it can never disagree with
+    /// ``AgentRunResult/failure``. The order is load-bearing:
+    /// ``AsyncStreamAgentSink`` finishes its continuation on `agentEnd`, so
+    /// anything emitted after it is dropped on the floor.
+    func settle(_ reason: RunStopReason, failure: DoMoError? = nil) async -> AgentRunResult {
+        let carried: DoMoError?
+        if reason == .errored, let failure, !failure.isCancellation {
+            carried = failure
+        } else {
+            carried = nil
+        }
+        if let carried {
+            await sink.emit(
+                .notice(
+                    AgentNotice(
+                        level: .error,
+                        code: noticeCode(for: carried.kind),
+                        // The whole cause chain, one line, capped: a gateway can
+                        // answer with an entire HTML error page.
+                        text: DoMoError.truncating(carried.description),
+                        kind: carried.kind.label
+                    )
+                )
+            )
+        }
         await sink.emit(.agentEnd(messages: produced, reason: reason))
-        return AgentRunResult(messages: produced, stopReason: reason)
+        return AgentRunResult(messages: produced, stopReason: reason, failure: carried)
     }
 
     /// A cancelled run settles with a synthesized aborted assistant turn, in
@@ -82,6 +118,12 @@ public func runAgentLoop(
     var firstTurn = true
     var turnCount = 0
     var lastBatchTerminated = false
+    // Runaway guard state. `lastSignature` is the tool work of the previous turn
+    // that did any; `repeatedTurns` is how many turns in a row have now produced
+    // exactly that work, counting the turn that established it. See the check
+    // after each `turn_end`.
+    var lastSignature: TurnToolSignature?
+    var repeatedTurns = 0
     // Steering may already be queued (the user typed while the agent was idle).
     var pendingMessages = await drain(config.getSteeringMessages)
 
@@ -121,19 +163,28 @@ public func runAgentLoop(
             }
 
             turnCount += 1
-            let message = await streamAssistantResponse(
+            let outcome = await streamAssistantResponse(
                 context: Context(systemPrompt: systemPrompt, messages: transcript, tools: toolDefinitions),
                 model: config.model,
                 sink: sink,
                 streamFn: streamFn
             )
+            let message = outcome.message
             transcript.append(.assistant(message))
             produced.append(.assistant(message))
 
             // A failed or aborted turn ends the run immediately.
             if message.stopReason == .error {
                 await sink.emit(.turnEnd(message: message, toolResults: []))
-                return await settle(.errored)
+                // `outcome.failure` is the provider's own classification, thrown
+                // out of the stream and kept rather than stringified. The
+                // fallback covers the other producer of an `.error` turn — an
+                // assembly-produced `.failed` terminal, which knows only that
+                // the provider refused, so `AssistantMessage.failure` answers
+                // `.provider(status: nil, isRetryable: false)`. Coarse, but
+                // never nil for a `.error` stop reason, so `.errored` always
+                // carries evidence.
+                return await settle(.errored, failure: outcome.failure ?? message.failure)
             }
             if message.stopReason == .aborted {
                 await sink.emit(.turnEnd(message: message, toolResults: []))
@@ -167,6 +218,99 @@ public func runAgentLoop(
 
             await sink.emit(.turnEnd(message: message, toolResults: toolResults))
 
+            // ── Runaway guard ────────────────────────────────────────────────
+            // The replacement for a turn cap. It fires ONLY on a state that is
+            // definitionally not progress — `noProgressLimit` turns in a row
+            // that made the SAME tool calls and got back the SAME results — so
+            // it cannot end a run that is doing varied work, however long that
+            // work runs. That property is the whole point: a guard that could
+            // stop a legitimate 200-turn refactor would be worse than the cap
+            // it replaces, because it would be trusted.
+            //
+            // "The same" means every call's name AND arguments AND every
+            // result's tool name, output and error flag, in order.
+            // ``TurnToolSignature`` deliberately drops tool-call ids (fresh per
+            // turn, so keeping them would make every turn unique and disable the
+            // guard) and keeps outputs (dropping them would fire on a legitimate
+            // poll whose answer keeps changing). Argument key ORDER cannot
+            // matter: `JSONValue.object` is a `[String: JSONValue]`, whose
+            // `Hashable` conformance is unordered, so two spellings of the same
+            // object compare equal.
+            //
+            // EVERY turn that did tool work counts, with exactly one exception:
+            // a turn with NO tool calls, which clears the streak. That turn is
+            // not a repetition of anything — its "repetition" would be that it
+            // did no tool work at all — and letting a run stop with
+            // `.noProgress` for that reads as a bug.
+            //
+            // A turn whose batch asked to `terminate` is NOT an exception. It
+            // counts like any other, and `terminate` decides only the REASON:
+            // at the limit the run settles `.terminatedByTool` instead of
+            // `.noProgress`, so the run is reported as ending the way a tool
+            // asked it to. That is what the honest-reason requirement actually
+            // needs (`terminate` is deliberately not part of
+            // ``TurnToolSignature`` — it is not model-visible work — so a
+            // `finish`-style tool reporting the same output every call would
+            // otherwise be called a runaway on the very turn it stopped the run,
+            // flipping print mode's exit code from 0 to 3). SKIPPING the guard
+            // on such a turn would go much further and reset the streak, which
+            // fails OPEN: a terminating tool plus any external message source
+            // (steering, or a follow-up queue that always resumes) clears the
+            // streak every turn or every other turn and disables the guard for
+            // the whole run — unbounded, since `maxTurns` ships as `nil`. That
+            // is precisely the embedder-disableable path the steering rule below
+            // exists to prevent, so it is closed BY CONSTRUCTION here: the
+            // counting branch has no case analysis to get wrong, and `terminate`
+            // is read only when choosing which reason to settle.
+            //
+            // Steering, by contrast, is NOT a reset. The rule fires on repeated
+            // tool work whether or not a human is typing, and that is deliberate
+            // both ways: a model that keeps making the same call and getting the
+            // same result while being corrected is precisely the stuck case, and
+            // if an injected message cleared the streak, any embedder that
+            // queues one every turn (a periodic status line, a nagging prompt)
+            // would silently disable the only bound an unbounded run has. A user
+            // whose steering does land sees the model do something different,
+            // which changes the signature and resets the streak on its own.
+            //
+            // Deliberately NOT detected: longer cycles (A, B, A, B…). Catching
+            // those needs a window and a similarity rule, and every such rule
+            // can fire on real alternating work. Strict consecutive identity is
+            // the only comparison that is safe to leave on by default.
+            //
+            // Checked after `turn_end` so the turn the user can see is complete
+            // before the run settles, and before `shouldStopAfterTurn`, matching
+            // the design. Note the hook is NOT consulted on the turn that trips
+            // the guard: the run has already been decided, so the guard's reason
+            // wins over `.stoppedByHook`.
+            //
+            // `nil` is the ONLY disable. Anything else clamps UP to 2 rather
+            // than switching off, because this is the only bound on a run once
+            // `maxTurns` is nil and it must fail closed: a limit below 2 cannot
+            // be honoured literally (one turn is not a repetition of anything,
+            // so "stop at the first tool call" would fire on perfectly varied
+            // work), but answering a request for the strictest possible guard
+            // with no guard at all is the wrong direction to fail. With
+            // `limit >= 2` the streak below can only reach `limit` through the
+            // `+= 1` branch, so exactly `limit` identical turns run and
+            // `limit - 1` never stops the run.
+            if let requestedLimit = config.noProgressLimit, !toolCalls.isEmpty {
+                let limit = max(2, requestedLimit)
+                let signature = TurnToolSignature(calls: toolCalls, results: toolResults)
+                if signature == lastSignature {
+                    repeatedTurns += 1
+                } else {
+                    lastSignature = signature
+                    repeatedTurns = 1
+                }
+                if repeatedTurns >= limit {
+                    return await settle(lastBatchTerminated ? .terminatedByTool : .noProgress)
+                }
+            } else {
+                lastSignature = nil
+                repeatedTurns = 0
+            }
+
             if let shouldStopAfterTurn = config.shouldStopAfterTurn {
                 let turnResult = TurnResult(message: message, toolResults: toolResults, messages: produced)
                 if await shouldStopAfterTurn(turnResult) {
@@ -189,6 +333,34 @@ public func runAgentLoop(
     return await settle(lastBatchTerminated ? .terminatedByTool : .completed)
 }
 
+/// Which ``AgentNotice/code`` family a classified failure belongs to.
+///
+/// Derived from the KIND, not from the catch site that produced it. Two catch
+/// sites deciding the code for themselves is exactly how the same 401 ends up
+/// filed two different ways depending on which frame it was caught in; here
+/// there is one rule and it reads off the classification the failing layer
+/// already made.
+///
+/// Exhaustive with no `default`, so a new ``DoMoError/Kind`` is a compile error
+/// in this file rather than a silent misfiling under whichever arm the default
+/// happened to be.
+private func noticeCode(for kind: DoMoError.Kind) -> String {
+    switch kind {
+    // Everything that names a step of the model request: the gateway could not
+    // be reached, refused the credential, throttled us, ran the account dry,
+    // rejected the request as too large, answered with an error, or answered
+    // with something no version of the API documents.
+    case .transport, .authentication, .rateLimit, .quotaExhausted, .contextOverflow, .provider,
+        .malformedResponse:
+        return "provider_error"
+    // Everything the harness itself owns. `.cancelled` is unreachable — a
+    // cancellation never becomes a notice — but naming it keeps the switch
+    // total rather than relying on that being true.
+    case .toolExecution, .file, .cancelled, .configuration:
+        return "runtime_error"
+    }
+}
+
 /// Calls an optional queue closure, treating absence as "nothing queued".
 private func drain(_ source: (@Sendable () async -> [Message])?) async -> [Message] {
     guard let source else { return [] }
@@ -209,12 +381,19 @@ private func drain(_ source: (@Sendable () async -> [Message])?) async -> [Messa
 /// cancelled, `.error` otherwise — so `CancellationError` and transport failures
 /// never escape into the loop. This is pi's guarantee that a run always settles
 /// with a well-formed transcript.
+///
+/// It returns the failure alongside the message rather than only the message,
+/// because the message can only carry PROSE. The provider classified the failure
+/// — authentication, quota, context overflow — and flattening that into
+/// `errorMessage` one frame later left every consumer re-deriving the
+/// classification from English. `failure` is `nil` for a turn that did not fail
+/// and for one that was cancelled; a cancellation is not a failure.
 private func streamAssistantResponse(
     context: Context,
     model: String,
     sink: any AgentEventSink,
     streamFn: AgentStreamFn
-) async -> AssistantMessage {
+) async -> (message: AssistantMessage, failure: DoMoError?) {
     var current: AssistantMessage?
     var startEmitted = false
 
@@ -226,7 +405,11 @@ private func streamAssistantResponse(
                     startEmitted = true
                 }
                 await sink.emit(.messageEnd(.assistant(terminal)))
-                return terminal
+                // Nothing was thrown, so there is no classified error to carry.
+                // A `.failed` terminal still reports itself through the
+                // message's own `stopReason`; the caller falls back to
+                // `AssistantMessage.failure` for it.
+                return (terminal, nil)
             }
 
             if case .start(let snapshot) = event {
@@ -248,21 +431,44 @@ private func streamAssistantResponse(
 
         // The stream ended without a terminal event. That is a truncated stream
         // if we were cancelled, a malformed one otherwise.
+        let unterminated = "Stream ended without a terminal event"
         return await synthesizeTerminal(
             current: current,
             model: model,
             startEmitted: startEmitted,
             cancelled: Task.isCancelled,
-            errorMessage: "Stream ended without a terminal event",
+            failure: DoMoError(.malformedResponse, unterminated),
+            errorMessage: unterminated,
             sink: sink
         )
     } catch {
+        // `cancelled` is read ONCE and used for both decisions below. Reading
+        // `Task.isCancelled` a second time inside `init(wrapping:as:_:)`'s
+        // default argument could see a different answer — cancellation can land
+        // between the two reads — and would produce a failure whose kind
+        // disagrees with the terminal message's stop reason.
+        let cancelled = DoMoError.isCancellation(error) || Task.isCancelled
+        let classified = error as? DoMoError
         return await synthesizeTerminal(
             current: current,
             model: model,
             startEmitted: startEmitted,
-            cancelled: DoMoError.isCancellation(error) || Task.isCancelled,
-            errorMessage: (error as? DoMoError)?.description ?? String(describing: error),
+            cancelled: cancelled,
+            // A foreign error is wrapped, not relabelled: `init(wrapping:as:_:)`
+            // keeps an inner `DoMoError`'s own kind and keeps the cause, so
+            // nothing about the classification is invented here.
+            failure: classified
+                ?? DoMoError(
+                    wrapping: error,
+                    as: .transport,
+                    "The model request failed",
+                    cancelled: cancelled
+                ),
+            // Byte-compat: `errorMessage` is spelled exactly as it was before
+            // the failure started being carried, so the persisted transcript
+            // does not change shape. `DoMoError.description` is the whole cause
+            // chain, so the prose was never the part that was lost.
+            errorMessage: classified?.description ?? String(describing: error),
             sink: sink
         )
     }
@@ -270,26 +476,37 @@ private func streamAssistantResponse(
 
 /// Builds and emits a terminal assistant message for a stream that neither
 /// completed nor failed cleanly, preserving whatever partial content arrived.
+///
+/// `failure` is the classification the caller caught; it is returned only when
+/// this is really a failure. The stop reason, the error text and the returned
+/// failure all come out of the SAME `cancelled` branch, so they cannot disagree:
+/// there is no arrangement of arguments that yields an `.aborted` message
+/// carrying a failure, or an `.error` message that silently drops one.
 private func synthesizeTerminal(
     current: AssistantMessage?,
     model: String,
     startEmitted: Bool,
     cancelled: Bool,
+    failure: DoMoError?,
     errorMessage: String,
     sink: any AgentEventSink
-) async -> AssistantMessage {
+) async -> (message: AssistantMessage, failure: DoMoError?) {
+    let (stopReason, text, carried): (StopReason, String, DoMoError?) =
+        cancelled
+        ? (.aborted, "Request was aborted", nil)
+        : (.error, errorMessage, failure)
     let message = AssistantMessage(
         content: current?.content ?? [],
         model: model,
         usage: current?.usage ?? .zero,
-        stopReason: cancelled ? .aborted : .error,
-        errorMessage: cancelled ? "Request was aborted" : errorMessage
+        stopReason: stopReason,
+        errorMessage: text
     )
     if !startEmitted {
         await sink.emit(.messageStart(.assistant(message)))
     }
     await sink.emit(.messageEnd(.assistant(message)))
-    return message
+    return (message, carried)
 }
 
 extension AssemblyEvent {
@@ -305,7 +522,7 @@ extension AssemblyEvent {
             .toolCallStart(_, let snapshot),
             .toolCallEnd(_, _, let snapshot):
             return snapshot
-        case .textDelta, .reasoningDelta, .toolCallDelta, .done, .failed:
+        case .textDelta, .reasoningDelta, .toolCallDelta, .retrying, .done, .failed:
             return nil
         }
     }

@@ -49,17 +49,31 @@ private let enterAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049h".utf8)
 /// the saved cursor, exactly reversing `?1049h`. Part of the full-screen exit
 /// sequence, and the byte a crash must never fail to emit.
 private let exitAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049l".utf8)
-/// Enable mouse reporting: `?1000h` turns on button/wheel reports, `?1006h` asks
-/// for them in the SGR encoding (decimal, unbounded coordinates, press and release
+/// Enable mouse reporting: `?1000h` turns on button/wheel reports, `?1002h` adds
+/// motion reports *while a button is held*, and `?1006h` asks for all of them in
+/// the SGR encoding (decimal, unbounded coordinates, press and release
 /// distinguishable). Only written in full-screen mode — on the alternate screen
 /// there is no scrollback for the terminal to scroll, so the wheel is the app's to
 /// handle; inline, taking the mouse would break the user's own selection and
 /// scrollback for no gain.
-private let enableMouseSequence: [UInt8] = Array("\u{1b}[?1000h\u{1b}[?1006h".utf8)
-/// Disable mouse reporting, in reverse of enable. A terminal left in `?1000h`
-/// after a crash types raw mouse escapes into the user's shell, so this is part of
-/// the crash-safe restore, not merely of `stop()`.
-private let disableMouseSequence: [UInt8] = Array("\u{1b}[?1006l\u{1b}[?1000l".utf8)
+///
+/// `?1002h` is what makes an in-app drag-selection possible at all. Under
+/// `?1000h` alone a terminal reports the press and the release and *nothing in
+/// between*, so an app can never learn where the pointer travelled and a drag is
+/// indistinguishable from a click somewhere else. Button-event tracking reports
+/// each cell the pointer crosses while a button is down — exactly the drag — and
+/// stays silent when the pointer merely moves across the screen.
+///
+/// `?1003h` (any-motion tracking) is deliberately NOT enabled. It floods stdin on
+/// every pointer move for no added capability, and its button-less motion reports
+/// carry button bits `3`, which ``decodeMouseEvent(_:)``'s X10 release heuristic
+/// reads as "a button came up" — so enabling it would synthesise phantom releases
+/// that end a drag the user is still making.
+private let enableMouseSequence: [UInt8] = Array("\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1006h".utf8)
+/// Disable mouse reporting, in the exact reverse of enable. A terminal left in
+/// `?1000h`/`?1002h` after a crash types raw mouse escapes into the user's shell,
+/// so this is part of the crash-safe restore, not merely of `stop()`.
+private let disableMouseSequence: [UInt8] = Array("\u{1b}[?1006l\u{1b}[?1002l\u{1b}[?1000l".utf8)
 
 /// The teardown bytes for the inline model: disable paste, then show cursor —
 /// the exact reverse of the enter order. Preallocated so the restore path, which
@@ -222,6 +236,55 @@ public final class TerminalLifecycle: Sendable {
         case (true, false): return alternateScreenExitSequence
         case (false, true): return mouseInlineExitSequence
         case (true, true): return mouseAlternateScreenExitSequence
+        }
+    }
+
+    /// The exact bytes that take (`enabled`) or release the mouse.
+    ///
+    /// The single source both ``enter()`` and ``setMouseReporting(_:)`` draw
+    /// from, exposed for the same reason ``teardownSequence(useAlternateScreen:enableMouse:)``
+    /// is: the release order must be provably the exact reverse of the take
+    /// order, and that is an assertion no test should have to stand up a tty to
+    /// make.
+    public static func mouseSequence(enabled: Bool) -> [UInt8] {
+        enabled ? enableMouseSequence : disableMouseSequence
+    }
+
+    /// Take or release mouse reporting *after* ``enter()``.
+    ///
+    /// This is the escape hatch behind an in-app selection: while the app owns
+    /// the mouse the terminal emulator cannot run its own selection or its
+    /// right-click menu, so a user whose terminal this program gets wrong needs a
+    /// way to hand the mouse back without ending the session.
+    ///
+    /// Writes the same bytes ``enter()`` would have written and — the
+    /// load-bearing half — REWRITES the registered crash-safe exit sequence so
+    /// the current mode is released however the process dies. Without that
+    /// rewrite a lifecycle constructed with `enableMouse: false` that later took
+    /// the mouse would leave the terminal in `?1000h` after a `SIGINT`, typing
+    /// raw mouse escapes into the user's shell — precisely the failure the
+    /// crash-safe restore exists to prevent.
+    ///
+    /// A no-op when the output descriptor is not a tty (the same gate
+    /// ``enter()`` applies, so a redirected stdout never collects tracking-mode
+    /// escapes), and a no-op once the restore has already run: the registration
+    /// is only ever UPDATED, never resurrected, so a `stop()` that already put
+    /// the terminal back is not undone by a late toggle.
+    ///
+    /// Safe to call on a value: it mutates only the process-global registration,
+    /// under its `Mutex`, which is why ``TerminalLifecycleControl`` can require
+    /// it without also requiring `AnyObject`.
+    public func setMouseReporting(_ enabled: Bool) {
+        guard isatty(outputDescriptor) == 1 else { return }
+        writeAll(outputDescriptor, Self.mouseSequence(enabled: enabled))
+        let exitSequence = Self.teardownSequence(useAlternateScreen: useAlternateScreen, enableMouse: enabled)
+        restoreRegistration.withLock { slot in
+            guard let current = slot else { return }
+            slot = RestoreRegistration(
+                rawMode: current.rawMode,
+                outputDescriptor: current.outputDescriptor,
+                exitSequence: exitSequence
+            )
         }
     }
 

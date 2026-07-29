@@ -148,7 +148,21 @@ public struct Keybindings: Sendable {
         .editorYank: [Key.ctrl("y")],
         .editorYankPop: [Key.alt("y")],
         .editorUndo: [Key.ctrl("-")],
-        .inputNewLine: [KeyId(base: .enter, shift: true), Key.ctrl("j")],
+        // Alt+Enter is a DELIBERATE divergence from pi's table, and it is the
+        // binding that actually works. Shift+Enter is undecodable unless the Kitty
+        // keyboard protocol (or xterm's modifyOtherKeys) is negotiated, and this
+        // package never negotiates either — `TerminalLifecycle` writes no `CSI > 1 u`
+        // and `kittyProtocolActive: true` is passed at zero call sites. So on every
+        // terminal we run on, pi's first entry can never match and Shift+Enter is
+        // byte-identical to Enter, i.e. it SUBMITS. `ESC \r` decodes as
+        // `KeyId(base: .enter, alt: true)` and is what iTerm2, xterm, alacritty,
+        // wezterm, kitty and GNOME Terminal send for Option/Alt+Enter. Plain Enter is
+        // unaffected: the alt match requires the ESC prefix.
+        .inputNewLine: [
+            KeyId(base: .enter, shift: true),
+            KeyId(base: .enter, alt: true),
+            Key.ctrl("j"),
+        ],
         .inputSubmit: [Key.enter],
         .inputTab: [Key.tab],
         .inputCopy: [Key.ctrl("c")],

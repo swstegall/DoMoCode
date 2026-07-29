@@ -5,6 +5,7 @@ import AsyncHTTPClient
 import DoMoCore
 import Foundation
 import HTTPTypes
+import Synchronization
 
 // MARK: - The seam
 
@@ -66,6 +67,115 @@ extension HTTPResponse {
     }
 }
 
+// MARK: - Stream idle guard
+
+/// When the guarded stream last saw a byte.
+///
+/// A class rather than a bare `Mutex` local because `Mutex` is non-copyable and
+/// cannot be captured by the two concurrent children directly; a `Sendable` box
+/// around it is the shape that crosses both closures.
+private final class StreamActivity: Sendable {
+    private let stamp: Mutex<ContinuousClock.Instant>
+
+    init(_ instant: ContinuousClock.Instant) {
+        stamp = Mutex(instant)
+    }
+
+    func record(_ instant: ContinuousClock.Instant) {
+        stamp.withLock { $0 = instant }
+    }
+
+    var last: ContinuousClock.Instant {
+        stamp.withLock { $0 }
+    }
+}
+
+/// Re-emits `upstream`, failing the stream if no chunk arrives within `idle` or
+/// the whole body takes longer than `overall`.
+///
+/// This exists because **nothing else bounds a streamed response body**.
+/// `HTTPClient.execute(_:timeout:)`'s deadline covers only time-to-response-head
+/// — AsyncHTTPClient cancels the deadline task in a `defer` the instant the head
+/// lands — and `HTTPClient.Configuration.Timeout.read` defaults to `nil`. So a
+/// gateway that writes headers and then stalls without closing the socket
+/// produces a stream that never yields, never throws and never finishes. That
+/// hangs the turn, which holds the server's run slot, which makes every later
+/// prompt on that session 409 — the "the session stopped answering, I had to
+/// make a new one" bug, exactly.
+///
+/// The failure message deliberately contains "timed out" so
+/// `LiteLLMClient.classifyTransport` marks it retryable and the user sees a
+/// transport error rather than a spinner. A loud failure beats a silent hang.
+///
+/// Semantics:
+/// - The idle window is measured from the last chunk actually delivered, so a
+///   healthy-but-slow stream is never cut off however long it runs.
+/// - `overall` is measured from the moment this function was called, i.e. from
+///   just after the response head arrived.
+/// - Dropping the consumer terminates this stream, which cancels the pump, which
+///   cancels the iteration of `upstream` — so the "abandoning the consumer aborts
+///   the request" guarantee ``AsyncHTTPClientTransport`` documents survives.
+///
+/// Public so its tests build in release mode without `@testable`.
+public func idleGuarded(
+    _ upstream: AsyncThrowingStream<[UInt8], any Error>,
+    idle: Duration,
+    overall: Duration,
+    clock: ContinuousClock = ContinuousClock()
+) -> AsyncThrowingStream<[UInt8], any Error> {
+    AsyncThrowingStream { continuation in
+        let start = clock.now
+        let activity = StreamActivity(start)
+        // Poll no slower than the idle window and no faster than 10ms, so a
+        // pathological `idle` of zero cannot turn this into a spin loop.
+        let tick = max(.milliseconds(10), min(idle, .seconds(1)))
+        let pump = Task {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    do {
+                        for try await chunk in upstream {
+                            activity.record(clock.now)
+                            continuation.yield(chunk)
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                group.addTask {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: tick)
+                        if Task.isCancelled { return }
+                        let now = clock.now
+                        if now - activity.last >= idle {
+                            continuation.finish(throwing: DoMoError(
+                                .transport,
+                                """
+                                The model stream stalled — no data for \(idle). \
+                                The connection was still open; it timed out.
+                                """
+                            ))
+                            return
+                        }
+                        if now - start >= overall {
+                            continuation.finish(throwing: DoMoError(
+                                .transport,
+                                "The model stream exceeded its \(overall) deadline and timed out."
+                            ))
+                            return
+                        }
+                    }
+                }
+                // Whichever child settles first decides the stream; cancel the
+                // other and let the group drain, so no task outlives this scope.
+                _ = await group.next()
+                group.cancelAll()
+            }
+        }
+        continuation.onTermination = { _ in pump.cancel() }
+    }
+}
+
 // MARK: - AsyncHTTPClient implementation
 
 /// The production transport.
@@ -77,20 +187,34 @@ extension HTTPResponse {
 public struct AsyncHTTPClientTransport: StreamingTransport {
     private let client: HTTPClient
     private let connectTimeout: Duration
+    private let idleTimeout: Duration
 
-    /// The default overall deadline when a caller supplies none. Ten minutes
-    /// matches `DOMOCODE_TIMEOUT_MS`'s default; a streamed coding turn with large
-    /// tool output legitimately runs for minutes.
+    /// The default value passed as `timeout:` when a caller supplies none.
+    ///
+    /// CORRECTION (this comment used to claim an "overall per-request deadline",
+    /// which it is not): AsyncHTTPClient's `execute(_:timeout:)` deadline covers
+    /// **only time-to-response-head** — it cancels its deadline task in a `defer`
+    /// as soon as the head arrives — so on its own this bounds nothing about the
+    /// streamed body. What actually bounds the body is ``idleGuarded(_:idle:overall:clock:)``,
+    /// which this transport wraps every response body in, using this same value as
+    /// its `overall` budget and ``defaultIdleTimeout`` as its silence budget.
+    ///
+    /// Ten minutes matches `DOMOCODE_TIMEOUT_MS`'s default; a streamed coding turn
+    /// with large tool output legitimately runs for minutes.
     public static let defaultTimeout: Duration = .seconds(600)
 
     /// Bound on time-to-response-head — connect, TLS, request send, and the first
-    /// response byte — separate from the overall streaming deadline above.
+    /// response byte.
     ///
     /// This exists because pointing `domo` at a gateway that is not running is
     /// the single most common misconfiguration, and `HTTPClient.shared` has no
-    /// connect timeout of its own: its only bound is the overall request deadline,
-    /// which is 600s to accommodate a long streamed turn. Without this a dead
-    /// gateway hangs for ten minutes instead of erroring. On a healthy proxy the
+    /// connect timeout of its own.
+    ///
+    /// CORRECTION (this comment used to say the client's "only bound is the
+    /// overall request deadline, which is 600s"): that deadline is not overall,
+    /// it is head-only — which means without this value a dead gateway hangs for
+    /// ten minutes, and without ``idleGuarded(_:idle:overall:clock:)`` a gateway
+    /// that answers and then goes quiet hangs *forever*. On a healthy proxy the
     /// head arrives in well under a second, so 10s is generous headroom for a slow
     /// corporate proxy rather than a limit anything real approaches.
     ///
@@ -100,12 +224,24 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
     /// `localhost` — is refused by the OS immediately and never reaches this bound.
     public static let defaultConnectTimeout: Duration = .seconds(10)
 
+    /// How long a committed response body may deliver **nothing** before the
+    /// stream is failed.
+    ///
+    /// Two minutes rather than something tight: a provider behind a proxy that
+    /// does not forward keepalives can legitimately go quiet through a long
+    /// reasoning block, and a false positive there costs the user a whole turn.
+    /// Anything past two minutes of total silence on a committed stream is a
+    /// wedged connection, not a slow model.
+    public static let defaultIdleTimeout: Duration = .seconds(120)
+
     public init(
         client: HTTPClient = .shared,
-        connectTimeout: Duration = AsyncHTTPClientTransport.defaultConnectTimeout
+        connectTimeout: Duration = AsyncHTTPClientTransport.defaultConnectTimeout,
+        idleTimeout: Duration = AsyncHTTPClientTransport.defaultIdleTimeout
     ) {
         self.client = client
         self.connectTimeout = connectTimeout
+        self.idleTimeout = idleTimeout
     }
 
     public func execute(
@@ -139,7 +275,10 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
             head.headerFields.append(HTTPField(name: name, value: header.value))
         }
 
-        let stream = Self.bridge(response.body)
+        // `deadline` bounded the head only (see `defaultTimeout`). The body is
+        // unbounded until this wrap: without it a gateway that stalls after the
+        // head hangs the turn, and the session, forever.
+        let stream = idleGuarded(Self.bridge(response.body), idle: idleTimeout, overall: deadline)
         return StreamingResponse(head: head, body: stream)
     }
 
@@ -149,7 +288,9 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
     /// `client.execute` resolves as soon as the response head is available and
     /// then streams the body separately, so racing it against a sleep bounds
     /// exactly the connect-and-headers phase without touching the body budget —
-    /// the returned response's body still streams under `deadline`. The losing
+    /// the returned response's body is bounded separately, by
+    /// ``idleGuarded(_:idle:overall:clock:)``, because `deadline` stops applying
+    /// the moment the head lands. The losing
     /// child is cancelled on exit, which is what tells AsyncHTTPClient to abandon
     /// a connection attempt that is going nowhere rather than leak it.
     ///

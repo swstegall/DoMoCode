@@ -164,7 +164,7 @@ struct ServerClientIntegrationTests {
         do {
             try await client.sendPrompt(sessionID: sessionID, prompt: "does this reach the agent?")
             Issue.record("expected an un-resumed session to be unknown to the runtime")
-        } catch let ServerClientError.unexpectedStatus(status, _) {
+        } catch let ServerClientError.unexpectedStatus(status, _, _) {
             #expect(status == 404)
         }
 
@@ -206,7 +206,7 @@ struct ServerClientIntegrationTests {
         do {
             _ = try await badClient.listSessions()
             Issue.record("expected an unauthorized error")
-        } catch let ServerClientError.unexpectedStatus(status, _) {
+        } catch let ServerClientError.unexpectedStatus(status, _, _) {
             #expect(status == 401)
         }
 

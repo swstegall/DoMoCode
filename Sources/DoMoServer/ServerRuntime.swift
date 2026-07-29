@@ -7,6 +7,7 @@ import DoMoHarness
 import DoMoLLM
 import DoMoPermissions
 import Foundation
+import Synchronization
 import SystemPackage
 
 // MARK: - Errors and value types
@@ -26,6 +27,37 @@ public struct SessionRef: Sendable, Codable, Hashable {
     public init(id: String, path: String) {
         self.id = id
         self.path = path
+    }
+}
+
+/// An authoritative snapshot of what the server believes about one session.
+///
+/// The server owns run state and the pending-prompt set; a client's copy is only
+/// ever a fold of edge-triggered SSE frames, and every one of those edges can be
+/// missed (a dropped frame on the bounded broadcast buffer, a half-open socket, a
+/// run that never emits its close). This is the level-triggered answer, so a
+/// wedged client can ask instead of guess.
+public struct SessionStatus: Sendable, Codable, Hashable {
+    public var sessionID: String
+    public var running: Bool
+    public var pendingPermissionIDs: [String]
+    public var subscribers: Int
+    /// ISO8601, or nil when nothing is running. Lets a client say "running for
+    /// 14m" instead of an undifferentiated spinner.
+    public var runStartedAt: String?
+
+    public init(
+        sessionID: String,
+        running: Bool,
+        pendingPermissionIDs: [String],
+        subscribers: Int,
+        runStartedAt: String?
+    ) {
+        self.sessionID = sessionID
+        self.running = running
+        self.pendingPermissionIDs = pendingPermissionIDs
+        self.subscribers = subscribers
+        self.runStartedAt = runStartedAt
     }
 }
 
@@ -123,6 +155,55 @@ public actor ServerRuntime {
         }
     }
 
+    /// One run's tap on a session's shared ``BroadcastEventSink``, which can be
+    /// switched off for good.
+    ///
+    /// ``forceClearRun(sessionID:)`` walks away from a run that by construction
+    /// cannot be stopped — it holds the slot precisely because nothing can unwind
+    /// it — while carrying the session's sink across to the replacement state, so
+    /// attached SSE subscribers survive. Without this gate the abandoned run keeps
+    /// broadcasting into that shared sink whenever it eventually settles: a
+    /// `tool_end` for a call the client never saw start, a foreign assistant
+    /// message, a spurious `turn_end`, and — the damaging one — a terminal
+    /// `agent_end`. A client folds `agent_end` into `runState = .idle` while a
+    /// *different* run is actually holding the slot, so the spinner stops, the user
+    /// types, and the server answers 409 "a turn is already running". That is the
+    /// exact "the session stopped accepting prompts" symptom this whole feature
+    /// exists to remove, re-created by its own escape hatch.
+    ///
+    /// ``finishRun(_:token:)``'s token guard protects the SLOT; this protects the
+    /// STREAM. Both are needed: they are consulted at different moments by
+    /// different threads, and neither implies the other.
+    ///
+    /// The flag is a `Mutex` rather than actor state because ``emit(_:)`` is called
+    /// from the run's task on whatever executor the loop is on, while ``detach()``
+    /// is called from the runtime actor.
+    private final class RunSink: AgentEventSink {
+        private let inner: BroadcastEventSink
+        private let live = Mutex(true)
+
+        init(_ inner: BroadcastEventSink) {
+            self.inner = inner
+        }
+
+        /// Silence this run permanently. Idempotent; never un-does.
+        func detach() {
+            live.withLock { $0 = false }
+        }
+
+        func emit(_ event: AgentEvent) async {
+            guard live.withLock({ $0 }) else { return }
+            await inner.emit(event)
+        }
+
+        /// A server-originated frame on behalf of this run (its terminal
+        /// `agent_end` when the loop could not emit its own), gated identically.
+        func broadcast(_ event: ServerEvent) {
+            guard live.withLock({ $0 }) else { return }
+            inner.broadcast(event)
+        }
+    }
+
     /// One live session's mutable state. A reference type held only inside the
     /// actor, so its `runTask` mutation is serialized by the actor, not shared.
     ///
@@ -135,6 +216,12 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let sink: BroadcastEventSink
         var runTask: Task<Void, Never>?
+        /// The gate on the current run's output. Retained beside `runTask` so
+        /// ``forceClearRun(sessionID:)`` can silence a run it is abandoning.
+        var runSink: RunSink?
+        /// When the run currently holding the slot was admitted; nil when idle.
+        /// Set beside `runTask` and cleared beside it, so the pair cannot drift.
+        var runStartedAt: Date?
         /// Permission prompts awaiting a client answer, keyed by request id. The
         /// engine's prompter suspends on the continuation; a REST answer (or an
         /// abort/shutdown) resumes it. Held only inside the actor, never shared.
@@ -255,15 +342,15 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let id: String
         if let resume {
-            let path = try resolveResume(resume)
-            let resumedID = try JSONLSessionStore(path: path).readHeader().id
+            let path = try await resolveResume(resume)
+            let resumedID = try await Self.readSessionID(at: path)
             // Already live? Return it rather than standing up a second harness over
             // the same file — that would orphan the running task and leave the
             // existing SSE subscribers attached to a sink no run feeds.
             if let existing = sessions[resumedID] {
                 return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
             }
-            harness = try AgentHarness.open(path: path, configuration: harnessConfiguration(sessionID: resumedID))
+            harness = try await Self.reopen(path: path, configuration: harnessConfiguration(sessionID: resumedID))
             id = resumedID
         } else {
             id = UUIDv7.generate().description
@@ -275,6 +362,10 @@ public actor ServerRuntime {
             )
         }
         let path = await harness.sessionFilePath
+        // Re-check after every suspension above, for the same reason as the first
+        // check: a concurrent resume of the same id must not replace a live session
+        // and strand its run and its subscribers. `harness` is dropped unused.
+        if sessions[id] != nil { return SessionRef(id: id, path: path.string) }
         sessions[id] = makeState(harness: harness, sink: BroadcastEventSink())
         return SessionRef(id: id, path: path.string)
     }
@@ -284,14 +375,14 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         let forked = try await session.harness.fork(sessionDirectory: config.sessionDirectory)
         let path = await forked.sessionFilePath
-        let id = try JSONLSessionStore(path: path).readHeader().id
+        let id = try await Self.readSessionID(at: path)
         // `fork` reuses the PARENT's configuration, whose permission hook is bound to
         // the parent's sessionID — a prompt from the forked run would route to the
         // wrong session and hang. Re-open the forked file with a correctly-bound
         // config (only when gating is on; ungated forks keep the cheap path).
         let harness: AgentHarness
         if config.permissions != nil {
-            harness = try AgentHarness.open(path: path, configuration: harnessConfiguration(sessionID: id))
+            harness = try await Self.reopen(path: path, configuration: harnessConfiguration(sessionID: id))
         } else {
             harness = forked
         }
@@ -311,10 +402,23 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
         let harness = session.harness
-        let sink = session.sink
+        // NOT `session.sink` directly: everything this run emits goes through a gate
+        // the runtime can close, so a run that ``forceClearRun(sessionID:)`` walked
+        // away from cannot narrate itself into a stream a later run owns. See
+        // ``RunSink``.
+        let sink = RunSink(session.sink)
         let token = session.token
+        session.runSink = sink
+        session.runStartedAt = Date()
         session.runTask = Task { [weak self] in
             do {
+                // A run the LOOP settled as `.errored` has already narrated itself:
+                // ``DoMoAgent`` emits its classified failure as an `AgentEvent.notice`
+                // from inside `settle`, immediately before `agent_end`, and that
+                // notice is projected onto this same stream. Re-broadcasting
+                // `result.failure` here would put the identical row on the screen
+                // twice — the frame is not missing, only the frames for the failures
+                // the loop never saw are, and those all arrive as a throw.
                 _ = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
             } catch is CancellationError {
                 // Aborted before the loop emitted its own close.
@@ -324,18 +428,85 @@ public actor ServerRuntime {
                 // persistence error after the loop settled would otherwise leave the
                 // stream with no terminal frame. Guarantee exactly one close per
                 // accepted prompt, so a subscriber never hangs.
-                sink.broadcast(.agentEnd(reason: "errored"))
+                //
+                // Say WHAT failed, and say it BEFORE the close: a client folds
+                // `agent_end` into "idle", and a reason that arrives after the run is
+                // already idle reads as belonging to nothing. `agent_end(reason:
+                // "errored")` on its own is a three-word status line and an empty
+                // pane — which is exactly the report this frame exists to answer.
+                let failure = error as? DoMoError
+                    ?? DoMoError(wrapping: error, as: .configuration, "The turn could not be run")
+                // An interrupt drawn in red as a failure is a bug report the user then
+                // files. A cancellation that did not surface as `CancellationError`
+                // (a torn-down socket classified by the layer that caught it) lands
+                // here, and must still close as an abort rather than an error.
+                if failure.isCancellation {
+                    sink.broadcast(.agentEnd(reason: "aborted"))
+                } else {
+                    sink.broadcast(Self.noticeEvent(failure))
+                    sink.broadcast(.agentEnd(reason: "errored"))
+                }
             }
             await self?.finishRun(sessionID, token: token)
+        }
+    }
+
+    /// One wire notice from a classified failure the run threw.
+    ///
+    /// The full cause chain becomes the text, capped HERE rather than at render
+    /// time: a gateway can answer with an entire HTML error page, and an
+    /// uncapped chain would make the SSE frame itself the payload problem for
+    /// every attached subscriber. The taxonomy rides along as
+    /// ``DoMoCore/DoMoError/Kind/label`` so a client renders a headline and a
+    /// recovery hint without parsing prose.
+    private static func noticeEvent(_ error: DoMoError) -> ServerEvent {
+        .notice(ServerNotice(
+            level: .error,
+            code: noticeCode(for: error.kind),
+            text: DoMoError.truncating(error.description),
+            kind: error.kind.label
+        ))
+    }
+
+    /// Which notice family a classified failure belongs to.
+    ///
+    /// Read off the KIND, never off the catch site — the same rule the agent
+    /// loop applies to the failures it settles, so the same 401 is filed the
+    /// same way whether it arrived through the loop's own stream or was thrown
+    /// out of `harness.run`'s pre-turn compaction. Filing everything that can
+    /// throw here as `runtime_error` would be the easy answer and the wrong
+    /// one: compaction issues a real model request, so a gateway refusal
+    /// genuinely does reach this catch.
+    ///
+    /// Exhaustive with no `default`, so a new ``DoMoCore/DoMoError/Kind`` is a
+    /// compile error here rather than a silent misfiling.
+    private static func noticeCode(for kind: DoMoError.Kind) -> String {
+        switch kind {
+        case .transport, .authentication, .rateLimit, .quotaExhausted, .contextOverflow, .provider,
+            .malformedResponse:
+            return "provider_error"
+        case .toolExecution, .file, .cancelled, .configuration:
+            return "runtime_error"
         }
     }
 
     /// Clear the run slot, but only if the session is still the one that started the
     /// run — a session replaced since must not have a completing run nil its
     /// successor's slot.
+    ///
+    /// This guard used to be dead code (no code path ever replaced a live
+    /// `SessionState`). ``forceClearRun(sessionID:)`` makes it load-bearing: the
+    /// doomed run it walks away from may settle at any later moment, and when it
+    /// does its completion hop must not free a slot that a *different*, healthy run
+    /// now holds. `ServerRuntimeForceClearTests.forceClearTokenGuardProtectsTheNextRun`
+    /// pins exactly that.
     private func finishRun(_ sessionID: String, token: Int) {
-        guard sessions[sessionID]?.token == token else { return }
-        sessions[sessionID]?.runTask = nil
+        guard let session = sessions[sessionID], session.token == token else { return }
+        session.runTask = nil
+        session.runSink = nil
+        // Cleared beside `runTask`, so `status` can never report `running: false`
+        // next to a stale start time a client would render as "running for 14m".
+        session.runStartedAt = nil
     }
 
     /// Cancel a running turn. The run settles cooperatively and clears its own slot.
@@ -352,6 +523,209 @@ public actor ServerRuntime {
         session.runTask?.cancel()
         drainPending(session, reason: "The tool call was aborted.")
         return wasRunning
+    }
+
+    /// Free the run slot **unconditionally**, whatever the run is doing.
+    ///
+    /// ``abort(sessionID:)`` only *cancels*: it never nils `runTask`, so clearing
+    /// the slot depends entirely on the run reaching ``finishRun(_:token:)``. A run
+    /// parked on something that cannot observe cancellation — an uncancellable tool,
+    /// a stalled-but-open socket before the transport's idle guard existed — holds
+    /// the slot for the life of the process, and every later prompt on that session
+    /// 409s. That is the "I had to make a new session" bug. This is the lever that
+    /// gets the session back without one.
+    ///
+    /// The `SessionState` is *replaced* rather than patched, because
+    /// ``DoMoHarness/AgentHarness/run(prompt:attachments:sink:)`` guards on its own
+    /// `isRunning` flag and clears it only in its own `defer`: a wedged run leaves
+    /// that flag set forever, so reusing the harness would make the very next prompt
+    /// fail with "already running a turn" and the wedge would simply move. Re-opening
+    /// from the session file re-derives the leaf and every persisted message, so the
+    /// only thing lost is the un-persisted tail of a run that was already dead.
+    ///
+    /// The session's ``BroadcastEventSink`` is carried across the replacement, so
+    /// every attached SSE subscriber survives — the same care `createSession(resume:)`
+    /// takes for a live session — and the new state's `token` makes the existing
+    /// `finishRun` guard no-op the doomed run's completion hop if it ever settles.
+    ///
+    /// Because the abandoned run is still alive, two things it shares with the
+    /// session have to be taken away from it:
+    ///
+    /// - **The stream.** Its ``RunSink`` is detached here, so nothing it emits when
+    ///   it finally settles — least of all a terminal `agent_end` — reaches the
+    ///   subscribers a *different* run is now feeding.
+    /// - **The transcript.** Its ``DoMoHarness/SessionPersistenceSink`` still writes
+    ///   to the same JSONL file, and the file's leaf is "last entry wins", so a late
+    ///   append moves the file leaf onto the dead branch. Every live read therefore
+    ///   walks back from the *live harness's* tip instead — see ``messages(sessionID:)``
+    ///   — and the replacement harness below is opened **pinned to the live branch**
+    ///   (that tip, or the nearest ancestor of it the file can still resolve), never
+    ///   to the file's leaf. Both halves are required: reading around the
+    ///   file leaf achieves nothing if this method re-derives one. A press of this
+    ///   lever after the abandoned run has settled would otherwise re-anchor the
+    ///   session onto the dead branch, and because every later turn is then appended
+    ///   as a child of it, the recovered turn leaves the model's *context* and not
+    ///   merely the rendering. It is also why nothing is replaced when nothing was
+    ///   held (below): a press on an idle session was enough to do it, and this is
+    ///   documented as a safe thing to do.
+    ///
+    ///   Two residuals, both stated plainly because the first version of this
+    ///   comment claimed a coverage it did not have:
+    ///
+    ///   1. A genuinely **cold** re-open — a later process, where the live tip died
+    ///      with the one that held it and the file is all there is. Distinguishing
+    ///      the abandoned branch there is a session-format change. The recovered
+    ///      turn is still on disk and reachable via ``children(sessionID:parent:)``,
+    ///      not lost.
+    ///   2. The live tip is read immediately before the re-open, which parses the
+    ///      whole file off-actor; a doomed run that persists a message *during* that
+    ///      parse leaves it off the branch this clear pins. That tail belongs to the
+    ///      run being abandoned, which is the tail this lever exists to walk away
+    ///      from, and closing the window exactly would need the harness to be able
+    ///      to stop writing on command — which is precisely what a wedged run
+    ///      cannot be made to do.
+    ///
+    /// It is **total**: it does not refuse. Every decision this method makes about
+    /// which branch to keep degrades along the live branch instead of throwing, and
+    /// the floor — an explicitly empty branch — is still a branch this session owns.
+    /// That property is the whole value of a lever of last resort: a refusal here is
+    /// not a retryable failure but a session that can never be cleared, because the
+    /// state that produced the refusal (a live tip the file does not have) can never
+    /// change back. Only the file itself failing to open or append can still stop it,
+    /// and that fails the whole session, not this method.
+    ///
+    /// It leaves the session **usable**, not merely unblocked. The branch it adopts
+    /// ends on a tool call that never returned — that is what the lever is *for* — so
+    /// before returning it persists a synthetic error result for every unanswered
+    /// call on that branch, exactly as ``drainPending(_:reason:)`` answers a parked
+    /// permission prompt. Without it the recovered session trades a 409 it cannot
+    /// clear for a 400 it cannot clear (see ``DoMoLLM/Context/hasToolHistory``), which
+    /// is the same dead session one layer down.
+    ///
+    /// It is **atomic**: the replacement harness is opened and sealed before anything
+    /// is cancelled, drained or replaced, so a failure in either leaves the session
+    /// exactly as it was and the call can simply be retried. Half-clearing a session —
+    /// cancelled and drained but still holding its slot on a harness whose `isRunning`
+    /// is stuck — would be strictly worse than not trying. The seal writes to the
+    /// session file, so a caller that loses the race below leaves those entries behind
+    /// on a branch nothing continues; that is the price of preparing before mutating,
+    /// and it is invisible to every reader, which walks from a live tip.
+    ///
+    /// It is also safely **repeatable and concurrent**: a caller whose session was
+    /// replaced while it was opening the file (a double-press on the diagnostics
+    /// panel's force-clear row) reports "nothing held" rather than throwing
+    /// `sessionNotFound` for a session that is plainly right there.
+    ///
+    /// - Returns: whether anything was actually holding the session.
+    @discardableResult
+    public func forceClearRun(sessionID: String) async throws -> Bool {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        // Read synchronously, before the first suspension, so "was anything held"
+        // cannot be answered from a stale snapshot.
+        guard session.runTask != nil || !session.pending.isEmpty else {
+            // Nothing to free. Replacing the state anyway is not harmlessly wasted
+            // work: rebuilding a harness means re-opening the file, and an earlier
+            // force-clear's abandoned run may since have moved the file's leaf onto
+            // its dead branch — so a press on an *idle* session was enough to
+            // re-anchor the live session there for good. Say nothing was held, touch
+            // nothing.
+            //
+            // The terminal frame is still sent: a client only presses this because
+            // it believes a run is in flight, and its run state is edge-triggered,
+            // so the frame is what un-pins the spinner it is sitting on.
+            session.sink.broadcast(.agentEnd(reason: "aborted"))
+            return false
+        }
+        // Both reads on the SAME harness object, so a replacement landing between
+        // them cannot pair one state's path with another's tip.
+        let harness = session.harness
+        let path = await harness.sessionFilePath
+        // The branch this session is actually on, tip first. The doomed run keeps its
+        // own persistence sink over `path`, and the file's leaf is "last entry wins",
+        // so the file is not an authority on the live branch — this harness is.
+        let liveBranch = await harness.leafLineage
+        // Opened FIRST, while nothing has been mutated yet — and OFF this actor,
+        // because it parses the whole session file and this lever is pulled exactly
+        // when the runtime is already unhealthy and every other session's calls are
+        // the last thing that should queue behind it.
+        //
+        // `preferring:` never falls back to the file's own leaf — that fallback IS
+        // the branch switch this pin exists to prevent — but it also never refuses:
+        // it takes the live tip when the file has it and the nearest ancestor of the
+        // live tip it can resolve otherwise, both of which are on the live branch by
+        // construction. That distinction is the whole point of the entry point. A
+        // strict pin makes this lever THROW, permanently and identically on every
+        // retry, whenever the file is behind the live tip — the crash-truncated tail
+        // the storage layer explicitly tolerates elsewhere is enough — and a lever of
+        // last resort that can refuse is a session that can never be cleared.
+        let fresh = try await Self.reopen(
+            path: path,
+            configuration: harnessConfiguration(sessionID: sessionID),
+            preferring: liveBranch
+        )
+        // The branch this lever adopts ends, by the nature of what it is for, on an
+        // assistant turn that called a tool which never returned — so nothing ever
+        // wrote the `tool_result` that call requires. Nothing downstream repairs
+        // that: `ContextBuilder` projects entries verbatim and there is no sanitizer
+        // between here and the wire, so every later prompt would be rejected by the
+        // provider (see `Context.hasToolHistory`) and the session would trade its 409
+        // for a permanent 400. Sealing here — through the FRESH harness, before it is
+        // ever handed a prompt — makes "the live tip is always answerable" an
+        // invariant this lever ESTABLISHES rather than one that happens to hold.
+        //
+        // Still in the preparation phase: no runtime state has been touched, so like
+        // the re-open, an I/O failure here leaves the session exactly as it was and
+        // the call retryable. It runs on the fresh harness's actor, not this one, so
+        // the parse it does is off this actor for the same reason the re-open is.
+        try await fresh.sealUnansweredToolCalls(reason: Self.clearedReason)
+        // Re-check after the suspensions above, and with no suspension between here
+        // and the swap: a concurrent shutdown or a concurrent force-clear must win
+        // rather than be clobbered by a state built from a stale snapshot. `fresh` is
+        // simply dropped in that case — no runtime state has been touched, which is
+        // the point of preparing first. What it wrote while sealing stays in the file
+        // as a branch nothing continues; every reader walks from a live tip, so it is
+        // unreachable rather than confusing.
+        guard let current = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard current === session else { return false }
+
+        // Silence the doomed run BEFORE the swap, so there is no window in which it
+        // can emit into a sink the replacement state already owns.
+        session.runSink?.detach()
+        session.runTask?.cancel()
+        drainPending(session, reason: Self.clearedReason)
+        sessions[sessionID] = makeState(harness: fresh, sink: session.sink)
+        // Terminal frame for anyone still attached: the client's run state is
+        // edge-triggered, so without this it stays pinned on "thinking…". Sent on
+        // the raw sink — this frame is the runtime's, not the abandoned run's.
+        session.sink.broadcast(.agentEnd(reason: "aborted"))
+        return true
+    }
+
+    /// What the client is told, and what the model is told, about a call this lever
+    /// walked away from. One string for both: a parked permission prompt and a parked
+    /// tool call are the same event from the session's point of view, and the model's
+    /// copy of it should read the same as the user's.
+    private static let clearedReason = "The run was cleared at the client's request."
+
+    /// The server's authoritative view of one session — see ``SessionStatus``.
+    public func status(sessionID: String) throws -> SessionStatus {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        return SessionStatus(
+            sessionID: sessionID,
+            running: session.runTask != nil,
+            // Sorted so the projection is stable across calls; the pending map is
+            // a dictionary and its iteration order is not.
+            pendingPermissionIDs: session.pending.keys.sorted(),
+            subscribers: session.sink.subscriberCount,
+            runStartedAt: session.runStartedAt.map(Self.iso8601)
+        )
+    }
+
+    /// Matches `JSONLSessionStore.iso8601`, which is internal to DoMoHarness.
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     /// Resume every pending prompt on `session` with a reject, and tell subscribers to
@@ -382,29 +756,155 @@ public actor ServerRuntime {
 
     // MARK: Reads
 
-    public func listSessions() throws -> [SessionSummary] {
-        let listings = try JSONLSessionStore.list(cwd: config.cwd, sessionDirectory: config.sessionDirectory)
-        return listings.map {
-            SessionSummary(id: $0.header.id, path: $0.path.string, cwd: $0.header.cwd, timestamp: $0.header.timestamp)
-        }
+    // Every read below parses whole JSONL files. That work used to run **while
+    // holding this actor**, so a large session stalled `startRun`, `abort`,
+    // `resolvePermission` and the `isRunning` read that produces the SSE
+    // `connected(running:)` frame for as long as the parse took — seconds, on a
+    // long transcript — which both hurt latency and widened every run-state race.
+    // The resolution stays on the actor (it reads `sessions`); the parsing hops
+    // off through the `@concurrent` helpers.
+    //
+    // `@concurrent` is load-bearing, not decoration: under
+    // NonisolatedNonsendingByDefault an unmarked `async func` runs on the
+    // CALLER's actor, which here is this one — i.e. exactly the bug being fixed.
+
+    public func listSessions() async throws -> [SessionSummary] {
+        try await Self.loadListing(cwd: config.cwd, sessionDirectory: config.sessionDirectory)
     }
 
     /// The linear root-to-leaf message path of a session — what a client renders
     /// as the transcript. Reads from disk, so it works for a session that is live
     /// or one that only exists as a file.
+    ///
+    /// For a **live** session the walk starts from the harness's own tip, not from
+    /// the file's last-written entry. Those are normally the same entry, and were
+    /// assumed to be until ``forceClearRun(sessionID:)`` existed: the run it
+    /// abandons keeps its own persistence sink over the same file, so when it
+    /// finally settles its late append becomes the file's leaf and a file-leaf walk
+    /// returns the **dead** branch — the recovered prompt and the model's answer to
+    /// it simply disappear from the transcript. The live harness is the authority on
+    /// which branch this session is actually on; the file is only the authority on
+    /// what is on it.
     public func messages(sessionID: String) async throws -> [Message] {
-        let tree = try SessionTree.load(from: JSONLSessionStore(path: try await sessionPath(sessionID)))
-        return try tree.branch().compactMap { entry in
-            if case .message(let message) = entry.payload { return message }
-            return nil
+        switch try await readLocation(sessionID) {
+        case .live(let path, let tip):
+            // An empty tip is an empty branch, not "ask the file": the harness will
+            // append its next entry as a root, so answering with whatever branch the
+            // file happens to end on would render a conversation this session is not
+            // on and is not about to continue.
+            guard let tip else { return [] }
+            return try await Self.loadMessages(at: path, from: tip)
+        case .file(let path):
+            return try await Self.loadMessages(at: path, from: nil)
         }
     }
 
     /// The direct children of a node (or of the tree roots when `parent` is nil),
     /// in chronological order — the branch-navigation primitive.
+    ///
+    /// Deliberately NOT leaf-relative: `SessionTree.children(of:)` filters entries
+    /// by `parentId` and never consults the leaf, so the force-clear hazard
+    /// ``messages(sessionID:)`` guards against does not exist here. Showing *both*
+    /// children of the fork point is the correct answer for branch navigation — it
+    /// is how a client reaches the abandoned run's tail at all.
     public func children(sessionID: String, parent: String?) async throws -> [SessionTreeEntry] {
-        let tree = try SessionTree.load(from: JSONLSessionStore(path: try await sessionPath(sessionID)))
+        try await Self.loadChildren(at: try await sessionPath(sessionID), parent: parent)
+    }
+
+    /// Which file to read, and on whose authority the tip is chosen.
+    ///
+    /// Two cases rather than one optional tip, because `nil` would have to mean two
+    /// different things — "this live branch is empty" and "nobody is live, so use
+    /// the file's leaf" — and the difference is exactly what the force-clear hazard
+    /// turns on.
+    private enum ReadLocation {
+        /// A live session: walk from the harness's own tip. `tip == nil` is an empty
+        /// branch, not an invitation to consult the file.
+        case live(path: FilePath, tip: String?)
+        /// A session that is only a file. Its own leaf is the only answer there is.
+        case file(path: FilePath)
+    }
+
+    private func readLocation(_ id: String) async throws -> ReadLocation {
+        guard let session = sessions[id] else {
+            return .file(path: try await Self.locate(
+                id: id,
+                cwd: config.cwd,
+                sessionDirectory: config.sessionDirectory
+            ))
+        }
+        // Both reads on the SAME harness object, so a replacement landing between
+        // them cannot pair one state's path with another's leaf.
+        let harness = session.harness
+        return .live(path: await harness.sessionFilePath, tip: await harness.currentLeafID)
+    }
+
+    @concurrent
+    private static func loadMessages(at path: FilePath, from leaf: String?) async throws -> [Message] {
+        let tree = try SessionTree.load(from: JSONLSessionStore(path: path))
+        // `branch(from:)` throws on a tip that is not in the file rather than
+        // silently falling back to the file's leaf: falling back is exactly the
+        // behaviour whose loss of the recovered turn this parameter exists to
+        // prevent, and a refusal is the store's own stance on a broken chain.
+        return try tree.branch(from: leaf).compactMap { entry in
+            if case .message(let message) = entry.payload { return message }
+            return nil
+        }
+    }
+
+    /// Re-open a session file off this actor. `@concurrent` is load-bearing: an
+    /// unmarked `async func` would run on the caller's actor — this one — which is
+    /// the whole thing being avoided.
+    @concurrent
+    private static func reopen(
+        path: FilePath,
+        configuration: AgentHarness.Configuration
+    ) async throws -> AgentHarness {
+        try AgentHarness.open(path: path, configuration: configuration)
+    }
+
+    /// Re-open a session file off this actor, continuing from the live branch
+    /// `preferring` describes rather than from the file's last entry — see
+    /// ``forceClearRun(sessionID:)``. A separate entry point rather than an optional
+    /// parameter on the one above, so "which tip" is always a decision a caller made
+    /// rather than a default it inherited.
+    @concurrent
+    private static func reopen(
+        path: FilePath,
+        configuration: AgentHarness.Configuration,
+        preferring leaves: [String]
+    ) async throws -> AgentHarness {
+        try AgentHarness.open(path: path, configuration: configuration, preferring: leaves)
+    }
+
+    /// Read a session file's header id off this actor.
+    @concurrent
+    private static func readSessionID(at path: FilePath) async throws -> String {
+        try JSONLSessionStore(path: path).readHeader().id
+    }
+
+    @concurrent
+    private static func loadChildren(at path: FilePath, parent: String?) async throws -> [SessionTreeEntry] {
+        let tree = try SessionTree.load(from: JSONLSessionStore(path: path))
         return tree.children(of: parent)
+    }
+
+    @concurrent
+    private static func loadListing(cwd: String, sessionDirectory: FilePath) async throws -> [SessionSummary] {
+        try JSONLSessionStore.list(cwd: cwd, sessionDirectory: sessionDirectory).map {
+            SessionSummary(id: $0.header.id, path: $0.path.string, cwd: $0.header.cwd, timestamp: $0.header.timestamp)
+        }
+    }
+
+    /// The on-disk path of a session that is only a file, resolved off the actor —
+    /// `JSONLSessionStore.list` scans and header-parses the whole directory.
+    @concurrent
+    private static func locate(id: String, cwd: String, sessionDirectory: FilePath) async throws -> FilePath {
+        let listings = (try? JSONLSessionStore.list(cwd: cwd, sessionDirectory: sessionDirectory)) ?? []
+        guard let match = listings.first(where: { $0.header.id == id }) else {
+            throw ServerRuntimeError.sessionNotFound
+        }
+        return match.path
     }
 
     // MARK: Shutdown
@@ -424,11 +924,7 @@ public actor ServerRuntime {
 
     private func sessionPath(_ id: String) async throws -> FilePath {
         if let session = sessions[id] { return await session.harness.sessionFilePath }
-        let listings = (try? JSONLSessionStore.list(cwd: config.cwd, sessionDirectory: config.sessionDirectory)) ?? []
-        guard let match = listings.first(where: { $0.header.id == id }) else {
-            throw ServerRuntimeError.sessionNotFound
-        }
-        return match.path
+        return try await Self.locate(id: id, cwd: config.cwd, sessionDirectory: config.sessionDirectory)
     }
 
     /// Resolve `resume` strictly as a session id within this cwd's session
@@ -436,11 +932,7 @@ public actor ServerRuntime {
     /// trusted, but treating the value as a path would let it open and *append to*
     /// any JSONL file the process can read, outside the session scope; keeping it an
     /// id keeps a session contained to the directory `listSessions` exposes.
-    private func resolveResume(_ value: String) throws -> FilePath {
-        let listings = (try? JSONLSessionStore.list(cwd: config.cwd, sessionDirectory: config.sessionDirectory)) ?? []
-        guard let match = listings.first(where: { $0.header.id == value }) else {
-            throw ServerRuntimeError.sessionNotFound
-        }
-        return match.path
+    private func resolveResume(_ value: String) async throws -> FilePath {
+        try await Self.locate(id: value, cwd: config.cwd, sessionDirectory: config.sessionDirectory)
     }
 }

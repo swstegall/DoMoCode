@@ -91,6 +91,23 @@ public protocol TerminalLifecycleControl: Sendable {
     func enter() throws(DoMoError)
     /// Restore the terminal. Idempotent — safe after a signal already restored.
     func stop()
+
+    /// Take or release mouse reporting mid-session, without leaving raw mode.
+    ///
+    /// Releasing it is what hands the mouse back to the terminal emulator, so
+    /// the emulator's own text selection and its right-click menu work again.
+    /// That is the escape hatch for anything the in-app selection cannot do —
+    /// and for a terminal whose mouse handling this program gets wrong.
+    func setMouseReporting(_ enabled: Bool)
+}
+
+public extension TerminalLifecycleControl {
+    /// A conformer that never enabled mouse reporting has nothing to take or
+    /// release, so the requirement is defaulted rather than mandatory.
+    ///
+    /// This default is load-bearing, not a convenience: three test doubles
+    /// conform to this protocol and must keep compiling untouched.
+    func setMouseReporting(_ enabled: Bool) {}
 }
 
 extension TerminalLifecycle: TerminalLifecycleControl {}

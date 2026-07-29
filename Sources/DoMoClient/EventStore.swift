@@ -10,7 +10,9 @@
 // `MainActor`: the UI reads it on the render actor, and the SSE consumer hops
 // here to mutate it, so a frame never observes a half-applied event.
 
+import DoMoCore
 import DoMoLLM
+import Foundation
 import DoMoPermissions
 import DoMoServer
 import DoMoTermGraphics
@@ -50,8 +52,56 @@ public final class EventStore {
     /// raced ahead of. Cleared on a session switch (ids reset per session).
     private var resolvedRequestIDs: Set<String> = []
 
+    /// The file backing the selected session, when the server told us.
+    ///
+    /// There is no log file in this program — the `Logger` bootstrap writes to
+    /// stderr, and stderr under an active alternate screen is invisible — so the
+    /// session JSONL is the only durable record of a run there is. Keeping the
+    /// path here is what lets a failure row end with "Full transcript: <path>"
+    /// instead of leaving "where do I see more" unanswered.
+    ///
+    /// Session-scoped, not transcript-scoped: ``seed(_:)`` replaces the
+    /// transcript several times for the SAME session (the initial history, then
+    /// every re-seed after a stream outage), and clearing the path on each of
+    /// those would delete a fact that never stopped being true.
+    public private(set) var sessionPath: String?
+
+    /// The most recent non-error notice.
+    ///
+    /// Transient by contract: a `warning` or `info` notice is something the user
+    /// may glance at and forget — a retry in progress, a refresh that did not
+    /// land — and it is deliberately NOT put in `transcript`, which is the place
+    /// reserved for things that must survive being scrolled past. Errors take
+    /// the other door; see ``postError(headline:message:hint:)``.
+    public private(set) var lastNotice: ServerNotice?
+
+    /// When the last event of ANY kind arrived on the stream.
+    ///
+    /// The one fact that separates "the model is slow" from "nothing is
+    /// connected", and the only reason a heartbeat is not a wasted frame. The
+    /// server sends one every 15 s whether or not a turn is running, so a stream
+    /// that has said nothing for appreciably longer than that is dead — whatever
+    /// the socket believes. This store used to DISCARD heartbeats before recording
+    /// anything about them, so a half-open connection (which throws nothing and
+    /// delivers nothing) was completely invisible.
+    ///
+    /// Advanced only by ``apply(_:)`` — deliberately NOT by ``adopt(_:)``. A
+    /// successful `/status` poll proves the SERVER is reachable, which is a
+    /// different fact from the stream being alive, and folding the two together
+    /// would hide exactly the failure the timestamp exists to expose.
+    public private(set) var lastEventAt: Date = Date()
+
     /// Fired after any mutation, so the UI can request a render. Set by the app.
     public var onChange: (() -> Void)?
+
+    /// Fired once per non-error notice, so a surface with a timed message area
+    /// can start its own dwell clock.
+    ///
+    /// A callback rather than a poll of ``lastNotice``, because ``onChange``
+    /// fires on every mutation: a status line that re-posted whatever
+    /// `lastNotice` currently held would restart the four-second timer on every
+    /// keystroke and the message would never go away.
+    public var onNotice: ((ServerNotice) -> Void)?
 
     // Streaming bookkeeping — indices into `transcript` of the in-progress items.
     private var streamingAssistantIndex: Int?
@@ -72,7 +122,26 @@ public final class EventStore {
     /// ``seed(_:)``s its history and attaches its event stream.
     public func select(_ sessionID: String?) {
         selectedSessionID = sessionID
+        // Cleared HERE and not in `clearTranscript()`, which a re-seed also calls:
+        // carrying a learned classification across a reconnect is the entire point
+        // of the map, and resetting it there wiped it a line before the lookup.
+        // Across a SESSION switch it must go — the same words in another session are
+        // another failure.
+        kindsByFailureText = [:]
         clearTranscript()
+        // Cleared HERE and not in `clearTranscript`, which `seed(_:)` also calls:
+        // the path belongs to the session, and a re-seed of the same session must
+        // not forget where that session lives. Selecting a different one must.
+        sessionPath = nil
+        lastNotice = nil
+        onChange?()
+    }
+
+    /// Record where the selected session is persisted, for a failure row's
+    /// "where do I see more". `nil` when the server did not say.
+    public func setSessionPath(_ path: String?) {
+        guard sessionPath != path else { return }
+        sessionPath = path
         onChange?()
     }
 
@@ -94,6 +163,32 @@ public final class EventStore {
             case .assistant(let assistant):
                 if !assistant.text.isEmpty {
                     transcript.append(.assistant(sanitizeUntrustedText(assistant.text)))
+                }
+                // A failed turn carries its detail in `errorMessage`, never in
+                // `text`. Gating on text alone is exactly why re-opening a session
+                // that errored rendered as an EMPTY pane: the turn is persisted, the
+                // reason is right there on it, and the renderer dropped the whole
+                // message because it had no words in it.
+                //
+                // An abort is not a failure — `AssistantMessage.failure` answers a
+                // `.cancelled` error for `stopReason == .aborted`, so `failure !=
+                // nil` alone would paint every Esc red. `.length` answers nil: a
+                // truncated turn is a short answer, not an error.
+                //
+                // No label: a persisted message carries prose, not a taxonomy (the
+                // kind was never part of the JSONL shape), so a seeded row honestly
+                // says "Something went wrong" rather than inventing a classification
+                // it cannot know. A LIVE failure keeps its kind — it comes through
+                // the notice frame, not through here.
+                if let failure = assistant.failure, !failure.isCancellation {
+                    // A kind this session already learned LIVE for these exact words
+                    // is not an invention — it is the classification the runtime
+                    // sent, being carried across the re-seed that would otherwise
+                    // drop it. Absent that, `nil` and the honest generic headline.
+                    appendError(ErrorPresentation.rows(
+                        label: kindsByFailureText[failure.message],
+                        message: failure.message
+                    ))
                 }
             case .tool(let result):
                 // History carries no arguments (the tool-result message has only the
@@ -118,6 +213,9 @@ public final class EventStore {
     /// *message* frames (`message_start`/`message_end` for the `tool` role) and
     /// system messages are ignored, so a tool call is never double-counted.
     public func apply(_ event: ServerEvent) {
+        // ABOVE the switch, so the `.heartbeat` arm's early `return` — the frame
+        // whose ONLY purpose is to prove the stream is alive — still advances it.
+        lastEventAt = Date()
         switch event {
         case .connected(_, _, let running):
             // Adopt the server's run state, in BOTH directions.
@@ -148,6 +246,37 @@ public final class EventStore {
 
         case .heartbeat, .turnStart, .turnEnd:
             return   // no transcript effect (version handled by the caller)
+
+        case .notice(let notice):
+            // The two doors, and the rule that picks between them: an error the
+            // user has to ACT on becomes a persistent transcript row, because a
+            // message that evaporates after four seconds is a message that was
+            // never delivered. Everything else is a glance — a retry in flight, a
+            // refresh that did not land — and belongs on the status line, where it
+            // does not push the conversation up the screen.
+            switch notice.level {
+            case .error:
+                let body = Self.noticeBody(notice)
+                // Remember the taxonomy against the words it came with.
+                //
+                // The JSONL stores a failure as a STRING and a stop reason — the kind
+                // was never part of that shape — so a re-seed rebuilds this same row
+                // from history with `label: nil` and it degrades to the generic
+                // "Something went wrong". The stream re-seeds on every reconnect, so
+                // "did I blow the context window?" was answered once and then
+                // silently un-answered by the next blip. Keyed on the message text
+                // because that is precisely what survives to the seeded row.
+                if let kind = notice.kind, !body.isEmpty {
+                    if kindsByFailureText.count >= Self.rememberedKindLimit {
+                        kindsByFailureText.removeAll(keepingCapacity: true)
+                    }
+                    kindsByFailureText[body] = kind
+                }
+                appendError(ErrorPresentation.rows(label: notice.kind, message: body))
+            case .warning, .info:
+                lastNotice = notice
+                onNotice?(notice)
+            }
 
         case .agentStart:
             runState = .running
@@ -268,6 +397,123 @@ public final class EventStore {
         onChange?()
     }
 
+    // MARK: The server's authoritative view
+
+    /// Fold a server-authoritative status snapshot.
+    ///
+    /// The server owns run state and the pending-prompt set; the client's copy is
+    /// only ever a fold of edge-triggered frames, and every one of those edges can
+    /// be missed. Once an edge is missed, nothing in the edge-triggered world can
+    /// undo it: a client that never saw `agent_end` believes a turn is in flight
+    /// forever, and the synchronous submit guard then refuses every prompt for the
+    /// life of the session. This is how it gets back in sync without needing a
+    /// reconnect it has no reason to make.
+    ///
+    /// Ignores a snapshot for a session that is no longer selected — a poll in
+    /// flight across a session switch must not decide the new session's state.
+    public func adopt(_ status: SessionStatus) {
+        guard status.sessionID == selectedSessionID else { return }
+        if status.running {
+            if runState != .running {
+                runState = .running
+                lastStopReason = nil
+            }
+        } else if runState != .idle {
+            runState = .idle
+            // A turn that is over cannot still have a tool call in flight, and
+            // cannot still be waiting on approval.
+            settleActiveToolCalls()
+            if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
+            pendingPermission = nil
+        }
+        // Drop a modal the server no longer has parked. This is the case where the
+        // `permission_resolved` echo was the frame that got lost: the run moved on,
+        // and the client is holding a question nobody is waiting for an answer to.
+        if let pending = pendingPermission, !status.pendingPermissionIDs.contains(pending.id) {
+            resolvedRequestIDs.insert(pending.id)
+            pendingPermission = nil
+            markPendingToolAwaitingApproval()
+        }
+        onChange?()
+    }
+
+    /// Whether any of `ids` names a prompt this store has neither parked nor
+    /// already answered — i.e. an ask that was lost in transit.
+    ///
+    /// The bounded broadcast buffers drop the OLDEST frame, and a `permission_request`
+    /// is followed by the deltas of whatever else the run is doing, so the ask is
+    /// exactly the frame most likely to be evicted. Recovering it used to require a
+    /// reconnect, because the `connected` reconcile was the only caller of
+    /// `GET /permissions`; a stream that never drops does not reconnect, so a
+    /// prompt lost this way was lost for good.
+    public func hasUnseenPermission(in ids: [String]) -> Bool {
+        guard pendingPermission == nil else { return false }
+        return ids.contains { !resolvedRequestIDs.contains($0) }
+    }
+
+    // MARK: Failures
+
+    /// Append a failure row.
+    ///
+    /// **The single entry point for client-side failures too.** A `try?` that
+    /// swallowed a transport error had nowhere to say so, which is why eleven of
+    /// them accumulated; now there is one obvious place, and a bootstrap that
+    /// could not list sessions renders in exactly the same shape as a gateway
+    /// that rejected the credential. Persistent by design — a transient notice
+    /// is the wrong surface for anything the user has to act on.
+    public func postError(headline: String, message: String, hint: String? = nil) {
+        appendError((headline: headline, message: message, hint: hint))
+        onChange?()
+    }
+
+    /// Whether the transcript holds anything `^O` acts on: a failure row with a
+    /// body, or a failed tool call with output.
+    ///
+    /// Deliberately width-independent, so it can be read in the same frame that
+    /// builds the status line. That makes it very slightly generous — a body
+    /// short enough to fit uncapped still counts — which is the safe direction:
+    /// it can advertise a key that turns out to have nothing more to show, never
+    /// hide one that does.
+    public var hasExpandableDetail: Bool {
+        transcript.contains { item in
+            switch item {
+            case .error(_, let message, _):
+                return !message.isEmpty
+            case .tool(_, _, let output, let state, _):
+                return state == .failed && !output.isEmpty
+            case .user, .assistant, .reasoning, .image:
+                return false
+            }
+        }
+    }
+
+    /// The message a notice contributes to its row: the headline line, plus the
+    /// provider's own words underneath when the notice carried a second line.
+    ///
+    /// Re-capped after joining rather than trusting the producer's per-field cap,
+    /// because two fields each within budget are not one field within budget.
+    private static func noticeBody(_ notice: ServerNotice) -> String {
+        guard let detail = notice.detail, !detail.isEmpty else { return notice.text }
+        return DoMoError.truncating(notice.text + "\n" + detail)
+    }
+
+    /// Put a failure row on the transcript, sanitizing all three parts.
+    ///
+    /// Sanitized HERE as well as at the render boundary, and deliberately so.
+    /// `ErrorPresentation.rows` cannot sanitize — `DoMoCore` has no access to
+    /// `DoMoTUI`'s `sanitizeUntrustedText` — and this is the ingress every other
+    /// untrusted string in this file already passes through, so the invariant
+    /// "nothing in `transcript` carries an ESC introducer" holds for the whole
+    /// type rather than for all-but-one of its cases. The renderer sanitizes too
+    /// because it also draws rows that did not come from here.
+    private func appendError(_ parts: (headline: String, message: String, hint: String?)) {
+        transcript.append(.error(
+            headline: sanitizeUntrustedText(parts.headline),
+            message: sanitizeUntrustedText(parts.message),
+            hint: parts.hint.map(sanitizeUntrustedText)
+        ))
+    }
+
     // MARK: Tool call state
 
     /// The tool call currently in flight, if any — what the status line reports so
@@ -369,7 +615,21 @@ public final class EventStore {
         streamingReasoningIndex = nil
     }
 
+    /// Kinds learned from live notices, keyed by the failure text they arrived with,
+    /// so a re-seed can restore a classification the persisted history cannot carry.
+    /// Per-session: cleared with the transcript, because a message is only the same
+    /// failure within the session that produced it.
+    private var kindsByFailureText: [String: String] = [:]
+
+    /// A bound, so a session that fails in a new way every turn cannot grow this
+    /// without limit. Dropping the whole map on overflow costs a generic headline
+    /// after a re-seed, which is exactly the behaviour that existed before it.
+    private static let rememberedKindLimit = 64
+
     private func clearTranscript() {
+        // Fresh data is a sign of life: a re-seed that did NOT reset this would
+        // leave a newly-opened session reporting the previous one's silence.
+        lastEventAt = Date()
         transcript = []
         streamingAssistantIndex = nil
         streamingReasoningIndex = nil

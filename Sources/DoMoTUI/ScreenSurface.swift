@@ -58,6 +58,31 @@ public final class ScreenSurface: TerminalApp {
     /// ``renderSync()`` throws directly instead.
     public var onRenderError: ((DoMoError) -> Void)?
 
+    /// The rows most recently composed for the screen: post-overlay,
+    /// PRE-decoration, exactly `target.rows` entries of exactly `target.columns`
+    /// visible columns.
+    ///
+    /// Retained so an owner can read back what is actually on screen. A mouse
+    /// selection has no other source of truth: the layout tree is rebuilt from
+    /// scratch every frame and its value-type nodes carry no identity, so there is
+    /// nothing content-shaped to anchor a selection to — only the painted page.
+    /// Pre-decoration, so a decorator reading it back sees the frame rather than
+    /// its own last output.
+    public private(set) var lastFrameLines: [String] = []
+
+    /// A last-chance transform on the composed rows, applied immediately before
+    /// the diff.
+    ///
+    /// For decoration that is a function of pointer state rather than of the
+    /// layout tree — a selection highlight — and therefore has no ``LayoutNode``
+    /// to live in.
+    ///
+    /// - Important: it MUST preserve every row's exact visible width.
+    ///   ``AltScreenCore`` throws on a row wider than the terminal and the driver
+    ///   escalates that to ending the session, so a decorator that adds a column
+    ///   does not draw wrong — it hangs up on the user.
+    public var decorateFrame: (([String]) -> [String])?
+
     /// - Parameters:
     ///   - target: where frames land and the object a resize is applied to.
     ///   - focus: the focus ring; inject a pre-populated one, or register regions
@@ -113,6 +138,8 @@ public final class ScreenSurface: TerminalApp {
         if !overlayStack.isEmpty {
             lines = compositeOverlays(lines, termWidth: width, termHeight: height)
         }
+        lastFrameLines = lines
+        if let decorateFrame { lines = decorateFrame(lines) }
         let bytes = try core.frame(
             lines: lines,
             width: width,

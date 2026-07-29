@@ -62,6 +62,69 @@ public enum AgentEvent: Sendable, Hashable {
     /// *completion* order, which is deliberately not the source order the
     /// matching tool-result messages are appended in — see ``ToolDispatch``.
     case toolExecutionEnd(toolCallID: String, toolName: String, result: AgentToolResult, isError: Bool)
+
+    /// Something the run wants the user to see that is not transcript content:
+    /// a retry the client is about to make, a provider failure that ended a
+    /// turn, a runtime error that never became a message.
+    ///
+    /// The single out-of-band channel from the run to the user. Never persisted
+    /// (``SessionPersistenceSink`` only handles ``messageEnd``) and never sent
+    /// to the model — it is display, not conversation.
+    case notice(AgentNotice)
+}
+
+// MARK: - Notice
+
+/// One out-of-band message from a run to whoever is watching it.
+///
+/// `Hashable` and carrying no `DoMoError`, both for the same reason:
+/// ``AgentEvent`` is `Sendable, Hashable`, and `DoMoError` is neither `Hashable`
+/// nor `Equatable` (its `cause` is `any Error`). A failure that wants to reach
+/// the user as an event therefore travels as its already-classified *parts* —
+/// the ``kind`` label plus prose — rather than as the error value. The error
+/// value itself reaches a caller through ``AgentRunResult/failure``, which is
+/// `Sendable`-only and can hold it.
+public struct AgentNotice: Sendable, Hashable {
+    public enum Level: String, Sendable, Hashable { case info, warning, error }
+
+    public var level: Level
+
+    /// Machine-readable family, so a UI special-cases without parsing prose.
+    /// Reserved: `"retry"`, `"provider_error"`, `"runtime_error"`.
+    public var code: String
+
+    /// One line, already truncated with `DoMoError.truncating(_:)` by whoever
+    /// built it — a provider body can be an entire HTML error page.
+    public var text: String
+
+    /// Optional second line: the provider's own words, or the cause-chain tail.
+    public var detail: String?
+
+    /// `DoMoError.Kind.label` when the failing layer knew one, `nil` otherwise.
+    /// A label rather than the kind itself so this stays payload-free and the
+    /// value crosses the wire unchanged.
+    public var kind: String?
+
+    /// How long the message stays relevant. `nil` means "use the consumer's
+    /// default" — a status line that shows notices transiently picks its own
+    /// dwell time, and a transcript that shows them permanently ignores this.
+    public var ttl: Duration?
+
+    public init(
+        level: Level,
+        code: String,
+        text: String,
+        detail: String? = nil,
+        kind: String? = nil,
+        ttl: Duration? = nil
+    ) {
+        self.level = level
+        self.code = code
+        self.text = text
+        self.detail = detail
+        self.kind = kind
+        self.ttl = ttl
+    }
 }
 
 /// A `JSONValue` wrapper so ``AgentEvent`` stays `Hashable`.

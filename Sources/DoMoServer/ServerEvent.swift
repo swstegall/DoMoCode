@@ -13,6 +13,14 @@ import DoMoLLM
 /// there is no generated SDK (that breadth is the sibling-scale surface this
 /// project bounds out). A client that does not recognize the version it is handed
 /// should refuse rather than guess at a shape that may have moved.
+///
+/// This stays `1` across a purely *additive* frame such as ``ServerEvent/notice``.
+/// The reason it can: `ServerClient.parseFrame` decodes each frame with `try?`
+/// and returns `nil` on failure, so a client built before a new `type` existed
+/// drops that one frame and keeps reading the stream — it does not tear the
+/// connection down. Bumping this number instead would make every older client
+/// refuse the whole session over a frame it never needed. Bump it when an
+/// EXISTING frame's shape changes, which is the case `parseFrame` cannot absorb.
 public let serverProtocolVersion = 1
 
 // MARK: - ServerEvent
@@ -76,6 +84,16 @@ public enum ServerEvent: Sendable, Hashable {
     /// the run ended). A subscriber still showing it should dismiss it.
     case permissionResolved(id: String)
 
+    /// Something the run wants the user to see that is not transcript content —
+    /// a retry in progress, a provider failure, a runtime error that never
+    /// became a message. The wire projection of ``DoMoAgent/AgentNotice``.
+    ///
+    /// One case with a *struct* payload rather than a flat parameter list: this
+    /// enum's `Kind`, `CodingKeys`, `encode` and `decode` are all hand-written,
+    /// so each additional case costs four coordinated edits. A struct payload
+    /// can grow a field without touching any of them again.
+    case notice(ServerNotice)
+
     /// Projects one runtime event onto the wire, or `nil` when the event carries
     /// nothing a client needs (an assembly frame that is neither a text nor a
     /// reasoning delta — a snapshot boundary the client reconstructs from the
@@ -113,6 +131,8 @@ public enum ServerEvent: Sendable, Hashable {
                 isError: isError,
                 imageCount: result.images.count
             )
+        case .notice(let notice):
+            return .notice(ServerNotice(notice))
         }
     }
 
@@ -126,7 +146,76 @@ public enum ServerEvent: Sendable, Hashable {
         case .maxTurnsReached: return "max_turns_reached"
         case .stoppedByHook: return "stopped_by_hook"
         case .terminatedByTool: return "terminated_by_tool"
+        case .noProgress: return "no_progress"
         }
+    }
+}
+
+// MARK: - ServerNotice
+
+/// The wire form of ``DoMoAgent/AgentNotice``.
+///
+/// A separate type rather than making `AgentNotice` `Codable` directly, for the
+/// reason the enum's own doc comment gives: the wire vocabulary must be free to
+/// move independently of the runtime's internal shape. The one substantive
+/// difference is `ttl`, which is a `Duration` in the runtime and a plain
+/// millisecond count here — `Duration`'s `Codable` shape is a pair of
+/// implementation-defined integer components, which is not something a
+/// hand-written client should have to reproduce.
+public struct ServerNotice: Sendable, Hashable, Codable {
+    public enum Level: String, Sendable, Hashable, Codable { case info, warning, error }
+
+    public var level: Level
+    /// Machine-readable family. Reserved: `"retry"`, `"provider_error"`,
+    /// `"runtime_error"`.
+    public var code: String
+    /// One line, already truncated by the producer.
+    public var text: String
+    /// Optional second line: the provider's own words, or the cause-chain tail.
+    public var detail: String?
+    /// A ``DoMoCore/DoMoError/Kind/label``, when the failing layer knew one.
+    /// `DoMoError.Kind.labeled(_:)` turns it back into a kind, and answers `nil`
+    /// for a label this build does not recognize.
+    public var kind: String?
+    /// How long the message stays relevant. `nil` means "use the consumer's
+    /// default".
+    public var ttlMilliseconds: Int?
+
+    public init(
+        level: Level,
+        code: String,
+        text: String,
+        detail: String? = nil,
+        kind: String? = nil,
+        ttlMilliseconds: Int? = nil
+    ) {
+        self.level = level
+        self.code = code
+        self.text = text
+        self.detail = detail
+        self.kind = kind
+        self.ttlMilliseconds = ttlMilliseconds
+    }
+
+    /// Project a runtime notice onto the wire. Total: `AgentNotice.Level` and
+    /// `ServerNotice.Level` are the same three raw values, so the `rawValue`
+    /// round-trip cannot fail and does not need a fallback.
+    public init(_ notice: AgentNotice) {
+        self.init(
+            level: Level(rawValue: notice.level.rawValue) ?? .info,
+            code: notice.code,
+            text: notice.text,
+            detail: notice.detail,
+            kind: notice.kind,
+            // The single projection of a `Duration` onto a millisecond count
+            // lives in `DoMoCore`; a second copy here would be a copy that can
+            // drift. A TTL can be built from a `Retry-After` header, which is
+            // text from the far side of a wire, so it must saturate at `Int.max`
+            // ("forever", the right answer for a hostile header) rather than
+            // trap and kill the server — which is exactly what that projection
+            // does.
+            ttlMilliseconds: notice.ttl.map(DoMoError.wholeMilliseconds)
+        )
     }
 }
 
@@ -148,6 +237,7 @@ extension ServerEvent: Codable {
         case toolEnd = "tool_end"
         case permissionRequest = "permission_request"
         case permissionResolved = "permission_resolved"
+        case notice
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -170,6 +260,7 @@ extension ServerEvent: Codable {
         case always
         case metadata
         case disableAlways
+        case notice
     }
 
     public init(from decoder: any Decoder) throws {
@@ -230,6 +321,8 @@ extension ServerEvent: Codable {
             )
         case .permissionResolved:
             self = .permissionResolved(id: try container.decode(String.self, forKey: .id))
+        case .notice:
+            self = .notice(try container.decode(ServerNotice.self, forKey: .notice))
         }
     }
 
@@ -286,6 +379,9 @@ extension ServerEvent: Codable {
         case .permissionResolved(let id):
             try container.encode(Kind.permissionResolved, forKey: .type)
             try container.encode(id, forKey: .id)
+        case .notice(let notice):
+            try container.encode(Kind.notice, forKey: .type)
+            try container.encode(notice, forKey: .notice)
         }
     }
 }

@@ -1,0 +1,1184 @@
+// Copyright (c) 2026 Sam Stegall. MIT license.
+// SPDX-License-Identifier: MIT
+//
+// THE USER'S BUG: "occasionally the session will lose the ability for your typed
+// prompt to query against the model and then you have to make a new session."
+//
+// Mechanically: `ServerRuntime.startRun` refuses while `session.runTask != nil`,
+// and the ONLY thing that nils that slot is the run task itself reaching
+// `finishRun`. `abort(sessionID:)` merely *cancels* — it returns without waiting
+// and never touches the slot. So a run parked on anything that cannot observe
+// cancellation holds the session for the life of the process, and every later
+// prompt 409s forever, with no agent_end ever broadcast so the client sits on
+// "thinking…".
+//
+// `wedgedRunHoldsTheSlotForever` reproduces that end of it exactly.
+// `forceClearFreesAWedgedSlot` proves the new lever gets the session back.
+// `stalledModelStreamEndsTheRunAndTheSessionRecovers` covers the dominant cause —
+// a gateway that sends a head and then stalls — from the transport all the way
+// out to "the next prompt is accepted".
+
+import DoMoAgent
+import DoMoCore
+import DoMoHarness
+import DoMoLLM
+import DoMoPermissions
+import DoMoServer
+import Foundation
+import HTTPTypes
+import JSONSchema
+import Synchronization
+import SystemPackage
+import Testing
+
+@Suite(.serialized)
+struct ServerRuntimeForceClearTests {
+
+    // MARK: - Fixtures
+
+    private struct Dirs {
+        let root: URL
+        let cwd: URL
+        let sessions: URL
+        init() throws {
+            root = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("domo-forceclear-\(UUID().uuidString)", isDirectory: true)
+            cwd = root.appendingPathComponent("work", isDirectory: true)
+            sessions = root.appendingPathComponent("sessions", isDirectory: true)
+            for directory in [cwd, sessions] {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            }
+        }
+        func cleanUp() { try? FileManager.default.removeItem(at: root) }
+    }
+
+    /// A tool that suspends on a plain `withCheckedContinuation` and is therefore
+    /// **uncancellable** — cancelling the run task cannot unwind it.
+    ///
+    /// This is not a contrivance for the test's benefit: it is the general shape
+    /// of everything that produced the reported wedge (a stalled-but-open socket
+    /// read before the transport's idle guard existed, a subprocess that ignores
+    /// SIGTERM, an MCP server that stops answering). The point of `forceClearRun`
+    /// is that it must not depend on the run being able to notice anything.
+    private final class ParkingTool: AgentTool, @unchecked Sendable {
+        private let lock = NSLock()
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        var definition: ToolDefinition {
+            ToolDefinition(name: "park", description: "parks until released", parameters: JSONSchema())
+        }
+
+        func execute(_ arguments: DoMoCore.JSONValue) async throws(DoMoError) -> AgentToolResult {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                waiters.append(continuation)
+                lock.unlock()
+            }
+            return AgentToolResult(output: "released")
+        }
+
+        var parkedCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return waiters.count
+        }
+
+        /// Release the OLDEST parked call, so a test can settle run A while run B
+        /// stays parked.
+        func releaseOne() {
+            lock.lock()
+            let waiter = waiters.isEmpty ? nil : waiters.removeFirst()
+            lock.unlock()
+            waiter?.resume()
+        }
+
+        func releaseAll() {
+            lock.lock()
+            let all = waiters
+            waiters.removeAll()
+            lock.unlock()
+            for waiter in all { waiter.resume() }
+        }
+    }
+
+    /// Turn N emits a `park` tool call for every index in `toolCallTurns`, and a
+    /// final text turn otherwise. Deterministic per invocation count, so a test can
+    /// arrange exactly which runs park and which complete.
+    private static func streamFn(toolCallTurns: Set<Int>) -> AgentStreamFn {
+        let calls = Mutex(0)
+        return { _ in
+            let n = calls.withLock { value in
+                value += 1
+                return value
+            }
+            return AsyncThrowingStream { continuation in
+                continuation.yield(.start(AssistantSnapshot(model: "test-model")))
+                if toolCallTurns.contains(n) {
+                    let call = ToolCallBlock(id: "call_park_\(n)", name: "park", arguments: .object([:]))
+                    continuation.yield(.done(AssistantMessage(
+                        content: [.toolCall(call)], model: "test-model", stopReason: .toolUse
+                    )))
+                } else {
+                    continuation.yield(.done(AssistantMessage(
+                        content: [.text("done \(n)")], model: "test-model", stopReason: .stop
+                    )))
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    /// The same scripted turns, plus a record of every context the runtime handed
+    /// the provider.
+    ///
+    /// What reaches the wire is the only place the force-clear's second failure mode
+    /// is visible: nothing between ``ServerRuntime`` and the gateway sanitizes a
+    /// transcript, so a branch that ends on an unanswered `tool_use` is shipped
+    /// verbatim and Anthropic-behind-LiteLLM answers 400 — the 409 the lever removes,
+    /// re-created one layer down.
+    private static func recordingStreamFn(
+        toolCallTurns: Set<Int>,
+        into recorder: ContextRecorder
+    ) -> AgentStreamFn {
+        let inner = streamFn(toolCallTurns: toolCallTurns)
+        return { context in
+            recorder.record(context.messages)
+            return inner(context)
+        }
+    }
+
+    /// The message lists handed to `streamFn`, in call order.
+    private final class ContextRecorder: Sendable {
+        private let storage = Mutex<[[Message]]>([])
+        func record(_ messages: [Message]) { storage.withLock { $0.append(messages) } }
+        var all: [[Message]] { storage.withLock { $0 } }
+    }
+
+    /// The tool calls in `messages` that no tool result answers.
+    ///
+    /// Deliberately re-derived here rather than shared with the production helper:
+    /// the assertion has to be an independent statement of the API's rule, not a
+    /// re-run of the code it is checking.
+    private static func unansweredToolCallIDs(_ messages: [Message]) -> [String] {
+        var answered: Set<String> = []
+        for case .tool(let result) in messages { answered.insert(result.toolCallID) }
+        var open: [String] = []
+        for case .assistant(let assistant) in messages {
+            for block in assistant.content {
+                if case .toolCall(let call) = block, !answered.contains(call.id) { open.append(call.id) }
+            }
+        }
+        return open
+    }
+
+    private func makeRuntime(
+        _ dirs: Dirs,
+        tools: [any AgentTool],
+        streamFn: @escaping AgentStreamFn,
+        permissions: ServerRuntime.PermissionRuntime? = nil
+    ) -> ServerRuntime {
+        ServerRuntime(config: .init(
+            systemPrompt: "test",
+            tools: tools,
+            model: "test-model",
+            streamFn: streamFn,
+            toolExecution: .sequential,
+            maxTurns: 10,
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path,
+            permissions: permissions
+        ))
+    }
+
+    /// The first broadcast event matching `predicate`, or nil if none arrives in
+    /// `within`. On timeout the reader is cancelled, which also unsubscribes — so a
+    /// test asserting on `subscriberCount` afterwards is asserting on the success
+    /// path only, which is what it wants.
+    private func firstEvent(
+        _ subscription: BroadcastEventSink.Subscription,
+        within: Duration = .seconds(3),
+        matching predicate: @escaping @Sendable (ServerEvent) -> Bool
+    ) async -> ServerEvent? {
+        let reader = Task { () -> ServerEvent? in
+            for await event in subscription.events where predicate(event) { return event }
+            return nil
+        }
+        let timer = Task {
+            try? await Task.sleep(for: within)
+            reader.cancel()
+        }
+        let found = await reader.value
+        timer.cancel()
+        return found
+    }
+
+    /// Poll `condition` up to `within`. Returns whether it ever held.
+    private func eventually(
+        _ within: Duration = .seconds(5),
+        _ condition: @Sendable () async -> Bool
+    ) async -> Bool {
+        var waited = Duration.zero
+        while waited < within {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+            waited += .milliseconds(20)
+        }
+        return await condition()
+    }
+
+    // MARK: - The bug
+
+    @Test("A run that cannot observe cancellation holds the slot forever, and abort does not free it")
+    func wedgedRunHoldsTheSlotForever() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "go", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 }, "the run never reached the parking tool")
+
+        // The slot is held.
+        #expect(await runtime.isRunning(sessionID: session.id))
+        await #expect(throws: ServerRuntimeError.sessionBusy) {
+            try await runtime.startRun(sessionID: session.id, prompt: "again", attachments: [])
+        }
+
+        // THE GAP: abort reports it stopped something, cancels the task — and the
+        // slot is still held, because the run can never reach `finishRun`.
+        #expect(try await runtime.abort(sessionID: session.id) == true)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(
+            await runtime.isRunning(sessionID: session.id),
+            "abort freed the slot — if this ever becomes true, the wedge premise changed"
+        )
+        await #expect(throws: ServerRuntimeError.sessionBusy) {
+            try await runtime.startRun(sessionID: session.id, prompt: "still refused", attachments: [])
+        }
+    }
+
+    // MARK: - The fix
+
+    @Test("forceClearRun frees a slot held by an uncancellable run, and the session takes prompts again")
+    func forceClearFreesAWedgedSlot() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "go", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true, "nothing was reported as held")
+        #expect(await runtime.isRunning(sessionID: session.id) == false, "the slot is still held after a force-clear")
+
+        // The whole point: the session works again, with no new session.
+        try await runtime.startRun(sessionID: session.id, prompt: "second prompt", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered session's run never settled")
+
+        // And the second turn really produced an answer through the REBUILT harness.
+        let messages = try await runtime.messages(sessionID: session.id)
+        #expect(messages.contains { if case .user(let u) = $0 { u.text == "second prompt" } else { false } },
+                "the second prompt did not land: \(messages.count) messages")
+    }
+
+    @Test("forceClearRun is idempotent and reports nothing held on an idle session")
+    func forceClearOnIdleSessionReportsNothingHeld() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = makeRuntime(dirs, tools: [], streamFn: Self.streamFn(toolCallTurns: []))
+        let session = try await runtime.createSession()
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == false)
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == false)
+        // Still usable afterwards.
+        try await runtime.startRun(sessionID: session.id, prompt: "hi", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false })
+    }
+
+    @Test("forceClearRun keeps the session's sink, so live subscribers survive it")
+    func forceClearKeepsTheSink() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        let sink = try await runtime.sink(for: session.id)
+        let subscription = sink.subscribe()
+
+        try await runtime.startRun(sessionID: session.id, prompt: "go", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        try await runtime.forceClearRun(sessionID: session.id)
+
+        // The SAME sink object: rebuilding the state must not orphan an attached
+        // SSE response onto a sink nothing feeds.
+        let after = try await runtime.sink(for: session.id)
+        #expect(after === sink, "force-clear replaced the session's sink and stranded its subscribers")
+
+        // The subscriber is told the run is over, which is the only thing that
+        // un-pins a client's edge-triggered run state.
+        let terminal = await firstEvent(subscription) {
+            if case .agentEnd = $0 { true } else { false }
+        }
+        if case .agentEnd(let reason) = terminal {
+            #expect(reason == "aborted", "terminal frame said \(reason)")
+        } else {
+            Issue.record("no agent_end reached the surviving subscriber")
+        }
+
+        // And the still-attached subscriber keeps receiving from the NEW run.
+        #expect(sink.subscriberCount == 1)
+    }
+
+    @Test("forceClearRun resolves a parked permission prompt")
+    func forceClearResolvesAParkedPrompt() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let ruleset = fromConfig(defaultBaselinePermissionConfig(), homeDirectory: "/home/test")
+        let factory = PermissionRequestFactory(workingDirectory: dirs.cwd.path)
+        // `bash` is asked about by the baseline policy, and the tool parks so the
+        // ask stays open for as long as the test needs it.
+        let tool = GatedParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(
+            dirs,
+            tools: [tool],
+            streamFn: Self.bashCallThenText(),
+            permissions: .init(ruleset: ruleset, factory: factory, persist: { _ in })
+        )
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "run it", attachments: [])
+        #expect(await eventually { (try? await runtime.pendingPermissions(sessionID: session.id))?.isEmpty == false },
+                "the run never parked on a permission prompt")
+
+        let status = try await runtime.status(sessionID: session.id)
+        #expect(status.running)
+        #expect(status.pendingPermissionIDs.count == 1, "status did not project the parked prompt")
+
+        try await runtime.forceClearRun(sessionID: session.id)
+        #expect(try await runtime.pendingPermissions(sessionID: session.id).isEmpty,
+                "a parked prompt survived the force-clear and its tool fiber is leaked")
+        #expect(try await runtime.status(sessionID: session.id).running == false)
+        #expect(try await runtime.status(sessionID: session.id).pendingPermissionIDs.isEmpty)
+    }
+
+    /// The `finishRun` token guard was dead code before force-clear existed (no
+    /// path ever replaced a live `SessionState`). It is load-bearing now: the run
+    /// that force-clear walked away from may settle at ANY later moment, and when
+    /// it does it must not free a slot a different, healthy run is holding.
+    @Test("The doomed run's completion hop cannot free the next run's slot")
+    func forceClearTokenGuardProtectsTheNextRun() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        // Turn 1 (run A) and turn 2 (run B) both park; turns 3+ finish with text.
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1, 2]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        try await runtime.forceClearRun(sessionID: session.id)
+        #expect(await runtime.isRunning(sessionID: session.id) == false)
+
+        // Run B takes the freed slot and parks in its turn.
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { tool.parkedCount == 2 }, "run B never reached the tool")
+        #expect(await runtime.isRunning(sessionID: session.id))
+
+        // Now let the ABANDONED run A finish. It settles, hops to `finishRun` with
+        // its stale token — and must be ignored.
+        tool.releaseOne()
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(
+            await runtime.isRunning(sessionID: session.id),
+            "the abandoned run's completion hop cleared the live run's slot — the token guard is not working"
+        )
+
+        // Run B still settles normally on its own.
+        tool.releaseOne()
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "run B never settled")
+    }
+
+    // MARK: - What force-clear must take away from the run it abandons
+
+    /// The run force-clear walks away from is, by construction, one that cannot be
+    /// stopped — so it is still holding two things the session shares: the JSONL
+    /// file and the broadcast sink. The next two tests are about taking those away.
+    ///
+    /// This one is the file. `forceClearRun` leaves the doomed ``AgentHarness``
+    /// alive with its own persistence sink over the SAME file, and the store's leaf
+    /// is "last entry wins" — so when the doomed run finally settles, its late
+    /// append becomes the file leaf and a file-leaf walk returns the DEAD branch.
+    /// The recovered prompt and the model's answer to it vanish from the transcript
+    /// the client renders.
+    ///
+    /// The pre-existing `forceClearFreesAWedgedSlot` misses this because it never
+    /// lets run A settle: it asserts on the transcript while A is still parked, the
+    /// one window in which the file leaf still happens to be right.
+    @Test("The abandoned run's late writes cannot steal the transcript from the recovered run")
+    func abandonedRunCannotStealTheTranscript() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        // Turn 1 (run A) parks on the tool; every later turn answers with text.
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        try await runtime.forceClearRun(sessionID: session.id)
+
+        // The recovered run takes the freed slot and completes fully.
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+
+        let recovered = try await runtime.messages(sessionID: session.id)
+        #expect(recovered.contains { if case .user(let u) = $0 { u.text == "B" } else { false } },
+                "the recovered prompt is missing before run A even settled")
+        #expect(recovered.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
+                "the recovered answer is missing before run A even settled")
+
+        // NOW let the abandoned run settle, and wait until it has actually appended.
+        let entriesBeforeARan = Self.entryCount(at: session.path)
+        tool.releaseOne()
+        #expect(await eventually { Self.entryCount(at: session.path) > entriesBeforeARan },
+                "run A never wrote to the session file — the premise of this test changed")
+        // Give it the rest of its turn, so the steal is as bad as it can get.
+        try await Task.sleep(for: .milliseconds(300))
+
+        let after = try await runtime.messages(sessionID: session.id)
+        #expect(after.contains { if case .user(let u) = $0 { u.text == "B" } else { false } },
+                "the abandoned run's late append deleted the recovered prompt from the transcript")
+        #expect(after.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
+                "the abandoned run's late append deleted the recovered answer from the transcript")
+        #expect(after.count == recovered.count,
+                "the transcript changed shape when the abandoned run settled: \(recovered.count) -> \(after.count)")
+    }
+
+    /// The transcript steal above is only half closed by walking from the live
+    /// harness's tip, because `forceClearRun` **itself** re-derives a tip from the
+    /// file: it rebuilds the session state from `AgentHarness.open`, whose leaf is
+    /// the file's last entry. So the second press of the lever hands the live
+    /// session the abandoned run's dead branch — and it is durable, because every
+    /// later run is then appended as a child of that branch. The recovered turn is
+    /// gone from the model's *context*, not merely from the rendering.
+    ///
+    /// This is the reviewer's measured sequence, verbatim: park A, force-clear,
+    /// B completes, A settles and appends, force-clear AGAIN, run C.
+    @Test("A second force-clear cannot re-anchor the live session onto the abandoned run's dead branch")
+    func secondForceClearCannotRebaseTheLiveSession() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        // Turn 1 (run A) parks on the tool; every later turn answers with text.
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true)
+
+        // The recovered run takes the freed slot and completes fully.
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+
+        // The abandoned run settles and appends; its tail is now the FILE's leaf.
+        let entriesBeforeARan = Self.entryCount(at: session.path)
+        tool.releaseOne()
+        #expect(await eventually { Self.entryCount(at: session.path) > entriesBeforeARan },
+                "run A never wrote to the session file — the premise of this test changed")
+        try await Task.sleep(for: .milliseconds(300))
+
+        // The lever pressed a second time — on a session that is now perfectly idle,
+        // which the suite already advertises as a safe thing to do.
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == false,
+                "the second press claimed something was held on an idle session")
+
+        try await runtime.startRun(sessionID: session.id, prompt: "C", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "run C never settled")
+
+        let messages = try await runtime.messages(sessionID: session.id)
+        // The linear root→leaf path IS the parent chain, so this single equality says
+        // both "B survived" and "C was appended as a child of B, not of the dead
+        // branch" — a rebase would read ["A", "C"].
+        #expect(Self.userPrompts(messages) == ["A", "B", "C"],
+                "the live branch was re-anchored onto the abandoned run: \(Self.userPrompts(messages))")
+        #expect(messages.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
+                "the recovered run's answer is gone from the context every later run is built from")
+        // The only tool result on the live branch is the lever's own synthetic answer
+        // to the call it abandoned. The real one ("released") is produced by the
+        // abandoned run and belongs to the branch this session walked away from.
+        #expect(!messages.contains { if case .tool(let result) = $0 { result.output == "released" } else { false } },
+                "the abandoned run's tool result is on the live branch")
+        #expect(Self.unansweredToolCallIDs(messages).isEmpty,
+                "the live branch ends on a call nothing answers: \(Self.unansweredToolCallIDs(messages))")
+    }
+
+    /// The same re-anchoring, in the case the "nothing was held" guard does not
+    /// cover: the second force-clear happens while a *later*, healthy run is holding
+    /// the slot, so the state genuinely is rebuilt — and the replacement harness must
+    /// be pinned to the live tip rather than to the file's last entry.
+    ///
+    /// Only `AgentHarness.open(path:configuration:leaf:)` closes this one.
+    @Test("A force-clear that really rebuilds the state pins the replacement to the live tip")
+    func forceClearPinsTheReplacementToTheLiveTip() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        // Turn 1 (run A) and turn 3 (run C) park; turn 2 and turn 4+ answer with text.
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1, 3]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true)
+
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+
+        // A third run takes the slot and parks, so the second force-clear below has
+        // something real to clear.
+        try await runtime.startRun(sessionID: session.id, prompt: "C", attachments: [])
+        #expect(await eventually { tool.parkedCount == 2 }, "run C never reached the tool")
+
+        // Now the abandoned run A settles and moves the FILE's leaf onto its branch.
+        let entriesBeforeARan = Self.entryCount(at: session.path)
+        tool.releaseOne()
+        #expect(await eventually { Self.entryCount(at: session.path) > entriesBeforeARan },
+                "run A never wrote to the session file — the premise of this test changed")
+        try await Task.sleep(for: .milliseconds(300))
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true,
+                "run C was not reported as held")
+
+        try await runtime.startRun(sessionID: session.id, prompt: "D", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "run D never settled")
+
+        let messages = try await runtime.messages(sessionID: session.id)
+        #expect(Self.userPrompts(messages) == ["A", "B", "C", "D"],
+                "the rebuilt harness adopted the file's leaf: \(Self.userPrompts(messages))")
+        #expect(messages.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
+                "the recovered run's answer is gone from the context every later run is built from")
+        // As above: the seals belong to the live branch, the "released" results to the
+        // branches the lever walked away from.
+        #expect(!messages.contains { if case .tool(let result) = $0 { result.output == "released" } else { false } },
+                "the abandoned run's tool result is on the live branch")
+        #expect(Self.unansweredToolCallIDs(messages).isEmpty,
+                "the live branch ends on a call nothing answers: \(Self.unansweredToolCallIDs(messages))")
+    }
+
+    /// Nothing held means nothing to clear, and rebuilding the state anyway is not
+    /// merely wasted work: re-opening the file is exactly how the abandoned run's
+    /// branch gets adopted (see the two tests above). So an idle force-clear must not
+    /// read the session file at all.
+    ///
+    /// Removing the file is a probe for that, not a scenario: with the file gone, any
+    /// re-open of it fails loudly, so this is a deterministic assertion on "did it
+    /// touch the file" rather than a timing measurement.
+    @Test("Force-clearing an idle session does not rebuild its harness from the file")
+    func forceClearOnAnIdleSessionDoesNotRebuildTheHarness() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = makeRuntime(dirs, tools: [], streamFn: Self.streamFn(toolCallTurns: []))
+        let session = try await runtime.createSession()
+
+        try await runtime.startRun(sessionID: session.id, prompt: "hi", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the run never settled")
+
+        try FileManager.default.removeItem(atPath: session.path)
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == false,
+                "an idle force-clear re-opened the session file")
+    }
+
+    /// The user prompts along a rendered transcript, in order.
+    private static func userPrompts(_ messages: [Message]) -> [String] {
+        messages.compactMap { if case .user(let user) = $0 { user.text } else { nil } }
+    }
+
+    // MARK: - The lever must be total
+
+    /// `forceClearRun` is the escape hatch of last resort, so a *refusal* from it is
+    /// worse than anything it could refuse over: the slot stays held and every later
+    /// prompt 409s, which is the reported bug with its last exit removed.
+    ///
+    /// This is the case that produced it. Pinning the replacement to the live tip is
+    /// right, but the live tip lives in memory and the file is allowed to be behind
+    /// it: `JSONLines.appendBytes` ("the previous process died between writing an
+    /// entry and writing its newline") and `SessionTree.load` ("a crash-truncated
+    /// tail … never fatal — because this is the resume path") both say so in as many
+    /// words. A tip that is not in the file can therefore never come back, so a
+    /// strict pin that propagates its refusal fails identically on every retry —
+    /// permanently, unlike every other reason a re-open can fail.
+    ///
+    /// The answer is the nearest ancestor of the live tip that the file still has:
+    /// an ancestor of the live tip is on the live branch by construction, so it can
+    /// never be the abandoned run's branch, and it keeps whatever context survived —
+    /// here, everything but the torn entry.
+    @Test("A force-clear recovers a session whose live tip was lost to a torn final line")
+    func forceClearSurvivesATornSessionTail() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+        // Header + the user turn + the assistant turn that called the tool. The last
+        // of those IS the live tip, which is what makes the damage below the exact
+        // case the pin cannot survive.
+        #expect(await eventually { Self.entryCount(at: session.path) >= 3 },
+                "the parked run had not written its assistant turn yet")
+
+        try Self.truncateFinalLine(at: session.path)
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true,
+                "the lever refused a session whose file lost its final line")
+        #expect(await runtime.isRunning(sessionID: session.id) == false, "the slot is still held")
+
+        // And the session is genuinely usable again, on the branch it was on.
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+        let messages = try await runtime.messages(sessionID: session.id)
+        #expect(Self.userPrompts(messages) == ["A", "B"],
+                "the recovery did not continue from the nearest surviving ancestor: \(Self.userPrompts(messages))")
+    }
+
+    /// The floor of the same rule. When *nothing* the live harness ever stood on is
+    /// still in the file, there is no ancestor to fall back to — and the answer is
+    /// still not "adopt whatever branch the file ends on", because that is the branch
+    /// switch the pin exists to prevent. An explicitly empty branch is the correct
+    /// worst case: the session is usable, the surviving entries stay on disk and
+    /// reachable through `children(sessionID:parent:)`, and no foreign conversation
+    /// is silently adopted as this session's own.
+    @Test("With no surviving ancestor a force-clear falls back to an explicitly empty branch")
+    func forceClearFallsBackToAnEmptyBranch() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+        #expect(await eventually { Self.entryCount(at: session.path) >= 3 })
+
+        // Replace every entry with one this session was never on, so the file has a
+        // perfectly resolvable leaf that belongs to nobody live.
+        try Self.keepOnlyHeader(at: session.path)
+        let store = JSONLSessionStore(path: FilePath(session.path))
+        try store.appendEntry(SessionTreeEntry(
+            id: "foreign-entry",
+            parentId: nil,
+            timestamp: "2026-01-01T00:00:00.000Z",
+            payload: .message(.user("foreign"))
+        ))
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true,
+                "the lever refused a session whose branch is entirely gone")
+        #expect(try await runtime.messages(sessionID: session.id).isEmpty,
+                "the recovered session adopted a branch it was never on")
+
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+        #expect(Self.userPrompts(try await runtime.messages(sessionID: session.id)) == ["B"],
+                "the recovered turn did not land on the empty branch it was pinned to")
+    }
+
+    /// A session recovered from the 409 must not land straight in a permanent 400.
+    ///
+    /// The lever exists precisely for tools that never return — and a tool that never
+    /// returns never produces the `tool_result` its `tool_use` requires, so the branch
+    /// it pins ends on an assistant turn nothing answers. Nothing between
+    /// `buildContextMessages` and the wire repairs that (`ContextBuilder` projects
+    /// entries verbatim), and the codebase already knows this API validates tool
+    /// history — `Context.hasToolHistory` says so. Every later prompt on the
+    /// "recovered" session would therefore be rejected by the gateway.
+    ///
+    /// So the lever seals what it abandons: a synthetic error result for every
+    /// unanswered call on the pinned branch, the same shape `drainPending` gives a
+    /// parked permission prompt.
+    @Test("A force-cleared session never hands the provider an unanswered tool call")
+    func forceClearLeavesNoUnansweredToolCallInTheNextRequest() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let contexts = ContextRecorder()
+        let runtime = makeRuntime(
+            dirs,
+            tools: [tool],
+            streamFn: Self.recordingStreamFn(toolCallTurns: [1], into: contexts)
+        )
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true)
+
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+
+        let requests = contexts.all
+        #expect(requests.count >= 2, "the recovered run never reached the provider")
+        for (index, messages) in requests.enumerated() {
+            #expect(Self.unansweredToolCallIDs(messages).isEmpty,
+                    "request \(index) would be rejected: unanswered \(Self.unansweredToolCallIDs(messages))")
+        }
+        // The seal is a real, addressed answer — not a padding user turn.
+        let branch = try await runtime.messages(sessionID: session.id)
+        #expect(
+            branch.contains {
+                if case .tool(let result) = $0 { result.toolCallID == "call_park_1" && result.isError } else { false }
+            },
+            "the abandoned call was never answered on the live branch: \(branch.count) messages"
+        )
+    }
+
+    /// And this one is the sink. `startRun` used to hand the run `session.sink`
+    /// itself, and `forceClearRun` deliberately carries that same object into the
+    /// replacement state — so the `finishRun` token guard protected the SLOT and
+    /// nothing protected the STREAM. The abandoned run's terminal `agent_end` folds
+    /// a client to `runState = .idle` while a *different* run holds the slot; the
+    /// user types and gets a 409. That is the reported bug, re-created by its own
+    /// escape hatch.
+    ///
+    /// `forceClearTokenGuardProtectsTheNextRun` releases run A too, but asserts only
+    /// on `isRunning` — it never looks at what reached the subscribers.
+    @Test("A run that force-clear abandoned cannot emit into the live session's stream")
+    func abandonedRunCannotEmitIntoTheLiveStream() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        // Turn 1 (run A) and turn 2 (run B) both park; turns 3+ finish with text.
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1, 2]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        try await runtime.forceClearRun(sessionID: session.id)
+
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { tool.parkedCount == 2 }, "run B never reached the tool")
+
+        // Subscribe only NOW, with run B parked and holding the slot, so every frame
+        // this subscriber sees is one emitted while B owns the session.
+        let sink = try await runtime.sink(for: session.id)
+        let subscription = sink.subscribe()
+        let collected = Mutex<[ServerEvent]>([])
+        let reader = Task {
+            for await event in subscription.events { collected.withLock { $0.append(event) } }
+        }
+        defer { reader.cancel() }
+
+        // Let the ABANDONED run A settle: its loop wants to emit a tool_end for
+        // call_park_1, a tool-result message, a whole further assistant turn, and a
+        // terminal agent_end.
+        tool.releaseOne()
+        try await Task.sleep(for: .milliseconds(800))
+
+        let strays = collected.withLock { $0 }
+        #expect(strays.isEmpty,
+                "the abandoned run emitted \(strays.count) frames into the live run's stream: \(strays)")
+        #expect(await runtime.isRunning(sessionID: session.id), "run B lost the slot")
+
+        // …and the subscriber is genuinely live, so the assertion above is not
+        // vacuously true: run B's own frames still reach it.
+        tool.releaseOne()
+        #expect(await eventually { collected.withLock { !$0.isEmpty } },
+                "the subscriber received nothing from run B either — the emptiness check proved nothing")
+        #expect(
+            collected.withLock { $0.contains { if case .agentEnd = $0 { true } else { false } } },
+            "run B's own terminal frame never arrived"
+        )
+    }
+
+    /// Two overlapping force-clears: `forceClearRun` releases the actor before it
+    /// mutates anything, so both callers capture the same `SessionState` and the
+    /// loser resumes to find it replaced. Reporting `sessionNotFound` there — a 404
+    /// for a session the user is looking at — contradicts the method's advertised
+    /// idempotence; a double-press on the diagnostics panel's force-clear row is
+    /// exactly this.
+    @Test("Overlapping force-clears both succeed rather than 404-ing the loser")
+    func overlappingForceClearsDoNotReportTheSessionMissing() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        let sessionID = session.id
+        let results = try await withThrowingTaskGroup(of: Bool.self) { group in
+            for _ in 0..<4 {
+                group.addTask { try await runtime.forceClearRun(sessionID: sessionID) }
+            }
+            var collected: [Bool] = []
+            for try await result in group { collected.append(result) }
+            return collected
+        }
+
+        #expect(results.count == 4)
+        #expect(results.contains(true), "no caller reported the wedged run as held")
+        // And the session is intact and usable, which is the whole point.
+        #expect(try await runtime.status(sessionID: sessionID).running == false)
+        try await runtime.startRun(sessionID: sessionID, prompt: "after", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: sessionID) == false })
+    }
+
+    /// `forceClearRun` re-opens the session file, which parses the whole thing. That
+    /// parse used to run **on the runtime actor**, so every other session's calls —
+    /// `startRun`, `abort`, `resolvePermission`, the `isRunning` read behind the SSE
+    /// `connected(running:)` frame — queued behind it. This lever is pulled exactly
+    /// when the runtime is already unhealthy, which is the worst possible moment to
+    /// stop serving every other session for the length of a multi-second parse.
+    ///
+    /// Self-calibrating rather than absolute: it measures the parse it actually got
+    /// on this machine and requires the unrelated read to be a small fraction of it,
+    /// so it does not encode a wall-clock assumption. The premise check fails loudly
+    /// if the padding stopped being slow enough to mean anything.
+    @Test("Re-opening a session file for a force-clear does not stall the rest of the actor")
+    func forceClearParsesOffTheActor() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let big = try await runtime.createSession()
+        let other = try await runtime.createSession()
+        // The lever only rebuilds a state when something is actually holding one, so
+        // park a run first — and pad only afterwards, so the run's own context build
+        // stays cheap and the whole parse cost lands where this test measures it.
+        try await runtime.startRun(sessionID: big.id, prompt: "go", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+        // Lines the tolerant bulk read must decode and reject: enough of them that
+        // the parse dominates any scheduling noise.
+        try Self.padWithUnparseableEntries(at: big.path, lines: 100_000)
+
+        let parseDuration = Mutex(Duration.zero)
+        let clock = ContinuousClock()
+        let clearing = Task {
+            let start = clock.now
+            try await runtime.forceClearRun(sessionID: big.id)
+            parseDuration.withLock { $0 = clock.now - start }
+        }
+        // Land inside the parse, then ask an unrelated question of the same actor.
+        try await Task.sleep(for: .milliseconds(50))
+        let probeStart = clock.now
+        _ = await runtime.isRunning(sessionID: other.id)
+        let probe = clock.now - probeStart
+        try await clearing.value
+
+        let parse = parseDuration.withLock { $0 }
+        #expect(parse > .milliseconds(200),
+                "the padded file parsed in \(parse) — too fast for this test to prove anything")
+        #expect(probe < parse / 4,
+                "an unrelated read waited \(probe) behind a \(parse) session-file parse")
+    }
+
+    /// Non-empty JSONL lines in a session file — the entry count, without parsing.
+    private static func entryCount(at path: String) -> Int {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+        return text.split(separator: "\n").count
+    }
+
+    /// Drop the file's final line.
+    ///
+    /// Not a contrivance: it is the exact damage the storage layer says it expects —
+    /// `JSONLines.appendBytes` ("the previous process died between writing an entry
+    /// and writing its newline"), `persistMessage` ("an interruption damages at most
+    /// the final line") — and the tolerant bulk read drops what is left of it, so the
+    /// entry simply is not in the tree any more.
+    private static func truncateFinalLine(at path: String) throws {
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        var lines = text.split(separator: "\n").map(String.init)
+        #expect(lines.count > 1, "nothing to truncate in \(path)")
+        lines.removeLast()
+        try (lines.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    /// Keep the header and drop every entry — the worst case a live harness's branch
+    /// can be in while the file is still a valid session.
+    private static func keepOnlyHeader(at path: String) throws {
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        let header = try #require(text.split(separator: "\n").first.map(String.init))
+        try (header + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    /// Append `lines` well-formed JSON objects that are not session entries. The
+    /// store reads entries tolerantly, so they are skipped — after being decoded and
+    /// rejected one at a time, which is the cost this measures.
+    private static func padWithUnparseableEntries(at path: String, lines: Int) throws {
+        var noise = ""
+        noise.reserveCapacity(lines * 48)
+        for index in 0..<lines {
+            noise += "{\"noise\":\(index),\"pad\":\"aaaaaaaaaaaaaaaaaaaaaaaa\"}\n"
+        }
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(noise.utf8))
+    }
+
+    // MARK: - status
+
+    @Test("status reports running, the run start, parked prompt ids and subscriber count")
+    func statusProjection() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        let idle = try await runtime.status(sessionID: session.id)
+        #expect(idle.sessionID == session.id)
+        #expect(idle.running == false)
+        #expect(idle.runStartedAt == nil, "an idle session must not claim a run start")
+        #expect(idle.pendingPermissionIDs.isEmpty)
+        #expect(idle.subscribers == 0)
+
+        let sink = try await runtime.sink(for: session.id)
+        let subscription = sink.subscribe()
+        defer { sink.unsubscribe(subscription.id) }
+
+        try await runtime.startRun(sessionID: session.id, prompt: "go", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        let busy = try await runtime.status(sessionID: session.id)
+        #expect(busy.running)
+        #expect(busy.subscribers == 1)
+        let startedAt = try #require(busy.runStartedAt, "a running session must carry a run start")
+        // ISO8601 with fractional seconds, the same shape the session header uses.
+        #expect(sessionTimestampParser().date(from: startedAt) != nil,
+                "runStartedAt is not a parseable ISO8601 timestamp: \(startedAt)")
+
+        // And it is cleared again once the slot frees.
+        try await runtime.forceClearRun(sessionID: session.id)
+        let cleared = try await runtime.status(sessionID: session.id)
+        #expect(cleared.running == false)
+        #expect(cleared.runStartedAt == nil)
+        #expect(cleared.subscribers == 1, "the surviving subscriber must still be counted")
+    }
+
+    /// `finishRun` clears `runStartedAt` beside `runTask`. Nothing pinned that:
+    /// every existing `runStartedAt == nil` assertion is on a session that never
+    /// ran, or is taken after a force-clear (which installs a brand-new state, so
+    /// the field is nil regardless). Deleting the line left the suite green, which
+    /// means "running: false next to a run start from 14 minutes ago" was unguarded.
+    @Test("A run that completes on its own leaves no stale run start behind")
+    func naturallyCompletedRunClearsTheRunStart() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = makeRuntime(dirs, tools: [], streamFn: Self.streamFn(toolCallTurns: []))
+        let session = try await runtime.createSession()
+
+        try await runtime.startRun(sessionID: session.id, prompt: "hi", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the run never settled")
+
+        let status = try await runtime.status(sessionID: session.id)
+        #expect(status.running == false)
+        #expect(status.runStartedAt == nil, "a naturally-completed run left a stale run start")
+    }
+
+    @Test("status and forceClearRun are not-found for an unknown session")
+    func unknownSessionIsNotFound() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = makeRuntime(dirs, tools: [], streamFn: Self.streamFn(toolCallTurns: []))
+        await #expect(throws: ServerRuntimeError.sessionNotFound) {
+            _ = try await runtime.status(sessionID: "nope")
+        }
+        await #expect(throws: ServerRuntimeError.sessionNotFound) {
+            _ = try await runtime.forceClearRun(sessionID: "nope")
+        }
+    }
+
+    // MARK: - The dominant root cause, end to end
+
+    /// A transport that answers with a committed 200 and then goes quiet: the
+    /// exact shape `AsyncHTTPClientTransport` faces, since `execute(_:timeout:)`
+    /// bounds only time-to-response-head. `idle == nil` reproduces the pre-fix
+    /// unbounded body.
+    private struct StallingTransport: StreamingTransport {
+        let idle: Duration?
+
+        func execute(
+            request: HTTPRequest,
+            body: [UInt8]?,
+            timeout: Duration?
+        ) async throws -> StreamingResponse {
+            var head = HTTPResponse(status: .ok)
+            head.headerFields[.contentType] = "text/event-stream"
+            let raw = AsyncThrowingStream<[UInt8], any Error> { continuation in
+                continuation.yield(Array(#"data: {"choices":[{"delta":{"content":"hel"}}]}"#.utf8) + Array("\n\n".utf8))
+                // Never finished, never failed. Still "connected".
+            }
+            let guarded = idle.map { idleGuarded(raw, idle: $0, overall: .seconds(60)) } ?? raw
+            return StreamingResponse(head: head, body: guarded)
+        }
+    }
+
+    private func stallingStreamFn(idle: Duration?) -> AgentStreamFn {
+        let client = LiteLLMClient(
+            configuration: .init(baseURL: "http://127.0.0.1:1/v1", maxRetries: 0),
+            transport: StallingTransport(idle: idle)
+        )
+        return { context in client.streamCompletion(model: "test-model", context: context) }
+    }
+
+    @Test("A stalled model stream wedges the session when nothing bounds the body")
+    func stalledModelStreamWedgesTheSession() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = makeRuntime(dirs, tools: [], streamFn: stallingStreamFn(idle: nil))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "hello", attachments: [])
+
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(await runtime.isRunning(sessionID: session.id),
+                "the unbounded stall did not wedge the run — the premise of this fix changed")
+        await #expect(throws: ServerRuntimeError.sessionBusy) {
+            try await runtime.startRun(sessionID: session.id, prompt: "second", attachments: [])
+        }
+
+        // …and force-clear is the way out even for this one.
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true)
+        try await runtime.startRun(sessionID: session.id, prompt: "after clear", attachments: [])
+    }
+
+    @Test("With the idle guard the stalled stream ends the run and the session takes the next prompt")
+    func stalledModelStreamEndsTheRunAndTheSessionRecovers() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = makeRuntime(dirs, tools: [], streamFn: stallingStreamFn(idle: .milliseconds(200)))
+
+        let session = try await runtime.createSession()
+        let sink = try await runtime.sink(for: session.id)
+        let subscription = sink.subscribe()
+        defer { sink.unsubscribe(subscription.id) }
+
+        try await runtime.startRun(sessionID: session.id, prompt: "hello", attachments: [])
+
+        // The run TERMINATES on its own — no force-clear, no abort, no new session.
+        #expect(await eventually(.seconds(10)) { await runtime.isRunning(sessionID: session.id) == false },
+                "the guarded stall still wedged the run")
+
+        // And exactly one terminal frame was broadcast, so a client cannot be left
+        // pinned on "thinking…".
+        let terminal = await firstEvent(subscription) {
+            if case .agentEnd = $0 { true } else { false }
+        }
+        #expect(terminal != nil, "no agent_end after the stalled stream failed")
+
+        // THE ACTUAL USER-VISIBLE FIX: the next prompt is accepted.
+        try await runtime.startRun(sessionID: session.id, prompt: "second prompt", attachments: [])
+        #expect(await eventually(.seconds(10)) { await runtime.isRunning(sessionID: session.id) == false })
+        let messages = try await runtime.messages(sessionID: session.id)
+        #expect(messages.contains { if case .user(let u) = $0 { u.text == "second prompt" } else { false } })
+    }
+
+    // MARK: - Gated fixture
+
+    /// Named `bash` so the baseline policy asks about it; parks so the ask stays
+    /// open.
+    private final class GatedParkingTool: AgentTool, @unchecked Sendable {
+        private let lock = NSLock()
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        var definition: ToolDefinition {
+            ToolDefinition(name: "bash", description: "bash", parameters: JSONSchema())
+        }
+
+        func execute(_ arguments: DoMoCore.JSONValue) async throws(DoMoError) -> AgentToolResult {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                waiters.append(continuation)
+                lock.unlock()
+            }
+            return AgentToolResult(output: "ran")
+        }
+
+        func releaseAll() {
+            lock.lock()
+            let all = waiters
+            waiters.removeAll()
+            lock.unlock()
+            for waiter in all { waiter.resume() }
+        }
+    }
+
+    private static func bashCallThenText() -> AgentStreamFn {
+        let calls = Mutex(0)
+        return { _ in
+            let n = calls.withLock { value in
+                value += 1
+                return value
+            }
+            return AsyncThrowingStream { continuation in
+                continuation.yield(.start(AssistantSnapshot(model: "test-model")))
+                if n == 1 {
+                    let call = ToolCallBlock(
+                        id: "call_bash",
+                        name: "bash",
+                        arguments: .object(["command": .string("rm -rf /tmp/x")])
+                    )
+                    continuation.yield(.done(AssistantMessage(
+                        content: [.toolCall(call)], model: "test-model", stopReason: .toolUse
+                    )))
+                } else {
+                    continuation.yield(.done(AssistantMessage(
+                        content: [.text("done")], model: "test-model", stopReason: .stop
+                    )))
+                }
+                continuation.finish()
+            }
+        }
+    }
+}
+
+/// The exact option set the session header uses, so a timestamp assertion is
+/// pinned to the real format rather than to "some ISO8601-ish string".
+private func sessionTimestampParser() -> ISO8601DateFormatter {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}

@@ -180,6 +180,21 @@ public enum AssemblyEvent: Sendable, Hashable {
     case toolCallDelta(blockIndex: Int, delta: String)
     case toolCallEnd(blockIndex: Int, toolCall: ToolCallBlock, snapshot: AssistantSnapshot)
 
+    /// The client is about to retry this request after a busy, overloaded or
+    /// transient failure.
+    ///
+    /// Non-terminal, and carries no snapshot: it is emitted *before* a stream
+    /// exists, so it must never be mistaken for content. Purely informational —
+    /// the turn goes on to succeed or fail exactly as it would have. It rides
+    /// here rather than on a client callback because the stream is already the
+    /// out-of-band channel from the LLM layer to the loop, and a callback on a
+    /// process-wide ``LiteLLMClient`` cannot know which session is listening.
+    ///
+    /// A consumer that folds assembly events into a message must skip this
+    /// before any "have we started yet" guard: every retry happens before the
+    /// first `.start`, so a guard placed above it drops every one of them.
+    case retrying(RetryNotice)
+
     /// The turn ended and its content is usable, truncation included.
     case done(AssistantMessage)
 

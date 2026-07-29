@@ -252,6 +252,12 @@ let package = Package(
             name: "DoMoClient",
             dependencies: [
                 "DoMoCore", "DoMoServer", "DoMoLLM", "DoMoHarness", "DoMoPermissions",
+                // DoMoExec is the package's single image loader
+                // (`ImageAttachmentLoader`) and its single filesystem seam. The
+                // client reads a dropped file locally before staging it, so it
+                // needs both. Already in the graph via DoMoHarness — this adds no
+                // third-party dependency and no new build edge of consequence.
+                "DoMoExec",
                 "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoToolsUI",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Logging", package: "swift-log"),
@@ -392,7 +398,7 @@ let package = Package(
             name: "DoMoClientTests",
             dependencies: [
                 "DoMoClient", "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent", "DoMoPermissions",
-                "DoMoHarness", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics",
+                "DoMoHarness", "DoMoExec", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],

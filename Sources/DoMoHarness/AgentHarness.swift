@@ -39,9 +39,26 @@ public actor AgentHarness {
     /// read; owns no tip.
     private let store: JSONLSessionStore
 
+    /// Every tip this harness has stood on, oldest first: the one it was opened
+    /// with (if any), then each entry it has appended since.
+    ///
+    /// This is a **parent chain by construction**, not a log that happens to look
+    /// like one: the only two places that move the tip — ``persistMessage(_:)`` and
+    /// ``compactIfNeeded()`` — both write the new entry with `parentId: leaf` and
+    /// then make it the tip, so element *i* is the parent of element *i+1*. That is
+    /// what makes ``leafLineage`` a usable answer to "which ancestor of this tip
+    /// does the file still have", for a caller re-opening a session whose file is
+    /// behind the tip — see ``open(path:configuration:preferring:)``.
+    ///
+    /// It costs one entry id per persisted message, against a design that already
+    /// re-parses the whole session file on every turn; the id is what the file
+    /// stores anyway.
+    private var leafChain: [String]
+
     /// The active tip. `nil` for a session with no entries yet. This is the one
-    /// piece of mutable state the actor exists to protect.
-    private var leaf: String?
+    /// piece of mutable state the actor exists to protect — derived from
+    /// ``leafChain`` rather than stored beside it, so the two cannot drift.
+    private var leaf: String? { leafChain.last }
 
     private let configuration: Configuration
 
@@ -52,7 +69,7 @@ public actor AgentHarness {
 
     private init(store: JSONLSessionStore, leaf: String?, configuration: Configuration) {
         self.store = store
-        self.leaf = leaf
+        self.leafChain = leaf.map { [$0] } ?? []
         self.configuration = configuration
     }
 
@@ -203,6 +220,123 @@ public actor AgentHarness {
         return AgentHarness(store: store, leaf: tree.leafID, configuration: configuration)
     }
 
+    /// Opens an existing session file and continues from a tip the **caller**
+    /// supplies, instead of recovering one from the file's last entry.
+    ///
+    /// ``open(path:configuration:)`` reconstructs the tip exactly as the store does
+    /// — last entry wins — which is the right answer for a cold resume and the
+    /// wrong one whenever a *live* harness already knows which branch the session
+    /// is on. Two harnesses can share a file: `ServerRuntime.forceClearRun` walks
+    /// away from a wedged run whose harness cannot be stopped and keeps its own
+    /// persistence sink over the same file, so when that run eventually settles its
+    /// late append becomes the file's last entry. Re-deriving a tip from the file
+    /// at that point silently moves the session onto the abandoned run's dead
+    /// branch, and because every later turn is then appended as a child of it, the
+    /// recovered turn disappears from the model's context and not merely from the
+    /// rendering. The live harness's own ``currentLeafID`` is the only authority on
+    /// the branch a session is actually on; the file is the authority only on what
+    /// is written to it.
+    ///
+    /// - Parameter leaf: The entry to continue from, which must be present in the
+    ///   file — an absent tip is refused rather than quietly downgraded to the
+    ///   file's own leaf, because that downgrade *is* the branch switch this entry
+    ///   point exists to prevent. `nil` pins an **empty** tip (a session whose live
+    ///   branch has nothing on it yet); it does not mean "use the file's".
+    ///
+    /// The refusal is right and is *not* a recovery path: the file is allowed to be
+    /// behind a live tip, and a tip it lost can never come back, so a caller that
+    /// must not fail — the force-clear lever — cannot be built on this entry point.
+    /// It uses ``open(path:configuration:preferring:)``, which degrades along the
+    /// live branch instead of refusing.
+    public static func open(
+        path: FilePath,
+        configuration: Configuration,
+        leaf: String?
+    ) throws -> AgentHarness {
+        let store = try JSONLSessionStore.open(
+            path: path,
+            now: configuration.now,
+            entryIDFactory: configuration.entryIDFactory
+        )
+        // Checked here rather than trusted: a harness whose tip is not in its file
+        // cannot build a context or persist a child, and every read of it would
+        // throw far from the call that chose the tip.
+        if let leaf {
+            let tree = try SessionTree.load(from: store)
+            guard tree.entry(withID: leaf) != nil else {
+                throw DoMoError(
+                    .file(path: path, errno: nil),
+                    "Cannot open a session pinned to an entry that is not in the file: \(leaf)"
+                )
+            }
+        }
+        return AgentHarness(store: store, leaf: leaf, configuration: configuration)
+    }
+
+    /// Opens an existing session file and continues from the **first tip in
+    /// `preferredLeaves` this file can actually resolve**, or from an explicitly
+    /// empty branch when it can resolve none.
+    ///
+    /// This is the recovery counterpart to the strict ``open(path:configuration:leaf:)``
+    /// above, and it exists because that strictness is unusable on its own for a
+    /// caller that must not fail. `ServerRuntime.forceClearRun` is the lever of last
+    /// resort for a session whose run cannot be stopped; the tip it must pin lives in
+    /// the live harness's memory, and the *file* is explicitly allowed to be behind
+    /// it — `JSONLines`' own append ("the previous process died between writing an
+    /// entry and writing its newline"), ``SessionTree/load(from:onSkippedLine:)``
+    /// ("a crash-truncated tail … never fatal — because this is the resume path"),
+    /// ``persistMessage(_:)`` ("an interruption damages at most the final line").
+    /// A tip the file lost can never come
+    /// back, so a refusal there is not retryable the way every other re-open failure
+    /// is: it is permanent, and it welds shut the one escape hatch the session has.
+    ///
+    /// Passing the live harness's ``leafLineage`` therefore degrades instead of
+    /// refusing, and does so **by construction rather than by reasoning**: every
+    /// candidate is an ancestor of the live tip, so whichever one is chosen is on the
+    /// live branch — it can never be some other harness's branch, which is the one
+    /// outcome the strict pin exists to prevent. Falling all the way through to `nil`
+    /// keeps that property (an empty branch is nobody's) and keeps the session usable;
+    /// the entries that survived stay on disk and reachable through the tree, they are
+    /// simply no longer the branch this harness continues.
+    ///
+    /// A candidate is accepted only if the file can resolve its whole chain, not
+    /// merely if the entry is present: the bulk read is tolerant of a malformed line
+    /// *anywhere*, while ``SessionTree/branch(from:)`` and
+    /// ``SessionTree/pathToRootOrCompaction(from:)`` throw on the hole it leaves. A
+    /// present-but-unresolvable tip would open cleanly and then fail on every read
+    /// and every turn — a session that takes prompts and answers none.
+    public static func open(
+        path: FilePath,
+        configuration: Configuration,
+        preferring preferredLeaves: [String]
+    ) throws -> AgentHarness {
+        let store = try JSONLSessionStore.open(
+            path: path,
+            now: configuration.now,
+            entryIDFactory: configuration.entryIDFactory
+        )
+        let tree = try SessionTree.load(from: store)
+        // Two tiers, strongest first.
+        //
+        // `branch(from:)` walks the full parent chain to the root; succeeding there
+        // implies the shorter `pathToRootOrCompaction` walk a turn takes succeeds
+        // too. But that implication only runs one way, and it is the CONVERSE this
+        // gate needs. A compacted session resolves a turn only as far back as its
+        // checkpoint, so a hole BELOW the checkpoint fails `branch` while leaving
+        // every read a turn actually performs intact. Gating on `branch` alone
+        // therefore rejected every candidate and fell through to an empty branch —
+        // force-clear silently discarding a whole compacted conversation that was
+        // still perfectly usable.
+        //
+        // So: prefer a candidate whose entire history resolves, and settle for one
+        // that resolves as far as a turn will ever look. Both tiers only ever accept
+        // an ancestor of the live tip, so the by-construction property holds — the
+        // chosen leaf is on the live branch and can never be another harness's.
+        let pinned = preferredLeaves.first { (try? tree.branch(from: $0)) != nil }
+            ?? preferredLeaves.first { (try? tree.pathToRootOrCompaction(from: $0)) != nil }
+        return AgentHarness(store: store, leaf: pinned, configuration: configuration)
+    }
+
     /// Forks the active path into a new session file whose header names this
     /// session as its parent, returning a harness over the fork.
     ///
@@ -231,6 +365,15 @@ public actor AgentHarness {
     /// The current tip.
     public var currentLeafID: String? { leaf }
 
+    /// The current tip followed by the ancestors of it this harness itself knows,
+    /// most recent first — see ``leafChain``.
+    ///
+    /// Ordered tip-first because that is the order a recovery wants to try them in:
+    /// the tip if it can be had, then as little of the branch given up as possible.
+    /// The list is what ``open(path:configuration:preferring:)`` consumes; it is
+    /// empty exactly when the tip is.
+    public var leafLineage: [String] { leafChain.reversed() }
+
     /// The messages the next turn would be seeded with, resolved from the current
     /// path exactly as ``run(prompt:sink:)`` resolves them.
     ///
@@ -238,6 +381,85 @@ public actor AgentHarness {
     /// harness reconstructs the identical context an uninterrupted run held.
     public func contextMessages() throws -> [Message] {
         try buildContextMessages()
+    }
+
+    // MARK: - Sealing an interrupted branch
+
+    /// Answers every tool call on the current branch that nothing answers, with a
+    /// synthetic error result, and returns the ids sealed.
+    ///
+    /// A branch is normally self-repairing: the loop dispatches the calls in an
+    /// assistant turn and persists a result for each, even for a tool that failed or
+    /// was aborted (``ToolDispatch`` synthesizes one), so a `tool_use` without its
+    /// `tool_result` cannot survive a run that ends. It survives a run that *never*
+    /// ends — which is exactly the situation a caller reaches for when it walks away
+    /// from a wedged run and adopts the branch that run was standing on.
+    ///
+    /// Left alone, that branch is not merely untidy: the provider validates it.
+    /// ``DoMoLLM/Context/hasToolHistory`` already records that Anthropic behind
+    /// LiteLLM rejects a transcript whose tool history does not line up, and nothing
+    /// between ``contextMessages()`` and the wire repairs anything —
+    /// ``ContextBuilder`` projects entries verbatim. So a session "recovered" onto a
+    /// dangling branch answers every later prompt with a 400 instead of a 409: the
+    /// same dead session, one layer down.
+    ///
+    /// Calling this is what turns "the tip is answerable" from something that
+    /// happens to hold into something the caller establishes. It is idempotent by
+    /// construction — the seals it writes are themselves the answers it looks for —
+    /// and writes nothing at all to a branch that is already complete.
+    ///
+    /// The results are persisted as their own `tool` entries through the normal
+    /// append path, which is the same shape the loop writes, so nothing downstream
+    /// can tell a sealed branch from an interrupted-and-answered one.
+    ///
+    /// They land at the tip, which is where the calls that need them are in the case
+    /// this exists for — the branch ends on the turn that was interrupted. A branch
+    /// that was *already* dangling further back is answered late rather than
+    /// adjacent, which is strictly better than leaving it unanswered and is not a
+    /// shape this method can produce: a branch it has sealed has nothing left to
+    /// dangle, and it is called before the branch is ever run again.
+    @discardableResult
+    public func sealUnansweredToolCalls(reason: String) throws -> [String] {
+        let unanswered = Self.unansweredToolCalls(in: try buildContextMessages())
+        for call in unanswered {
+            try persistMessage(.tool(ToolResultBlock(
+                toolCallID: call.id,
+                toolName: call.name,
+                output: reason,
+                isError: true
+            )))
+        }
+        return unanswered.map(\.id)
+    }
+
+    /// The tool calls in `messages` that no tool result addresses, in the order they
+    /// were requested.
+    ///
+    /// Answers are counted wherever they can appear: a `tool`-role message (what the
+    /// loop persists) and a `toolResult` content block on any other role (what the
+    /// wire shapes for providers that hoist results onto a user turn), so a call that
+    /// *is* answered is never answered twice.
+    public static func unansweredToolCalls(in messages: [Message]) -> [ToolCallBlock] {
+        var answered: Set<String> = []
+        for message in messages {
+            switch message {
+            case .tool(let result):
+                answered.insert(result.toolCallID)
+            case .user(let user):
+                for case .toolResult(let result) in user.content { answered.insert(result.toolCallID) }
+            case .assistant(let assistant):
+                for case .toolResult(let result) in assistant.content { answered.insert(result.toolCallID) }
+            case .system:
+                continue
+            }
+        }
+        var open: [ToolCallBlock] = []
+        for case .assistant(let assistant) in messages {
+            for case .toolCall(let call) in assistant.content where !answered.contains(call.id) {
+                open.append(call)
+            }
+        }
+        return open
     }
 
     // MARK: - Run
@@ -310,7 +532,17 @@ public actor AgentHarness {
     }
 
     private func buildContextMessages() throws -> [Message] {
-        try ContextBuilder.buildContext(SessionTree.load(from: store), from: leaf)
+        // An empty tip means an empty branch — NOT "ask the file". The resolvers
+        // below read `nil` as "start from the file's leaf", which is right for a
+        // cold read of a file and wrong for a harness that knows its own branch has
+        // nothing on it: ``persistMessage(_:)`` writes the next entry with
+        // `parentId: leaf`, i.e. as a new root, so a context resolved from someone
+        // else's leaf would seed a turn with a conversation this branch is not on
+        // and then answer it in a different place. Same-answering for every harness
+        // that could exist before ``open(path:configuration:leaf:)`` (a `nil` tip
+        // only ever came with an empty file); load-bearing for the ones that can now.
+        guard let leaf else { return [] }
+        return try ContextBuilder.buildContext(SessionTree.load(from: store), from: leaf)
     }
 
     // MARK: - Compaction
@@ -356,8 +588,12 @@ public actor AgentHarness {
     /// older than the recent budget yields no preparation and nothing is written.
     private func compactIfNeeded() async throws {
         guard configuration.compaction.enabled else { return }
+        // Same reason as ``buildContextMessages()``: an empty tip is an empty branch,
+        // and resolving `nil` here would measure — and then summarize — a path this
+        // harness is not on, anchoring the checkpoint it writes at the root.
+        guard let tip = leaf else { return }
         let tree = try SessionTree.load(from: store)
-        let pathEntries = try tree.pathToRootOrCompaction(from: leaf)
+        let pathEntries = try tree.pathToRootOrCompaction(from: tip)
         let messages = ContextBuilder.messages(for: pathEntries)
         let estimate = estimateContextTokens(messages)
         guard
@@ -378,7 +614,7 @@ public actor AgentHarness {
             summarize: effectiveSummarizer
         )
         try store.appendEntry(entry)
-        leaf = entry.id
+        leafChain.append(entry.id)
     }
 
     // MARK: - Summarization prompt
@@ -413,6 +649,6 @@ extension AgentHarness: SessionMessagePersisting {
             payload: .message(message)
         )
         try store.appendEntry(entry)
-        leaf = entry.id
+        leafChain.append(entry.id)
     }
 }

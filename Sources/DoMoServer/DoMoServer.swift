@@ -19,6 +19,18 @@ public struct AbortResult: Codable, Sendable, Hashable {
     public init(aborted: Bool) { self.aborted = aborted }
 }
 
+/// The `POST /session/{id}/force-clear` result: whether anything was actually
+/// holding the session's run slot.
+///
+/// Force-clear is not "abort". It walks away from a run that may never settle and
+/// rebuilds the session from its file, so anything the doomed turn produced but
+/// did not persist is gone. A UI must label it as freeing the session, not as
+/// cancelling, or a user will reach for it as a normal stop.
+public struct ForceClearResult: Codable, Sendable, Hashable {
+    public var cleared: Bool
+    public init(cleared: Bool) { self.cleared = cleared }
+}
+
 private struct CreateBody: Decodable {
     var resume: String?
 }
@@ -176,7 +188,12 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/prompt") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
-                let body = try await Self.requiredBody(PromptBody.self, request)
+                // The ONLY route with the large cap: a prompt carries base64 image
+                // attachments, and the 4 MiB default 413s anything over ~3 MiB raw
+                // — a dropped screenshot, silently refused.
+                let body = try await Self.requiredBody(
+                    PromptBody.self, request, upTo: Self.maximumPromptBodyBytes
+                )
                 try await self.runtime.startRun(sessionID: id, prompt: body.prompt, attachments: body.images ?? [])
                 return Response(status: .accepted)
             }
@@ -216,6 +233,25 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        // The server's authoritative view of a session. A client whose run state is
+        // pinned by a missed edge polls this rather than guessing.
+        router.get("/session/:id/status") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.status(sessionID: id))
+            }
+        }
+
+        // The escape hatch for a run that can never settle. Destructive by design:
+        // see `ForceClearResult`.
+        router.post("/session/:id/force-clear") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let cleared = try await self.runtime.forceClearRun(sessionID: id)
+                return try Self.json(ForceClearResult(cleared: cleared), status: .ok)
+            }
+        }
+
         router.post("/session/:id/fork") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
@@ -237,14 +273,23 @@ public struct DoMoServer: Sendable {
     /// The `text/event-stream` response for a session: an opening `connected`
     /// frame, then every run event, with a periodic heartbeat so an idle-but-live
     /// stream is not torn down between turns.
-    private func eventStream(sessionID: String, sink: BroadcastEventSink) -> Response {
-        let subscription = sink.subscribe()
+    ///
+    /// Internal rather than private so a test can build the response and *never*
+    /// consume it — the exact shape of the leak fixed below.
+    func eventStream(sessionID: String, sink: BroadcastEventSink) -> Response {
         let heartbeatSeconds = options.heartbeatSeconds
         var headers = HTTPFields()
         headers[.contentType] = "text/event-stream"
         headers[.cacheControl] = "no-cache"
 
         let body = ResponseBody { writer in
+            // Subscribe INSIDE the writer closure, so the registration has exactly
+            // the same lifetime as the `defer` that tears it down. Subscribing
+            // outside leaked a registration and a 512-slot buffer forever for any
+            // response whose writer is never invoked — and poisoned
+            // `subscriberCount`, which is the natural diagnostic for this whole
+            // class of bug.
+            let subscription = sink.subscribe()
             // One ordered stream of run events plus heartbeats. Two producers feed
             // it: the subscription forwarder and the heartbeat ticker. The consumer
             // is this single writer loop, so there is no contention on the writer.
@@ -314,16 +359,33 @@ public struct DoMoServer: Sendable {
         return Response(status: status, headers: headers, body: ResponseBody(byteBuffer: ByteBuffer(bytes: data)))
     }
 
-    private static func requiredBody<T: Decodable>(_ type: T.Type, _ request: Request) async throws -> T {
+    /// The default request-body cap. Generous for a JSON control message and small
+    /// enough that a local client cannot make the server buffer arbitrarily.
+    public static let defaultBodyBytes = 4 << 20
+
+    /// The prompt route's cap, and only the prompt route's.
+    ///
+    /// A prompt carries image attachments base64-encoded, which costs ~4/3 of the
+    /// raw bytes plus JSON escaping, so the 4 MiB default 413s a screenshot over
+    /// roughly 3 MiB. The image loader's own ceiling is 10 MiB total across at most
+    /// 8 images (`ImageAttachmentLimits`), so 32 MiB clears the encoded worst case
+    /// with headroom and still bounds the buffer.
+    public static let maximumPromptBodyBytes = 32 << 20
+
+    private static func requiredBody<T: Decodable>(
+        _ type: T.Type,
+        _ request: Request,
+        upTo limit: Int = DoMoServer.defaultBodyBytes
+    ) async throws -> T {
         var request = request
-        let buffer = try await request.collectBody(upTo: 4 << 20)
+        let buffer = try await request.collectBody(upTo: limit)
         let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) ?? []
         return try JSONDecoder().decode(T.self, from: Data(bytes))
     }
 
     private static func optionalBody<T: Decodable>(_ type: T.Type, _ request: Request) async throws -> T? {
         var request = request
-        let buffer = try await request.collectBody(upTo: 4 << 20)
+        let buffer = try await request.collectBody(upTo: Self.defaultBodyBytes)
         guard buffer.readableBytes > 0 else { return nil }
         let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) ?? []
         return try JSONDecoder().decode(T.self, from: Data(bytes))

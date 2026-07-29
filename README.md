@@ -576,7 +576,10 @@ default.**
 | `DOMOCODE_REASONING_EFFORT` | unset | `minimal` / `low` / `medium` / `high`. |
 | `DOMOCODE_TIMEOUT_MS` | `600000` | Overall request timeout. |
 | `DOMOCODE_STREAM_TIMEOUT_MS` | `30000` | Time to first chunk — the knob that makes the UI feel responsive. |
-| `DOMOCODE_MAX_RETRIES` | `3` | Client-side retry count. |
+| `DOMOCODE_MAX_RETRIES` | `10` | Client-side retry count for a *retryable* failure. `0` disables retrying. |
+| `DOMOCODE_RETRY_BASE_MS` | `1000` | First backoff; each further attempt doubles it before jitter. |
+| `DOMOCODE_RETRY_MAX_MS` | `60000` | Backoff ceiling, which also caps a server-supplied `Retry-After`. |
+| `DOMOCODE_RETRY_BUDGET_MS` | `300000` | Total time one request may spend asleep between attempts. `0` means no budget. |
 | `DOMOCODE_CONFIG_DIR` | `~/.domocode` | Settings, sessions, trust store, skills, themes. |
 | `DOMOCODE_SESSION_DIR` | `$CONFIG_DIR/sessions` | Session JSONL root. |
 | `DOMOCODE_LOG_LEVEL` | `warning` | Logs go to stderr; stdout is reserved for the JSON protocol channel. |
@@ -585,6 +588,54 @@ default.**
 
 Secrets are never written to `settings.json` — only the *name* of the environment variable holding
 them, or a `~/.domocode/credentials.json` created `0600` whose permissions are checked on read.
+
+### Retries
+
+A busy or overloaded provider is the one failure that reliably clears on its own, so it is waited out
+rather than reported. A retryable failure — HTTP 429/5xx, a transport error, or a body LiteLLM
+normalizes into one of those — is retried up to `DOMOCODE_MAX_RETRIES` times on an exponential
+schedule: `DOMOCODE_RETRY_BASE_MS`, doubling per attempt, capped at `DOMOCODE_RETRY_MAX_MS`, with
+half jitter, and with `DOMOCODE_RETRY_BUDGET_MS` as the ceiling on total sleep for one request. A
+server-supplied `Retry-After` (or `retry-after-ms`) wins over the computed delay, clamped to the same
+maximum. A failure that arrives *before* the gateway ever answered keeps its own, far smaller budget,
+because an unreachable host is not a busy one.
+
+Nothing that cannot clear on its own is retried: a rejected credential, an exhausted quota, a context
+overflow and a malformed response all fail immediately. Retries are announced while they happen
+rather than hidden — a waiting run says so instead of looking frozen.
+
+### Command line
+
+`--max-turns <n>` — **unlimited by default, in every mode** (the full-screen client, `--inline`,
+`-p`, and `--serve`). A run continues until the model produces a final answer, you abort it, or the
+runaway guard trips: twelve consecutive turns that made the same tool calls and got back the same
+results. `--max-turns 0` is the explicit spelling of unlimited, for a caller that builds its
+arguments programmatically; a negative value is a usage error. `0` cannot mean "zero turns" — the
+loop emits `agent_start`/`turn_start` before its first bound check, so a literal 0 would settle a run
+with a dangling `turn_start`.
+
+`--no-mouse` — never claim the mouse in the full-screen client. The app then reports no mouse events
+at all, so the terminal's own selection and scrollback keep working and wheel scrolling inside the
+app is lost in exchange.
+
+Keys in the full-screen client: `Tab` moves between panes, `Enter` sends, `Alt+Enter` (or `Ctrl+J`)
+inserts a newline so a prompt can be several lines, `↑`/`↓` walk the prompt history for this
+workspace, `Ctrl+O` expands a truncated error to its full text, `Esc` aborts a running turn, and
+`Ctrl+C` quits.
+
+Under `-p`, the exit code is the run's verdict:
+
+| Code | Meaning |
+|---|---|
+| `0` | The model produced a final answer (or a tool ended the run cleanly). |
+| `1` | The run failed: a provider error, an aborted turn, a bad `finish_reason`. |
+| `2` | The `--max-turns` limit was reached before a final answer. Only reachable when a limit was asked for. |
+| `3` | The runaway guard stopped the run: the same tool call returned the same result and made no progress. Raising `--max-turns` would change nothing. |
+
+`2` and `3` are deliberately distinct: a script that retries with a bigger budget on `2` must not
+retry on `3`. In text mode an unbounded run prints `… still working — turn N` to **stderr** every
+twenty-five turns, so a long run in a CI log is not mistaken for a hung one; stdout still carries only
+the answer, and the `--json` event stream is unchanged.
 
 ### LiteLLM compatibility notes
 

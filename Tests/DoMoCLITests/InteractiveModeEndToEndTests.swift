@@ -713,6 +713,728 @@ struct InteractiveModeEndToEndTests {
         inputCont.finish()
         try await runTask.value
     }
+
+    // MARK: A run that stops without finishing
+
+    /// One assistant turn that calls `ls .` and finishes with `tool_calls`, so the
+    /// loop dispatches the (auto-allowed, read-only) call and asks for another turn.
+    static let lsToolTurn = #"""
+        data: {"id":"l1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_ls_1","type":"function","function":{"name":"ls","arguments":""}}]},"finish_reason":null}]}
+
+        data: {"id":"l1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\": \".\"}"}}]},"finish_reason":null}]}
+
+        data: {"id":"l1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+        data: [DONE]
+
+
+        """#
+
+    /// A run cut off by `--max-turns` says so, in the transcript.
+    ///
+    /// This is the inline half of the reported defect: the REPL reacted to
+    /// `.aborted` and to nothing else, so a run that hit the turn budget produced
+    /// NO output at all — the session simply went quiet mid-task, which reads
+    /// exactly like the model deciding it was finished.
+    @Test
+    func inlineReplSaysWhyARunStoppedAtTheTurnLimit() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.lsToolTurn, Self.lsToolTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        try tree.writeFile("hello.txt", "hi\n")
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path,
+            maxTurns: 1
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("list the files"))
+        inputCont.yield(bytes("\r"))
+
+        let explained = await waitUntil { screenContains(target, rows: rows, cols: cols, "--max-turns limit") }
+        #expect(explained, "the REPL went idle without saying the turn limit stopped the run")
+        // The budget really did stop it — one turn, one request.
+        #expect(gateway.requestCount == 1)
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    // MARK: Drag and drop
+
+    /// A 16-byte PNG the sniffer accepts: signature + IHDR length 13 + "IHDR".
+    static let tinyPNG = Data([
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    ])
+
+    /// Wrap `text` in the bracketed-paste guards a terminal puts around a drop.
+    static func bracketedPaste(_ text: String) -> [UInt8] {
+        bytes("\u{1b}[200~" + text + "\u{1b}[201~")
+    }
+
+    /// Dragging an image onto the inline REPL attaches it instead of typing its
+    /// path.
+    ///
+    /// The file deliberately lives OUTSIDE the session's working directory: a
+    /// dropped screenshot from `~/Desktop` is trusted operator input, exactly like
+    /// `--image`, and resolving it through the tool sandbox would refuse the
+    /// commonest case there is.
+    @Test
+    func inlineReplAttachesADroppedImage() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        let dropped = tree.root.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the drop was not staged as an attachment")
+
+        inputCont.yield(bytes("what is this"))
+        inputCont.yield(bytes("\r"))
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "the turn never completed")
+
+        // The bytes really rode the message, and the path was NOT typed into it.
+        let json = try JSONValue(parsing: Data(gateway.requests[0].body.utf8))
+        let content = json["messages"]?[1]?["content"]
+        #expect(content?[0]?["text"]?.stringValue == "what is this", "body: \(gateway.requests[0].body)")
+        #expect(content?[1]?["type"]?.stringValue == "image_url", "body: \(gateway.requests[0].body)")
+        #expect(
+            content?[1]?["image_url"]?["url"]?.stringValue
+                == "data:image/png;base64,\(Self.tinyPNG.base64EncodedString())",
+            "body: \(gateway.requests[0].body)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// A paste that is not path-shaped is ordinary text, untouched.
+    ///
+    /// The whole safety property of the drop parser: prose that merely MENTIONS a
+    /// path must reach the prompt verbatim, or pasting a paragraph would start
+    /// eating words.
+    @Test
+    func inlineReplLeavesOrdinaryPastedProseAlone() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste("check /tmp/absent.png and tell me"))
+        let typed = await waitUntil { screenContains(target, rows: rows, cols: cols, "check /tmp/absent.png and tell me") }
+        #expect(typed, "a non-drop paste did not reach the prompt")
+        #expect(!screenContains(target, rows: rows, cols: cols, "attached"))
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// A dropped file that is not an image is refused — and its path goes back into
+    /// the prompt as text, so the gesture never silently loses what the user meant.
+    ///
+    /// The restored text is asserted through the SUBMITTED MESSAGE, not by looking
+    /// for the file name on the grid. The rejection notice already contains the
+    /// file's display name (`notes.txt is not a supported image …`), so a screen
+    /// assertion on `notes.txt` is satisfied by the notice alone and stays green
+    /// with the entire restore block — and with it the only scrubber on this
+    /// attacker-influenced paste path — deleted. The request body carries the FULL
+    /// path plus the words typed before the drop, neither of which the notice has,
+    /// and it cannot be produced at all if the editor was left empty: `handleSubmit`
+    /// returns early on an empty line with nothing staged, so no request is made.
+    @Test
+    func inlineReplRestoresARefusedDropAsText() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        // In its own subdirectory, so the full path contains a component that the
+        // rejection message provably does not.
+        let dropZone = tree.root.appendingPathComponent("dropzone", isDirectory: true)
+        try FileManager.default.createDirectory(at: dropZone, withIntermediateDirectories: true)
+        let dropped = dropZone.appendingPathComponent("notes.txt")
+        try "not an image\n".write(to: dropped, atomically: true, encoding: .utf8)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 120, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        // Words typed BEFORE the drop must survive it; the path is appended after.
+        inputCont.yield(bytes("please look at"))
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let explained = await waitUntil {
+            screenContains(target, rows: rows, cols: cols, "notes.txt is not a supported image")
+        }
+        #expect(explained, "a refused drop said nothing")
+
+        // Submit what the editor now holds. If the restore block were gone the
+        // editor would hold only "please look at" — and if the typed words were
+        // clobbered it would hold only the path — so the body pins both halves.
+        inputCont.yield(bytes("\r"))
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "the refused drop left nothing submittable in the prompt")
+        #expect(gateway.requestCount == 1)
+
+        let submitted = try Self.firstUserText(gateway.requests[0].body)
+        #expect(submitted.contains("please look at"), "the typed words were eaten: \(submitted)")
+        #expect(submitted.contains(dropped.path), "the refused drop's text was eaten: \(submitted)")
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// The text of the first user message in a chat-completions body, whichever
+    /// wire shape it took: a bare string when the turn carried no attachments, or
+    /// the first `text` content part when it did.
+    static func firstUserText(_ body: String) throws -> String {
+        let json = try JSONValue(parsing: Data(body.utf8))
+        guard let messages = json["messages"]?.arrayValue else { return "" }
+        for message in messages where message["role"]?.stringValue == "user" {
+            if let text = message["content"]?.stringValue { return text }
+            if let text = message["content"]?[0]?["text"]?.stringValue { return text }
+        }
+        return ""
+    }
+
+    /// Every `image_url` data URL carried by a chat-completions body, in message
+    /// order. Parsed rather than substring-matched: Foundation escapes `/` in JSON,
+    /// so `body.contains("data:image/png…")` is a false negative waiting to happen.
+    static func imageDataURLs(_ body: String) throws -> [String] {
+        let json = try JSONValue(parsing: Data(body.utf8))
+        guard let messages = json["messages"]?.arrayValue else { return [] }
+        var urls: [String] = []
+        for message in messages {
+            guard let parts = message["content"]?.arrayValue else { continue }
+            for part in parts where part["type"]?.stringValue == "image_url" {
+                if let url = part["image_url"]?["url"]?.stringValue { urls.append(url) }
+            }
+        }
+        return urls
+    }
+
+    /// The data URL the 16-byte test PNG must appear as on the wire.
+    static var tinyPNGDataURL: String {
+        "data:image/png;base64,\(Self.tinyPNG.base64EncodedString())"
+    }
+
+    /// A drop staged WHILE a turn is in flight rides the steering message into the
+    /// current run's next turn.
+    ///
+    /// A mid-run submit does not go through the submissions stream — it is appended
+    /// to the ``SteeringBox`` as a `Message`, and `Message.user(_:)` builds a
+    /// TEXT-ONLY message. Using it there is exactly how a mid-run drop's bytes used
+    /// to vanish, and nothing else in the suite touches that construction: the
+    /// existing drop test only covers the idle path. The gateway holds turn 1 open
+    /// so the drop and the submit are provably in the box before the loop polls,
+    /// then turn 2's request body has to carry the image.
+    @Test
+    func aDropStagedWhileARunIsInFlightRidesTheSteeringMessage() async throws {
+        let gateway = try SteerableGateway(firstTurnText: "checking-now", secondTurnText: "all-done")
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        try tree.writeFile("marker.txt", "hi\n")
+        let dropped = tree.root.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        // Turn 1 starts and then hangs, so everything below happens mid-run.
+        inputCont.yield(bytes("kick off the work"))
+        inputCont.yield(bytes("\r"))
+        let started = await waitUntil { screenContains(target, rows: rows, cols: cols, "checking-now") }
+        #expect(started, "the first turn never began streaming, so there is no in-flight run to drop onto")
+
+        // Drop the image onto the prompt of a RUNNING session.
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the mid-run drop was not staged")
+
+        // …and submit it. This is the steering path, not the submissions stream.
+        inputCont.yield(bytes("what is this"))
+        inputCont.yield(bytes("\r"))
+        let echoed = await waitUntil { screenContains(target, rows: rows, cols: cols, "what is this") }
+        #expect(echoed, "the mid-run submission was never accepted")
+
+        gateway.release()
+        let finished = await waitUntil { screenContains(target, rows: rows, cols: cols, "all-done") }
+        #expect(finished, "the run never produced its steered second turn")
+
+        // Two turns of ONE run, and the steered turn carries the dropped bytes.
+        #expect(gateway.requestCount == 2)
+        let secondBody = gateway.requests[1].body
+        #expect(secondBody.contains("what is this"), "steer missing from turn 2 request: \(secondBody)")
+        #expect(
+            try Self.imageDataURLs(secondBody) == [Self.tinyPNGDataURL],
+            "the mid-run drop's bytes did not ride the steering message: \(secondBody)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// A steering message left in the box when the run ends carries its IMAGES into
+    /// the re-queued run, not just its text.
+    ///
+    /// `drainLeftoverSteering` re-queues whatever landed after the run's last
+    /// steering poll. Escape is what makes that window deterministic: an aborted run
+    /// settles straight out of the turn without ever polling, so the mid-run
+    /// submission below is still in the box when `agentLoop` drains it. Re-queuing
+    /// `user.text` alone silently threw the attachment away — the one place a
+    /// leftover can lose content rather than merely arrive late.
+    @Test
+    func aLeftoverSteeringMessageCarriesItsImageIntoTheRequeuedRun() async throws {
+        let gateway = try SteerableGateway(firstTurnText: "checking-now", secondTurnText: "all-done")
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        let dropped = tree.root.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("kick off the work"))
+        inputCont.yield(bytes("\r"))
+        let started = await waitUntil { screenContains(target, rows: rows, cols: cols, "checking-now") }
+        #expect(started, "the first turn never began streaming")
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the mid-run drop was not staged")
+
+        inputCont.yield(bytes("look at this"))
+        inputCont.yield(bytes("\r"))
+        let echoed = await waitUntil { screenContains(target, rows: rows, cols: cols, "look at this") }
+        #expect(echoed, "the mid-run submission was never accepted")
+
+        // Abort turn 1. The loop settles `.aborted` without ever polling steering,
+        // so the message above is a LEFTOVER — exactly the window under test.
+        inputCont.yield(bytes("\u{1b}"))
+        let interrupted = await waitUntil { screenContains(target, rows: rows, cols: cols, "interrupted") }
+        #expect(interrupted, "Escape did not abort the running agent")
+
+        // Free the gateway's accept loop so the re-queued run gets served.
+        gateway.release()
+        let requeued = await waitUntil { screenContains(target, rows: rows, cols: cols, "all-done") }
+        #expect(requeued, "the leftover steering message never became a fresh run")
+
+        #expect(gateway.requestCount == 2)
+        let secondBody = gateway.requests[1].body
+        #expect(secondBody.contains("look at this"), "the leftover's text was lost: \(secondBody)")
+        #expect(
+            try Self.imageDataURLs(secondBody) == [Self.tinyPNGDataURL],
+            "the leftover steering message dropped its image: \(secondBody)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// `/clear` drops staged attachments with the transcript.
+    ///
+    /// Their `📎 attached …` rows are gone, so bytes still staged after a clear are
+    /// invisible: the next message would carry an image the user has no way to know
+    /// is still there.
+    @Test
+    func clearDropsStagedAttachments() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        let dropped = tree.root.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the drop was not staged")
+
+        // `/` opens the slash-command popup, and Enter with a popup up APPLIES the
+        // completion rather than submitting. Two Enters cover both orderings: with
+        // the popup up the first applies `/clear ` and the second submits it; with
+        // the popup not yet built the first submits and the second is a no-op on an
+        // empty editor. No wait for the clear to be VISIBLE is possible — the oracle
+        // replays the whole captured byte stream, so the already-scrolled
+        // `📎 attached …` row never leaves its scrollback — but keystrokes are
+        // delivered in order through one stream and `handleSubmit` is synchronous,
+        // so the clear provably precedes the next submission.
+        inputCont.yield(bytes("/clear"))
+        inputCont.yield(bytes("\r"))
+        inputCont.yield(bytes("\r"))
+
+        inputCont.yield(bytes("words only please"))
+        inputCont.yield(bytes("\r"))
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "the post-clear turn never completed")
+        #expect(gateway.requestCount == 1)
+
+        let body = gateway.requests[0].body
+        #expect(try Self.imageDataURLs(body).isEmpty, "a cleared session still sent the staged image: \(body)")
+        #expect(try Self.firstUserText(body) == "words only please", "body: \(body)")
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// Dropping a file AND naming it with `@` sends ONE copy, not two.
+    ///
+    /// The two attachment sources meet in `runOne`, which deduplicates them; without
+    /// that, the commonest way to be explicit about a drop — drag it, then also type
+    /// its name — doubles the image payload of the turn.
+    @Test
+    func aDropAlsoNamedWithAtSignAttachesOnce() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        // Inside the working directory, so the SAME file is reachable both as a
+        // dropped absolute path and as a sandbox-resolved `@shot.png` mention.
+        let dropped = tree.work.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the drop was not staged")
+
+        // Trailing words keep the cursor out of the mention token, so no completion
+        // popup is up when Enter submits.
+        inputCont.yield(bytes("@shot.png what is this"))
+        inputCont.yield(bytes("\r"))
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "the turn never completed")
+        #expect(gateway.requestCount == 1)
+
+        let body = gateway.requests[0].body
+        #expect(
+            try Self.imageDataURLs(body) == [Self.tinyPNGDataURL],
+            "the drop and its @mention were both attached: \(body)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// A drop with no words is still a message: Enter on an empty editor sends the
+    /// image.
+    ///
+    /// The submit guard used to require text, so dragging a photo in and pressing
+    /// Enter did nothing at all — no turn, no error, and the staged bytes silently
+    /// held for whenever the user next typed something.
+    @Test
+    func aDropWithNoWordsStillSendsATurn() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        let dropped = tree.root.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the drop was not staged")
+
+        // Enter with an EMPTY editor.
+        inputCont.yield(bytes("\r"))
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "an image-only Enter sent nothing at all")
+        #expect(gateway.requestCount == 1)
+        #expect(
+            try Self.imageDataURLs(gateway.requests[0].body) == [Self.tinyPNGDataURL],
+            "body: \(gateway.requests[0].body)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// Dropping the same file twice says so, and still attaches exactly one copy.
+    ///
+    /// A duplicate is neither a success nor a failure: with no notice the second
+    /// drop looks like it did nothing, and treating it as "not a drop" would type
+    /// the path into the prompt as literal text instead.
+    @Test
+    func reDroppingTheSameFileSaysItIsAlreadyAttached() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        let dropped = tree.root.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the first drop was not staged")
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let noticed = await waitUntil {
+            screenContains(target, rows: rows, cols: cols, "shot.png is already attached")
+        }
+        #expect(noticed, "the duplicate drop was silent")
+        // And it was NOT typed into the prompt as text.
+        //
+        // Asserted on the REQUEST BODY rather than on the screen. A screen check
+        // here cannot fail: `screenContains` matches within one rendered LINE, and
+        // "❯ " plus an absolute temp path is longer than the grid is wide, so no
+        // line could ever contain it. The body is where the answer actually is.
+
+        inputCont.yield(bytes("what is this"))
+        inputCont.yield(bytes("\r"))
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "the turn never completed")
+        #expect(
+            try Self.imageDataURLs(gateway.requests[0].body) == [Self.tinyPNGDataURL],
+            "the re-drop attached a second copy: \(gateway.requests[0].body)"
+        )
+        #expect(
+            try Self.firstUserText(gateway.requests[0].body) == "what is this",
+            "the duplicate drop's path was typed into the prompt as text: \(gateway.requests[0].body)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    // MARK: Errors
+
+    /// A failure the loop SETTLES (rather than throws) is spelled out in the
+    /// transcript, with the same three parts the full-screen client shows.
+    ///
+    /// This is the whole reason the REPL's notice handling exists. A refused
+    /// credential produces an assistant message with EMPTY text, which
+    /// `finalizeAssistant` deletes as a tool-only turn — so before this the REPL
+    /// went straight back to idle with nothing on screen at all, and the user's
+    /// only evidence that anything had happened was that no answer arrived.
+    @Test
+    func inlineReplSpellsOutAGatewayRefusal() async throws {
+        let gateway = try MockGateway(
+            chatCompletionBodies: [],
+            refuseWith: (
+                status: 401,
+                reason: "Unauthorized",
+                body: #"{"error":{"message":"Invalid API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#
+            )
+        )
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("what went wrong"))
+        inputCont.yield(bytes("\r"))
+
+        // 1. The class of failure, named.
+        let headline = await waitUntil {
+            screenContains(target, rows: rows, cols: cols, "The gateway rejected the credential")
+        }
+        #expect(headline, "the REPL went idle with no error on screen")
+        // 2. The provider's own words, so the cause is not guesswork.
+        #expect(screenContains(target, rows: rows, cols: cols, "Invalid API key provided"))
+        // 3. What to do about it — "is my key wrong?" answered without a log.
+        #expect(screenContains(target, rows: rows, cols: cols, "credential is set and has not expired"))
+
+        inputCont.finish()
+        try await runTask.value
+    }
 }
 
 /// A tiny thread-safe done flag: the run task marks it on the main actor, the test
@@ -865,6 +1587,14 @@ final class SteerableGateway: @unchecked Sendable {
     private func handleConnection(_ fd: Int32) {
         var timeout = timeval(tv_sec: 20, tv_usec: 0)
         _ = unsafe setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        #if canImport(Darwin)
+        // The abort test releases this turn AFTER the client has hung up, so the
+        // tail below is written to a socket whose peer is gone. Without this, a
+        // second `send` on the RST'd socket would raise SIGPIPE and take the whole
+        // test process down rather than returning EPIPE to `writeAll`.
+        var noSigPipe: Int32 = 1
+        _ = unsafe setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        #endif
 
         guard let request = readRequest(fd) else { return }
 

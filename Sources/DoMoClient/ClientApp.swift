@@ -9,12 +9,31 @@
 // The same `TerminalDriver` that runs the inline `TUI` runs this.
 
 import DoMoCore
+import DoMoExec
+import DoMoLLM
 import DoMoPermissions
 import Foundation
 import DoMoServer
 import DoMoTUI
 import DoMoTermGraphics
 import DoMoTermIO
+import SystemPackage
+
+/// Lines computed fresh on every render.
+///
+/// The overlay compositor re-renders its content every frame, so a component that
+/// asks a closure for its rows stays true for as long as it is on screen. The
+/// diagnostics panel's most useful row — how long the stream has been silent — is
+/// a number that changes once a second, and a `Text` built when the panel opened
+/// would be a lie one second later.
+@MainActor
+final class DynamicLines: @MainActor Component {
+    private let lines: (Int) -> [String]
+
+    init(_ lines: @escaping (Int) -> [String]) { self.lines = lines }
+
+    func render(width: Int) -> [String] { lines(width) }
+}
 
 /// The remote full-screen client application.
 @MainActor
@@ -61,11 +80,118 @@ public final class ClientApp {
     private var notice: String?
     private var noticeExpiry: Date?
 
+    // MARK: The one shared stored-property block
+    //
+    // Every area that adds state to this class adds it HERE, together, declared once.
+    // Four separate waves land in this file; four separate `private var` clusters is
+    // how two of them end up with overlapping copies of the same fact (a prompt
+    // height, a mouse-owned flag) and how the copies drift.
+
+    /// The prompt's height in the frame MOST RECENTLY BUILT.
+    ///
+    /// `handleMouse` runs between frames and has to hit-test the geometry the user is
+    /// actually looking at. Recomputing it there would render the editor a third time
+    /// per event and — worse — could disagree with what is on screen, which is the
+    /// exact failure `ClientLayout` exists to prevent.
+    private var promptRows = 1
+    /// Where prompt history is persisted, or nil when the client is running without
+    /// a workspace to key it on.
+    private let historyStore: PromptHistoryStore?
+    /// Where a copy goes. `NoClipboardSink` is a real answer, not a fallback: over
+    /// ssh there may genuinely be no clipboard to write to.
+    private let clipboard: any ClipboardSink
+    /// The multiplexer wrapping this terminal, which decides how an OSC 52 must be
+    /// escaped to reach the outer terminal at all.
+    private let multiplexer: TerminalMultiplexer
+    /// Whether the app currently owns mouse reporting. Toggling it off hands
+    /// drag-select back to the terminal's own selection.
+    private var mouseOwned: Bool
+    /// The live text selection over the painted page, and the rules for when it
+    /// stops being live.
+    private let selection = SelectionController()
+    /// Held so F8 can reach ``TerminalLifecycleControl/setMouseReporting(_:)``
+    /// mid-session. The app cannot take or release the mouse itself — the bytes
+    /// belong to the lifecycle, which also owns the crash-safe restore that has to
+    /// be rewritten whenever the mode changes.
+    private var lifecycle: (any TerminalLifecycleControl)?
+    /// Where a dropped file's bytes are read from. A `POSIXFileSystem` on purpose,
+    /// not the sandboxed one: the whole gesture is "this file, the one I just
+    /// dragged in", and a screenshot lives in `~/Desktop`, not in the workspace.
+    /// It is a read of a file the user physically pointed at, in a process that
+    /// already runs as them.
+    private let fileSystem = POSIXFileSystem()
+    /// Hands out ``PromptAttachment/id``s. Monotonic per session so a chip's
+    /// identity is stable across renders and unambiguous across removals.
+    private var attachmentCounter: UInt32 = 0
+    /// Why the event stream is down, as the status line should say it. `nil` while
+    /// connected. "disconnected — reconnecting…" on its own is indistinguishable
+    /// from a slow model; the reason is what makes it actionable.
+    private var lastStreamError: String?
+    /// Whether the current outage has already produced a transcript row, so a
+    /// reconnect loop that runs for an hour posts one row and not four hundred.
+    /// Reset when the stream comes back.
+    private var reportedStreamFailure = false
+    /// How long a stream outage must last before it earns a persistent transcript row
+    /// rather than just the status line.
+    private static let streamOutageNoticeDelay: TimeInterval = 8
+    /// Whether a `/status` poll is already in flight, so a slow server cannot make
+    /// the polls stack up — the poll exists to diagnose a stall, and a stack of
+    /// them queued behind the same stall is a second failure, not a diagnosis.
+    private var statusPollInFlight = false
+    /// When the last poll was STARTED. `.distantPast` forces one on the next tick,
+    /// which is how a refused prompt turns pressing Enter into a repair action.
+    private var lastStatusPollAt = Date.distantPast
+    /// The ^G panel, when it is up. The HANDLE is the authority — see
+    /// ``presentDiagnosticsOverlay()``.
+    private var diagnosticsHandle: ScreenOverlayHandle?
+    private var diagnosticsList: SelectList?
+    /// The server's last answer for the panel, and the reason there isn't one.
+    /// Fetched once when the panel opens; everything else on the panel is local
+    /// and therefore live.
+    private var diagnosticsStatus: SessionStatus?
+    private var diagnosticsStatusError: String?
+    /// The terminal size the panel was laid out for, so a resize can rebuild it.
+    private var diagnosticsOverlaySize: (columns: Int, rows: Int)?
+    /// How often the client asks the server what it actually believes, while the
+    /// client believes a run is in flight.
+    private static let statusPollInterval: TimeInterval = 5
+    /// How long the stream must be silent before the status line says so. Longer
+    /// than the server's 15 s heartbeat, so an ordinary gap between heartbeats
+    /// never trips it; short enough that a user has not yet given up.
+    private static let silenceThreshold: TimeInterval = 20
+    /// How many times a create/resume is retried before it becomes a failure row.
+    /// A single attempt is how "no session selected, forever" happened.
+    private static let sessionAttempts = 3
+
     private static let ctrlC: [UInt8] = [0x03]
     private static let escape: [UInt8] = [0x1b]
+    /// `^O` toggles expanded error/tool detail. A raw byte compare, matching the
+    /// `ctrlC` precedent above and deliberately NOT a new `Keybinding`: ^O is
+    /// unbound everywhere in this package, and adding a binding would mean
+    /// editing a file three other areas also want.
+    private static let ctrlO: [UInt8] = [0x0f]
+    /// What one image drop may cost. The client's own limits rather than
+    /// `.unlimited`, because a drop is a one-handed gesture: the `--image` flag is
+    /// an operator naming a file deliberately, a drag is a file that happened to
+    /// be under the pointer.
+    private static let attachmentLimits = ImageAttachmentLimits.default
+    /// `^G` opens the diagnostics panel. Same reasoning as `ctrlO`, and verified
+    /// free on this path: it is in no `Keybindings.defaults`, `PromptInput` only
+    /// accepts scalars ≥ 0x20, and the sidebar ignores it.
+    private static let ctrlG: [UInt8] = [0x07]
 
-    public init(client: ServerClient) {
+    public init(
+        client: ServerClient,
+        historyStore: PromptHistoryStore? = nil,
+        clipboard: any ClipboardSink = NoClipboardSink(),
+        multiplexer: TerminalMultiplexer = .none,
+        mouseOwned: Bool = true
+    ) {
         self.client = client
+        self.historyStore = historyStore
+        self.clipboard = clipboard
+        self.multiplexer = multiplexer
+        self.mouseOwned = mouseOwned
     }
 
     // MARK: Run
@@ -81,18 +207,56 @@ public final class ClientApp {
     ) async throws {
         focus.register(sidebar)
         focus.register(promptInput)
+        // `FocusRing.register` focuses only the FIRST registration, which is the
+        // sidebar — so the client came up with the caret in the wrong pane and every
+        // arrow key drove the session list instead of the text you were writing. The
+        // prompt is where a user starts, and now that the arrows walk prompt history
+        // it is also where they are most likely to be pressed first.
+        focus.setCurrent(promptInput)
         detectGraphics()
 
         let surface = ScreenSurface(target: target, focus: focus) { [weak self] in
             self?.buildTree(width: target.columns, height: target.rows) ?? Column([])
         }
         self.surface = surface
+        // Held for F8. The app can flip its own `mouseOwned` flag all it likes;
+        // only the lifecycle can actually write `?1000l` at the terminal.
+        self.lifecycle = lifecycle
+        // The selection is not part of the layout tree — it is a function of where
+        // the pointer has been, and the tree is rebuilt from scratch every frame —
+        // so it is painted here, after the page is composed and before it is
+        // diffed. `validate` runs first so a selection whose rows moved is gone
+        // before it can highlight the wrong text.
+        surface.decorateFrame = { [weak self] lines in
+            guard let self else { return lines }
+            self.selection.validate(against: lines)
+            return self.selection.decorate(lines)
+        }
 
         store.onChange = { [weak self] in
             self?.reconcilePermissionOverlay()
             self?.surface?.requestRender()
         }
-        promptInput.onSubmit = { [weak self] text in self?.submit(text) }
+        promptInput.onSubmit = { [weak self] text, attachments in self?.submit(text, attachments) }
+        // Persist off the render loop. The store is an actor, so the write cannot
+        // race the startup load and cannot stall the frame that just accepted the
+        // keystroke.
+        promptInput.onHistoryAdd = { [weak self] entry in
+            guard let store = self?.historyStore else { return }
+            Task { await store.append(entry) }
+        }
+        // The prompt parses a paste into path candidates; the app owns the
+        // filesystem and answers. Split that way so the input component has no IO
+        // seam of its own and stays synchronous.
+        promptInput.onDrop = { [weak self] token, candidates in
+            self?.resolveDrop(token: token, candidates: candidates)
+        }
+        // Enter while a drop is still being read is REFUSED, not queued and not
+        // sent without the picture. The prompt has no status line, so it says so
+        // here, and it names the thing to wait for rather than just "try again".
+        promptInput.onSubmitDeferredForDrop = { [weak self] in
+            self?.post(notice: "still reading the dropped file — Enter again once the 📎 chip appears")
+        }
         sidebar.onSelect = { [weak self] id in self?.openSession(id) }
         sidebar.onNew = { [weak self] in self?.newSession() }
 
@@ -137,11 +301,22 @@ public final class ClientApp {
         transcriptView.running = store.runState == .running
         statusBar.text = statusText()
 
-        let layout = ClientLayout(width: width, height: height)
+        let sidebarWidth = ClientLayout.sidebarWidth(for: width)
+        // The width the input will ACTUALLY be placed at: `Row` gives the flexible
+        // main column `width - sidebarWidth`, and `Column` stretches every child to
+        // the full content width. Measuring at any other width wraps differently than
+        // it paints, and the editor's first/last-visual-line tests — the ones that
+        // decide whether an arrow recalls history or moves the caret — are computed
+        // against the last width it rendered at.
+        let inputWidth = max(0, width - sidebarWidth)
+        promptRows = inputWidth > 0
+            ? promptInput.height(forWidth: inputWidth, maxRows: ClientLayout.promptRowCap(for: height))
+            : 1
+        let layout = ClientLayout(width: width, height: height, promptRows: promptRows)
         let main = Column([
             Flexible(1, TranscriptNode(view: transcriptView, capabilities: graphicsCapabilities, cell: cellSize)),
-            Fixed(.absolute(1), statusBar.layout),
-            Fixed(.absolute(1), promptInput.layout),
+            Fixed(.absolute(ClientLayout.statusRows), statusBar.layout),
+            Fixed(.absolute(layout.promptRows), promptInput.layout),
         ])
         return Row([
             Fixed(.absolute(layout.sidebarWidth), sidebar.layout),
@@ -157,7 +332,11 @@ public final class ClientApp {
     private func statusText() -> String {
         var parts: [String] = []
         if !streamConnected {
-            parts.append("\u{1b}[31mdisconnected — reconnecting…\u{1b}[0m")
+            // Name the reason. "disconnected — reconnecting…" says only that
+            // something is wrong; "connection refused" says the runtime is gone,
+            // and "HTTP 401" says the token is.
+            let reason = lastStreamError.map { " — \(sanitizeUntrustedText(collapseToOneLine($0)))" } ?? ""
+            parts.append("\u{1b}[31mdisconnected\(reason) — reconnecting…\u{1b}[0m")
         }
         if let active = store.activeToolCall {
             let label = active.detail.isEmpty ? active.name : "\(active.name) \(active.detail)"
@@ -173,11 +352,27 @@ public final class ClientApp {
             case .idle: parts.append(store.lastStopReason.map { "idle (\($0))" } ?? "idle")
             }
         }
+        // How long the stream has been silent, whenever a run is supposed to be in
+        // flight. This one segment is the difference between "the model is slow"
+        // and "nothing is connected", which up to now looked identical: a spinner.
+        //
+        // Outside the run-state branch above rather than inside it, deliberately.
+        // A tool call that has been running for six minutes is the same question,
+        // and the answer is just as available: the server heartbeats every 15 s
+        // whether or not a turn is doing anything, so silence past the threshold
+        // means the STREAM is dead, never merely that the work is slow.
+        if store.runState == .running {
+            let quiet = Int(Date().timeIntervalSince(store.lastEventAt))
+            if quiet >= Int(Self.silenceThreshold) { parts.append("(no data for \(quiet)s)") }
+        }
         if let notice {
             parts.append("\u{1b}[33m\(notice)\u{1b}[0m")
         }
         if transcriptView.scrollOffset > 0 {
-            parts.append("↑ \(transcriptView.scrollOffset) rows — scroll down to follow")
+            // Names a key, not a wheel. The wheel is gone the moment the mouse is
+            // released, and this segment used to go on advertising "scroll down to
+            // follow" while no gesture on the machine could do it.
+            parts.append("↑ \(transcriptView.scrollOffset) rows — PgDn to follow")
         }
         // While a modal owns the keyboard the ordinary hints are lies: Enter answers
         // the prompt rather than sending, and Escape selects Reject rather than
@@ -188,9 +383,71 @@ public final class ClientApp {
             parts.append("Enter: answer")
             parts.append("Esc: select Reject")
             parts.append("^C: quit")
+        } else if selection.selection != nil {
+            // While something is highlighted the ordinary hints are wrong in the
+            // two places that matter: Escape clears the selection rather than
+            // aborting the turn, and there is a gesture on offer that is otherwise
+            // undiscoverable. A selection is short-lived, so this replaces the hints
+            // rather than crowding in beside them.
+            parts.append("right-click: copy")
+            parts.append("Esc: clear selection")
+            parts.append(mouseOwned ? "F8: release mouse" : "F8: capture mouse")
+            parts.append("^C: quit")
         } else {
+            // Which mode the mouse is in, always, and FIRST among the hints — a
+            // released mouse changes what every other hint means (whether a drag
+            // selects here or in the terminal, whether the wheel scrolls the
+            // transcript), and a status line is truncated from the right, so a
+            // mode marker at the end is a mode marker that vanishes on a narrow
+            // terminal exactly when a notice is explaining it.
+            //
+            // It also carries the scroll keys, and it is the ONLY place they are
+            // advertised, for two reasons. The line is already over budget at
+            // ordinary widths — a ninth constant hint would push `Esc: abort` off
+            // an 80-column terminal — and this is exactly the state in which the
+            // wheel does not work, so it is the state in which the keys have to be
+            // discoverable. With the mouse captured the wheel is the gesture, and
+            // the "↑ N rows — PgDn to follow" segment names the key the moment
+            // there is anything to scroll back to.
+            //
+            // Spelled "mouse: released" rather than "mouse released" so it is not a
+            // substring of the six-second F8 notice: the two used to be
+            // indistinguishable on the page, which meant deleting this marker
+            // entirely changed nothing any test could see.
+            //
+            // Kept SHORT on purpose. Naming the keys here instead cost 21 columns
+            // and pushed "Esc: abort" and "^C: quit" off a 150-column terminal
+            // whenever the mouse was released — the same harm this block's own
+            // reasoning avoids by not adding a ninth constant hint. The keys go on
+            // the transient F8 notice, which has the room and is on screen at
+            // exactly the moment the user needs them.
+            if !mouseOwned { parts.append("mouse: released") }
+            // CONTEXTUAL HINTS FIRST, then the constants.
+            //
+            // The line is truncated from the RIGHT, and four separate waves each
+            // appended their own hint to the end of it — enough that on a 220-column
+            // terminal the tail was being cut off. What got cut was exactly the wrong
+            // half: `^G` and `^O` appear only when there is something wrong to
+            // diagnose or something capped to expand, i.e. only at the moment they
+            // matter, whereas `Tab: pane` is true forever and is the first thing a
+            // user learns. A hint that is only ever shown in an emergency has to
+            // outrank one that is always true.
+            if !streamConnected || store.runState == .running {
+                parts.append("^G: diagnostics")
+            }
+            if store.hasExpandableDetail {
+                parts.append(transcriptView.expandErrors ? "^O: collapse" : "^O: expand")
+            }
+            parts.append(mouseOwned ? "F8: release mouse" : "F8: capture mouse")
             parts.append("Tab: pane")
             parts.append("Enter: send")
+            // The working newline bindings, not the one a user will reach for first.
+            // Shift+Enter is byte-identical to Enter unless the terminal volunteers a
+            // CSI-u report, and this package never negotiates the Kitty keyboard
+            // protocol that would ask for one — so advertising Shift+Enter would be
+            // advertising a key that submits.
+            parts.append("Alt+↵/^J: newline")
+            parts.append("↑/↓: history")
             parts.append("Esc: abort")
             parts.append("^C: quit")
         }
@@ -206,6 +463,52 @@ public final class ClientApp {
         notice = text
         noticeExpiry = Date().addingTimeInterval(seconds)
         surface?.requestRender()
+    }
+
+    /// One line describing anything the transport threw.
+    ///
+    /// Three shapes, because three things are actually thrown here. An HTTP
+    /// status keeps the endpoint AND the body — a 500 and a 502 look identical
+    /// until you read what the server said about it. A ``DoMoError`` keeps its
+    /// whole cause chain, which is the one line it was designed to produce.
+    /// Anything else falls back to `String(describing:)`, which for a
+    /// `NIOConnectionError` is at least the address that refused.
+    private static func describe(_ error: any Error) -> String {
+        if case ServerClientError.unexpectedStatus(let status, let path, let body) = error {
+            return "HTTP \(status) from \(path)" + (body.map { ": \($0)" } ?? "")
+        }
+        if case ServerClientError.timedOut(let path) = error { return "timed out: \(path)" }
+        if case ServerClientError.streamIdle(let path) = error { return "stream went silent: \(path)" }
+        if let domo = error as? DoMoError { return domo.description }
+        return String(describing: error)
+    }
+
+    /// Put a failure on the transcript, where it stays.
+    ///
+    /// The rule this file now follows: a transient notice is for an action that
+    /// was REFUSED with nothing lost and an obvious remedy ("no session is
+    /// open"); a transcript row is for anything the user has to read, act on, or
+    /// copy. A four-second status message is not a delivery mechanism for
+    /// "prompts will not work until you reopen this session".
+    ///
+    /// The session file is appended to the hint because it is the only "where do
+    /// I see more" this program can honestly offer: there is no log file, and
+    /// stderr under the alternate screen is invisible.
+    private func postError(_ headline: String, _ error: any Error, hint: String? = nil) {
+        postError(headline, reason: Self.describe(error), hint: hint)
+    }
+
+    /// The same row, for a failure that is already a sentence rather than a
+    /// thrown value — a stream that ended cleanly has nothing to `describe`.
+    private func postError(_ headline: String, reason: String, hint: String? = nil) {
+        var hints: [String] = []
+        if let hint { hints.append(hint) }
+        if let path = store.sessionPath { hints.append("Full transcript: \(path)") }
+        store.postError(
+            headline: headline,
+            message: reason,
+            hint: hints.isEmpty ? nil : hints.joined(separator: " ")
+        )
     }
 
     private func spinnerGlyph() -> String {
@@ -235,45 +538,545 @@ public final class ClientApp {
                     self.transcriptView.spinnerFrame &+= 1
                     self.surface?.requestRender()
                 }
+                self.pollStatusIfDue()
                 try? await Task.sleep(for: animating ? .milliseconds(100) : .milliseconds(250))
             }
         }
     }
 
-    // MARK: Mouse
-
-    /// Route a wheel report to the pane under the pointer.
+    /// Ask the server what it actually believes, while the client believes a run is
+    /// in flight, and adopt the answer.
     ///
-    /// Pointer-targeted rather than focus-targeted, which is what every terminal
-    /// application does and what a user expects: you scroll what you are looking at,
-    /// without first Tab-ing focus to it. Buttons and motion are ignored — this
-    /// takes the mouse only so the wheel works, since the alternate screen has no
-    /// scrollback for the terminal to scroll on our behalf.
-    private func handleMouse(_ event: MouseEvent) {
-        guard event.kind == .scrollUp || event.kind == .scrollDown else { return }
-        guard let target = surface?.target else { return }
-        let layout = ClientLayout(width: target.columns, height: target.rows)
-        // Ctrl-wheel pages, matching the convention of a viewport that has no
-        // separate page keys.
-        let step = event.ctrl ? max(1, layout.transcriptHeight - 1) : 3
-        let up = event.kind == .scrollUp
+    /// This is the one thing that makes the client self-correcting. Every other
+    /// path back to `idle` is an edge — `agent_end`, a `connected(running:false)`,
+    /// an abort that answers "nothing was running" — and the wedge is precisely the
+    /// state where none of those edges will ever arrive. There is a real window in
+    /// which even `connected` lies: the run task broadcasts its terminal `agent_end`
+    /// and only THEN hops to `finishRun`, so a `connected` frame generated during
+    /// that hop reports `running: true` AFTER the client already applied the end,
+    /// pinning it with no further frame ever coming.
+    ///
+    /// Folded into the existing spinner clock rather than given a timer of its own:
+    /// that clock is already adaptive, already cancelled with the app, and one task
+    /// that can be reasoned about beats two that can drift apart.
+    private func pollStatusIfDue() {
+        guard store.runState == .running,
+              !statusPollInFlight,
+              Date().timeIntervalSince(lastStatusPollAt) >= Self.statusPollInterval,
+              let id = store.selectedSessionID
+        else { return }
+        statusPollInFlight = true
+        lastStatusPollAt = Date()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.statusPollInFlight = false }
+            await self.reconcileWithServer(id)
+        }
+    }
 
-        switch layout.pane(atColumn: event.column, row: event.row) {
+    /// Ask for the server's snapshot once and adopt it.
+    ///
+    /// `try?` throughout: an older runtime has no such route, and this is a
+    /// diagnosis rather than something the user asked for — it must never put a row
+    /// on the transcript for failing.
+    private func reconcileWithServer(_ id: String) async {
+        guard let status = try? await client.status(sessionID: id),
+              store.selectedSessionID == id
+        else { return }
+        let wasRunning = store.runState == .running
+        store.adopt(status)
+        if wasRunning, !status.running {
+            // Said out loud, because from the user's side nothing visibly happened:
+            // the spinner they had been watching simply stops.
+            post(notice: "the server says nothing is running — you can send again")
+        }
+        // The ask frame was lost while we stayed connected. This is the window the
+        // connected-reconcile can never cover, because no reconnect happens and
+        // therefore no `connected` frame is ever generated to trigger it.
+        if store.hasUnseenPermission(in: status.pendingPermissionIDs) {
+            await reconcilePendingPermissions(id)
+        }
+    }
+
+    // MARK: Scrolling
+
+    /// Move a pane's viewport. The ONE writer of ``TranscriptView/scrollOffset``.
+    ///
+    /// Shared by the wheel and by the keyboard deliberately. Until this existed the
+    /// offset was written in exactly one place — inside `handleMouse`, behind
+    /// `guard mouseOwned` — so releasing the mouse (F8, or `--no-mouse` for a whole
+    /// session) left the transcript with no way to scroll at all while the status
+    /// line went on advertising a gesture that no longer existed.
+    ///
+    /// No upper clamp here: only ``TranscriptNode/place(in:into:)`` knows the
+    /// viewport height, and it writes the clamped value back after painting, so a
+    /// PgUp past the top self-corrects on the very next frame rather than leaving a
+    /// phantom offset the status line would report.
+    private func scroll(_ pane: ClientLayout.Pane, rows: Int, up: Bool, layout: ClientLayout) {
+        // Rows are about to move under the selection, so it is gone by definition —
+        // cleared BEFORE the scroll, so no frame is ever composed with a highlight
+        // over content that has shifted. The click run goes with it: a second click
+        // in the same cell after a scroll is a click on different text and must not
+        // expand to a word.
+        selection.clear()
+        selection.resetClickRun()
+        switch pane {
         case .sidebar:
-            sidebar.scroll(by: up ? -step : step, viewportHeight: layout.height)
+            sidebar.scroll(by: up ? -rows : rows, viewportHeight: layout.height)
         case .transcript, .mainFooter:
             // The transcript is the main column's scrollable body; the status and
             // prompt rows are one line each and scroll it too, so a wheel near the
             // bottom edge is not silently dead.
-            transcriptView.scrollOffset = max(0, transcriptView.scrollOffset + (up ? step : -step))
+            transcriptView.scrollOffset = max(0, transcriptView.scrollOffset + (up ? rows : -rows))
+        }
+    }
+
+    /// A scroll asked for with the keyboard, or nil when `data` is not one.
+    ///
+    /// PgUp/PgDn is the primary binding and Shift+↑/↓ the fine-grained one. Both
+    /// were checked against `DoMoTermIO/KeyDecoding.swift` rather than assumed:
+    ///
+    /// * PgUp/PgDn arrive as `\e[5~`/`\e[6~` (`legacyKeySequences`) or as the
+    ///   Kitty `\e[5;1~` form, both unmodified and both unambiguous. They are
+    ///   bound to `.editorPageUp`/`.editorPageDown` in `Keybindings.defaults`, so
+    ///   intercepting them here TAKES them from the prompt — deliberately. The
+    ///   prompt is capped at about a third of the screen and its page motion there
+    ///   is indistinguishable from ↑/↓, while the transcript is the only viewport
+    ///   in this UI with a page worth turning. They are also bound to
+    ///   `.selectPageUp`/`.selectPageDown`, which is why this check sits BELOW the
+    ///   modal and diagnostics branches: a list that is up keeps its own paging.
+    /// * Shift+↑/↓ arrive as `\e[1;2A`/`\e[1;2B` (xterm/kitty/iTerm2) or `\e[a`/
+    ///   `\e[b` (rxvt) — different bytes from the bare `\e[A`/`\e[B` that recall
+    ///   prompt history, so the decoder tells them apart and the boundary-row
+    ///   history gesture is untouched. On a terminal that sends bare arrows for
+    ///   Shift+arrow the keystroke simply recalls history, exactly as it does
+    ///   today.
+    ///
+    /// Ctrl-U/Ctrl-D were rejected: `Keybindings.defaults` binds them to
+    /// `.editorDeleteToLineStart` and `.editorDeleteCharForward`, so taking them
+    /// would make a scroll key delete the user's text on a terminal where the
+    /// other bindings work.
+    private func keyboardScroll(_ data: [UInt8]) -> (rows: Int, up: Bool, page: Bool)? {
+        if matchesKey(data, Key.pageUp) { return (0, true, true) }
+        if matchesKey(data, Key.pageDown) { return (0, false, true) }
+        if matchesKey(data, KeyId(base: .up, shift: true)) { return (1, true, false) }
+        if matchesKey(data, KeyId(base: .down, shift: true)) { return (1, false, false) }
+        return nil
+    }
+
+    /// Scroll the pane the user is looking at, from the keyboard.
+    ///
+    /// FOCUS-targeted, unlike the wheel, because a keystroke carries no
+    /// coordinates: with the sidebar focused the keys page the session list, and
+    /// otherwise — including the ordinary case where the prompt holds the caret —
+    /// they page the transcript, which is what a user reading a long reply while
+    /// typing the next question expects.
+    private func scrollFromKeyboard(rows: Int, up: Bool, page: Bool) {
+        let columns = surface?.target.columns ?? 0
+        let height = surface?.target.rows ?? 0
+        let layout = ClientLayout(width: columns, height: height, promptRows: promptRows)
+        // A page keeps one row of overlap, so the eye has an anchor across the
+        // jump — the same step the Ctrl-wheel already uses.
+        let step = page ? max(1, layout.transcriptHeight - 1) : max(1, rows)
+        scroll(focus.current === sidebar ? .sidebar : .transcript, rows: step, up: up, layout: layout)
+        surface?.requestRender()
+    }
+
+    // MARK: Mouse
+
+    /// Route a mouse report to the pane under the pointer.
+    ///
+    /// Pointer-targeted rather than focus-targeted, which is what every terminal
+    /// application does and what a user expects: you scroll — and select — what you
+    /// are looking at, without first Tab-ing focus to it.
+    ///
+    /// Two gestures live here. The wheel scrolls, because the alternate screen has
+    /// no scrollback for the terminal to scroll on our behalf. A left drag selects
+    /// and a right click copies, because taking the mouse for the first also takes
+    /// away the terminal's OWN selection and its right-click menu — a debt this
+    /// pays back rather than leaving the user with F8 as the only answer.
+    private func handleMouse(_ event: MouseEvent) {
+        // With the mouse released the terminal owns the pointer. A report can still
+        // arrive — one already in the pipe when F8 was pressed — and acting on it
+        // would paint a highlight the user cannot clear with a gesture we no longer
+        // receive.
+        guard mouseOwned, let target = surface?.target else { return }
+        let layout = ClientLayout(width: target.columns, height: target.rows, promptRows: promptRows)
+
+        if event.isScroll {
+            guard event.kind == .scrollUp || event.kind == .scrollDown else { return }
+            // Ctrl-wheel pages, matching the convention of a viewport that has no
+            // separate page keys.
+            let step = event.ctrl ? max(1, layout.transcriptHeight - 1) : 3
+            scroll(
+                layout.pane(atColumn: event.column, row: event.row),
+                rows: step,
+                up: event.kind == .scrollUp,
+                layout: layout
+            )
+            surface?.requestRender()
+            return
+        }
+
+        let cell = ScreenCell(row: event.row, column: event.column)
+        // The PREVIOUS frame, which is what the user was looking at when they
+        // pressed. `validate` re-checks it against the next composed frame, and
+        // `copySelection` re-checks it before copying, so a press against a frame
+        // that has since changed can never produce a wrong clipboard.
+        let frame = surface?.lastFrameLines ?? []
+        switch (event.kind, event.button) {
+        case (.press, .left):
+            let pane = layout.pane(atColumn: event.column, row: event.row)
+            selection.press(
+                at: cell,
+                columns: layout.bounds(of: pane).columns,
+                frame: frame,
+                shiftExtend: event.shift,
+                now: Date()
+            )
+        case (.move, .left):
+            selection.drag(to: cell, frame: frame)
+        case (.release, .left), (.release, .none):
+            // SGR names the button on release; X10 has no release code of its own
+            // and reports button bits `3`, which the decoder maps to `.none`. Both
+            // end the drag.
+            selection.release(at: cell, frame: frame)
+        case (.press, .right):
+            copySelection()
+        default:
+            // Middle click is X11 primary-selection paste. It stays inert on
+            // purpose: reading a clipboard needs an OSC 52 *query*, whose answer
+            // arrives on stdin — a terminal-side exfiltration channel this program
+            // will not open for a convenience.
+            break
         }
         surface?.requestRender()
     }
 
+    /// Right-click: put the selection on the clipboard.
+    private func copySelection() {
+        let frame = surface?.lastFrameLines ?? []
+        // Re-checked against the frame the copy is actually taken from, so a
+        // selection whose rows changed between the drag and the click copies
+        // nothing rather than copying whatever replaced them.
+        selection.validate(against: frame)
+        guard let text = selection.text(from: frame), !text.isEmpty else {
+            // Nothing selected. Say what the gesture is for rather than doing
+            // something surprising: pasting is impossible (we cannot read the
+            // clipboard) and selecting under the pointer would copy text the user
+            // never chose.
+            post(notice: "drag to select, then right-click to copy · F8 releases the mouse")
+            return
+        }
+        writeClipboard(text)
+        // The highlight goes with the copy: it has served its purpose, and leaving
+        // it up invites a second right-click that copies the same thing again.
+        selection.clear()
+    }
+
+    /// Put `text` on the user's clipboard by both routes that exist.
+    ///
+    /// OSC 52 first, because it is the only one that works across ssh and inside a
+    /// multiplexer — the bytes ride the tty this UI is already painting on. The
+    /// local helper second, because several terminals ship OSC 52 writes disabled
+    /// and would otherwise silently do nothing. Neither is a fallback for the
+    /// other; whichever the user's setup supports wins, and doing both is how the
+    /// copy works without asking the user which one they have.
+    ///
+    /// Writing an escape between frames is safe here specifically: every
+    /// alternate-screen row is placed with an absolute CUP, so an out-of-band
+    /// sequence cannot desynchronise the paint cursor.
+    private func writeClipboard(_ text: String) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        if let sequence = osc52CopySequence(Array(text.utf8), multiplexer: multiplexer) {
+            surface?.target.write(String(decoding: sequence, as: UTF8.self))
+            post(notice: "copied \(lines) line\(lines == 1 ? "" : "s")")
+        } else {
+            // A refusal, not a truncation: a terminal bounds its OSC parser and
+            // truncates past the bound SILENTLY, so an oversized sequence does not
+            // fail, it produces a wrong clipboard. The local helper has no such cap.
+            post(notice: "selection too large for the terminal clipboard — trying the local helper")
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if case .failed(let why) = await self.clipboard.copy(text) {
+                self.post(notice: "clipboard: \(sanitizeUntrustedText(collapseToOneLine(why)))")
+            }
+        }
+    }
+
+    /// F8: hand the mouse back to the terminal, or take it again.
+    ///
+    /// The escape hatch the in-app selection owes the user. Terminals differ, and
+    /// this program cannot be right about all of them; a user whose terminal it
+    /// gets wrong needs their own selection and their own right-click menu back
+    /// without ending the session and restarting with `--no-mouse`.
+    private func toggleMouse() {
+        mouseOwned.toggle()
+        // Whatever was selected was selected with a mouse we may no longer have.
+        selection.clear()
+        lifecycle?.setMouseReporting(mouseOwned)
+        post(
+            // The wheel goes WITH the mouse — that is the surprise, and saying it
+            // is the whole point of this notice: a user who pressed F8 to get
+            // their terminal's own selection back did not ask to lose scrolling
+            // and would otherwise discover it by finding the transcript frozen.
+            // The replacement keys are on the persistent marker beside it, which
+            // outlives the six seconds; repeating them here would only cost the
+            // columns that the marker itself needs.
+            notice: mouseOwned
+                ? "mouse captured — drag to select, right-click to copy"
+                : "mouse released — PgUp/PgDn scrolls now, the wheel went with it",
+            seconds: 6
+        )
+        surface?.requestRender()
+    }
+
+    // MARK: Dropped files
+
+    /// Answer a drop the prompt handed over: read the candidate paths off the main
+    /// actor and either stage them as chips or give the text back.
+    ///
+    /// The whole gesture rests on one rule — NEVER SILENTLY EAT A PATH THE USER
+    /// MEANT AS TEXT. `DroppedPaths` refuses to even offer prose, and this refuses
+    /// everything that is not an image on disk right now, putting the raw paste
+    /// back at the caret verbatim. Asking about `/tmp/notes.txt` in a sentence, or
+    /// dropping a PDF, leaves you with exactly the text you pasted plus a line
+    /// saying why nothing was attached.
+    ///
+    /// Three outcomes, not two, because `ImageAttachmentLoader.resolveDrop` ranks
+    /// whole READINGS of the paste: `/Users/x/my pic.png` is either one file with a
+    /// space or two files, and only the disk can say which. A rejection can
+    /// therefore mean either "this tokenization was wrong" — in which case nothing
+    /// may be attached and the raw paste goes back whole — or "this file cannot
+    /// ride this message", in which case the ones that CAN must be attached and
+    /// only the refused paths go back. ``readingResolved(_:candidateCount:)`` is
+    /// where those two are told apart; treating every rejection as the first is
+    /// how a drop of nine photos attached none of them and then said the ninth
+    /// had been "skipped".
+    private func resolveDrop(token: UInt32, candidates: [[String]]) {
+        // Taken before the hop: the raw text is the only copy of what the user
+        // pasted, and the prompt forgets it the moment the drop is answered.
+        let rawText = promptInput.pendingDropText(for: token) ?? ""
+        let staged = promptInput.attachments
+        let limits = Self.attachmentLimits
+        let fileSystem = self.fileSystem
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // `resolveDrop` is `@concurrent`, so the stat/sniff/read and the whole
+            // image payload stay off the render loop — which is the difference
+            // between a chip appearing and the UI freezing for the length of a
+            // 5 MiB read.
+            let result = await ImageAttachmentLoader.resolveDrop(
+                candidates: candidates,
+                using: fileSystem,
+                limits: limits,
+                alreadyLoaded: staged.map(Self.loadedImage)
+            )
+            defer { self.surface?.requestRender() }
+
+            if result.isCompleteSuccess {
+                let attached = self.stage(result.loaded)
+                let live = self.promptInput.resolveDrop(token: token, outcome: .attached(attached))
+                guard live else { self.reportAbandonedDrop(attached.count); return }
+                if attached.isEmpty {
+                    // Every path in the reading named something already staged. Not a
+                    // failure, and not a new chip either — say so, or a second drop of
+                    // the same file looks like it did nothing.
+                    self.post(notice: "already attached")
+                } else {
+                    self.post(notice: "attached \(attached.count) image\(attached.count == 1 ? "" : "s")")
+                }
+                return
+            }
+
+            // A resolved reading that hit a limit or named one non-image among
+            // several: attach what loaded and hand back ONLY the refused paths.
+            if !result.loaded.isEmpty,
+               Self.readingResolved(result, candidateCount: candidates.count) {
+                let attached = self.stage(result.loaded)
+                // The paths as the loader named them, one per line — not `rawText`,
+                // which is the whole paste and would put the attached files back as
+                // text beside their own chips.
+                let refusedText = result.rejected.map(\.path.string).joined(separator: "\n")
+                let live = self.promptInput.resolveDrop(
+                    token: token,
+                    outcome: .partial(attached: attached, text: refusedText)
+                )
+                guard live else { self.reportAbandonedDrop(attached.count); return }
+                self.post(notice: Self.partialNotice(attached: attached.count, refused: result.rejected), seconds: 6)
+                return
+            }
+
+            // A cancelled batch is a gesture the user took back, so it earns no
+            // complaint — but the text still goes back, because losing it would
+            // be the one failure this feature must never have.
+            let notice = result.wasCancelled
+                ? ""
+                : (result.rejected.first?.message ?? "nothing there to attach")
+            let live = self.promptInput.resolveDrop(
+                token: token, outcome: .rejected(rawText: rawText, notice: notice))
+            guard live else { self.reportAbandonedDrop(0); return }
+            if !notice.isEmpty {
+                self.post(notice: "not attached — \(sanitizeUntrustedText(collapseToOneLine(notice)))", seconds: 6)
+            }
+        }
+    }
+
+    /// A drop whose answer arrived after the prompt had moved on.
+    ///
+    /// `PromptInput.resolveDrop` applies nothing to a document that was cleared
+    /// under it, so this is the ONLY thing standing between the user and a message
+    /// that silently lost its picture while the status line congratulated them. It
+    /// says the opposite of what the success notice would have said.
+    private func reportAbandonedDrop(_ count: Int) {
+        guard count > 0 else { return }
+        post(
+            notice: "the prompt was cleared while it loaded — "
+                + "\(count) image\(count == 1 ? "" : "s") not attached · drop again",
+            seconds: 6
+        )
+    }
+
+    /// Whether a reading that produced rejections nonetheless RESOLVED — i.e. the
+    /// rejections mean "this file cannot be attached", not "this was the wrong
+    /// tokenization of the paste".
+    ///
+    /// Exactly two reasons are treated as evidence AGAINST the tokenization, and
+    /// only while an alternative reading exists:
+    ///
+    /// * `.missing` — nothing at that path. This is the signature of a bad split:
+    ///   `/Users/x/my pic.png` read as two tokens leaves `/Users/x/my`, which is
+    ///   not there. It is also what the whole-string reading produces when the
+    ///   drop really was several files.
+    /// * `.notARegularFile` — a directory, which is the other thing the leading
+    ///   half of a split filename tends to be.
+    ///
+    /// Every other reason — `.notAnImage`, `.tooLarge`, `.unreadable`, and both
+    /// limits — means a REAL FILE was found at that exact path and could not be
+    /// attached. A path that resolves to a file on disk is the strongest evidence
+    /// there is that the tokenization was right, so the reading is resolved and
+    /// the images beside it must be kept.
+    ///
+    /// The count check is not redundant: `DroppedPaths` offers the whole trimmed
+    /// string as a single path alongside the tokenized reading, so a
+    /// space-separated multi-file drop essentially always has two candidates and a
+    /// rule keyed on "was there only one reading" would refuse every one of them.
+    private static func readingResolved(
+        _ result: ImageAttachmentLoadResult,
+        candidateCount: Int
+    ) -> Bool {
+        if candidateCount <= 1 { return true }
+        return result.rejected.allSatisfy { rejection in
+            switch rejection.reason {
+            case .missing, .notARegularFile: return false
+            default: return true
+            }
+        }
+    }
+
+    /// The notice for a drop that partly attached.
+    ///
+    /// `ImageAttachmentRejection.message` says "skipped", which is written for the
+    /// all-or-nothing surfaces (`--image`, the REPL) where nothing else happened.
+    /// Here something else did happen — the rest are on the prompt — so the two
+    /// limit reasons are re-worded to say which file is missing from the message
+    /// about to be sent. Every other reason already names itself exactly.
+    private static func partialNotice(attached: Int, refused: [ImageAttachmentRejection]) -> String {
+        let head = "attached \(attached) image\(attached == 1 ? "" : "s")"
+        guard let first = refused.first else { return head }
+        let clause: String
+        switch first.reason {
+        case .countLimitReached(let limit):
+            clause = "\(first.displayName) not attached: at most \(limit) image\(limit == 1 ? "" : "s") per message"
+        case .totalBytesExceeded(let limit):
+            clause = "\(first.displayName) not attached: over the "
+                + "\(LoadedImage.formattedByteCount(limit)) total limit"
+        default:
+            clause = first.message
+        }
+        let more = refused.count > 1 ? " (+\(refused.count - 1) more)" : ""
+        return head + " — " + sanitizeUntrustedText(collapseToOneLine(clause)) + more
+    }
+
+    /// Turn loaded images into chips, minting an id for each.
+    private func stage(_ images: [LoadedImage]) -> [PromptAttachment] {
+        images.map { image in
+            attachmentCounter &+= 1
+            return PromptAttachment(
+                id: attachmentCounter,
+                path: image.path.string,
+                name: image.displayName,
+                byteCount: image.byteCount,
+                image: ImageBlock(mediaType: image.mediaType, data: image.data)
+            )
+        }
+    }
+
+    /// A staged chip, in the loader's terms, so the count and total-byte limits are
+    /// enforced against what is ALREADY on the prompt rather than against each drop
+    /// in isolation.
+    private static func loadedImage(_ attachment: PromptAttachment) -> LoadedImage {
+        LoadedImage(
+            path: FilePath(attachment.path),
+            displayName: attachment.name,
+            mediaType: attachment.image.mediaType,
+            data: attachment.image.data
+        )
+    }
+
     // MARK: Session lifecycle
 
+    /// Run `work`, retrying a few times before giving up, saying so between goes.
+    ///
+    /// Only for the two calls that make a session usable at all — the create and
+    /// the resume. Everything else in this file is either idempotent and retried
+    /// by its own loop (the event stream) or is a user action that must fail
+    /// visibly rather than silently take four seconds (a prompt, an abort).
+    ///
+    /// The notice is the point as much as the retry is: a startup that pauses for
+    /// three seconds with a blank sidebar and no explanation is the same experience
+    /// as a startup that failed.
+    private func retrying<T>(
+        _ what: String,
+        _ work: () async throws -> T
+    ) async throws -> T {
+        var lastError: (any Error)?
+        for attempt in 1...Self.sessionAttempts {
+            do {
+                return try await work()
+            } catch {
+                lastError = error
+                guard attempt < Self.sessionAttempts else { break }
+                post(notice: "could not \(what) — retrying (\(attempt)/\(Self.sessionAttempts - 1))")
+                try? await Task.sleep(for: .milliseconds(500 * attempt))
+            }
+        }
+        // Non-nil: the loop runs at least once and only leaves here via a `catch`.
+        throw lastError ?? ServerClientError.timedOut(path: what)
+    }
+
     private func bootstrap() async {
-        let sessions = (try? await client.listSessions()) ?? []
+        // Prompt history first, and off the render loop: it is a local file read, it
+        // is what the very first Up will want, and it must not be behind a network
+        // round trip to the runtime.
+        if let historyStore {
+            promptInput.seedHistory(await historyStore.load())
+        }
+        let sessions: [SessionSummary]
+        do {
+            sessions = try await client.listSessions()
+        } catch {
+            // Everything below this needs the runtime. Reporting and stopping is
+            // honest; carrying on with an empty list produced an empty sidebar,
+            // an empty pane, and a prompt box that silently 404'd every send.
+            postError(
+                "Could not reach the runtime",
+                error,
+                hint: "The server may not be running, or the token may be wrong."
+            )
+            return
+        }
         store.setSessions(sessions)
         if let first = sessions.first {
             await open(first.id)
@@ -283,9 +1086,31 @@ public final class ClientApp {
     }
 
     private func createAndOpen() async {
-        guard let ref = try? await client.createSession() else { return }
-        let sessions = (try? await client.listSessions()) ?? store.sessions
-        store.setSessions(sessions)
+        let ref: SessionRef
+        do {
+            ref = try await retrying("create a session") { try await self.client.createSession() }
+        } catch {
+            // A `guard … else { return }` here left the app with no session at
+            // all: no transcript, no target for a prompt, and no explanation —
+            // and, because bootstrap is the only caller, no way back short of
+            // restarting the program.
+            postError(
+                "Could not create a session",
+                error,
+                hint: "There is no session to send to. Press 'n' in the sidebar to try again."
+            )
+            return
+        }
+        // No `setSessionPath` here: `open` selects the session, which clears it,
+        // and then re-learns it from the idempotent resume. One producer.
+        do {
+            store.setSessions(try await client.listSessions())
+        } catch {
+            // The sidebar's CONTENT is intact — it is missing one new row, and
+            // the session we just made is about to be opened anyway. A transient
+            // notice is the right weight for that.
+            post(notice: "the session list did not refresh")
+        }
         await open(ref.id)
     }
 
@@ -306,10 +1131,50 @@ public final class ClientApp {
         // worked and nothing said so. `createSession(resume:)` is idempotent — it
         // returns the existing reference when the session is already live — so this is
         // also correct for the session we just created.
-        _ = try? await client.createSession(resume: sessionID)
+        // Both failures below are held and posted AFTER `seed`, never before:
+        // `seed` replaces the whole transcript, so a row appended first would be
+        // silently deleted by the very next statement — a report that reports
+        // nothing is worse than the `try?` it replaced.
+        var failures: [(headline: String, error: any Error, hint: String?)] = []
+
+        do {
+            // The path comes back on the reference; it is the only durable record
+            // of this conversation there is, so a failure row can point at it.
+            //
+            // Retried, because ONE failure here used to be permanent: the client
+            // attached to a session the server does not have live, every endpoint
+            // 404'd, and no code path ever tried the resume again. A runtime that
+            // is a second slow to come up is not a dead session.
+            let ref = try await retrying("reopen this session") {
+                try await self.client.createSession(resume: sessionID)
+            }
+            guard store.selectedSessionID == sessionID else { return }
+            store.setSessionPath(ref.path)
+        } catch {
+            guard store.selectedSessionID == sessionID else { return }
+            // The highest-value row in this file. Without it the session opens
+            // looking completely normal and then refuses everything: prompts,
+            // aborts and approvals all 404 into a `try?`, the stream never
+            // attaches, and no permission_request can arrive. The user sees a
+            // working-looking UI that does nothing.
+            failures.append((
+                "This session is not live on the server",
+                error,
+                "Prompts, aborts and approvals will not work until it is reopened. Retrying in the background."
+            ))
+        }
         guard store.selectedSessionID == sessionID else { return }
 
-        let history = (try? await client.messages(sessionID: sessionID)) ?? []
+        var history: [Message] = []
+        do {
+            history = try await client.messages(sessionID: sessionID)
+        } catch {
+            guard store.selectedSessionID == sessionID else { return }
+            // An empty pane is indistinguishable from a brand-new session, so a
+            // history that would not load must say so — and the stream still gets
+            // attached below, because live events are useful even without the past.
+            failures.append(("Could not load this session's history", error, nil))
+        }
         // A newer selection may have superseded this one while messages() was in
         // flight (a slow session opened, then a fast one). Drop this stale
         // completion so it cannot clobber the newer session's transcript or attach
@@ -317,6 +1182,7 @@ public final class ClientApp {
         // pane shows A and a prompt silently targets B.
         guard store.selectedSessionID == sessionID else { return }
         store.seed(history)
+        for failure in failures { postError(failure.headline, failure.error, hint: failure.hint) }
         attachEvents(sessionID)
     }
 
@@ -335,8 +1201,18 @@ public final class ClientApp {
         eventTask = Task { @MainActor [weak self] in
             var backoffMS = 125
             var isReconnect = false
+            // When the CURRENT outage began, or nil while the stream is up. The
+            // escalation below is a statement about elapsed time, so it has to be
+            // measured in elapsed time.
+            var outageStartedAt: Date?
+            // The thrown value, not just its description: a 404 here is a
+            // different DIAGNOSIS from every other failure and gets a different
+            // repair (see below), and `lastStreamError` has already flattened it
+            // to prose by then.
+            var lastFailure: (any Error)?
             while !Task.isCancelled {
                 guard let self, self.store.selectedSessionID == sessionID else { return }
+                lastFailure = nil
                 do {
                     for try await event in self.client.events(sessionID: sessionID) {
                         guard self.store.selectedSessionID == sessionID else { return }
@@ -345,6 +1221,12 @@ public final class ClientApp {
                             // server sends `connected` first). Doing the GET before
                             // subscribing would lose a prompt asked in the gap.
                             backoffMS = 125
+                            self.lastStreamError = nil
+                            // Armed again: the NEXT outage gets its own row. An
+                            // outage that recovered is a different event from the
+                            // one that follows it.
+                            self.reportedStreamFailure = false
+                            outageStartedAt = nil
                             self.setStreamConnected(true)
                             // Re-seed after an OUTAGE: the stream is delta-only, so
                             // everything that streamed while we were away is simply
@@ -354,9 +1236,18 @@ public final class ClientApp {
                             // partial streamed text. Before `apply`, because `seed`
                             // clears the transcript (and the run state with it), which
                             // would wipe the `running` this very frame carries.
-                            if isReconnect, let history = try? await self.client.messages(sessionID: sessionID) {
-                                guard self.store.selectedSessionID == sessionID else { return }
-                                self.store.seed(history)
+                            if isReconnect {
+                                do {
+                                    let history = try await self.client.messages(sessionID: sessionID)
+                                    guard self.store.selectedSessionID == sessionID else { return }
+                                    self.store.seed(history)
+                                } catch {
+                                    // The pane keeps what it has; what it is missing
+                                    // is whatever streamed while we were away. A
+                                    // transient notice, because nothing the user
+                                    // typed was lost and the next reconnect retries.
+                                    self.post(notice: "history refresh failed — the pane may be missing what streamed while you were away")
+                                }
                             }
                             isReconnect = false
                             self.store.apply(event)
@@ -366,17 +1257,67 @@ public final class ClientApp {
                         self.store.apply(event)
                     }
                 } catch {
-                    // Fall through to the same retry as a clean end.
+                    // Fall through to the same retry as a clean end — but KEEP the
+                    // reason. A thrown transport error and a clean end-of-body are
+                    // the same recovery and very different diagnoses, and the
+                    // status line can only say which if this records it.
+                    self.lastStreamError = Self.describe(error)
+                    lastFailure = error
                 }
                 guard !Task.isCancelled, self.store.selectedSessionID == sessionID else { return }
                 // The stream is down. Say so — a silent disconnect is exactly what made
                 // this look like a freeze — then retry with bounded backoff.
                 self.setStreamConnected(false)
+                let outageStart = outageStartedAt ?? Date()
+                outageStartedAt = outageStart
+                // Escalate from the status line to a persistent row ONCE the outage
+                // has genuinely lasted a while, so scrolling away from a spinner no
+                // longer hides the fact that nothing is connected.
+                //
+                // Measured against the CLOCK, not against the backoff counter. The
+                // counter only tracks elapsed time if each failed attempt returns
+                // instantly, and the case that matters most — a runtime whose port is
+                // gone — costs about ten seconds per attempt to surface ECONNREFUSED.
+                // Six of those put the row nearly a minute after the outage, long past
+                // the point the user has decided the client is broken.
+                if Date().timeIntervalSince(outageStart) >= Self.streamOutageNoticeDelay,
+                   !self.reportedStreamFailure {
+                    self.reportedStreamFailure = true
+                    self.postError(
+                        "Lost the connection to the runtime",
+                        reason: self.lastStreamError ?? "the event stream ended without an error",
+                        hint: "Reconnecting automatically; nothing you typed was lost."
+                    )
+                }
+                // A 404 on the event stream means one specific thing: the runtime
+                // does not have this session LIVE. That is not a network problem
+                // and reconnecting forever will never fix it — the resume is what
+                // fixes it, and until this existed nothing ever tried the resume a
+                // second time, so a session that failed to open at startup stayed
+                // permanently inert with every endpoint 404ing.
+                if let failure = lastFailure,
+                   case ServerClientError.unexpectedStatus(404, _, _) = failure {
+                    await self.reviveSession(sessionID)
+                }
                 isReconnect = true
                 try? await Task.sleep(for: .milliseconds(backoffMS))
                 backoffMS = min(backoffMS * 2, 4000)
             }
         }
+    }
+
+    /// Try to make a session live again after the runtime said it does not have it.
+    ///
+    /// `createSession(resume:)` is idempotent and cheap, and it is the ONLY thing
+    /// that turns a 404-ing session back into a working one. Silent on failure —
+    /// the reconnect loop is already saying, once, that the connection is down, and
+    /// this runs on every backoff tick.
+    private func reviveSession(_ sessionID: String) async {
+        guard let ref = try? await client.createSession(resume: sessionID),
+              store.selectedSessionID == sessionID
+        else { return }
+        store.setSessionPath(ref.path)
+        post(notice: "the session is live again")
     }
 
     /// Record the stream's health for the status line, repainting on a change.
@@ -390,10 +1331,18 @@ public final class ClientApp {
     /// missed on the drop-oldest SSE stream, or one left over on reconnect). The store
     /// drops events for the wrong session and already-resolved ids, so this is safe.
     private func reconcilePendingPermissions(_ sessionID: String) async {
-        guard store.selectedSessionID == sessionID,
-              let pending = try? await client.pendingPermissions(sessionID: sessionID),
-              store.selectedSessionID == sessionID
-        else { return }
+        guard store.selectedSessionID == sessionID else { return }
+        let pending: [ServerEvent]
+        do {
+            pending = try await client.pendingPermissions(sessionID: sessionID)
+        } catch {
+            // A parked run stays unanswerable until the next reconnect retries
+            // this, so the user has to know the modal they are waiting for may
+            // never arrive. Transient: the retry is automatic and close.
+            post(notice: "could not check for pending approvals")
+            return
+        }
+        guard store.selectedSessionID == sessionID else { return }
         for event in pending { store.apply(event) }
     }
 
@@ -416,35 +1365,80 @@ public final class ClientApp {
     /// synchronous one for the common case, which can put the text back in the same
     /// main-actor turn as the keystroke; and a `catch` for every remaining race, which
     /// restores it too.
-    private func submit(_ text: String) {
+    private func submit(_ text: String, _ attachments: [PromptAttachment]) {
         guard let id = store.selectedSessionID else {
-            promptInput.restore(text)
+            promptInput.restore(text, attachments: attachments)
             post(notice: "no session is open")
             return
         }
         // The client's view of run state is racy against the server's, so this is an
         // optimisation of the common case, not the guarantee — the catch below is.
         if store.runState == .running {
-            promptInput.restore(text)
-            post(notice: "a turn is already running — Esc to abort it, or wait")
+            promptInput.restore(text, attachments: attachments)
+            refuseAsBusy()
             return
         }
         // Sending snaps the transcript back to the tail: a user who scrolled up to
         // re-read something and then asks a question must see the answer, not stay
         // parked in the history while the reply streams in off-screen.
         transcriptView.scrollToBottom()
+        // The bytes are already in hand — they were read at drop time, off the main
+        // actor — so this is a pure send with no IO of its own and nothing that can
+        // fail for a reason the prompt is not about.
+        let images = attachments.map(\.image)
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                try await self.client.sendPrompt(sessionID: id, prompt: text)
-            } catch ServerClientError.unexpectedStatus(409, _) {
-                self.promptInput.restore(text)
-                self.post(notice: "a turn is already running — Esc to abort it, or wait")
+                try await self.client.sendPrompt(sessionID: id, prompt: text, images: images)
+            } catch ServerClientError.unexpectedStatus(413, _, _) {
+                // The body was refused as too large. Everything is put back —
+                // including the chips, which is the whole point: a 413 that
+                // restored the text and dropped the images would leave the user
+                // re-sending a message that is silently missing its attachment.
+                self.promptInput.restore(text, attachments: attachments)
+                self.post(notice: "attachments too large — the message was put back")
+                self.postError(
+                    "The server refused the message as too large",
+                    reason: "HTTP 413 — the prompt and its \(images.count) attachment\(images.count == 1 ? "" : "s") exceed the server's body limit",
+                    hint: "Remove an image (Backspace on an empty prompt) or send a smaller one. Your text and chips were put back."
+                )
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                // Expected, recoverable, and already explained by the notice: the
+                // server allows one turn at a time. No transcript row — a red
+                // block for "wait a moment" is noise.
+                self.promptInput.restore(text, attachments: attachments)
+                self.refuseAsBusy()
+                // The refusal is only trustworthy if the run it names is real. A
+                // 409 from a run that can never settle is exactly the wedge, and
+                // asking the server here is what turns the SECOND press of Enter
+                // into the thing that either clears the state or proves it is real.
+                await self.reconcileWithServer(id)
             } catch {
-                self.promptInput.restore(text)
+                self.promptInput.restore(text, attachments: attachments)
                 self.post(notice: "could not send — the message was put back")
+                // The notice says the text is safe; the row says WHY it did not
+                // send, which is the part that survives long enough to act on.
+                self.postError(
+                    "Could not send the message",
+                    error,
+                    hint: "Your text was put back in the prompt."
+                )
             }
         }
+    }
+
+    /// Refuse a prompt because a turn is already in flight — and make the refusal
+    /// itself a repair.
+    ///
+    /// "a turn is already running" was true and useless: it named no way out, and
+    /// in the wedged case it was not even true, because the run it named could
+    /// never finish. So the message names BOTH exits, and pressing Enter forces the
+    /// authoritative poll on the very next tick — meaning a user hammering the key
+    /// in frustration is, without knowing it, doing the exact thing that unsticks a
+    /// client whose run state is stale.
+    private func refuseAsBusy() {
+        post(notice: "a turn is already running — Esc aborts it · ^G shows why")
+        lastStatusPollAt = .distantPast
     }
 
     private func abort() {
@@ -466,6 +1460,178 @@ public final class ClientApp {
                 }
             } catch {
                 self.post(notice: "could not abort — the run may still be going")
+                // A run the user asked to stop and could not is something they
+                // have to decide about; that decision outlives four seconds.
+                self.postError("Could not abort the run", error)
+            }
+        }
+    }
+
+    // MARK: Diagnostics (^G)
+
+    /// The ^G panel's outer width.
+    private static let diagnosticsOverlayWidth = 70
+
+    /// Open or close the diagnostics panel.
+    private func toggleDiagnostics() {
+        if diagnosticsHandle != nil {
+            dismissDiagnosticsOverlay()
+        } else {
+            presentDiagnosticsOverlay()
+            fetchDiagnosticsStatus()
+        }
+    }
+
+    /// Show the panel: what the client believes, what the server says, and the one
+    /// lever that frees a session whose run can never settle.
+    ///
+    /// The whole point is that a user who wedges has something to LOOK at and
+    /// something to PULL, instead of a spinner and a restart. It is reachable while
+    /// a permission modal is up — see the branch order in ``handleInput(_:)`` —
+    /// because "why is this parked" is exactly the question a modal provokes.
+    private func presentDiagnosticsOverlay() {
+        let items = [
+            SelectItem(value: "close", label: "Close", description: nil),
+            SelectItem(
+                value: "force-clear",
+                label: "Force-clear the run (frees the session, loses this turn)",
+                description: nil
+            ),
+        ]
+        let columns = surface?.target.columns ?? Self.diagnosticsOverlayWidth
+        let width = min(Self.diagnosticsOverlayWidth, max(30, columns))
+
+        let list = SelectList(items: items, maxVisible: items.count, keybindings: keybindings)
+        let inner = Container()
+        inner.addChild(Text("\u{1b}[1mConnection & run state\u{1b}[0m", wrap: false))
+        // A LIVE component, not a snapshot: "last frame 4s ago" is the single most
+        // useful row here and it would be a lie one second after it was drawn.
+        // The overlay is re-rendered every frame, so a closure-backed component
+        // simply keeps telling the truth for as long as the panel is open — and
+        // it is handed the width the compositor is actually laying it out at,
+        // rather than one captured when the panel opened.
+        inner.addChild(DynamicLines { [weak self] width in self?.diagnosticsRows(width: width) ?? [] })
+        inner.addChild(Spacer(lines: 1))
+        inner.addChild(list)
+        inner.addChild(Text(dim("↑/↓ choose · Enter · ^G or Esc closes"), wrap: false))
+
+        let contentHeight = 1 + Self.diagnosticsRowCount + 1 + items.count + 1
+        diagnosticsOverlaySize = surface.map { ($0.target.columns, $0.target.rows) }
+        // The HANDLE is assigned FIRST and the list second, and the input branch
+        // keys off the handle. The other order is a whole-keyboard trap: a nil
+        // surface would leave a list with no overlay, and the input branch would
+        // then swallow every key forever with nothing on screen to dismiss.
+        diagnosticsHandle = surface?.showOverlay(
+            Box(inner, paddingX: 1),
+            options: OverlayOptions(
+                width: .absolute(width),
+                minWidth: 20,
+                maxHeight: .absolute(contentHeight + 2),
+                anchor: .center
+            )
+        )
+        diagnosticsList = list
+    }
+
+    /// How many rows ``diagnosticsRows(width:)`` always produces, so the overlay's
+    /// height budget and its content cannot drift apart.
+    private static let diagnosticsRowCount = 9
+
+    /// The panel's body. Every value is read fresh on each render.
+    private func diagnosticsRows(width: Int) -> [String] {
+        let quiet = Int(Date().timeIntervalSince(store.lastEventAt))
+        func row(_ label: String, _ value: String) -> String {
+            let padded = label.padding(toLength: min(22, max(1, width)), withPad: " ", startingAt: 0)
+            return truncateToWidth(padded + " " + sanitizeUntrustedText(collapseToOneLine(value)), width)
+        }
+        let server: [String]
+        if let status = diagnosticsStatus {
+            server = [
+                row("server running", status.running ? "yes" : "no"),
+                row("server run started", status.runStartedAt ?? "—"),
+                row("server prompts", status.pendingPermissionIDs.isEmpty
+                    ? "none" : status.pendingPermissionIDs.joined(separator: ", ")),
+                row("server subscribers", String(status.subscribers)),
+            ]
+        } else {
+            let reason = diagnosticsStatusError ?? "checking…"
+            server = [row("server", reason), row("", ""), row("", ""), row("", "")]
+        }
+        return [
+            row("runtime", client.baseURL),
+            row("stream", streamConnected ? "connected" : "reconnecting… \(lastStreamError ?? "")"),
+            row("last frame", "\(quiet)s ago"),
+            row("client run state", store.runState == .running
+                ? "running" : "idle\(store.lastStopReason.map { " (\($0))" } ?? "")"),
+            row("client prompt", store.pendingPermission?.id ?? "none"),
+        ] + server
+    }
+
+    /// Ask the server for its half of the panel, once, when the panel opens.
+    private func fetchDiagnosticsStatus() {
+        diagnosticsStatus = nil
+        diagnosticsStatusError = nil
+        guard let id = store.selectedSessionID else {
+            diagnosticsStatusError = "no session is open"
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let status = try await self.client.status(sessionID: id)
+                guard self.store.selectedSessionID == id else { return }
+                self.diagnosticsStatus = status
+            } catch {
+                // Named, not swallowed: "unavailable" and "the token is wrong" are
+                // very different answers to "why does nothing work".
+                self.diagnosticsStatusError = "unavailable — \(Self.describe(error))"
+            }
+            self.surface?.requestRender()
+        }
+    }
+
+    /// Rebuild the panel when the terminal size changes, mirroring the modal's own
+    /// re-fit: an overlay laid out for the old size is clipped or cramped.
+    private func rebuildDiagnosticsOverlayIfResized() {
+        guard diagnosticsHandle != nil, let surface else { return }
+        let size = (surface.target.columns, surface.target.rows)
+        guard let previous = diagnosticsOverlaySize, previous != size else {
+            diagnosticsOverlaySize = size
+            return
+        }
+        // Carried by VALUE, not index: losing the selection silently across a
+        // resize is how a window drag turns "Close" into a destructive lever, or
+        // the reverse. `diagnosticsStatus` survives on its own — only the overlay
+        // is rebuilt, and the server's answer is not part of it.
+        let selected = diagnosticsList?.getSelectedItem()?.value
+        dismissDiagnosticsOverlay()
+        presentDiagnosticsOverlay()
+        if selected == "force-clear" { diagnosticsList?.setSelectedIndex(1) }
+    }
+
+    private func dismissDiagnosticsOverlay() {
+        diagnosticsHandle?.hide()
+        diagnosticsHandle = nil
+        diagnosticsList = nil
+        diagnosticsOverlaySize = nil
+    }
+
+    /// Act on the selected panel row.
+    private func activateDiagnosticsRow() {
+        let value = diagnosticsList?.getSelectedItem()?.value
+        dismissDiagnosticsOverlay()
+        guard value == "force-clear", let id = store.selectedSessionID else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.forceClearRun(sessionID: id)
+                // Do not wait for a frame to tell us: the whole reason this lever
+                // exists is that the run in question cannot produce one.
+                self.store.markIdle()
+                self.post(notice: "the run was cleared — you can send again")
+            } catch {
+                self.post(notice: "could not clear the run")
+                self.postError("Could not clear the run", error)
             }
         }
     }
@@ -538,7 +1704,6 @@ public final class ClientApp {
         // on an option the user could not see.
         let visibleItems = max(1, min(items.count, available - borderRows))
         let list = SelectList(items: items, maxVisible: visibleItems, keybindings: keybindings)
-        permissionList = list
         permissionItemValues = items.map(\.value)
 
         // Box takes one column of border and one of padding on each side.
@@ -563,6 +1728,13 @@ public final class ClientApp {
         if showHint { contentHeight += 1 }
 
         permissionOverlaySize = surface.map { ($0.target.columns, $0.target.rows) }
+        // Handle FIRST, list second — and `handleInput` keys off the HANDLE.
+        //
+        // The other order is one refactor away from the worst wedge in this file: a
+        // nil `surface` would leave `permissionList` set with no overlay on screen,
+        // and the input branch would then swallow the entire keyboard forever with
+        // nothing visible and no path to dismissal (`reconcilePermissionOverlay`
+        // keys off the handle, so it would never take it down either).
         permissionHandle = surface?.showOverlay(
             Box(inner, paddingX: 1),
             options: OverlayOptions(
@@ -572,6 +1744,7 @@ public final class ClientApp {
                 anchor: .center
             )
         )
+        permissionList = list
     }
 
     /// Rebuild the modal when the terminal size changes.
@@ -630,6 +1803,11 @@ public final class ClientApp {
                 // The answer never landed, so the server run is still parked with no
                 // modal. Re-fetch the pending prompt so it returns and can be
                 // re-answered, rather than leaving the run hung.
+                //
+                // Say so first: the modal is about to reappear on its own, and a
+                // prompt that silently re-asks the question you just answered
+                // reads as the UI having lost the answer rather than the network.
+                self.post(notice: "the approval did not reach the server — re-asking")
                 await self.reconcilePendingPermissions(sessionID)
             }
         }
@@ -689,6 +1867,7 @@ extension ClientApp: TerminalApp {
         // The driver repaints on resize, which is the only hook the app gets; use it
         // to re-fit a modal that is already up.
         rebuildPermissionOverlayIfResized()
+        rebuildDiagnosticsOverlayIfResized()
         try surface?.renderSync()
     }
 
@@ -707,6 +1886,75 @@ extension ClientApp: TerminalApp {
         // agent that re-asks on every tool call left the session genuinely unquittable
         // while the status bar still advertised "^C: quit".
         if data == Self.ctrlC { quit.quit(); return }
+        // F8 takes or releases the mouse. ABOVE the modal branch deliberately: the
+        // moment a user most wants their terminal's own selection back is while a
+        // modal is showing them a command they want to copy elsewhere.
+        if matchesKey(data, Key.f8) { toggleMouse(); return }
+        // ^G opens the diagnostics panel. ABOVE the modal branch, and for the same
+        // reason ^O is: a parked modal is one of the states you most want to
+        // diagnose, and it is the state in which a user is most likely to conclude
+        // the client has frozen. BELOW Ctrl-C, always, so it can never shadow quit.
+        if data == Self.ctrlG { toggleDiagnostics(); return }
+        // ^O expands capped error and failed-tool detail. ABOVE the modal branch
+        // deliberately: reading the failure that is being re-tried, or the tool
+        // output that prompted the approval you are being asked for, is exactly
+        // what you want while a modal is up.
+        if data == Self.ctrlO {
+            transcriptView.expandErrors.toggle()
+            surface?.requestRender()
+            return
+        }
+        // The diagnostics panel owns the keyboard while it is up — including over a
+        // permission modal, which it can be opened on top of. Keyed off the HANDLE,
+        // so a list that somehow exists without an overlay cannot eat every key.
+        // Keyboard scrolling sits with the other above-the-modal globals, for the
+        // same reason the WHEEL does: re-reading what a tool is about to do is
+        // exactly what you want while its approval modal is up. Below the modal
+        // branch — which returns unconditionally — a released mouse plus a modal
+        // left the transcript unscrollable by any means at all, which is the hole
+        // this whole mechanism exists to close, in its most important state.
+        // Safe here: the modal reads only its four select actions and already
+        // swallowed these keys, and the sidebar ignores them.
+        // Escape clears a live selection BEFORE it means abort. Two reasons, and the
+        // order is semantic rather than a preference: dismissing a highlight is the
+        // less destructive of the two readings, and it is the one the status line is
+        // advertising at that exact moment. Below Ctrl-C, always — a selection must
+        // never make the session harder to leave.
+        if selection.selection != nil, matchesKey(data, Key.escape) {
+            selection.clear()
+            surface?.requestRender()
+            return
+        }
+        // Through the decoder, not a raw byte compare: the framer delivers two fast
+        // Escapes as ONE `[esc, esc]` frame, which a byte compare against `[0x1b]`
+        // never matches — so the abort key did not get the fix the decoder did.
+        // `matchesKey` (not `.selectCancel`) deliberately: that action is also bound
+        // to Ctrl-C, which must keep meaning quit.
+        if matchesKey(data, Key.escape) { abort(); return }
+        // The keyboard scroll, and the LAST branch before the surface, so every
+        // modal, overlay and global key above keeps its own meaning for these
+        // bytes. It is what makes a released mouse — F8, or `--no-mouse` for the
+        // whole session — a real alternative rather than a one-way door: the wheel
+        // goes with the mouse, and until this existed nothing else could move the
+        // transcript.
+        if let request = keyboardScroll(data) {
+            scrollFromKeyboard(rows: request.rows, up: request.up, page: request.page)
+            return
+        }
+
+        if diagnosticsHandle != nil {
+            if isKeyRelease(data) { return }
+            if let list = diagnosticsList,
+               keybindings.matches(data, .selectUp) || keybindings.matches(data, .selectDown) {
+                list.handleInput(data)
+                surface?.requestRender()
+            } else if keybindings.matches(data, .selectConfirm) {
+                activateDiagnosticsRow()
+            } else if keybindings.matches(data, .selectCancel) {
+                dismissDiagnosticsOverlay()
+            }
+            return
+        }
         // A permission prompt captures the rest of the keyboard: arrows move, Enter
         // confirms, Escape rejects; everything else is swallowed while a tool waits.
         if let list = permissionList {
@@ -733,12 +1981,6 @@ extension ClientApp: TerminalApp {
             }
             return
         }
-        // Through the decoder, not a raw byte compare: the framer delivers two fast
-        // Escapes as ONE `[esc, esc]` frame, which a byte compare against `[0x1b]`
-        // never matches — so the abort key did not get the fix the decoder did.
-        // `matchesKey` (not `.selectCancel`) deliberately: that action is also bound
-        // to Ctrl-C, which must keep meaning quit.
-        if matchesKey(data, Key.escape) { abort(); return }
         surface?.handleInput(data)
     }
 

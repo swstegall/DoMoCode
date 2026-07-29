@@ -262,12 +262,45 @@ extension DoMoError {
     /// 503, 504, plus 524 via the 5xx range). 408 is included because pi's
     /// pattern list retries request timeouts by wording anyway.
     ///
-    /// Deliberately narrow: it answers only the question a status code can
-    /// answer. Retryability decided from a response *body* belongs to the
+    /// The whole 5xx range is deliberate, and is what already covers the two
+    /// "the provider is busy" statuses that matter most in practice: 503, and
+    /// Anthropic's 529 `overloaded_error` as LiteLLM forwards it. 425 (Too
+    /// Early) is here because RFC 8470 §5.2 names retrying as *the* remedy —
+    /// the request was refused for when it arrived, not for what it said.
+    ///
+    /// Deliberately narrow otherwise: it answers only the question a status code
+    /// can answer. Retryability decided from a response *body* belongs to the
     /// provider adapter that understands that provider's vocabulary, and reaches
     /// callers through ``Kind/provider(status:isRetryable:)``.
     public static func isRetryableStatus(_ status: Int) -> Bool {
-        status == 408 || status == 429 || (500..<600).contains(status)
+        status == 408 || status == 425 || status == 429 || (500..<600).contains(status)
+    }
+
+    /// Whole milliseconds of `duration`, truncated toward zero, saturating
+    /// rather than trapping.
+    ///
+    /// The single projection of a `Duration` onto a millisecond count, because
+    /// the naive `components.seconds * 1000` is a trap waiting to happen:
+    /// `Duration` is arithmetic over a 128-bit value, so the multiply overflows
+    /// `Int64` long before a `Duration` runs out of range — and the durations
+    /// that reach here are built from `Retry-After`, which is text from the far
+    /// side of a wire. Saturating at `Int.max` reads as "forever", which is the
+    /// right answer for a hostile header; a trap would kill the process.
+    ///
+    /// A sub-millisecond duration truncates to `0`, deliberately — and it
+    /// truncates toward *zero*, not downward: `-500µs` is `0`, not `-1`. The
+    /// durations that reach here (retry delays, notice TTLs) are non-negative,
+    /// so the distinction never bites; it is documented so nobody reads
+    /// "rounds down" and relies on a floor this does not implement.
+    public static func wholeMilliseconds(_ duration: Duration) -> Int {
+        let components = duration.components
+        let (scaled, scaleOverflowed) = components.seconds.multipliedReportingOverflow(by: 1000)
+        guard !scaleOverflowed else { return components.seconds > 0 ? Int.max : Int.min }
+        let (total, addOverflowed) = scaled.addingReportingOverflow(
+            components.attoseconds / 1_000_000_000_000_000
+        )
+        guard !addOverflowed else { return components.seconds > 0 ? Int.max : Int.min }
+        return Int(total)
     }
 }
 
@@ -527,32 +560,12 @@ extension DoMoError: LocalizedError {
     ///
     /// `nil` where there is nothing honest to say. A suggestion that only
     /// restates the error trains people to stop reading them.
-    public var recoverySuggestion: String? {
-        switch kind {
-        case .transport:
-            return "Check network connectivity; this request can be retried."
-        case .authentication:
-            return "Check that the provider credential is set and has not expired."
-        case .rateLimit(let delay):
-            return delay.map { "Rate limited. Retry in \($0)." }
-                ?? "Rate limited. Retry after a short backoff."
-        case .quotaExhausted:
-            return
-                "The account is out of quota or credit. Waiting will not help — top up or switch model."
-        case .contextOverflow:
-            return "The conversation no longer fits the model's context window. Compact it and retry."
-        case .file(_, let errno):
-            switch errno {
-            case .noSuchFileOrDirectory: return "Check that the path exists."
-            case .permissionDenied: return "Check file permissions."
-            default: return nil
-            }
-        case .configuration:
-            return "Correct the configuration and start again."
-        case .provider, .malformedResponse, .toolExecution, .cancelled:
-            return nil
-        }
-    }
+    ///
+    /// The strings themselves live in ``ErrorPresentation/hint(for:)`` so that a
+    /// consumer holding only a wire *label* — a `ServerNotice`'s `kind`, with no
+    /// `DoMoError` to hand — reaches exactly the same wording. This property is
+    /// the same rule read through a value that still has its kind.
+    public var recoverySuggestion: String? { ErrorPresentation.hint(for: kind) }
 }
 
 // MARK: - Text
