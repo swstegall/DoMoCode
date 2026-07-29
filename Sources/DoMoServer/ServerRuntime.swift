@@ -495,8 +495,9 @@ public actor ServerRuntime {
     ///   to the same JSONL file, and the file's leaf is "last entry wins", so a late
     ///   append moves the file leaf onto the dead branch. Every live read therefore
     ///   walks back from the *live harness's* tip instead — see ``messages(sessionID:)``
-    ///   — and the replacement harness below is opened **pinned to that same live
-    ///   tip**, never to the file's. Both halves are required: reading around the
+    ///   — and the replacement harness below is opened **pinned to the live branch**
+    ///   (that tip, or the nearest ancestor of it the file can still resolve), never
+    ///   to the file's leaf. Both halves are required: reading around the
     ///   file leaf achieves nothing if this method re-derives one. A press of this
     ///   lever after the abandoned run has settled would otherwise re-anchor the
     ///   session onto the dead branch, and because every later turn is then appended
@@ -521,11 +522,31 @@ public actor ServerRuntime {
     ///      to stop writing on command — which is precisely what a wedged run
     ///      cannot be made to do.
     ///
-    /// It is **atomic**: the replacement harness is opened before anything is
-    /// cancelled or drained, so a failure to re-open the session file leaves the
-    /// session exactly as it was and the call can simply be retried. Half-clearing
-    /// a session — cancelled and drained but still holding its slot on a harness
-    /// whose `isRunning` is stuck — would be strictly worse than not trying.
+    /// It is **total**: it does not refuse. Every decision this method makes about
+    /// which branch to keep degrades along the live branch instead of throwing, and
+    /// the floor — an explicitly empty branch — is still a branch this session owns.
+    /// That property is the whole value of a lever of last resort: a refusal here is
+    /// not a retryable failure but a session that can never be cleared, because the
+    /// state that produced the refusal (a live tip the file does not have) can never
+    /// change back. Only the file itself failing to open or append can still stop it,
+    /// and that fails the whole session, not this method.
+    ///
+    /// It leaves the session **usable**, not merely unblocked. The branch it adopts
+    /// ends on a tool call that never returned — that is what the lever is *for* — so
+    /// before returning it persists a synthetic error result for every unanswered
+    /// call on that branch, exactly as ``drainPending(_:reason:)`` answers a parked
+    /// permission prompt. Without it the recovered session trades a 409 it cannot
+    /// clear for a 400 it cannot clear (see ``DoMoLLM/Context/hasToolHistory``), which
+    /// is the same dead session one layer down.
+    ///
+    /// It is **atomic**: the replacement harness is opened and sealed before anything
+    /// is cancelled, drained or replaced, so a failure in either leaves the session
+    /// exactly as it was and the call can simply be retried. Half-clearing a session —
+    /// cancelled and drained but still holding its slot on a harness whose `isRunning`
+    /// is stuck — would be strictly worse than not trying. The seal writes to the
+    /// session file, so a caller that loses the race below leaves those entries behind
+    /// on a branch nothing continues; that is the price of preparing before mutating,
+    /// and it is invisible to every reader, which walks from a live tip.
     ///
     /// It is also safely **repeatable and concurrent**: a caller whose session was
     /// replaced while it was opening the file (a double-press on the diagnostics
@@ -556,28 +577,51 @@ public actor ServerRuntime {
         // them cannot pair one state's path with another's tip.
         let harness = session.harness
         let path = await harness.sessionFilePath
-        // The branch this session is actually on. The doomed run keeps its own
-        // persistence sink over `path`, and the file's leaf is "last entry wins", so
-        // the file is not an authority on the live branch — this harness is.
-        let liveLeaf = await harness.currentLeafID
+        // The branch this session is actually on, tip first. The doomed run keeps its
+        // own persistence sink over `path`, and the file's leaf is "last entry wins",
+        // so the file is not an authority on the live branch — this harness is.
+        let liveBranch = await harness.leafLineage
         // Opened FIRST, while nothing has been mutated yet — and OFF this actor,
         // because it parses the whole session file and this lever is pulled exactly
         // when the runtime is already unhealthy and every other session's calls are
         // the last thing that should queue behind it.
         //
-        // `leaf:` refuses a tip that is not in the file rather than falling back to
-        // the file's own, so the replacement cannot silently land on another branch;
-        // a refusal leaves the session untouched and the call retryable, which is the
-        // same stance as any other failure to re-open.
+        // `preferring:` never falls back to the file's own leaf — that fallback IS
+        // the branch switch this pin exists to prevent — but it also never refuses:
+        // it takes the live tip when the file has it and the nearest ancestor of the
+        // live tip it can resolve otherwise, both of which are on the live branch by
+        // construction. That distinction is the whole point of the entry point. A
+        // strict pin makes this lever THROW, permanently and identically on every
+        // retry, whenever the file is behind the live tip — the crash-truncated tail
+        // the storage layer explicitly tolerates elsewhere is enough — and a lever of
+        // last resort that can refuse is a session that can never be cleared.
         let fresh = try await Self.reopen(
             path: path,
             configuration: harnessConfiguration(sessionID: sessionID),
-            leaf: liveLeaf
+            preferring: liveBranch
         )
-        // Re-check after the suspensions above: a concurrent shutdown or a
-        // concurrent force-clear must win rather than be clobbered by a state built
-        // from a stale snapshot. `fresh` is simply dropped in that case — nothing
-        // has been mutated yet, which is the point of opening first.
+        // The branch this lever adopts ends, by the nature of what it is for, on an
+        // assistant turn that called a tool which never returned — so nothing ever
+        // wrote the `tool_result` that call requires. Nothing downstream repairs
+        // that: `ContextBuilder` projects entries verbatim and there is no sanitizer
+        // between here and the wire, so every later prompt would be rejected by the
+        // provider (see `Context.hasToolHistory`) and the session would trade its 409
+        // for a permanent 400. Sealing here — through the FRESH harness, before it is
+        // ever handed a prompt — makes "the live tip is always answerable" an
+        // invariant this lever ESTABLISHES rather than one that happens to hold.
+        //
+        // Still in the preparation phase: no runtime state has been touched, so like
+        // the re-open, an I/O failure here leaves the session exactly as it was and
+        // the call retryable. It runs on the fresh harness's actor, not this one, so
+        // the parse it does is off this actor for the same reason the re-open is.
+        try await fresh.sealUnansweredToolCalls(reason: Self.clearedReason)
+        // Re-check after the suspensions above, and with no suspension between here
+        // and the swap: a concurrent shutdown or a concurrent force-clear must win
+        // rather than be clobbered by a state built from a stale snapshot. `fresh` is
+        // simply dropped in that case — no runtime state has been touched, which is
+        // the point of preparing first. What it wrote while sealing stays in the file
+        // as a branch nothing continues; every reader walks from a live tip, so it is
+        // unreachable rather than confusing.
         guard let current = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         guard current === session else { return false }
 
@@ -585,7 +629,7 @@ public actor ServerRuntime {
         // can emit into a sink the replacement state already owns.
         session.runSink?.detach()
         session.runTask?.cancel()
-        drainPending(session, reason: "The run was cleared at the client's request.")
+        drainPending(session, reason: Self.clearedReason)
         sessions[sessionID] = makeState(harness: fresh, sink: session.sink)
         // Terminal frame for anyone still attached: the client's run state is
         // edge-triggered, so without this it stays pinned on "thinking…". Sent on
@@ -593,6 +637,12 @@ public actor ServerRuntime {
         session.sink.broadcast(.agentEnd(reason: "aborted"))
         return true
     }
+
+    /// What the client is told, and what the model is told, about a call this lever
+    /// walked away from. One string for both: a parked permission prompt and a parked
+    /// tool call are the same event from the session's point of view, and the model's
+    /// copy of it should read the same as the user's.
+    private static let clearedReason = "The run was cleared at the client's request."
 
     /// The server's authoritative view of one session — see ``SessionStatus``.
     public func status(sessionID: String) throws -> SessionStatus {
@@ -750,17 +800,18 @@ public actor ServerRuntime {
         try AgentHarness.open(path: path, configuration: configuration)
     }
 
-    /// Re-open a session file off this actor, continuing from `leaf` rather than
-    /// from the file's last entry — see ``forceClearRun(sessionID:)``. A separate
-    /// entry point rather than an optional parameter on the one above, so "which
-    /// tip" is always a decision a caller made rather than a default it inherited.
+    /// Re-open a session file off this actor, continuing from the live branch
+    /// `preferring` describes rather than from the file's last entry — see
+    /// ``forceClearRun(sessionID:)``. A separate entry point rather than an optional
+    /// parameter on the one above, so "which tip" is always a decision a caller made
+    /// rather than a default it inherited.
     @concurrent
     private static func reopen(
         path: FilePath,
         configuration: AgentHarness.Configuration,
-        leaf: String?
+        preferring leaves: [String]
     ) async throws -> AgentHarness {
-        try AgentHarness.open(path: path, configuration: configuration, leaf: leaf)
+        try AgentHarness.open(path: path, configuration: configuration, preferring: leaves)
     }
 
     /// Read a session file's header id off this actor.

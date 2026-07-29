@@ -20,6 +20,7 @@
 
 import DoMoAgent
 import DoMoCore
+import DoMoHarness
 import DoMoLLM
 import DoMoPermissions
 import DoMoServer
@@ -125,6 +126,49 @@ struct ServerRuntimeForceClearTests {
                 continuation.finish()
             }
         }
+    }
+
+    /// The same scripted turns, plus a record of every context the runtime handed
+    /// the provider.
+    ///
+    /// What reaches the wire is the only place the force-clear's second failure mode
+    /// is visible: nothing between ``ServerRuntime`` and the gateway sanitizes a
+    /// transcript, so a branch that ends on an unanswered `tool_use` is shipped
+    /// verbatim and Anthropic-behind-LiteLLM answers 400 — the 409 the lever removes,
+    /// re-created one layer down.
+    private static func recordingStreamFn(
+        toolCallTurns: Set<Int>,
+        into recorder: ContextRecorder
+    ) -> AgentStreamFn {
+        let inner = streamFn(toolCallTurns: toolCallTurns)
+        return { context in
+            recorder.record(context.messages)
+            return inner(context)
+        }
+    }
+
+    /// The message lists handed to `streamFn`, in call order.
+    private final class ContextRecorder: Sendable {
+        private let storage = Mutex<[[Message]]>([])
+        func record(_ messages: [Message]) { storage.withLock { $0.append(messages) } }
+        var all: [[Message]] { storage.withLock { $0 } }
+    }
+
+    /// The tool calls in `messages` that no tool result answers.
+    ///
+    /// Deliberately re-derived here rather than shared with the production helper:
+    /// the assertion has to be an independent statement of the API's rule, not a
+    /// re-run of the code it is checking.
+    private static func unansweredToolCallIDs(_ messages: [Message]) -> [String] {
+        var answered: Set<String> = []
+        for case .tool(let result) in messages { answered.insert(result.toolCallID) }
+        var open: [String] = []
+        for case .assistant(let assistant) in messages {
+            for block in assistant.content {
+                if case .toolCall(let call) = block, !answered.contains(call.id) { open.append(call.id) }
+            }
+        }
+        return open
     }
 
     private func makeRuntime(
@@ -480,8 +524,13 @@ struct ServerRuntimeForceClearTests {
                 "the live branch was re-anchored onto the abandoned run: \(Self.userPrompts(messages))")
         #expect(messages.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
                 "the recovered run's answer is gone from the context every later run is built from")
-        #expect(!messages.contains { if case .tool = $0 { true } else { false } },
+        // The only tool result on the live branch is the lever's own synthetic answer
+        // to the call it abandoned. The real one ("released") is produced by the
+        // abandoned run and belongs to the branch this session walked away from.
+        #expect(!messages.contains { if case .tool(let result) = $0 { result.output == "released" } else { false } },
                 "the abandoned run's tool result is on the live branch")
+        #expect(Self.unansweredToolCallIDs(messages).isEmpty,
+                "the live branch ends on a call nothing answers: \(Self.unansweredToolCallIDs(messages))")
     }
 
     /// The same re-anchoring, in the case the "nothing was held" guard does not
@@ -533,8 +582,12 @@ struct ServerRuntimeForceClearTests {
                 "the rebuilt harness adopted the file's leaf: \(Self.userPrompts(messages))")
         #expect(messages.contains { if case .assistant(let a) = $0 { a.text == "done 2" } else { false } },
                 "the recovered run's answer is gone from the context every later run is built from")
-        #expect(!messages.contains { if case .tool = $0 { true } else { false } },
+        // As above: the seals belong to the live branch, the "released" results to the
+        // branches the lever walked away from.
+        #expect(!messages.contains { if case .tool(let result) = $0 { result.output == "released" } else { false } },
                 "the abandoned run's tool result is on the live branch")
+        #expect(Self.unansweredToolCallIDs(messages).isEmpty,
+                "the live branch ends on a call nothing answers: \(Self.unansweredToolCallIDs(messages))")
     }
 
     /// Nothing held means nothing to clear, and rebuilding the state anyway is not
@@ -564,6 +617,152 @@ struct ServerRuntimeForceClearTests {
     /// The user prompts along a rendered transcript, in order.
     private static func userPrompts(_ messages: [Message]) -> [String] {
         messages.compactMap { if case .user(let user) = $0 { user.text } else { nil } }
+    }
+
+    // MARK: - The lever must be total
+
+    /// `forceClearRun` is the escape hatch of last resort, so a *refusal* from it is
+    /// worse than anything it could refuse over: the slot stays held and every later
+    /// prompt 409s, which is the reported bug with its last exit removed.
+    ///
+    /// This is the case that produced it. Pinning the replacement to the live tip is
+    /// right, but the live tip lives in memory and the file is allowed to be behind
+    /// it: `JSONLines.appendBytes` ("the previous process died between writing an
+    /// entry and writing its newline") and `SessionTree.load` ("a crash-truncated
+    /// tail … never fatal — because this is the resume path") both say so in as many
+    /// words. A tip that is not in the file can therefore never come back, so a
+    /// strict pin that propagates its refusal fails identically on every retry —
+    /// permanently, unlike every other reason a re-open can fail.
+    ///
+    /// The answer is the nearest ancestor of the live tip that the file still has:
+    /// an ancestor of the live tip is on the live branch by construction, so it can
+    /// never be the abandoned run's branch, and it keeps whatever context survived —
+    /// here, everything but the torn entry.
+    @Test("A force-clear recovers a session whose live tip was lost to a torn final line")
+    func forceClearSurvivesATornSessionTail() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+        // Header + the user turn + the assistant turn that called the tool. The last
+        // of those IS the live tip, which is what makes the damage below the exact
+        // case the pin cannot survive.
+        #expect(await eventually { Self.entryCount(at: session.path) >= 3 },
+                "the parked run had not written its assistant turn yet")
+
+        try Self.truncateFinalLine(at: session.path)
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true,
+                "the lever refused a session whose file lost its final line")
+        #expect(await runtime.isRunning(sessionID: session.id) == false, "the slot is still held")
+
+        // And the session is genuinely usable again, on the branch it was on.
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+        let messages = try await runtime.messages(sessionID: session.id)
+        #expect(Self.userPrompts(messages) == ["A", "B"],
+                "the recovery did not continue from the nearest surviving ancestor: \(Self.userPrompts(messages))")
+    }
+
+    /// The floor of the same rule. When *nothing* the live harness ever stood on is
+    /// still in the file, there is no ancestor to fall back to — and the answer is
+    /// still not "adopt whatever branch the file ends on", because that is the branch
+    /// switch the pin exists to prevent. An explicitly empty branch is the correct
+    /// worst case: the session is usable, the surviving entries stay on disk and
+    /// reachable through `children(sessionID:parent:)`, and no foreign conversation
+    /// is silently adopted as this session's own.
+    @Test("With no surviving ancestor a force-clear falls back to an explicitly empty branch")
+    func forceClearFallsBackToAnEmptyBranch() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let runtime = makeRuntime(dirs, tools: [tool], streamFn: Self.streamFn(toolCallTurns: [1]))
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+        #expect(await eventually { Self.entryCount(at: session.path) >= 3 })
+
+        // Replace every entry with one this session was never on, so the file has a
+        // perfectly resolvable leaf that belongs to nobody live.
+        try Self.keepOnlyHeader(at: session.path)
+        let store = JSONLSessionStore(path: FilePath(session.path))
+        try store.appendEntry(SessionTreeEntry(
+            id: "foreign-entry",
+            parentId: nil,
+            timestamp: "2026-01-01T00:00:00.000Z",
+            payload: .message(.user("foreign"))
+        ))
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true,
+                "the lever refused a session whose branch is entirely gone")
+        #expect(try await runtime.messages(sessionID: session.id).isEmpty,
+                "the recovered session adopted a branch it was never on")
+
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+        #expect(Self.userPrompts(try await runtime.messages(sessionID: session.id)) == ["B"],
+                "the recovered turn did not land on the empty branch it was pinned to")
+    }
+
+    /// A session recovered from the 409 must not land straight in a permanent 400.
+    ///
+    /// The lever exists precisely for tools that never return — and a tool that never
+    /// returns never produces the `tool_result` its `tool_use` requires, so the branch
+    /// it pins ends on an assistant turn nothing answers. Nothing between
+    /// `buildContextMessages` and the wire repairs that (`ContextBuilder` projects
+    /// entries verbatim), and the codebase already knows this API validates tool
+    /// history — `Context.hasToolHistory` says so. Every later prompt on the
+    /// "recovered" session would therefore be rejected by the gateway.
+    ///
+    /// So the lever seals what it abandons: a synthetic error result for every
+    /// unanswered call on the pinned branch, the same shape `drainPending` gives a
+    /// parked permission prompt.
+    @Test("A force-cleared session never hands the provider an unanswered tool call")
+    func forceClearLeavesNoUnansweredToolCallInTheNextRequest() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let contexts = ContextRecorder()
+        let runtime = makeRuntime(
+            dirs,
+            tools: [tool],
+            streamFn: Self.recordingStreamFn(toolCallTurns: [1], into: contexts)
+        )
+
+        let session = try await runtime.createSession()
+        try await runtime.startRun(sessionID: session.id, prompt: "A", attachments: [])
+        #expect(await eventually { tool.parkedCount == 1 })
+
+        #expect(try await runtime.forceClearRun(sessionID: session.id) == true)
+
+        try await runtime.startRun(sessionID: session.id, prompt: "B", attachments: [])
+        #expect(await eventually { await runtime.isRunning(sessionID: session.id) == false },
+                "the recovered run never settled")
+
+        let requests = contexts.all
+        #expect(requests.count >= 2, "the recovered run never reached the provider")
+        for (index, messages) in requests.enumerated() {
+            #expect(Self.unansweredToolCallIDs(messages).isEmpty,
+                    "request \(index) would be rejected: unanswered \(Self.unansweredToolCallIDs(messages))")
+        }
+        // The seal is a real, addressed answer — not a padding user turn.
+        let branch = try await runtime.messages(sessionID: session.id)
+        #expect(
+            branch.contains {
+                if case .tool(let result) = $0 { result.toolCallID == "call_park_1" && result.isError } else { false }
+            },
+            "the abandoned call was never answered on the live branch: \(branch.count) messages"
+        )
     }
 
     /// And this one is the sink. `startRun` used to hand the run `session.sink`
@@ -717,6 +916,29 @@ struct ServerRuntimeForceClearTests {
     private static func entryCount(at path: String) -> Int {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
         return text.split(separator: "\n").count
+    }
+
+    /// Drop the file's final line.
+    ///
+    /// Not a contrivance: it is the exact damage the storage layer says it expects —
+    /// `JSONLines.appendBytes` ("the previous process died between writing an entry
+    /// and writing its newline"), `persistMessage` ("an interruption damages at most
+    /// the final line") — and the tolerant bulk read drops what is left of it, so the
+    /// entry simply is not in the tree any more.
+    private static func truncateFinalLine(at path: String) throws {
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        var lines = text.split(separator: "\n").map(String.init)
+        #expect(lines.count > 1, "nothing to truncate in \(path)")
+        lines.removeLast()
+        try (lines.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    /// Keep the header and drop every entry — the worst case a live harness's branch
+    /// can be in while the file is still a valid session.
+    private static func keepOnlyHeader(at path: String) throws {
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        let header = try #require(text.split(separator: "\n").first.map(String.init))
+        try (header + "\n").write(toFile: path, atomically: true, encoding: .utf8)
     }
 
     /// Append `lines` well-formed JSON objects that are not session entries. The

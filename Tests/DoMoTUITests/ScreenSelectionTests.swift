@@ -310,11 +310,87 @@ struct ScreenSelectionTests {
         // measuring the reverse-video run, which is the text between the columns
         // `from` and `to` and nothing else.
         //
-        // The atoms here are deliberately WELL-FORMED — no bare `ESC`, no bare `BEL`,
-        // no orphan skin-tone modifier — because on those the assembler is entitled
-        // to blank a cluster it cannot place, and this sweep additionally asserts
-        // that it never has to: the un-highlighted fallback must not fire, and the
-        // highlight brackets must always be present.
+        // The atoms deliberately INCLUDE the ill-formed ones — a bare `ESC`, and the
+        // `[`, `]`, `_`, `3` and `m` that turn one into a LATENT escape the scanner
+        // cannot resolve until some later byte completes it. An earlier version of
+        // this corpus excluded them and asserted, unconditionally, that the fallback
+        // never fires and the brackets are always present. Both claims were true only
+        // because the assembler was free to drop the brackets themselves — that is,
+        // the corpus was chosen to avoid the inputs on which the assertions were
+        // false, and a highlight that opened reverse video and never closed it
+        // shipped underneath them.
+        //
+        // So the assertion is the honest one: EITHER the row comes back untouched —
+        // the assembler could not place a piece and said so — OR both brackets are
+        // present, in order, with exactly `to - from` columns between them. Never an
+        // opener without a closer, and never a row that silently lost its highlight
+        // while measuring perfectly.
+        let atoms = [
+            "a", "b", "z", " ", "漢", "字", "✅", "😀", "👩‍👩‍👧‍👦", "\t",
+            "\u{0301}", "\u{200d}", "\u{2064}",
+            "\(escape)[0m", "\(escape)[2m", "\(escape)[31m", "\(escape)[K",
+            "\(escape)]8;;u\u{07}", "\(escape)]8;;\u{07}", cursorMarker,
+            escape, "[", "3", "]", "_", "m",
+        ]
+        let width = 14
+        let rows = generatedRows(atoms: atoms, width: width, attempts: 500)
+        var samples = 0
+        var highlighted = 0
+        for row in rows {
+            for from in 0..<width {
+                for to in (from + 1)...width {
+                    samples += 1
+                    let decorated = highlightColumns(row, from: from, to: to, width: width)
+                    #expect(
+                        visibleWidth(decorated) == width,
+                        "from \(from) to \(to) measured \(visibleWidth(decorated)) on \(String(reflecting: row))"
+                    )
+                    // The untouched row is the one permitted way out, and it is
+                    // self-announcing: byte-identical means no bracket was written at
+                    // all, so there is nothing to leak.
+                    if decorated == row { continue }
+                    highlighted += 1
+                    let run = reverseVideoRun(of: decorated)
+                    #expect(
+                        run != nil,
+                        """
+                        from \(from) to \(to) produced a row with an unmatched reverse-video \
+                        bracket on \(String(reflecting: row)): \(String(reflecting: decorated))
+                        """
+                    )
+                    #expect(
+                        visibleWidth(run ?? "") == to - from,
+                        """
+                        from \(from) to \(to) highlighted \(visibleWidth(run ?? "")) columns \
+                        on \(String(reflecting: row))
+                        """
+                    )
+                }
+            }
+        }
+        #expect(samples > 20_000, "the differential sweep shrank to \(samples) samples")
+        // The escape hatch must stay an escape hatch. Without this, an implementation
+        // that returned `line` for every row would satisfy every expectation above.
+        #expect(
+            highlighted > samples / 2,
+            "only \(highlighted) of \(samples) samples were highlighted at all — the fallback is not an exception"
+        )
+    }
+
+    @Test("A WELL-FORMED row is always highlighted, never handed back untouched")
+    @MainActor
+    func wellFormedRowsAreAlwaysHighlighted() {
+        // The companion sweep above admits ill-formed atoms, so its assertion has to
+        // permit the untouched-row fallback. That permission is load-bearing there and
+        // a hole here: an implementation that silently declined to highlight some
+        // recognisable class of row satisfies it completely. A mutant returning `line`
+        // for every row carrying an OSC-8 hyperlink passed that sweep — and hyperlink
+        // rows are ordinary output, emitted by `Markdown` and by `segmentReset` itself.
+        //
+        // So this corpus is deliberately WELL-FORMED — every escape is complete and
+        // resolvable — and the assertion is unconditional: a row like this is ALWAYS
+        // highlighted, with both brackets, spanning exactly the requested columns. The
+        // fallback is permitted only where the input gave it no choice.
         let atoms = [
             "a", "b", "z", " ", "漢", "字", "✅", "😀", "👩‍👩‍👧‍👦", "\t",
             "\u{0301}", "\u{200d}", "\u{2064}",
@@ -335,10 +411,19 @@ struct ScreenSelectionTests {
                     )
                     #expect(
                         decorated != row,
-                        "from \(from) to \(to) fell back to the unhighlighted row on \(String(reflecting: row))"
+                        """
+                        from \(from) to \(to) fell back to the untouched row on a WELL-FORMED \
+                        input: \(String(reflecting: row))
+                        """
                     )
                     let run = reverseVideoRun(of: decorated)
-                    #expect(run != nil, "from \(from) to \(to) lost its brackets on \(String(reflecting: row))")
+                    #expect(
+                        run != nil,
+                        """
+                        from \(from) to \(to) produced an unmatched reverse-video bracket on \
+                        \(String(reflecting: row)): \(String(reflecting: decorated))
+                        """
+                    )
                     #expect(
                         visibleWidth(run ?? "") == to - from,
                         """
@@ -349,7 +434,73 @@ struct ScreenSelectionTests {
                 }
             }
         }
-        #expect(samples > 20_000, "the differential sweep shrank to \(samples) samples")
+        #expect(samples > 20_000, "the well-formed sweep shrank to \(samples) samples")
+    }
+
+    @Test("A latent escape never leaves reverse video opened and never closed")
+    func latentEscapeNeverHalfOpensTheHighlight() {
+        // `ansiEscapeLength`'s CSI final-byte set is `m G K H J`, so `ESC[3` is not an
+        // escape yet: it stays LATENT in the row and measures zero columns, one
+        // control plus four printable characters. Appending `selectionClose` supplies
+        // the `m` that completes it — the scanner then swallows `ESC[3xy…ESC[27m` as
+        // ONE escape, so the closing bracket measures as REMOVING four columns from
+        // the row rather than adding none.
+        //
+        // The closer owes no columns and cannot take a grapheme break, so a repair
+        // ladder that ends in "drop any piece that owes nothing" dropped it: a row of
+        // exactly the right width, with reverse video opened and never closed, and a
+        // highlight that runs to the right edge instead of stopping where the user
+        // released the drag. Dropping BOTH brackets is the same bug one step further
+        // on — a row that reports success and carries no highlight.
+        //
+        // These rows are pathological and losing the highlight on them is acceptable;
+        // emitting half of it is not.
+        let width = 12
+        let rows = [
+            padToWidth("\(escape)[3xy", width),
+            padToWidth("\(escape)[ab", width),
+            padToWidth("ab\(escape)[3cd", width),
+            padToWidth("\(escape)[3\(escape)[K", width),
+            padToWidth("a\(escape)]8;;x", width),
+            padToWidth("a\(escape)_b", width),
+            padToWidth("ab\(escape)[", width),
+            padToWidth("\(escape)\(escape)[2", width),
+        ]
+        for row in rows {
+            #expect(visibleWidth(row) == width, "fixture \(String(reflecting: row)) is not \(width) columns")
+            for from in 0..<width {
+                for to in (from + 1)...width {
+                    let decorated = highlightColumns(row, from: from, to: to, width: width)
+                    #expect(
+                        visibleWidth(decorated) == width,
+                        "from \(from) to \(to) measured \(visibleWidth(decorated)) on \(String(reflecting: row))"
+                    )
+                    if decorated == row { continue }
+                    let run = reverseVideoRun(of: decorated)
+                    #expect(
+                        run != nil,
+                        """
+                        from \(from) to \(to) on \(String(reflecting: row)) emitted an unmatched \
+                        bracket: \(String(reflecting: decorated))
+                        """
+                    )
+                    #expect(
+                        visibleWidth(run ?? "") == to - from,
+                        """
+                        from \(from) to \(to) on \(String(reflecting: row)) highlighted \
+                        \(visibleWidth(run ?? "")) columns
+                        """
+                    )
+                }
+            }
+        }
+        // The exact repro, spelled out, so a regression names itself.
+        let repro = padToWidth("\(escape)[3xy", width)
+        let decorated = highlightColumns(repro, from: 0, to: 4, width: width)
+        #expect(
+            decorated == repro || decorated.contains("\(escape)[27m"),
+            "the highlight opened without closing: \(String(reflecting: decorated))"
+        )
     }
 
     @Test("The plain text of a highlighted row keeps every column exactly where it was")
@@ -475,9 +626,16 @@ struct ScreenSelectionTests {
 
     /// The text between `ESC[7m` and `ESC[27m` — the run the terminal actually
     /// paints in reverse video.
+    ///
+    /// `nil` means the row carries no complete, correctly ordered bracket pair, which
+    /// is exactly the failure the callers assert against: an opener with no closer
+    /// leaks reverse video down the rest of the line. The ordering guard is not
+    /// decorative — a row that lost its opener but kept its closer would otherwise
+    /// build a reversed `Range` and trap.
     private func reverseVideoRun(of decorated: String) -> String? {
         guard let open = decorated.range(of: "\(escape)[7m"),
-            let close = decorated.range(of: "\(escape)[27m")
+            let close = decorated.range(of: "\(escape)[27m"),
+            open.upperBound <= close.lowerBound
         else { return nil }
         return String(decorated[open.upperBound..<close.lowerBound])
     }

@@ -255,11 +255,24 @@ private nonisolated struct RowPiece {
     /// and re-stating it paints nothing; outside the span the same escape would
     /// smear the highlight across the rest of the row.
     var breakable: Bool
+    /// Whether this piece IS the feature, so a row without it is not a row worth
+    /// returning.
+    ///
+    /// The ladder's last resort is "emit nothing", which is sound for any piece
+    /// that owes no columns — a style escape or a zero-width mark costs the row
+    /// nothing, so dropping it keeps the width. That argument is about WIDTH only,
+    /// and the two selection brackets are the counter-example: they owe no columns
+    /// and they are the entire point of the call. Dropping one leaves reverse video
+    /// opened and never closed; dropping both returns the row unhighlighted while
+    /// claiming success. Marking them here makes "never drop the brackets" a
+    /// property of the piece rather than a case analysis in the loop.
+    var required: Bool
 
-    init(_ text: String, columns: Int = 0, breakable: Bool = false) {
+    init(_ text: String, columns: Int = 0, breakable: Bool = false, required: Bool = false) {
         self.text = text
         self.columns = columns
         self.breakable = breakable
+        self.required = required
     }
 }
 
@@ -342,12 +355,18 @@ private nonisolated func scanReachesEveryBoundary(_ text: String, _ boundaries: 
 ///   3. one blank per column the piece owed — the same repair the straddle loop
 ///      already uses, and the only one that keeps the column count by construction;
 ///   4. nothing at all, for a piece that owes no columns (a style escape or a
-///      zero-width mark), which costs the row nothing.
+///      zero-width mark) and is not ``RowPiece/required``, which costs the row
+///      nothing.
+///
+/// A `required` piece that reaches the end of the ladder abandons the whole
+/// assembly instead, because the last candidate trades content for width and the
+/// selection brackets are content the width check cannot audit.
 ///
 /// The returned string therefore satisfies `visibleWidth(result) == accepted`, where
 /// `accepted` is at most the sum of the declared columns — so the result can be
 /// SHORT (only if every candidate for some piece failed) but never OVER-wide.
-/// `nil` reports that shortfall so the caller can fall back to the untouched row.
+/// `nil` reports that shortfall — or an unplaceable required piece — so the caller
+/// can fall back to the untouched row.
 private nonisolated func assembleRow(_ pieces: [RowPiece], width: Int) -> String? {
     var naive = ""
     var boundaries: [PieceBoundary] = []
@@ -384,6 +403,12 @@ private nonisolated func assembleRow(_ pieces: [RowPiece], width: Int) -> String
                 continue
             }
         }
+        // A piece the caller marked `required` is never dropped: a row missing one
+        // of its selection brackets is a WRONG row, not a narrower one, and the
+        // width check below cannot see the difference. Bail out here and let the
+        // caller return the untouched line — no highlight is a cosmetic loss, a
+        // half-opened one leaks reverse video into the rest of the row.
+        if piece.required { return nil }
         // Nothing that keeps the count fits. Dropping the piece keeps
         // `visibleWidth(result) == measured` true, which is what makes an over-wide
         // row impossible; the columns it owed are simply missing, and the guard
@@ -395,16 +420,14 @@ private nonisolated func assembleRow(_ pieces: [RowPiece], width: Int) -> String
     // row is exactly `width` columns" into a fact about the returned value instead
     // of a claim about the code that built it.
     //
-    // No input reaches it today. Candidate 3 cannot fail — a blank is neither an
-    // `Extend`, a `ZWJ`, a `SpacingMark` nor a CSI/OSC terminator, so appending one
-    // can neither fuse with the cluster before it nor complete an escape — and
-    // candidate 4 always succeeds for a piece that owes nothing, so `measured`
-    // always reaches `width`. That argument is exactly the kind that has been wrong
-    // three times in this function, which is why the check is here rather than in a
-    // comment: it costs one linear pass and it removes the argument from the safety
-    // property. `differentialFuzzAgainstTheWidthInvariant` asserts the fallback does
-    // NOT fire, so if the ladder above ever regresses the loss shows up as a test
-    // failure rather than as a silently unhighlighted row.
+    // Candidate 3 cannot fail — a blank is neither an `Extend`, a `ZWJ`, a
+    // `SpacingMark` nor a CSI/OSC terminator, so appending one can neither fuse with
+    // the cluster before it nor complete an escape — and candidate 4 always succeeds
+    // for a piece that owes nothing, so on the rows that get this far `measured`
+    // does reach `width`. That argument is exactly the kind that has been wrong
+    // several times in this function, which is why the check is here rather than in
+    // a comment: it costs one linear pass and it removes the argument from the
+    // safety property.
     return visibleWidth(result) == width ? result : nil
 }
 
@@ -421,7 +444,14 @@ private nonisolated func assembleRow(_ pieces: [RowPiece], width: Int) -> String
 /// re-measures after every append and repairs — with a grapheme break, or with
 /// blanks, or by dropping a piece that owes nothing — whenever the measurement
 /// disagrees. If the finished row still does not measure exactly `width`, the
-/// UNTOUCHED `line` is returned. Losing the highlight on a pathological row is a
+/// UNTOUCHED `line` is returned.
+///
+/// The two reverse-video brackets are exempt from that last repair. They owe no
+/// columns, so the width check alone would happily drop them — and a row that
+/// opened reverse video and never closed it, or lost the highlight entirely while
+/// measuring perfectly, is what that leniency produced. They are marked
+/// ``RowPiece/required``, so the row falls back to `line` instead: dropping the
+/// highlight the user asked for is a defect whether or not the width survives it. Losing the highlight on a pathological row is a
 /// cosmetic glitch; returning an over-wide one ends the session, so no residual case
 /// is left to an argument about which scalars fuse with which. Earlier versions of
 /// this function made exactly that argument — that only zero-width scalars can fuse
@@ -564,10 +594,10 @@ public nonisolated func highlightColumns(_ line: String, from: Int, to: Int, wid
 
     var pieces = beforePieces
     pieces.append(RowPiece(String(repeating: " ", count: beforePad), columns: beforePad))
-    pieces.append(RowPiece(selectionOpen))
+    pieces.append(RowPiece(selectionOpen, required: true))
     pieces += middlePieces
     pieces.append(RowPiece(String(repeating: " ", count: middlePad), columns: middlePad, breakable: true))
-    pieces.append(RowPiece(selectionClose))
+    pieces.append(RowPiece(selectionClose, required: true))
     // A span that runs to the edge of the page has no tail to restyle, so the
     // carried escapes are dropped rather than emitted after the last cell.
     if spanEnd < width { pieces.append(RowPiece(entering)) }

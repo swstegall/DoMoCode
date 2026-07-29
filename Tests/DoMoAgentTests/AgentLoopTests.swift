@@ -150,9 +150,10 @@ extension AgentEvent {
         case .messageEnd(let message): "messageEnd(\(message.role.rawValue))"
         case .toolExecutionStart(_, let name, _): "toolStart(\(name))"
         case .toolExecutionEnd(_, let name, _, _): "toolEnd(\(name))"
-        // Nothing in the loop emits `.notice` yet, so no order assertion can see
-        // one. The label names the code so a later wave's assertion reads the
-        // same way as every other kind here.
+        // The loop emits exactly one of these, and only for a failed run: the
+        // classified failure, immediately before `agentEnd`. The label names the
+        // code so an order assertion reads the same way as every other kind
+        // here. See `AgentFailureTests`.
         case .notice(let notice): "notice(\(notice.code))"
         }
     }

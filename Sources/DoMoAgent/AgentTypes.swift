@@ -466,8 +466,11 @@ public struct AgentRunResult: Sendable {
     /// ``AgentEvent``, which IS `Hashable`; an event that wants to report a
     /// failure carries an ``AgentNotice`` instead.
     ///
-    /// DECLARED, NOT YET POPULATED. Nothing sets it to a non-`nil` value until
-    /// the wave that stops discarding the classified error in `AgentLoop`.
+    /// Populated by `AgentLoop`'s single `settle`, which is also the one place
+    /// the rule above is enforced — a non-`errored` reason drops whatever it is
+    /// handed, and so does a cancellation. The same value is reported as an
+    /// ``AgentEvent/notice`` immediately before ``AgentEvent/agentEnd``, so a
+    /// live consumer and a returning caller see the same failure.
     public var failure: DoMoError?
 
     public init(messages: [Message], stopReason: RunStopReason, failure: DoMoError? = nil) {
