@@ -54,6 +54,27 @@ import Foundation
 import Synchronization
 import SystemPackage
 
+// MARK: - Pending submission
+
+/// One queued prompt, with whatever the user attached to it.
+///
+/// The submissions stream carried a bare `String` until images could be dropped
+/// onto the prompt, at which point a bare string is a silent truncation of what
+/// the user actually submitted: the drop stages BYTES, and a stream that can only
+/// carry text drops them on the floor. Keeping the pair together means the two
+/// places a submission can be re-queued — a fresh submit and
+/// ``InteractiveMode/drainLeftoverSteering()`` — cannot disagree about what is in
+/// the message.
+struct PendingSubmission: Sendable {
+    var text: String
+    var images: [ImageBlock]
+
+    init(text: String, images: [ImageBlock] = []) {
+        self.text = text
+        self.images = images
+    }
+}
+
 // MARK: - Steering box
 
 /// The `Sendable` seam that carries a mid-run submission into the running agent.
@@ -222,9 +243,18 @@ final class InteractiveCoordinator {
     // `getSteeringMessages` hook drains into the *current* run's next turn (see the
     // file header). The box is the same instance the harness ``Configuration`` was
     // built with.
-    private let submissions: AsyncStream<String>
-    private let submissionsContinuation: AsyncStream<String>.Continuation
+    private let submissions: AsyncStream<PendingSubmission>
+    private let submissionsContinuation: AsyncStream<PendingSubmission>.Continuation
     private let steering: SteeringBox
+
+    /// Images dropped onto the prompt and not yet sent.
+    ///
+    /// Held here rather than inside the editor because the editor's document is
+    /// TEXT — a drop consumes the path it typed and leaves nothing behind, so
+    /// something outside the document has to remember the bytes until the next
+    /// submit. Cleared by `handleSubmit` (they ride that message) and by `/clear`
+    /// (a cleared session must not carry invisible attachments forward).
+    private var stagedImages: [LoadedImage] = []
 
     // Run state.
     private var running = false
@@ -332,6 +362,11 @@ final class InteractiveCoordinator {
     /// starts, so the first frame already shows the (empty) editor.
     func install() {
         editor.onSubmit = { [weak self] text in self?.handleSubmit(text) }
+        // The drop seam. `Editor` is the only layer that sees a WHOLE bracketed
+        // paste (it buffers one across `handleInput` calls), so this is the only
+        // place a dragged file can be recognised before its path is typed into the
+        // document as literal text. Returning `true` swallows the paste entirely.
+        editor.onPaste = { [weak self] pasted in self?.handleDroppedPaste(pasted) ?? false }
         prompt.onInput = { [weak self] data in self?.handleKey(data) }
 
         tui.addChild(transcript)
@@ -469,8 +504,10 @@ final class InteractiveCoordinator {
     private func handleSubmit(_ text: String) {
         closePopup()
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        editor.addToHistory(trimmed)
+        // A drop with no words is still a message: the images are the content.
+        let staged = stagedImages
+        guard !trimmed.isEmpty || !staged.isEmpty else { return }
+        if !trimmed.isEmpty { editor.addToHistory(trimmed) }
 
         switch trimmed {
         case "/exit", "/quit":
@@ -482,25 +519,148 @@ final class InteractiveCoordinator {
             assistantBuffer = ""
             toolBlocks.removeAll()
             toolArgs.removeAll()
+            // Attachments are invisible once their transcript lines are gone;
+            // carrying them into the next message would send bytes the user has
+            // no way to see are still staged.
+            stagedImages = []
             render()
             return
         default:
             break
         }
 
-        appendUser(trimmed)
+        stagedImages = []
+        if !trimmed.isEmpty { appendUser(trimmed) }
         render()
 
+        let images = staged.map { ImageBlock(mediaType: $0.mediaType, data: $0.data) }
         if running {
             // Steer the in-flight run: the harness's `getSteeringMessages` hook
             // drains this box at the current run's next turn boundary, so the text
             // joins the running agent rather than waiting for a fresh run. The user
             // turn is already echoed above; the loop's own `messageStart(.user)` for
             // the injected message is ignored by ``handle(_:)``, so it is not doubled.
-            steering.append(.user(trimmed))
+            //
+            // The message is built by hand rather than with `Message.user(_:)` so
+            // the attachments ride it: the convenience builds a TEXT-ONLY message,
+            // which is how a mid-run drop used to be silently discarded.
+            steering.append(
+                .user(UserMessage(content: [.text(trimmed)] + images.map(ContentBlock.image)))
+            )
         } else {
-            submissionsContinuation.yield(trimmed)
+            submissionsContinuation.yield(PendingSubmission(text: trimmed, images: images))
         }
+    }
+
+    // MARK: Drag and drop
+
+    /// Intercept a bracketed paste that is really a file drop.
+    ///
+    /// Dragging a file onto a terminal does not deliver a file — it makes the
+    /// terminal *paste the path*, spelled differently by every terminal
+    /// (backslash-escaped, quoted, `file://` percent-encoded, …). ``DroppedPaths``
+    /// owns that grammar and returns every plausible reading; the disk decides
+    /// which one was meant.
+    ///
+    /// Returns `true` only when the paste parses as one or more path-shaped
+    /// tokens, so ordinary pasted prose and code are untouched — a paste that is
+    /// not path-shaped never reaches the loader at all. The read itself happens on
+    /// a detached task through `@concurrent` loaders, because a multi-megabyte
+    /// image must not be read on the render loop.
+    ///
+    /// Resolution against ``POSIXFileSystem`` rather than the tool sandbox is
+    /// deliberate and matches `--image`: a file the user physically dragged onto
+    /// the window is trusted operator input, and refusing a screenshot from
+    /// `~/Desktop` because the session is rooted in a project would make the
+    /// gesture useless exactly when it is most wanted.
+    private func handleDroppedPaste(_ pasted: String) -> Bool {
+        let candidates = DroppedPaths.candidates(pasted)
+        guard !candidates.isEmpty else { return false }
+
+        let alreadyStaged = stagedImages
+        Task { @MainActor [weak self] in
+            let result = await ImageAttachmentLoader.resolveDrop(
+                candidates: candidates,
+                using: POSIXFileSystem(),
+                alreadyLoaded: alreadyStaged
+            )
+            self?.finishDrop(result, rawText: pasted)
+        }
+        return true
+    }
+
+    /// Apply a resolved drop: stage what loaded, say what did not.
+    ///
+    /// A reading that did not resolve COMPLETELY means the paste was not a drop
+    /// (or not one this surface can take), so the text goes into the document
+    /// after all — the "never silently eat a path the user meant as text"
+    /// guarantee. It lands at the END of the document rather than at the caret:
+    /// this arrives asynchronously, by which time the caret is by definition in
+    /// the middle of whatever the user has typed since, and splicing there
+    /// produces mangled text.
+    private func finishDrop(_ result: ImageAttachmentLoadResult, rawText: String) {
+        // A cancelled batch is a gesture the user took back. Silence, not a
+        // rejection notice per file.
+        guard !result.wasCancelled else { return }
+
+        if result.isCompleteSuccess {
+            // Re-check identity HERE, not only against the snapshot the resolve
+            // started from: two drops of the same file can be in flight at once,
+            // and each would have been told it was the first.
+            let staged = Set(stagedImages.map(\.path))
+            let fresh = result.loaded.filter { !staged.contains($0.path) }
+            stagedImages.append(contentsOf: fresh)
+            for image in fresh {
+                appendAttachmentNotice(
+                    "📎 attached \(sanitizeUntrustedText(image.displayName)) "
+                        + "(\(LoadedImage.formattedByteCount(image.byteCount)))"
+                )
+            }
+            for duplicate in result.skippedDuplicates {
+                appendAttachmentNotice(
+                    "📎 \(sanitizeUntrustedText(duplicate.lastComponent?.string ?? duplicate.string))"
+                        + " is already attached"
+                )
+            }
+            render()
+            return
+        }
+
+        // Not a drop we could take. Put the text back, and say why for the path
+        // the user most likely meant.
+        if let rejection = result.rejected.first {
+            appendAttachmentNotice("📎 " + sanitizeUntrustedText(rejection.message))
+        }
+        let restored = Self.sanitizedForInsertion(rawText)
+        if !restored.isEmpty {
+            let existing = editor.getText()
+            editor.setText(existing.isEmpty ? restored : existing + "\n" + restored)
+        }
+        render()
+    }
+
+    /// Strip everything a terminal would ACT on, keeping newlines.
+    ///
+    /// `Editor.handlePaste` applies exactly this filter, but `onPaste` returning
+    /// `true` short-circuits it — so the one route that puts a refused drop's raw
+    /// payload back into the document has to apply it itself. Line endings and
+    /// tabs are folded first, the way `Editor.normalizeText` would, so a
+    /// CR-separated multi-file drop keeps its line breaks.
+    static func sanitizedForInsertion(_ text: String) -> String {
+        var folded = text.replacingOccurrences(of: "\r\n", with: "\n")
+        folded = folded.replacingOccurrences(of: "\r", with: "\n")
+        folded = folded.replacingOccurrences(of: "\t", with: "    ")
+        var scalars = String.UnicodeScalarView()
+        for scalar in folded.unicodeScalars {
+            let value = scalar.value
+            if value == 0x0a {
+                scalars.append(scalar)
+                continue
+            }
+            if value < 0x20 || value == 0x7f || (value >= 0x80 && value <= 0x9f) { continue }
+            scalars.append(scalar)
+        }
+        return String(scalars)
     }
 
     // MARK: Completion popup
@@ -724,8 +884,8 @@ final class InteractiveCoordinator {
     func agentLoop() async {
         var iterator = submissions.makeAsyncIterator()
         while !Task.isCancelled {
-            guard let prompt = await iterator.next() else { break }
-            await runOne(prompt)
+            guard let submission = await iterator.next() else { break }
+            await runOne(submission)
             drainLeftoverSteering()
         }
     }
@@ -739,14 +899,27 @@ final class InteractiveCoordinator {
     private func drainLeftoverSteering() {
         for message in steering.drain() {
             if case .user(let user) = message {
-                submissionsContinuation.yield(user.text)
+                // Carry the IMAGES too. Re-queuing `user.text` alone silently threw
+                // away any attachment a mid-run drop had put on the message, which
+                // is the one place a leftover could lose content rather than just
+                // arrive late.
+                submissionsContinuation.yield(
+                    PendingSubmission(
+                        text: user.text,
+                        images: user.content.compactMap {
+                            if case .image(let block) = $0 { return block }
+                            return nil
+                        }
+                    )
+                )
             }
         }
     }
 
     /// Run a single prompt to completion through the harness, streaming into the
     /// transcript via the sink, cancellable via ``currentRunTask``.
-    private func runOne(_ prompt: String) async {
+    private func runOne(_ submission: PendingSubmission) async {
+        let prompt = submission.text
         running = true
         currentAssistant = nil
         assistantBuffer = ""
@@ -757,7 +930,15 @@ final class InteractiveCoordinator {
         // Resolve any `@path` image mentions into attachments before the turn —
         // off the main actor (the read is `@concurrent`), so a large image does not
         // stall the renderer. The `@token` stays in the prompt as the reference.
-        let attachments = await Self.extractImageAttachments(from: prompt, fileSystem: fileSystem)
+        let mentioned = await Self.extractImageAttachments(from: prompt, fileSystem: fileSystem)
+        // Dropped images first (the user attached them deliberately), then `@path`
+        // mentions, deduplicated: dropping a file and ALSO naming it with `@` must
+        // send one copy, not two.
+        var attachments: [ImageBlock] = []
+        var seen: Set<ImageBlock> = []
+        for block in submission.images + mentioned where seen.insert(block).inserted {
+            attachments.append(block)
+        }
 
         let sink = InteractiveEventSink(coordinator: self)
         let task = Task { @MainActor () -> RunStopReason in
@@ -767,7 +948,7 @@ final class InteractiveCoordinator {
             } catch is CancellationError {
                 return .aborted
             } catch {
-                self.appendError(String(describing: error))
+                self.appendError(error)
                 return .errored
             }
         }
@@ -792,6 +973,12 @@ final class InteractiveCoordinator {
         statusLine.text = idleStatus
         if reason == .aborted {
             appendInterrupted()
+        } else if let notice = Self.stopNotice(for: reason) {
+            // A run that stopped WITHOUT finishing has to say so. Before this,
+            // `.maxTurnsReached` produced no output whatsoever here — the REPL
+            // simply went idle mid-task, which is indistinguishable from the model
+            // deciding it was done.
+            appendStopNotice(notice)
         }
         render()
     }
@@ -867,14 +1054,8 @@ final class InteractiveCoordinator {
             startTool(id: id, name: name, arguments: arguments.value)
         case .toolExecutionEnd(let id, let name, let result, let isError):
             endTool(id: id, name: name, result: result, isError: isError)
-        case .notice:
-            // INERT SEAM. Nothing emits `.notice` yet, so the REPL's transcript is
-            // byte-identical to before the case existed. The wave that adds the
-            // notice producers fills in the body here: a dim, sanitized one-line
-            // transcript entry (a notice is model/gateway-controlled text), with
-            // `.error` levels routed through the same red treatment `appendError`
-            // uses rather than a second, divergent style.
-            break
+        case .notice(let notice):
+            appendNotice(notice)
 
         case .agentStart, .agentEnd, .turnStart, .turnEnd:
             break
@@ -892,8 +1073,99 @@ final class InteractiveCoordinator {
         transcript.addChild(Text("  ⛔ interrupted"))
     }
 
-    private func appendError(_ message: String) {
-        transcript.addChild(Text("  ⚠ " + message))
+    /// The SGR sequences the transcript's non-content rows use. Spelled here
+    /// rather than reached for across a module boundary: `DoMoClient`'s `dim` and
+    /// `sgrReset` are internal to that target, and DoMoCLI does not depend on it.
+    private static let sgrReset = "\u{1b}[0m"
+    private static func dim(_ text: String) -> String { "\u{1b}[2m" + text + sgrReset }
+
+    /// A failure that came back as a THROW rather than as a settled run — harness
+    /// construction, session persistence, a tool-context failure.
+    ///
+    /// Rendered through exactly the same path a settled failure takes, because to
+    /// a reader they are the same event. Before this the REPL printed
+    /// `String(describing:)` of whatever was caught, which for a ``DoMoError``
+    /// spells out the Swift value rather than the sentence the type already knows
+    /// how to write, and never carried a hint.
+    private func appendError(_ error: any Error) {
+        let domo = error as? DoMoError
+        appendNotice(
+            AgentNotice(
+                level: .error,
+                code: "runtime_error",
+                text: DoMoError.truncating(domo?.description ?? String(describing: error)),
+                kind: domo?.kind.label
+            )
+        )
+    }
+
+    /// Render an out-of-band notice — the REPL's whole error surface for a failure
+    /// the loop SETTLED rather than threw.
+    ///
+    /// This is what a provider 401, a gateway 500 or a stream that died mid-answer
+    /// looks like here. It matters that it exists at all: such a run produces an
+    /// assistant message with empty text, which ``finalizeAssistant(_:)`` removes,
+    /// so before this arm was filled in the REPL simply went idle with NOTHING on
+    /// screen — indistinguishable from the model deciding it was finished.
+    ///
+    /// The three parts and the colours are ``ErrorPresentation``'s, the same ones
+    /// the full-screen transcript draws, so the two surfaces cannot drift into two
+    /// different vocabularies for the same failure. Notice text is provider- and
+    /// gateway-controlled, so every part of it is sanitized before it reaches a
+    /// live terminal.
+    private func appendNotice(_ notice: AgentNotice) {
+        let kind = notice.kind.flatMap(DoMoError.Kind.labeled)
+        guard notice.level == .error else {
+            // Progress chatter (a retry in flight, say), not a failure: one dim
+            // line, no headline, no hint.
+            let body = sanitizeUntrustedText(collapseToOneLine(notice.text))
+            guard !body.isEmpty else { return }
+            transcript.addChild(Text("  " + Self.dim("· " + body)))
+            return
+        }
+        var lines = ["  \u{1b}[1;31m✗ " + sanitizeUntrustedText(ErrorPresentation.headline(for: kind)) + Self.sgrReset]
+        let body = sanitizeUntrustedText(notice.text)
+        if !body.isEmpty { lines.append("    \u{1b}[31m" + body + Self.sgrReset) }
+        if let detail = notice.detail.map(sanitizeUntrustedText), !detail.isEmpty {
+            lines.append("    \u{1b}[31m" + detail + Self.sgrReset)
+        }
+        if let hint = ErrorPresentation.hint(for: kind) {
+            lines.append("    " + Self.dim(sanitizeUntrustedText(hint)))
+        }
+        transcript.addChild(Text(lines.joined(separator: "\n")))
+    }
+
+    /// A run that stopped without finishing, said out loud.
+    private func appendStopNotice(_ text: String) {
+        transcript.addChild(Text("  \u{1b}[33m⚠ " + text + Self.sgrReset))
+    }
+
+    /// A drop's outcome — what attached, what did not.
+    private func appendAttachmentNotice(_ text: String) {
+        transcript.addChild(Text("  " + Self.dim(text)))
+    }
+
+    /// The sentence a run that stopped WITHOUT finishing owes the user, or `nil`
+    /// for the endings the transcript already shows.
+    ///
+    /// `nil` for `.completed`/`.terminatedByTool`/`.stoppedByHook` (the model's own
+    /// answer is right there), for `.aborted` (`⛔ interrupted` is already
+    /// appended), and for `.errored` — that one gets a persistent `✗` row from
+    /// ``appendNotice(_:)``, and a second line restating it would be noise. The two
+    /// that remain are exactly the two endings that stop work with nothing to show
+    /// for it, which is the defect: `.maxTurnsReached` produced NO output at all
+    /// before this existed.
+    static func stopNotice(for reason: RunStopReason) -> String? {
+        switch reason {
+        case .maxTurnsReached:
+            return "stopped at the --max-turns limit — send another message to continue, "
+                + "or restart without --max-turns for no limit"
+        case .noProgress:
+            return "stopped — the model repeated the same tool call with the same result "
+                + "and made no progress"
+        case .completed, .terminatedByTool, .stoppedByHook, .errored, .aborted:
+            return nil
+        }
     }
 
     private func startAssistantBlock() {
@@ -1049,7 +1321,11 @@ public struct InteractiveMode: Sendable {
         configDirectory: String,
         homeDirectory: String? = nil,
         reasoningEffort: ReasoningEffort? = nil,
-        maxTurns: Int = 100,
+        // Unbounded by default, matching every other surface. The old `100` was a
+        // silent cap that only ever applied to callers who omitted the label — the
+        // real CLI always passed its own — so it stopped nothing and surprised
+        // whoever it did stop.
+        maxTurns: Int? = nil,
         sessionSource: SessionSource = .new,
         toolTheme: ToolRenderTheme = .ansi,
         mcpServers: [String: MCPServerConfig] = [:],

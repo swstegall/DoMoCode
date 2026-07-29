@@ -53,10 +53,27 @@ final class MockGateway: @unchecked Sendable {
     private var stopped = false
     private var thread: Thread?
 
+    /// A status and JSON body to answer every `chat/completions` request with,
+    /// instead of a stream.
+    ///
+    /// Exists so a test can exercise the CLASSIFIED failure paths — a 401 becomes
+    /// `DoMoError.Kind.authentication`, which is what decides the headline and the
+    /// remedy a surface shows. A mid-stream `data: {"error": ...}` frame cannot
+    /// stand in for it: that path only ever yields
+    /// `.provider(status: nil, isRetryable: false)`, so it can never prove a
+    /// surface renders the right advice for the wrong-credential case.
+    private let refusal: (status: Int, reason: String, body: String)?
+
     /// - Parameter chatCompletionBodies: the SSE body for each successive
     ///   `chat/completions` request, `data:`-framed and `[DONE]`-terminated.
-    init(chatCompletionBodies: [String]) throws {
+    /// - Parameter refuseWith: answer every completion request with this HTTP
+    ///   status and JSON body instead of a stream.
+    init(
+        chatCompletionBodies: [String],
+        refuseWith refusal: (status: Int, reason: String, body: String)? = nil
+    ) throws {
         self.chatBodies = chatCompletionBodies
+        self.refusal = refusal
 
         let fd = socket(AF_INET, streamSocketType, 0)
         guard fd >= 0 else { throw MockGatewayError("socket() failed: \(errno)") }
@@ -179,6 +196,12 @@ final class MockGateway: @unchecked Sendable {
                 contentType: "application/json",
                 body: Array(#"{"object":"list","data":[{"id":"mock-model","object":"model","owned_by":"openai"}]}"#.utf8)
             )
+        } else if let refusal {
+            response = Self.errorResponse(
+                status: refusal.status,
+                reason: refusal.reason,
+                body: Array(refusal.body.utf8)
+            )
         } else {
             let body = index < chatBodies.count ? chatBodies[index] : Self.fallbackDoneBody
             response = Self.sseResponse(callID: "mock-call-\(index)", body: body)
@@ -280,6 +303,19 @@ final class MockGateway: @unchecked Sendable {
             "",
         ].joined(separator: "\r\n")
         return Array(headers.utf8) + Array(body.utf8)
+    }
+
+    /// A non-2xx JSON answer, the shape LiteLLM returns when it refuses outright.
+    private static func errorResponse(status: Int, reason: String, body: [UInt8]) -> [UInt8] {
+        let headers = [
+            "HTTP/1.1 \(status) \(reason)",
+            "Content-Type: application/json",
+            "Content-Length: \(body.count)",
+            "Connection: close",
+            "",
+            "",
+        ].joined(separator: "\r\n")
+        return Array(headers.utf8) + body
     }
 
     private static func httpResponse(contentType: String, body: [UInt8]) -> [UInt8] {

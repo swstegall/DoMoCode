@@ -88,4 +88,32 @@ struct ClientLayout {
         if column < sidebarWidth { return .sidebar }
         return row < transcriptHeight ? .transcript : .mainFooter
     }
+
+    /// The screen window a pane occupies, as half-open ranges.
+    struct PaneBounds: Equatable {
+        let columns: Range<Int>
+        let rows: Range<Int>
+    }
+
+    /// Where a pane lives.
+    ///
+    /// Derived here, from the same `sidebarWidth` and `transcriptHeight` the hit
+    /// test uses, for the reason this file's header gives: a second derivation of
+    /// the same rectangle drifts from the first. A text selection is clamped to
+    /// this window, so a drag that began in the transcript never cuts the sidebar
+    /// into every copied line.
+    ///
+    /// `.sidebar` spans the full height because the sidebar is one column with no
+    /// footer of its own — the status line and prompt live only in the main
+    /// column.
+    func bounds(of pane: Pane) -> PaneBounds {
+        switch pane {
+        case .sidebar:
+            return PaneBounds(columns: 0..<min(sidebarWidth, width), rows: 0..<height)
+        case .transcript:
+            return PaneBounds(columns: min(sidebarWidth, width)..<width, rows: 0..<transcriptHeight)
+        case .mainFooter:
+            return PaneBounds(columns: min(sidebarWidth, width)..<width, rows: transcriptHeight..<height)
+        }
+    }
 }

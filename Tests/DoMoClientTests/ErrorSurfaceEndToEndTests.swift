@@ -81,7 +81,11 @@ private func screenContains(_ target: CaptureTarget, rows: Int, columns: Int, _ 
 @Suite(.serialized)
 struct ErrorSurfaceEndToEndTests {
     private static let token = "e2e-error-surface-token"
-    private static let columns = 150
+    // Widened from 150 when the mouse-mode hint joined the status line. The
+    // status line is truncated from the right and this suite asserts on a hint
+    // near its end (`^O: expand`), so the terminal has to be wide enough to hold
+    // the whole line. No assertion changed.
+    private static let columns = 180
     private static let rows = 30
 
     private struct Dirs {
@@ -125,6 +129,10 @@ struct ErrorSurfaceEndToEndTests {
         script: @escaping @MainActor (AsyncStream<[UInt8]>.Continuation, CaptureTarget) async -> Void = { _, _ in },
         until: @escaping @MainActor (CaptureTarget) -> Bool
     ) async -> CaptureTarget {
+        // One end-to-end client at a time across the whole binary — see
+        // FullScreenClientGate. This suite's `type` helper has a wall-clock
+        // budget, and a second client running on the same main actor spends it.
+        await FullScreenClientGate.shared.enter()
         let target = CaptureTarget(columns: Self.columns, rows: Self.rows)
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
@@ -144,6 +152,7 @@ struct ErrorSurfaceEndToEndTests {
         inputCont.finish()
         resizeCont.finish()
         _ = await clientTask.result
+        await FullScreenClientGate.shared.leave()
         return target
     }
 

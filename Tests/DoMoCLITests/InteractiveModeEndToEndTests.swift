@@ -713,6 +713,282 @@ struct InteractiveModeEndToEndTests {
         inputCont.finish()
         try await runTask.value
     }
+
+    // MARK: A run that stops without finishing
+
+    /// One assistant turn that calls `ls .` and finishes with `tool_calls`, so the
+    /// loop dispatches the (auto-allowed, read-only) call and asks for another turn.
+    static let lsToolTurn = #"""
+        data: {"id":"l1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_ls_1","type":"function","function":{"name":"ls","arguments":""}}]},"finish_reason":null}]}
+
+        data: {"id":"l1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\": \".\"}"}}]},"finish_reason":null}]}
+
+        data: {"id":"l1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+        data: [DONE]
+
+
+        """#
+
+    /// A run cut off by `--max-turns` says so, in the transcript.
+    ///
+    /// This is the inline half of the reported defect: the REPL reacted to
+    /// `.aborted` and to nothing else, so a run that hit the turn budget produced
+    /// NO output at all — the session simply went quiet mid-task, which reads
+    /// exactly like the model deciding it was finished.
+    @Test
+    func inlineReplSaysWhyARunStoppedAtTheTurnLimit() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.lsToolTurn, Self.lsToolTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        try tree.writeFile("hello.txt", "hi\n")
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path,
+            maxTurns: 1
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("list the files"))
+        inputCont.yield(bytes("\r"))
+
+        let explained = await waitUntil { screenContains(target, rows: rows, cols: cols, "--max-turns limit") }
+        #expect(explained, "the REPL went idle without saying the turn limit stopped the run")
+        // The budget really did stop it — one turn, one request.
+        #expect(gateway.requestCount == 1)
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    // MARK: Drag and drop
+
+    /// A 16-byte PNG the sniffer accepts: signature + IHDR length 13 + "IHDR".
+    static let tinyPNG = Data([
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    ])
+
+    /// Wrap `text` in the bracketed-paste guards a terminal puts around a drop.
+    static func bracketedPaste(_ text: String) -> [UInt8] {
+        bytes("\u{1b}[200~" + text + "\u{1b}[201~")
+    }
+
+    /// Dragging an image onto the inline REPL attaches it instead of typing its
+    /// path.
+    ///
+    /// The file deliberately lives OUTSIDE the session's working directory: a
+    /// dropped screenshot from `~/Desktop` is trusted operator input, exactly like
+    /// `--image`, and resolving it through the tool sandbox would refuse the
+    /// commonest case there is.
+    @Test
+    func inlineReplAttachesADroppedImage() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        let dropped = tree.root.appendingPathComponent("shot.png")
+        try Self.tinyPNG.write(to: dropped)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let attached = await waitUntil { screenContains(target, rows: rows, cols: cols, "attached shot.png") }
+        #expect(attached, "the drop was not staged as an attachment")
+
+        inputCont.yield(bytes("what is this"))
+        inputCont.yield(bytes("\r"))
+        let replied = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(replied, "the turn never completed")
+
+        // The bytes really rode the message, and the path was NOT typed into it.
+        let json = try JSONValue(parsing: Data(gateway.requests[0].body.utf8))
+        let content = json["messages"]?[1]?["content"]
+        #expect(content?[0]?["text"]?.stringValue == "what is this", "body: \(gateway.requests[0].body)")
+        #expect(content?[1]?["type"]?.stringValue == "image_url", "body: \(gateway.requests[0].body)")
+        #expect(
+            content?[1]?["image_url"]?["url"]?.stringValue
+                == "data:image/png;base64,\(Self.tinyPNG.base64EncodedString())",
+            "body: \(gateway.requests[0].body)"
+        )
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// A paste that is not path-shaped is ordinary text, untouched.
+    ///
+    /// The whole safety property of the drop parser: prose that merely MENTIONS a
+    /// path must reach the prompt verbatim, or pasting a paragraph would start
+    /// eating words.
+    @Test
+    func inlineReplLeavesOrdinaryPastedProseAlone() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste("check /tmp/absent.png and tell me"))
+        let typed = await waitUntil { screenContains(target, rows: rows, cols: cols, "check /tmp/absent.png and tell me") }
+        #expect(typed, "a non-drop paste did not reach the prompt")
+        #expect(!screenContains(target, rows: rows, cols: cols, "attached"))
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// A dropped file that is not an image is refused — and its path goes back into
+    /// the prompt as text, so the gesture never silently loses what the user meant.
+    @Test
+    func inlineReplRestoresARefusedDropAsText() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+        let dropped = tree.root.appendingPathComponent("notes.txt")
+        try "not an image\n".write(to: dropped, atomically: true, encoding: .utf8)
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 120, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(Self.bracketedPaste(dropped.path))
+        let explained = await waitUntil {
+            screenContains(target, rows: rows, cols: cols, "notes.txt is not a supported image")
+        }
+        #expect(explained, "a refused drop said nothing")
+        let restored = await waitUntil { screenContains(target, rows: rows, cols: cols, "notes.txt") }
+        #expect(restored, "the refused drop's text was eaten")
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    // MARK: Errors
+
+    /// A failure the loop SETTLES (rather than throws) is spelled out in the
+    /// transcript, with the same three parts the full-screen client shows.
+    ///
+    /// This is the whole reason the REPL's notice handling exists. A refused
+    /// credential produces an assistant message with EMPTY text, which
+    /// `finalizeAssistant` deletes as a tool-only turn — so before this the REPL
+    /// went straight back to idle with nothing on screen at all, and the user's
+    /// only evidence that anything had happened was that no answer arrived.
+    @Test
+    func inlineReplSpellsOutAGatewayRefusal() async throws {
+        let gateway = try MockGateway(
+            chatCompletionBodies: [],
+            refuseWith: (
+                status: 401,
+                reason: "Unauthorized",
+                body: #"{"error":{"message":"Invalid API key provided","type":"invalid_request_error","code":"invalid_api_key"}}"#
+            )
+        )
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("what went wrong"))
+        inputCont.yield(bytes("\r"))
+
+        // 1. The class of failure, named.
+        let headline = await waitUntil {
+            screenContains(target, rows: rows, cols: cols, "The gateway rejected the credential")
+        }
+        #expect(headline, "the REPL went idle with no error on screen")
+        // 2. The provider's own words, so the cause is not guesswork.
+        #expect(screenContains(target, rows: rows, cols: cols, "Invalid API key provided"))
+        // 3. What to do about it — "is my key wrong?" answered without a log.
+        #expect(screenContains(target, rows: rows, cols: cols, "credential is set and has not expired"))
+
+        inputCont.finish()
+        try await runTask.value
+    }
 }
 
 /// A tiny thread-safe done flag: the run task marks it on the main actor, the test

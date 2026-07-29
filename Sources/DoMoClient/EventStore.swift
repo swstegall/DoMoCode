@@ -12,6 +12,7 @@
 
 import DoMoCore
 import DoMoLLM
+import Foundation
 import DoMoPermissions
 import DoMoServer
 import DoMoTermGraphics
@@ -73,6 +74,22 @@ public final class EventStore {
     /// reserved for things that must survive being scrolled past. Errors take
     /// the other door; see ``postError(headline:message:hint:)``.
     public private(set) var lastNotice: ServerNotice?
+
+    /// When the last event of ANY kind arrived on the stream.
+    ///
+    /// The one fact that separates "the model is slow" from "nothing is
+    /// connected", and the only reason a heartbeat is not a wasted frame. The
+    /// server sends one every 15 s whether or not a turn is running, so a stream
+    /// that has said nothing for appreciably longer than that is dead — whatever
+    /// the socket believes. This store used to DISCARD heartbeats before recording
+    /// anything about them, so a half-open connection (which throws nothing and
+    /// delivers nothing) was completely invisible.
+    ///
+    /// Advanced only by ``apply(_:)`` — deliberately NOT by ``adopt(_:)``. A
+    /// successful `/status` poll proves the SERVER is reachable, which is a
+    /// different fact from the stream being alive, and folding the two together
+    /// would hide exactly the failure the timestamp exists to expose.
+    public private(set) var lastEventAt: Date = Date()
 
     /// Fired after any mutation, so the UI can request a render. Set by the app.
     public var onChange: (() -> Void)?
@@ -183,6 +200,9 @@ public final class EventStore {
     /// *message* frames (`message_start`/`message_end` for the `tool` role) and
     /// system messages are ignored, so a tool call is never double-counted.
     public func apply(_ event: ServerEvent) {
+        // ABOVE the switch, so the `.heartbeat` arm's early `return` — the frame
+        // whose ONLY purpose is to prove the stream is alive — still advances it.
+        lastEventAt = Date()
         switch event {
         case .connected(_, _, let running):
             // Adopt the server's run state, in BOTH directions.
@@ -351,6 +371,60 @@ public final class EventStore {
         onChange?()
     }
 
+    // MARK: The server's authoritative view
+
+    /// Fold a server-authoritative status snapshot.
+    ///
+    /// The server owns run state and the pending-prompt set; the client's copy is
+    /// only ever a fold of edge-triggered frames, and every one of those edges can
+    /// be missed. Once an edge is missed, nothing in the edge-triggered world can
+    /// undo it: a client that never saw `agent_end` believes a turn is in flight
+    /// forever, and the synchronous submit guard then refuses every prompt for the
+    /// life of the session. This is how it gets back in sync without needing a
+    /// reconnect it has no reason to make.
+    ///
+    /// Ignores a snapshot for a session that is no longer selected — a poll in
+    /// flight across a session switch must not decide the new session's state.
+    public func adopt(_ status: SessionStatus) {
+        guard status.sessionID == selectedSessionID else { return }
+        if status.running {
+            if runState != .running {
+                runState = .running
+                lastStopReason = nil
+            }
+        } else if runState != .idle {
+            runState = .idle
+            // A turn that is over cannot still have a tool call in flight, and
+            // cannot still be waiting on approval.
+            settleActiveToolCalls()
+            if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
+            pendingPermission = nil
+        }
+        // Drop a modal the server no longer has parked. This is the case where the
+        // `permission_resolved` echo was the frame that got lost: the run moved on,
+        // and the client is holding a question nobody is waiting for an answer to.
+        if let pending = pendingPermission, !status.pendingPermissionIDs.contains(pending.id) {
+            resolvedRequestIDs.insert(pending.id)
+            pendingPermission = nil
+            markPendingToolAwaitingApproval()
+        }
+        onChange?()
+    }
+
+    /// Whether any of `ids` names a prompt this store has neither parked nor
+    /// already answered — i.e. an ask that was lost in transit.
+    ///
+    /// The bounded broadcast buffers drop the OLDEST frame, and a `permission_request`
+    /// is followed by the deltas of whatever else the run is doing, so the ask is
+    /// exactly the frame most likely to be evicted. Recovering it used to require a
+    /// reconnect, because the `connected` reconcile was the only caller of
+    /// `GET /permissions`; a stream that never drops does not reconnect, so a
+    /// prompt lost this way was lost for good.
+    public func hasUnseenPermission(in ids: [String]) -> Bool {
+        guard pendingPermission == nil else { return false }
+        return ids.contains { !resolvedRequestIDs.contains($0) }
+    }
+
     // MARK: Failures
 
     /// Append a failure row.
@@ -516,6 +590,9 @@ public final class EventStore {
     }
 
     private func clearTranscript() {
+        // Fresh data is a sign of life: a re-seed that did NOT reset this would
+        // leave a newly-opened session reporting the previous one's silence.
+        lastEventAt = Date()
         transcript = []
         streamingAssistantIndex = nil
         streamingReasoningIndex = nil

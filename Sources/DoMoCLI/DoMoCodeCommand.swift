@@ -63,6 +63,13 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             records the answer. Print mode and --serve cannot ask, so pass --trust to record trust \
             up front (in <config-dir>/trust.json, keyed by resolved path; a trusted directory also \
             trusts its subdirectories). A directory with no such project file needs no trust.
+
+            TURN LIMIT. There is none by default, in EVERY mode — interactive, -p and --serve \
+            alike. A run continues until the model produces a final answer, you abort it, or the \
+            runaway guard trips (the same tool calls returning the same results, twelve turns \
+            running). Set --max-turns N to cap a run instead; --max-turns 0 asks for unlimited \
+            explicitly. Under -p, hitting the cap exits 2 and the runaway guard exits 3, so a \
+            script can tell "I under-budgeted" from "the model is stuck".
             """
     )
 
@@ -96,8 +103,40 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     @Option(name: .customLong("base-url"), help: "LiteLLM proxy base URL (default http://localhost:4000/v1).")
     public var baseURL: String?
 
-    @Option(name: .customLong("max-turns"), help: "Maximum assistant turns before giving up (default 20).")
-    public var maxTurns: Int = 20
+    @Option(
+        name: .customLong("max-turns"),
+        help: ArgumentHelp(
+            """
+            Maximum assistant turns in one run. UNLIMITED by default — the agent keeps working \
+            until it produces a final answer, is aborted, or the runaway guard trips. Pass 0 for \
+            unlimited explicitly.
+            """,
+            valueName: "n"
+        )
+    )
+    public var maxTurns: Int?
+
+    /// The turn bound the runtimes actually receive.
+    ///
+    /// `nil` — the default, and the meaning of `--max-turns 0` — is unbounded, which
+    /// is already the downstream vocabulary (``AgentLoopConfig/maxTurns``), so no new
+    /// sentinel is invented. Never `0`: the loop emits `agent_start`/`turn_start`
+    /// before its first bound check, so a literal 0 would settle a run with a
+    /// dangling `turn_start` and no `turn_end`. Collapsing the sentinel here, once,
+    /// is what keeps the four fan-out sites from each restating the rule.
+    var turnLimit: Int? {
+        guard let maxTurns, maxTurns > 0 else { return nil }
+        return maxTurns
+    }
+
+    @Flag(
+        name: .customLong("no-mouse"),
+        help: """
+            Never claim the mouse in the full-screen client, so the terminal's own selection and \
+            scrollback keep working. Wheel scrolling inside the app is lost in exchange.
+            """
+    )
+    public var noMouse: Bool = false
 
     @Flag(name: .customLong("json"), help: "Emit a newline-delimited JSON event stream on stdout.")
     public var json: Bool = false
@@ -215,8 +254,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 "No model configured. Set --model, \(EnvName.model), or \"model\" in settings.json."
             )
         }
-        guard maxTurns >= 1 else {
-            throw DoMoError(.configuration, "--max-turns must be at least 1 (got \(maxTurns)).")
+        // 0 is accepted and means unlimited (see ``turnLimit``); only a negative
+        // budget is a usage error.
+        if let maxTurns, maxTurns < 0 {
+            throw DoMoError(.configuration, "--max-turns must be 0 (unlimited) or greater (got \(maxTurns)).")
         }
 
         // Refuse to run an untrusted project's local settings before any tool is
@@ -275,7 +316,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     configDirectory: configuration.configDirectory.string,
                     homeDirectory: environment["HOME"],
                     reasoningEffort: configuration.reasoningEffort,
-                    maxTurns: maxTurns,
+                    maxTurns: turnLimit,
                     sessionSource: sessionSource,
                     mcpServers: configuration.mcpServers,
                     mcpLog: { Self.writeStderr($0 + "\n") }
@@ -286,7 +327,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     configuration: configuration,
                     model: model,
                     workingDirectory: workingDirectory,
-                    maxTurns: maxTurns,
+                    maxTurns: turnLimit,
+                    environment: environment,
+                    noMouse: noMouse,
                     serverURL: serverURL,
                     serverToken: serverToken
                 )
@@ -340,7 +383,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             toolContext: toolContext,
             workingDirectory: workingDirectory,
             mode: json ? .json : .text,
-            maxTurns: maxTurns,
+            maxTurns: turnLimit,
             channel: OutputChannel(),
             sessionSource: sessionSource,
             sessionDirectory: configuration.sessionDirectory,
@@ -450,7 +493,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             configuration: configuration,
             model: model,
             workingDirectory: workingDirectory,
-            maxTurns: maxTurns
+            maxTurns: turnLimit
         )
         let token = Self.generateToken()
         let server = DoMoServer(
@@ -479,7 +522,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         configuration: ResolvedConfiguration,
         model: String,
         workingDirectory: FilePath,
-        maxTurns: Int
+        maxTurns: Int?
     ) async throws -> (runtime: ServerRuntime, mcpManager: MCPManager) {
         let shell = try SubprocessShell()
         let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
@@ -543,7 +586,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         configuration: ResolvedConfiguration,
         model: String,
         workingDirectory: FilePath,
-        maxTurns: Int,
+        maxTurns: Int?,
+        environment: [String: String],
+        noMouse: Bool,
         serverURL: String?,
         serverToken: String?
     ) async throws {
@@ -594,7 +639,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // The full-screen UI declares the terminal state it needs (alternate screen
         // + mouse reporting); this must not be a default-constructed lifecycle, as
         // it once was — see `fullScreenClientLifecycle`.
-        let lifecycle = fullScreenClientLifecycle()
+        //
+        // `--no-mouse` is the one genuine caller choice here: a user who wants
+        // their terminal's own selection and scrollback back asks for it, and the
+        // app then never claims the mouse at all. It has to reach BOTH the
+        // lifecycle (which decides whether the enable sequence is ever written)
+        // and the app (whose `mouseOwned` is the truth an in-session toggle and
+        // the status hint start from — a lifecycle that never took the mouse plus
+        // an app that thinks it has it is the disagreement that would make a
+        // toggle turn the mouse ON when the user asked for it off).
+        let lifecycle = fullScreenClientLifecycle(enableMouse: !noMouse)
         do {
             try await runFullScreenClient(
                 baseURL: baseURL,
@@ -611,7 +665,19 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 promptHistoryPath: PromptHistoryStore.defaultPath(
                     sessionDirectory: configuration.sessionDirectory,
                     cwd: workingDirectory.string
-                )
+                ),
+                // The clipboard half a terminal cannot do for itself. Resolved ONCE,
+                // here, from this process's environment: DoMoClient has no
+                // subprocess dependency and must not grow one so a right-click can
+                // reach `pbcopy`. With no local helper this is `NoClipboardSink`,
+                // which over ssh is the right answer rather than a degraded one —
+                // OSC 52 is the path that reaches the clipboard that matters there.
+                clipboard: SystemClipboard.makeClipboardSink(environment: environment),
+                // Whether an OSC 52 has to be wrapped to escape a multiplexer. Read
+                // from the same environment, for the same reason: the detection is
+                // about the process's own surroundings, which only the CLI can see.
+                multiplexer: TerminalMultiplexer.detect(environment: environment),
+                mouseOwned: !noMouse
             )
         } catch {
             serverTask?.cancel()

@@ -46,13 +46,29 @@ struct StubRoute: Sendable {
     let status: Int
     let reason: String
     let body: String
+    /// How many times this route may answer before it is skipped and matching
+    /// falls through to whatever comes after it. `nil` is unlimited.
+    ///
+    /// Needed because several of the client's error paths only exist on the
+    /// SECOND call to the same endpoint: the session-list refresh that follows a
+    /// create, and the history re-seed that follows a reconnect, both go back to a
+    /// route that had to succeed the first time for the client to reach them at all.
+    let times: Int?
 
-    init(_ method: String, _ pathContains: String, _ status: Int, _ reason: String, _ body: String) {
+    init(
+        _ method: String,
+        _ pathContains: String,
+        _ status: Int,
+        _ reason: String,
+        _ body: String,
+        times: Int? = nil
+    ) {
         self.method = method
         self.pathContains = pathContains
         self.status = status
         self.reason = reason
         self.body = body
+        self.times = times
     }
 }
 
@@ -65,6 +81,8 @@ final class ExplainingServer: @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
     private var thread: Thread?
+    /// How many times each route has answered, so a `times`-limited route retires.
+    private var used: [Int]
 
     /// Answer everything the same way.
     convenience init(status: Int, reason: String, body: String) throws {
@@ -76,6 +94,7 @@ final class ExplainingServer: @unchecked Sendable {
     init(routes: [StubRoute], fallback: StubRoute) throws {
         self.routes = routes
         self.fallback = fallback
+        self.used = Array(repeating: 0, count: routes.count)
 
         let fd = socket(AF_INET, explainingStreamSocketType, 0)
         guard fd >= 0 else { throw ExplainingServerError("socket() failed: \(errno)") }
@@ -158,15 +177,39 @@ final class ExplainingServer: @unchecked Sendable {
         var timeout = timeval(tv_sec: 10, tv_usec: 0)
         _ = unsafe setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         guard let requestLine = drainRequestHeaders(fd) else { return }
-        writeAll(fd, Self.response(for: requestLine, routes: routes, fallback: fallback))
+        writeAll(fd, Self.encode(claimRoute(for: requestLine)))
     }
 
-    /// The canned answer for one request line ("GET /sessions HTTP/1.1").
+    /// The route that answers this request line, consuming one of its `times`
+    /// budget. Under the lock: the accept loop is one thread today, but the counter
+    /// is the only mutable state here and a test that spawns a second is one line
+    /// away.
+    private func claimRoute(for requestLine: String) -> StubRoute {
+        let parts = requestLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        let method = parts.count > 0 ? String(parts[0]) : ""
+        let path = parts.count > 1 ? String(parts[1]) : ""
+        lock.lock()
+        defer { lock.unlock() }
+        for (index, route) in routes.enumerated() {
+            guard route.method == method, path.contains(route.pathContains) else { continue }
+            if let times = route.times, used[index] >= times { continue }
+            used[index] += 1
+            return route
+        }
+        return fallback
+    }
+
+    /// The canned answer for one request line ("GET /sessions HTTP/1.1"), ignoring
+    /// any `times` budget — the stateless form, for a caller with a fixed table.
     static func response(for requestLine: String, routes: [StubRoute], fallback: StubRoute) -> [UInt8] {
         let parts = requestLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
         let method = parts.count > 0 ? String(parts[0]) : ""
         let path = parts.count > 1 ? String(parts[1]) : ""
-        let route = routes.first { $0.method == method && path.contains($0.pathContains) } ?? fallback
+        return encode(routes.first { $0.method == method && path.contains($0.pathContains) } ?? fallback)
+    }
+
+    /// One route as HTTP/1.1 response bytes.
+    static func encode(_ route: StubRoute) -> [UInt8] {
         let bodyBytes = Array(route.body.utf8)
         let head = [
             "HTTP/1.1 \(route.status) \(route.reason)",

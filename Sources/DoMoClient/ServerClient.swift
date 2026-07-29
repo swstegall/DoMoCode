@@ -17,6 +17,7 @@ import DoMoLLM
 import DoMoPermissions
 import DoMoServer
 import Foundation
+import Synchronization
 
 // MARK: - Errors
 
@@ -32,16 +33,38 @@ public enum ServerClientError: Error, Sendable, Equatable {
 
     /// A REST call whose body never completed within the request timeout.
     ///
-    /// NOT YET THROWN — declared so the wave that adds the body watchdog does not
-    /// have to re-break every `catch` in the package.
+    /// `HTTPClient.execute(_:timeout:)`'s deadline covers only time-to-response-
+    /// HEAD — the deadline task is cancelled the instant the head lands — so the
+    /// `collect(upTo:)` that follows it is unbounded. A proxy that answers with
+    /// headers and then stalls therefore hangs `abort`, `sendPrompt` and every
+    /// other control call forever, which is precisely the case where the user's
+    /// last escape hatch silently does nothing.
     case timedOut(path: String)
 
     /// An SSE stream that delivered nothing — not even a heartbeat — for the
     /// stream idle timeout. A half-open socket throws nothing on its own: the
     /// read simply never returns, which is exactly the wedged-session symptom.
-    ///
-    /// NOT YET THROWN — declared for the same reason as ``timedOut(path:)``.
     case streamIdle(path: String)
+}
+
+// MARK: - Idle watchdog state
+
+/// The instant an SSE stream last showed a sign of life, shared between the task
+/// reading the socket and the task watching for silence.
+///
+/// A reference box around a `Mutex` rather than a bare `Mutex`, because a `Mutex`
+/// is non-copyable and therefore cannot be captured by two sibling child tasks;
+/// and a lock rather than an actor, because the watchdog's whole job is to answer
+/// while something else is stuck — queueing it behind the reader's isolation
+/// would be a watchdog that hangs exactly when it is needed.
+private final class ActivityStamp: Sendable {
+    private let instant: Mutex<ContinuousClock.Instant>
+
+    init(_ now: ContinuousClock.Instant) { instant = Mutex(now) }
+
+    func touch(_ now: ContinuousClock.Instant) { instant.withLock { $0 = now } }
+
+    func silence(at now: ContinuousClock.Instant) -> Duration { now - instant.withLock { $0 } }
 }
 
 // MARK: - Client
@@ -53,15 +76,41 @@ public struct ServerClient: Sendable {
     public let baseURL: String
     private let token: String
     private let http: HTTPClient
+    private let streamIdleTimeout: Duration
+    private let requestTimeout: Duration
+
+    /// How long an SSE stream may deliver NOTHING — not even a heartbeat — before
+    /// it is declared dead.
+    ///
+    /// 2.5× the server's 15 s heartbeat (`DoMoServer.Options.heartbeatSeconds`),
+    /// so an ordinary scheduling hiccup cannot trip it but a socket that has gone
+    /// half-open cannot hide behind it either. This is the only thing that turns a
+    /// dead-but-not-closed connection into an error: the read never returns, so
+    /// nothing else in the stack ever notices.
+    public static let streamIdleTimeout: Duration = .seconds(40)
+
+    /// The deadline on a REST call, covering the body as well as the head.
+    public static let requestTimeout: Duration = .seconds(30)
 
     /// - Parameters:
     ///   - baseURL: e.g. `http://127.0.0.1:4100` (no trailing slash).
     ///   - token: the bearer token the server minted (its stderr `Authorization:` line).
     ///   - http: a shared client; the caller owns its lifecycle (`shutdown()`).
-    public init(baseURL: String, token: String, http: HTTPClient) {
+    ///   - streamIdleTimeout: the SSE silence watchdog; injectable so a test can
+    ///     assert the watchdog in a fraction of a second rather than in forty.
+    ///   - requestTimeout: the REST deadline, head AND body.
+    public init(
+        baseURL: String,
+        token: String,
+        http: HTTPClient,
+        streamIdleTimeout: Duration = ServerClient.streamIdleTimeout,
+        requestTimeout: Duration = ServerClient.requestTimeout
+    ) {
         self.baseURL = baseURL
         self.token = token
         self.http = http
+        self.streamIdleTimeout = streamIdleTimeout
+        self.requestTimeout = requestTimeout
     }
 
     // MARK: Request bodies (the server decodes these shapes; kept local since the
@@ -173,6 +222,48 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode([ServerEvent].self, from: data)
     }
 
+    /// The server's authoritative view of a session. `GET /session/{id}/status` → 200.
+    ///
+    /// The level-triggered answer to an edge-triggered problem. Every other way the
+    /// client learns run state is an edge it can miss — a frame dropped by the
+    /// bounded broadcast buffer, a socket that went half-open, a run that never got
+    /// to emit its close — and once it has missed one, nothing short of a reconnect
+    /// ever corrects it. This can be asked at any time.
+    ///
+    /// **Degradation is the caller's job, deliberately.** A 404 here means either
+    /// "no such session" or "this server predates the route", and the two are not
+    /// distinguishable from the status line — Hummingbird answers an unrouted path
+    /// and an unknown session with the same number. Swallowing it inside would
+    /// therefore have to invent a `SessionStatus` for a session that may genuinely
+    /// be gone, which is the same class of lie this endpoint exists to end. The
+    /// poll uses `try?` and simply does not adopt; the diagnostics panel renders
+    /// "unavailable". The precedent at ``abort(sessionID:)`` is about tolerating a
+    /// missing *body*, not a missing route.
+    public func status(sessionID: String) async throws -> SessionStatus {
+        let path = "/session/\(sessionID)/status"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionStatus.self, from: data)
+    }
+
+    /// Free a run slot whose task can never complete. `POST /session/{id}/force-clear`
+    /// → 200. Destructive: the server walks away from the run and re-opens the
+    /// session from disk, so anything the wedged turn produced but did not persist
+    /// is lost.
+    ///
+    /// - Returns: whether anything was actually holding the session. `false` means
+    ///   the lever was pulled on a session that was already free.
+    @discardableResult
+    public func forceClearRun(sessionID: String) async throws -> Bool {
+        let path = "/session/\(sessionID)/force-clear"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        // An older server that answers 200 with no body reads as "something was
+        // cleared", matching `abort`'s tolerance for exactly the same shape.
+        guard let result = try? JSONDecoder().decode(ForceClearResult.self, from: data) else { return true }
+        return result.cleared
+    }
+
     // MARK: SSE
 
     /// The live event stream for a session, decoded to ``ServerEvent``s.
@@ -181,37 +272,101 @@ public struct ServerClient: Sendable {
     /// stream is torn down, so a client opens this once for the selected session
     /// and reads continuously (heartbeats included — the consumer ignores them).
     /// Cancelling the consuming task cancels the underlying request.
+    ///
+    /// **Guarded against silence.** The request's own `timeout:` bounds only the
+    /// time to the response HEAD, and the client is built with no read timeout, so
+    /// a socket that dies without closing — a laptop that slept, a NAT table that
+    /// forgot the flow, a proxy that went away — delivers nothing and throws
+    /// nothing. Nothing downstream can tell that apart from a quiet session: the
+    /// consumer's `catch` never runs, the reconnect never happens, and the
+    /// `connected` reconcile that recovers a missed permission prompt is never
+    /// re-run. So the watchdog lives HERE rather than in the consumer: it makes the
+    /// stream simply THROW, and the existing reconnect/re-seed/re-reconcile path is
+    /// reused unchanged with no new state anywhere above.
     public func events(sessionID: String) -> AsyncThrowingStream<ServerEvent, Error> {
         let baseURL = baseURL
         let token = token
         let http = http
+        let idle = streamIdleTimeout
         let path = "/session/\(sessionID)/events"
         return AsyncThrowingStream { continuation in
             let task = Task {
-                do {
-                    var request = HTTPClientRequest(url: baseURL + path)
-                    request.method = .GET
-                    request.headers.add(name: "authorization", value: "Bearer \(token)")
-                    // A long deadline for a long-lived stream; heartbeats keep it
-                    // active, and the consumer cancels on teardown / session switch.
-                    let response = try await http.execute(request, timeout: .hours(24))
-                    guard response.status.code == 200 else {
-                        throw ServerClientError.unexpectedStatus(response.status.code, path: path, body: nil)
+                let clock = ContinuousClock()
+                // Shared between the reader and the watchdog. A `Mutex` rather than
+                // an actor because the watchdog reads it once a second and must not
+                // be able to queue behind the reader's own hop.
+                let lastActivityAt = ActivityStamp(clock.now)
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        do {
+                            var request = HTTPClientRequest(url: baseURL + path)
+                            request.method = .GET
+                            request.headers.add(name: "authorization", value: "Bearer \(token)")
+                            // A long deadline for a long-lived stream; heartbeats keep it
+                            // active, and the consumer cancels on teardown / session switch.
+                            let response = try await http.execute(request, timeout: .hours(24))
+                            // The head arriving is activity: a slow connect must not
+                            // be charged against the idle budget. Stamped BEFORE the
+                            // status check, so the error-body read below is itself
+                            // covered by the watchdog rather than being a second
+                            // unbounded read on the failure path.
+                            lastActivityAt.touch(clock.now)
+                            guard response.status.code == 200 else {
+                                // Carry what the server said. This throw site used to
+                                // pass `body: nil`, so the ONE place the client tells
+                                // the user why the stream is down — the status line's
+                                // disconnect reason — could only ever say a number.
+                                // A reverse proxy in front of the runtime is exactly
+                                // the thing that answers 503 with a sentence.
+                                throw ServerClientError.unexpectedStatus(
+                                    response.status.code,
+                                    path: path,
+                                    body: await Self.readErrorBody(response.body)
+                                )
+                            }
+                            var decoder = SSEFrameDecoder()
+                            for try await chunk in response.body {
+                                lastActivityAt.touch(clock.now)
+                                var chunk = chunk
+                                let bytes = chunk.readBytes(length: chunk.readableBytes) ?? []
+                                for event in decoder.push(bytes) { continuation.yield(event) }
+                                try Task.checkCancellation()
+                            }
+                            continuation.finish()
+                        } catch {
+                            continuation.finish(throwing: error)
+                        }
                     }
-                    var decoder = SSEFrameDecoder()
-                    for try await chunk in response.body {
-                        var chunk = chunk
-                        let bytes = chunk.readBytes(length: chunk.readableBytes) ?? []
-                        for event in decoder.push(bytes) { continuation.yield(event) }
-                        try Task.checkCancellation()
+                    group.addTask {
+                        // Poll rather than schedule a one-shot: every chunk would
+                        // otherwise have to cancel and re-arm a timer, on a path that
+                        // runs for every delta of every turn.
+                        let tick = min(idle, .seconds(1))
+                        while !Task.isCancelled {
+                            try? await Task.sleep(for: tick)
+                            if Task.isCancelled { return }
+                            if lastActivityAt.silence(at: clock.now) >= idle {
+                                continuation.finish(throwing: ServerClientError.streamIdle(path: path))
+                                return
+                            }
+                        }
                     }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+                    // Whichever finishes first ends the stream; the other is torn down.
+                    _ = await group.next()
+                    group.cancelAll()
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// The readable head of a failed SSE response's body, or nil when it had none
+    /// (or would not produce one). Never throws: a missing explanation must not
+    /// replace the status code the caller already has.
+    private static func readErrorBody(_ body: HTTPClientResponse.Body) async -> String? {
+        guard var buffer = try? await body.collect(upTo: errorBodyCharacterCap * 4) else { return nil }
+        let bytes = buffer.readBytes(length: buffer.readableBytes) ?? []
+        return errorBody(Data(bytes))
     }
 
     /// Decode one SSE frame's raw bytes (`data: <json>`), or nil for a
@@ -244,10 +399,52 @@ public struct ServerClient: Sendable {
             request.headers.add(name: "content-type", value: "application/json")
             request.body = .bytes(Array(body))
         }
-        let response = try await http.execute(request, timeout: .seconds(30))
-        var buffer = try await response.body.collect(upTo: 4 << 20)
-        let bytes = buffer.readBytes(length: buffer.readableBytes) ?? []
-        return (response.status.code, Data(bytes))
+        let response = try await http.execute(request, timeout: .nanoseconds(Self.nanoseconds(requestTimeout)))
+        return (response.status.code, try await collectWithin(requestTimeout, path: path, response.body))
+    }
+
+    /// `Duration` as whole nanoseconds, saturating rather than trapping.
+    ///
+    /// NIO's `TimeAmount` is an `Int64` nanosecond count and the timeout is
+    /// caller-supplied, so a `Duration.seconds(Int.max)` handed in by a test (or a
+    /// future config knob) must clamp to "effectively never" instead of killing the
+    /// client on an overflow.
+    static func nanoseconds(_ duration: Duration) -> Int64 {
+        let components = duration.components
+        guard components.seconds < Int64.max / 1_000_000_000 else { return .max }
+        guard components.seconds > Int64.min / 1_000_000_000 else { return .min }
+        let (product, overflow) = components.seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        guard !overflow else { return components.seconds > 0 ? .max : .min }
+        let (sum, sumOverflow) = product.addingReportingOverflow(components.attoseconds / 1_000_000_000)
+        return sumOverflow ? (components.seconds > 0 ? .max : .min) : sum
+    }
+
+    /// Read a response body under a deadline of our own.
+    ///
+    /// `execute(_:timeout:)`'s deadline is cancelled the moment the response HEAD
+    /// arrives, and the client carries no read timeout, so the `collect` below is
+    /// otherwise unbounded: a server that answers with headers and then stalls
+    /// hangs the call forever. That is survivable for `messages`; it is not
+    /// survivable for `abort`, which is the user's escape hatch from exactly the
+    /// kind of stall that produces it.
+    private func collectWithin(
+        _ timeout: Duration,
+        path: String,
+        _ body: HTTPClientResponse.Body
+    ) async throws -> Data {
+        try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask {
+                var buffer = try await body.collect(upTo: 4 << 20)
+                return Data(buffer.readBytes(length: buffer.readableBytes) ?? [])
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw ServerClientError.timedOut(path: path)
+            }
+            defer { group.cancelAll() }
+            // Non-nil: the group has two tasks and neither returns without a value.
+            return try await group.next()!
+        }
     }
 
     /// How much of an error body is carried into the thrown error.

@@ -395,7 +395,9 @@ public struct PrintMode: Sendable {
     let toolContext: ToolContext
     let workingDirectory: FilePath
     let mode: OutputMode
-    let maxTurns: Int
+    /// The turn bound, or `nil` for unbounded — the shipping default. See
+    /// ``DoMoCodeCommand/turnLimit``.
+    let maxTurns: Int?
     let channel: OutputChannel
     /// Where this run's session file comes from — new, resumed, or forked.
     let sessionSource: SessionSource
@@ -408,6 +410,11 @@ public struct PrintMode: Sendable {
     /// built-ins. Already connected by the caller, which owns their teardown.
     let mcpTools: [any AgentTool]
 
+    /// How often text mode says it is still alive, in turns. Rare enough that a
+    /// short run prints nothing extra (the two-turn end-to-end runs are untouched),
+    /// frequent enough that a run left going for an hour is visibly progressing.
+    static let progressHeartbeatTurns = 25
+
     public init(
         client: LiteLLMClient,
         model: String,
@@ -416,7 +423,7 @@ public struct PrintMode: Sendable {
         toolContext: ToolContext,
         workingDirectory: FilePath,
         mode: OutputMode,
-        maxTurns: Int,
+        maxTurns: Int?,
         channel: OutputChannel,
         sessionSource: SessionSource,
         sessionDirectory: FilePath,
@@ -565,6 +572,15 @@ public struct PrintMode: Sendable {
             }
             let turn = counter.next()
             log.emit("turn_start", ["turn": .int(turn)])
+            // An unbounded run under `-p` must not look dead in a CI log. JSON mode
+            // already carries `turn_start` per turn; text mode had no signal at all,
+            // and now that there is no turn cap a long run's only other output is
+            // its final answer. Deliberately NOT a new JSON event: the JSON stream's
+            // exact ordered event list is a published contract a script reads, so
+            // this goes to stderr and stdout still carries only the answer.
+            if mode == .text, turn % Self.progressHeartbeatTurns == 0 {
+                channel.writeErr("… still working — turn \(turn)\n")
+            }
             return client.streamCompletion(
                 model: model,
                 context: context,
@@ -605,6 +621,13 @@ public struct PrintMode: Sendable {
     /// This is the one place the run decides success from failure, so the exit-code
     /// contract lives here: a clean completion is `0`, hitting ``maxTurns`` is `2`,
     /// stopping for lack of progress is `3`, and every other non-completion is `1`.
+    ///
+    /// What the unlimited default changed is REACHABILITY, not the contract. With
+    /// no `--max-turns`, ``maxTurns`` is `nil`, the loop's bound check never fires,
+    /// `.maxTurnsReached` can never be produced, and exit `2` therefore cannot
+    /// occur — every other code keeps its exact meaning, and `--max-turns N` brings
+    /// `2` back unchanged. The one code that gained reachability is `3`: the
+    /// runaway guard is the bound an unbounded run still has.
     private func finish(result: AgentRunResult, turns: Int) -> Int32 {
         let lastAssistant = Self.lastAssistant(in: result.messages)
 
@@ -629,7 +652,16 @@ public struct PrintMode: Sendable {
             // The model still wanted to act when the turn budget ran out. A
             // genuine non-completion: a distinct exit code, and nothing on stdout
             // — there is no clean final answer to print.
-            let message = "Reached --max-turns limit (\(maxTurns)) before the model produced a final response"
+            //
+            // Only reachable when a limit was ASKED FOR, so the message names it
+            // and says how to lift it. `"unset"` is defensive: a reason the loop
+            // cannot produce without a bound must still not print `Optional(…)`.
+            let limit = maxTurns.map(String.init) ?? "unset"
+            let message = """
+                Reached --max-turns limit (\(limit)) before the model produced a final response. \
+                Re-run with a higher --max-turns, or omit the flag entirely — there is no turn \
+                limit by default.
+                """
             log.emit("error", ["message": .string(message), "stopReason": .string("maxTurns")])
             channel.writeErr(message + "\n")
             return 2
@@ -639,9 +671,6 @@ public struct PrintMode: Sendable {
             // the budget did not run out, the model stopped getting anywhere.
             // A script that retries on `2` (raise the limit) must not retry on
             // this — raising the limit changes nothing.
-            //
-            // UNREACHABLE TODAY: the loop does not yet produce `.noProgress`.
-            // The arm ships now so the enforcement wave is a pure loop change.
             let message = """
                 Stopped: the model repeated the same tool call with the same result \
                 and made no progress. Nothing was accomplished by continuing.

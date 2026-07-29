@@ -21,6 +21,7 @@
 // to leave the transcript its last row, a placeholder, attachment chips, and a
 // persistence hook for history.
 
+import DoMoCore
 import DoMoTUI
 import DoMoTermIO
 
@@ -59,10 +60,18 @@ final class PromptInput: @MainActor Focusable {
 
     private(set) var attachments: [PromptAttachment] = []
 
-    /// Drops handed to the app and not yet answered. A resolution for anything not
-    /// in here is stale (the prompt was cleared, or the same token answered twice)
-    /// and is dropped rather than applied to a document that has moved on.
-    private var pendingDrops: Set<UInt32> = []
+    /// Drops handed to the app and not yet answered, each holding the RAW pasted
+    /// text it was made from. A resolution for anything not in here is stale (the
+    /// prompt was cleared, or the same token answered twice) and is dropped
+    /// rather than applied to a document that has moved on.
+    ///
+    /// The raw text is kept because it is the only copy: `handlePastedText`
+    /// swallows the paste, so if the app decides the paths were not attachable
+    /// after all, this is what has to go back into the document. The app asks for
+    /// it with ``pendingDropText(for:)`` rather than being handed it through
+    /// `onDrop`, so the hook stays the two-argument shape everything else is
+    /// written against and the text has exactly one owner.
+    private var pendingDrops: [UInt32: String] = [:]
     private var dropCounter: UInt32 = 0
 
     private static let placeholder =
@@ -90,7 +99,7 @@ final class PromptInput: @MainActor Focusable {
     func clear() {
         editor.setText("")
         attachments = []
-        pendingDrops = []
+        pendingDrops = [:]
     }
 
     /// Put a submitted message, and anything staged with it, back after a refused
@@ -188,20 +197,25 @@ final class PromptInput: @MainActor Focusable {
         case rejected(rawText: String, notice: String)
     }
 
-    /// Mint a token for a drop about to be handed to the app.
+    /// Mint a token for a drop about to be handed to the app, remembering the raw
+    /// text it came from.
     ///
     /// Kept separate from `onDrop` so the caller decides whether the paste is a drop
     /// at all — the parse needs a path grammar this component deliberately does not
     /// own.
-    func beginDrop() -> UInt32 {
+    func beginDrop(rawText: String = "") -> UInt32 {
         dropCounter &+= 1
-        pendingDrops.insert(dropCounter)
+        pendingDrops[dropCounter] = rawText
         return dropCounter
     }
 
+    /// The raw pasted text behind an unanswered drop, for an app that has to put
+    /// it back. `nil` once the drop is answered or abandoned.
+    func pendingDropText(for token: UInt32) -> String? { pendingDrops[token] }
+
     /// Apply the app's answer to a drop.
     func resolveDrop(token: UInt32, outcome: DropOutcome) {
-        guard pendingDrops.remove(token) != nil else { return }
+        guard pendingDrops.removeValue(forKey: token) != nil else { return }
         switch outcome {
         case .attached(let resolved):
             for attachment in resolved { addAttachment(attachment) }
@@ -333,18 +347,33 @@ final class PromptInput: @MainActor Focusable {
     /// Consulted with a WHOLE bracketed paste before the editor inserts it. Return
     /// `true` to swallow it.
     ///
-    /// This is the one place drop decoding can correctly live, and it is deliberately
-    /// empty for now. What goes here is: parse `pasted` into path candidates, and if
-    /// there are any, `let token = beginDrop(); onDrop?(token, candidates); return
-    /// true` — the app then reads the files off the main actor and answers through
-    /// ``resolveDrop(token:outcome:)``. The path grammar is not this component's to
-    /// own, which is why the parse is not inlined.
+    /// This is the one place drop decoding can correctly live: dragging a file onto
+    /// a terminal makes the terminal PASTE the path, so a drop and a paste are the
+    /// same event and only the content tells them apart. The hook is on the editor
+    /// rather than on this façade because a bracketed paste is buffered across
+    /// `handleInput` calls until its terminator arrives — a sniff at this level
+    /// would miss any paste the driver delivered in two pieces.
     ///
-    /// Until then every paste is ordinary text: inserted with its newlines intact,
-    /// and never a submit.
+    /// ``DoMoCore/DroppedPaths/candidates(_:)`` owns the grammar and is deliberately
+    /// conservative: it answers with an empty array for anything that is not
+    /// unambiguously a list of absolute paths, and prose mentioning a path — "check
+    /// /tmp/a.png and tell me" — is such a thing. An empty answer returns `false`
+    /// here, which is today's behaviour byte for byte: ordinary text, newlines
+    /// intact, never a submit.
+    ///
+    /// With no `onDrop` consumer the paste is also ordinary text. A prompt whose
+    /// owner cannot resolve a file must not swallow one: there would be nobody to
+    /// answer ``resolveDrop(token:outcome:)`` and the user's path would simply
+    /// vanish.
     private func handlePastedText(_ pasted: String) -> Bool {
-        _ = pasted
-        return false
+        guard let onDrop else { return false }
+        let candidates = DroppedPaths.candidates(pasted)
+        guard !candidates.isEmpty else { return false }
+        // Nothing is inserted here, and nothing is inserted by the app on
+        // success. The raw text is held against the token so a rejection can put
+        // it back exactly as it arrived.
+        onDrop(beginDrop(rawText: pasted), candidates)
+        return true
     }
 
     // MARK: Submit
@@ -354,7 +383,7 @@ final class PromptInput: @MainActor Focusable {
         let pending = attachments
         guard !trimmed.isEmpty || !pending.isEmpty else { return }
         attachments = []
-        pendingDrops = []
+        pendingDrops = [:]
         if !trimmed.isEmpty {
             editor.addToHistory(trimmed)
             onHistoryAdd?(trimmed)
