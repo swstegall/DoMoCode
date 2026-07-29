@@ -109,6 +109,53 @@ struct PromptHistoryTests {
         #expect(await store.load().isEmpty)
     }
 
+    @Test("The history file is owner-only, and stays owner-only across appends")
+    func promptHistoryFileIsOwnerReadWriteOnly() async throws {
+        // The session transcript in the SAME directory is 0600 because it holds
+        // exactly this class of content; prompt text is where people paste tokens,
+        // internal hostnames and paths. `Data.write(options: .atomic)` renames a
+        // fresh 0644 temp over the file on every append, so the mode was re-created
+        // world-readable on every Enter and a chmod by hand did not survive one.
+        let root = sandbox()
+        defer { remove(root) }
+        let path = root.appending("h.json")
+        let store = PromptHistoryStore(path: path)
+
+        await store.append("first")
+        let created = try FileManager.default.attributesOfItem(atPath: path.string)
+        #expect(created[.posixPermissions] as? Int == 0o600, "a freshly created file is owner-only")
+
+        // Umask-independent half: a file that IS group/world readable must come back
+        // owner-only after the next append, not inherit what was there.
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path.string)
+        await store.append("second")
+        let rewritten = try FileManager.default.attributesOfItem(atPath: path.string)
+        #expect(rewritten[.posixPermissions] as? Int == 0o600, "an append re-tightens the mode")
+        #expect(await store.load() == ["first", "second"], "and the contents survived")
+
+        // No temp file left behind.
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.string)
+        #expect(leftovers == ["h.json"], "leftovers: \(leftovers)")
+    }
+
+    @Test("A file a newer build wrote is left alone, not truncated")
+    func promptHistoryDoesNotDestroyAFutureVersionedFile() async throws {
+        // `load()` reads a future version as no history, and rewriting from that
+        // empty base wiped every entry the user had: running an older `domo` once
+        // after a schema bump was permanent data loss.
+        let root = sandbox()
+        defer { remove(root) }
+        let path = root.appending("h.json")
+        let original = #"{"version":2,"entries":["precious one","precious two"]}"#
+        try Data(original.utf8).write(to: URL(fileURLWithPath: path.string))
+
+        let store = PromptHistoryStore(path: path)
+        await store.append("new entry")
+        let onDisk = try String(contentsOfFile: path.string, encoding: .utf8)
+        #expect(onDisk == original, "the newer file is untouched")
+        #expect(await store.load().isEmpty, "and still reads as no history")
+    }
+
     @Test("A control character never reaches the store on the way in either")
     func promptHistoryRefusesToWriteControlCharacters() async {
         let root = sandbox()
@@ -117,5 +164,32 @@ struct PromptHistoryTests {
         await store.append("clean")
         await store.append("dirty \u{1b}[2J")
         #expect(await store.load() == ["clean"])
+    }
+
+    @Test("A symlinked history file still records, and still ends up owner-only")
+    func promptHistoryFollowsASymlinkedDestination() async throws {
+        // The ordinary dotfiles arrangement. `FileManager.replaceItemAt` does NOT
+        // follow a symlink even though the `fileExists` probe guarding it does, so
+        // this destination took the replace branch, threw, and — because the whole
+        // write path is best-effort — silently stopped recording anything, forever.
+        let root = sandbox()
+        defer { remove(root) }
+        let real = root.appending("real.json")
+        let link = root.appending("link.json")
+        try Data(#"{"version":1,"entries":["old"]}"#.utf8)
+            .write(to: URL(fileURLWithPath: real.string))
+        try FileManager.default.createSymbolicLink(
+            atPath: link.string,
+            withDestinationPath: real.string
+        )
+
+        let store = PromptHistoryStore(path: link)
+        await store.append("new")
+
+        #expect(await store.load() == ["old", "new"], "the append was swallowed")
+        let type = try FileManager.default.attributesOfItem(atPath: link.string)[.type] as? FileAttributeType
+        #expect(type == .typeSymbolicLink, "the symlink itself was replaced by a regular file")
+        let mode = try FileManager.default.attributesOfItem(atPath: real.string)[.posixPermissions] as? Int
+        #expect(mode == 0o600, "the fallback left the file readable by other users")
     }
 }

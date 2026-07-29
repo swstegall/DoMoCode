@@ -412,6 +412,13 @@ public actor ServerRuntime {
         session.runStartedAt = Date()
         session.runTask = Task { [weak self] in
             do {
+                // A run the LOOP settled as `.errored` has already narrated itself:
+                // ``DoMoAgent`` emits its classified failure as an `AgentEvent.notice`
+                // from inside `settle`, immediately before `agent_end`, and that
+                // notice is projected onto this same stream. Re-broadcasting
+                // `result.failure` here would put the identical row on the screen
+                // twice — the frame is not missing, only the frames for the failures
+                // the loop never saw are, and those all arrive as a throw.
                 _ = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
             } catch is CancellationError {
                 // Aborted before the loop emitted its own close.
@@ -421,9 +428,65 @@ public actor ServerRuntime {
                 // persistence error after the loop settled would otherwise leave the
                 // stream with no terminal frame. Guarantee exactly one close per
                 // accepted prompt, so a subscriber never hangs.
-                sink.broadcast(.agentEnd(reason: "errored"))
+                //
+                // Say WHAT failed, and say it BEFORE the close: a client folds
+                // `agent_end` into "idle", and a reason that arrives after the run is
+                // already idle reads as belonging to nothing. `agent_end(reason:
+                // "errored")` on its own is a three-word status line and an empty
+                // pane — which is exactly the report this frame exists to answer.
+                let failure = error as? DoMoError
+                    ?? DoMoError(wrapping: error, as: .configuration, "The turn could not be run")
+                // An interrupt drawn in red as a failure is a bug report the user then
+                // files. A cancellation that did not surface as `CancellationError`
+                // (a torn-down socket classified by the layer that caught it) lands
+                // here, and must still close as an abort rather than an error.
+                if failure.isCancellation {
+                    sink.broadcast(.agentEnd(reason: "aborted"))
+                } else {
+                    sink.broadcast(Self.noticeEvent(failure))
+                    sink.broadcast(.agentEnd(reason: "errored"))
+                }
             }
             await self?.finishRun(sessionID, token: token)
+        }
+    }
+
+    /// One wire notice from a classified failure the run threw.
+    ///
+    /// The full cause chain becomes the text, capped HERE rather than at render
+    /// time: a gateway can answer with an entire HTML error page, and an
+    /// uncapped chain would make the SSE frame itself the payload problem for
+    /// every attached subscriber. The taxonomy rides along as
+    /// ``DoMoCore/DoMoError/Kind/label`` so a client renders a headline and a
+    /// recovery hint without parsing prose.
+    private static func noticeEvent(_ error: DoMoError) -> ServerEvent {
+        .notice(ServerNotice(
+            level: .error,
+            code: noticeCode(for: error.kind),
+            text: DoMoError.truncating(error.description),
+            kind: error.kind.label
+        ))
+    }
+
+    /// Which notice family a classified failure belongs to.
+    ///
+    /// Read off the KIND, never off the catch site — the same rule the agent
+    /// loop applies to the failures it settles, so the same 401 is filed the
+    /// same way whether it arrived through the loop's own stream or was thrown
+    /// out of `harness.run`'s pre-turn compaction. Filing everything that can
+    /// throw here as `runtime_error` would be the easy answer and the wrong
+    /// one: compaction issues a real model request, so a gateway refusal
+    /// genuinely does reach this catch.
+    ///
+    /// Exhaustive with no `default`, so a new ``DoMoCore/DoMoError/Kind`` is a
+    /// compile error here rather than a silent misfiling.
+    private static func noticeCode(for kind: DoMoError.Kind) -> String {
+        switch kind {
+        case .transport, .authentication, .rateLimit, .quotaExhausted, .contextOverflow, .provider,
+            .malformedResponse:
+            return "provider_error"
+        case .toolExecution, .file, .cancelled, .configuration:
+            return "runtime_error"
         }
     }
 

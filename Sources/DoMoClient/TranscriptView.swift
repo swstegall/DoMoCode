@@ -41,8 +41,30 @@ final class TranscriptView: Component {
     /// viewport height, which only it knows.
     var scrollOffset = 0
 
+    /// Whether long failure bodies and failed-tool output are shown in full.
+    /// Toggled by `^O`.
+    ///
+    /// A render-affecting flag, so it is part of the memo key below — in BOTH
+    /// the tuple and the comparison. A flag in one and not the other is a toggle
+    /// that silently does nothing: the key would still match, the cached rows
+    /// would still be returned, and the user would press the advertised key and
+    /// watch the screen not change.
+    var expandErrors = false
+
     private let toolOutputCap = 8
     private let toolOutputCharCap = 4000
+
+    /// How many wrapped rows a failure body gets before it is capped.
+    ///
+    /// Larger than a tool call's eight, because the thing being capped is the
+    /// answer to "why did this fail" and the useful part of a provider body is
+    /// often not in its first line. Lifted entirely by `^O`.
+    private let errorBodyRowCap = 12
+
+    /// The rows a FAILED tool call gets. A failure's output is the diagnosis —
+    /// a compiler's error list, a stack trace — and eight rows of it is a
+    /// truncation right through the middle of the thing being read.
+    private let failedToolOutputCap = 24
 
     /// The braille spinner, shared with ``DoMoTUI/Loader``'s frame set so every
     /// surface animates identically.
@@ -51,8 +73,9 @@ final class TranscriptView: Component {
     /// Memoize the rendered rows: the transcript is re-rendered every frame (e.g.
     /// on every keystroke), but only changes when an event lands — and re-encoding
     /// an image (base64 + escape) every frame would be very expensive. Keyed on the
-    /// content, width, streaming flag, spinner frame, and the graphics context.
-    private var cache: (items: [TranscriptItem], running: Bool, spinnerFrame: Int, width: Int, capabilities: TerminalCapabilities, cell: CellDimensions, rows: [TranscriptVisualRow])?
+    /// content, width, streaming flag, spinner frame, the graphics context, and
+    /// the expand toggle.
+    private var cache: (items: [TranscriptItem], running: Bool, spinnerFrame: Int, width: Int, capabilities: TerminalCapabilities, cell: CellDimensions, expandErrors: Bool, rows: [TranscriptVisualRow])?
 
     /// The mixed text/image rows for the main pane, given the terminal's image
     /// capability and cell size.
@@ -65,7 +88,8 @@ final class TranscriptView: Component {
         guard width > 0 else { return [] }
         if let cache, cache.width == width, cache.running == running,
            cache.spinnerFrame == spinnerFrame,
-           cache.capabilities == capabilities, cache.cell == cell, cache.items == items {
+           cache.capabilities == capabilities, cache.cell == cell,
+           cache.expandErrors == expandErrors, cache.items == items {
             return cache.rows
         }
         let previous = cache
@@ -76,13 +100,19 @@ final class TranscriptView: Component {
         // with new content, so comparing across a resize walked the viewport
         // backwards through history on every drag of the window edge. A shrink — a
         // session switch, a re-seed — is left to ``TranscriptNode``'s clamp.
+        // `expandErrors` is the first thing in the package that grows rows in the
+        // MIDDLE rather than at the tail, and the anchor arithmetic above assumes an
+        // append. Toggling it while scrolled therefore teleported the viewport back
+        // through history by the size of every expansion above it, and toggling again
+        // did not undo it. A toggle is not new content, so it does not move the anchor.
         if scrollOffset > 0,
            let previous,
            previous.width == width, previous.capabilities == capabilities, previous.cell == cell,
+           previous.expandErrors == expandErrors,
            rows.count > previous.rows.count {
             scrollOffset += rows.count - previous.rows.count
         }
-        cache = (items, running, spinnerFrame, width, capabilities, cell, rows)
+        cache = (items, running, spinnerFrame, width, capabilities, cell, expandErrors, rows)
         return rows
     }
 
@@ -116,7 +146,8 @@ final class TranscriptView: Component {
                         width
                     )))
                 }
-                rows += toolBody(output, width: width).map(TranscriptVisualRow.text)
+                rows += toolBody(output, width: width, failed: state == .failed)
+                    .map(TranscriptVisualRow.text)
             case .image(let block, let imageId):
                 rows += imageRows(block, imageId: imageId, width: width, capabilities: capabilities, cell: cell)
             case .error(let headline, let message, let hint):
@@ -232,9 +263,13 @@ final class TranscriptView: Component {
         ]
         let body = sanitizeUntrustedText(message)
         if !body.isEmpty {
-            rows += wrapToWidth(body, width: bodyWidth).map {
-                indent + "\u{1b}[31m" + $0 + sgrReset
-            }
+            let wrapped = wrapToWidth(body, width: bodyWidth)
+            let shown = expandErrors ? wrapped : Array(wrapped.prefix(errorBodyRowCap))
+            rows += shown.map { indent + "\u{1b}[31m" + $0 + sgrReset }
+            // Capped, but never DEAD-ended: the footer counts what is behind it
+            // and names the key that lifts the cap, so a body whose useful part
+            // is on line 40 is reachable rather than merely alluded to.
+            rows += moreRow(hidden: wrapped.count - shown.count, width: bodyWidth, indent: indent)
         }
         if let hint, !hint.isEmpty {
             rows += wrapToWidth("→ " + sanitizeUntrustedText(hint), width: bodyWidth).map {
@@ -244,14 +279,48 @@ final class TranscriptView: Component {
         return rows
     }
 
-    private func toolBody(_ output: String, width: Int) -> [String] {
-        guard !output.isEmpty else { return [] }
+    /// The "there is more, and here is how to see it" footer, or nothing when
+    /// nothing was hidden.
+    ///
+    /// The indent is emitted OUTSIDE the SGR so the row keeps the alignment of
+    /// the body it follows, and the text is truncated to the body width BEFORE
+    /// styling so the arithmetic stays over plain text.
+    private func moreRow(hidden: Int, width: Int, indent: String) -> [String] {
+        guard hidden > 0 else { return [] }
+        let text = "… \(hidden) more line\(hidden == 1 ? "" : "s") — ^O to expand"
+        return [indent + dim(truncateToWidth(text, width))]
+    }
+
+    /// A tool call's output, capped — with headroom for the case that needs it.
+    ///
+    /// A FAILED call gets three times the rows of a successful one, because its
+    /// output is the diagnosis and not merely a receipt; `^O` lifts the cap on
+    /// both. The old eight-row cap plus a dead-end `… (output truncated)` is
+    /// why "a tool failed and I cannot see why" was a real complaint: the text
+    /// was always there, it just had no door.
+    private func toolBody(_ output: String, width: Int, failed: Bool) -> [String] {
+        guard !output.isEmpty, width > 0 else { return [] }
+        // The two-space indent is DROPPED, not clamped, on a pane too narrow to
+        // hold it. `max(1, width - 2)` bottoms out at one column, and prefixing
+        // that with two spaces emits a three-column row into a two-column pane —
+        // which does not wrap, it overwrites whatever is drawn to the right.
+        let indent = width >= 4 ? "  " : ""
+        let bodyWidth = max(1, width - indent.count)
+
+        // The CHARACTER cap holds even when expanded: the row cap is a display
+        // budget the user may spend, but a multi-megabyte body is a repaint cost
+        // no single keystroke should be able to buy. Its own footer says so
+        // without offering a key, because no key reveals more.
         let overCharCap = output.count > toolOutputCharCap
         let bounded = overCharCap ? String(output.prefix(toolOutputCharCap)) : output
-        var wrapped = wrapToWidth(bounded, width: max(1, width - 2)).map { "  " + $0 }
-        if wrapped.count > toolOutputCap || overCharCap {
-            wrapped = Array(wrapped.prefix(toolOutputCap)) + [dim("  … (output truncated)")]
+        let rowCap = failed ? failedToolOutputCap : toolOutputCap
+        let wrapped = wrapToWidth(bounded, width: bodyWidth)
+        let shown = expandErrors ? wrapped : Array(wrapped.prefix(rowCap))
+        var rows = shown.map { indent + $0 }
+        rows += moreRow(hidden: wrapped.count - shown.count, width: bodyWidth, indent: indent)
+        if overCharCap {
+            rows.append(indent + dim(truncateToWidth("… (output truncated)", bodyWidth)))
         }
-        return wrapped
+        return rows
     }
 }

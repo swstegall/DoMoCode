@@ -10,6 +10,7 @@
 // `MainActor`: the UI reads it on the render actor, and the SSE consumer hops
 // here to mutate it, so a frame never observes a half-applied event.
 
+import DoMoCore
 import DoMoLLM
 import DoMoPermissions
 import DoMoServer
@@ -50,8 +51,40 @@ public final class EventStore {
     /// raced ahead of. Cleared on a session switch (ids reset per session).
     private var resolvedRequestIDs: Set<String> = []
 
+    /// The file backing the selected session, when the server told us.
+    ///
+    /// There is no log file in this program — the `Logger` bootstrap writes to
+    /// stderr, and stderr under an active alternate screen is invisible — so the
+    /// session JSONL is the only durable record of a run there is. Keeping the
+    /// path here is what lets a failure row end with "Full transcript: <path>"
+    /// instead of leaving "where do I see more" unanswered.
+    ///
+    /// Session-scoped, not transcript-scoped: ``seed(_:)`` replaces the
+    /// transcript several times for the SAME session (the initial history, then
+    /// every re-seed after a stream outage), and clearing the path on each of
+    /// those would delete a fact that never stopped being true.
+    public private(set) var sessionPath: String?
+
+    /// The most recent non-error notice.
+    ///
+    /// Transient by contract: a `warning` or `info` notice is something the user
+    /// may glance at and forget — a retry in progress, a refresh that did not
+    /// land — and it is deliberately NOT put in `transcript`, which is the place
+    /// reserved for things that must survive being scrolled past. Errors take
+    /// the other door; see ``postError(headline:message:hint:)``.
+    public private(set) var lastNotice: ServerNotice?
+
     /// Fired after any mutation, so the UI can request a render. Set by the app.
     public var onChange: (() -> Void)?
+
+    /// Fired once per non-error notice, so a surface with a timed message area
+    /// can start its own dwell clock.
+    ///
+    /// A callback rather than a poll of ``lastNotice``, because ``onChange``
+    /// fires on every mutation: a status line that re-posted whatever
+    /// `lastNotice` currently held would restart the four-second timer on every
+    /// keystroke and the message would never go away.
+    public var onNotice: ((ServerNotice) -> Void)?
 
     // Streaming bookkeeping — indices into `transcript` of the in-progress items.
     private var streamingAssistantIndex: Int?
@@ -73,6 +106,19 @@ public final class EventStore {
     public func select(_ sessionID: String?) {
         selectedSessionID = sessionID
         clearTranscript()
+        // Cleared HERE and not in `clearTranscript`, which `seed(_:)` also calls:
+        // the path belongs to the session, and a re-seed of the same session must
+        // not forget where that session lives. Selecting a different one must.
+        sessionPath = nil
+        lastNotice = nil
+        onChange?()
+    }
+
+    /// Record where the selected session is persisted, for a failure row's
+    /// "where do I see more". `nil` when the server did not say.
+    public func setSessionPath(_ path: String?) {
+        guard sessionPath != path else { return }
+        sessionPath = path
         onChange?()
     }
 
@@ -94,6 +140,25 @@ public final class EventStore {
             case .assistant(let assistant):
                 if !assistant.text.isEmpty {
                     transcript.append(.assistant(sanitizeUntrustedText(assistant.text)))
+                }
+                // A failed turn carries its detail in `errorMessage`, never in
+                // `text`. Gating on text alone is exactly why re-opening a session
+                // that errored rendered as an EMPTY pane: the turn is persisted, the
+                // reason is right there on it, and the renderer dropped the whole
+                // message because it had no words in it.
+                //
+                // An abort is not a failure — `AssistantMessage.failure` answers a
+                // `.cancelled` error for `stopReason == .aborted`, so `failure !=
+                // nil` alone would paint every Esc red. `.length` answers nil: a
+                // truncated turn is a short answer, not an error.
+                //
+                // No label: a persisted message carries prose, not a taxonomy (the
+                // kind was never part of the JSONL shape), so a seeded row honestly
+                // says "Something went wrong" rather than inventing a classification
+                // it cannot know. A LIVE failure keeps its kind — it comes through
+                // the notice frame, not through here.
+                if let failure = assistant.failure, !failure.isCancellation {
+                    appendError(ErrorPresentation.rows(label: nil, message: failure.message))
                 }
             case .tool(let result):
                 // History carries no arguments (the tool-result message has only the
@@ -149,14 +214,23 @@ public final class EventStore {
         case .heartbeat, .turnStart, .turnEnd:
             return   // no transcript effect (version handled by the caller)
 
-        case .notice:
-            // INERT SEAM. Nothing broadcasts `.notice` yet, so the transcript is
-            // byte-identical to before the case existed. The wave that adds the
-            // notice producers fills in the body here: an `.error` level appends
-            // a persistent `.error` transcript row built from
-            // `ErrorPresentation.rows(label:message:)`; `.warning`/`.info` set a
-            // transient `lastNotice` the status line shows and nothing else.
-            return
+        case .notice(let notice):
+            // The two doors, and the rule that picks between them: an error the
+            // user has to ACT on becomes a persistent transcript row, because a
+            // message that evaporates after four seconds is a message that was
+            // never delivered. Everything else is a glance — a retry in flight, a
+            // refresh that did not land — and belongs on the status line, where it
+            // does not push the conversation up the screen.
+            switch notice.level {
+            case .error:
+                appendError(ErrorPresentation.rows(
+                    label: notice.kind,
+                    message: Self.noticeBody(notice)
+                ))
+            case .warning, .info:
+                lastNotice = notice
+                onNotice?(notice)
+            }
 
         case .agentStart:
             runState = .running
@@ -275,6 +349,69 @@ public final class EventStore {
             }
         }
         onChange?()
+    }
+
+    // MARK: Failures
+
+    /// Append a failure row.
+    ///
+    /// **The single entry point for client-side failures too.** A `try?` that
+    /// swallowed a transport error had nowhere to say so, which is why eleven of
+    /// them accumulated; now there is one obvious place, and a bootstrap that
+    /// could not list sessions renders in exactly the same shape as a gateway
+    /// that rejected the credential. Persistent by design — a transient notice
+    /// is the wrong surface for anything the user has to act on.
+    public func postError(headline: String, message: String, hint: String? = nil) {
+        appendError((headline: headline, message: message, hint: hint))
+        onChange?()
+    }
+
+    /// Whether the transcript holds anything `^O` acts on: a failure row with a
+    /// body, or a failed tool call with output.
+    ///
+    /// Deliberately width-independent, so it can be read in the same frame that
+    /// builds the status line. That makes it very slightly generous — a body
+    /// short enough to fit uncapped still counts — which is the safe direction:
+    /// it can advertise a key that turns out to have nothing more to show, never
+    /// hide one that does.
+    public var hasExpandableDetail: Bool {
+        transcript.contains { item in
+            switch item {
+            case .error(_, let message, _):
+                return !message.isEmpty
+            case .tool(_, _, let output, let state, _):
+                return state == .failed && !output.isEmpty
+            case .user, .assistant, .reasoning, .image:
+                return false
+            }
+        }
+    }
+
+    /// The message a notice contributes to its row: the headline line, plus the
+    /// provider's own words underneath when the notice carried a second line.
+    ///
+    /// Re-capped after joining rather than trusting the producer's per-field cap,
+    /// because two fields each within budget are not one field within budget.
+    private static func noticeBody(_ notice: ServerNotice) -> String {
+        guard let detail = notice.detail, !detail.isEmpty else { return notice.text }
+        return DoMoError.truncating(notice.text + "\n" + detail)
+    }
+
+    /// Put a failure row on the transcript, sanitizing all three parts.
+    ///
+    /// Sanitized HERE as well as at the render boundary, and deliberately so.
+    /// `ErrorPresentation.rows` cannot sanitize — `DoMoCore` has no access to
+    /// `DoMoTUI`'s `sanitizeUntrustedText` — and this is the ingress every other
+    /// untrusted string in this file already passes through, so the invariant
+    /// "nothing in `transcript` carries an ESC introducer" holds for the whole
+    /// type rather than for all-but-one of its cases. The renderer sanitizes too
+    /// because it also draws rows that did not come from here.
+    private func appendError(_ parts: (headline: String, message: String, hint: String?)) {
+        transcript.append(.error(
+            headline: sanitizeUntrustedText(parts.headline),
+            message: sanitizeUntrustedText(parts.message),
+            hint: parts.hint.map(sanitizeUntrustedText)
+        ))
     }
 
     // MARK: Tool call state

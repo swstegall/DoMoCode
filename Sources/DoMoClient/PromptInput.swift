@@ -99,19 +99,23 @@ final class PromptInput: @MainActor Focusable {
     /// The editor clears itself BEFORE `onSubmit` runs, so the typed string survives
     /// only as the callback argument and a refusal would otherwise destroy it.
     ///
-    /// Restoring APPENDS at the caret rather than prepending through `setText`: a
-    /// failure can arrive asynchronously, by which time the user may already be
-    /// typing the next thing, and `setText` clears the paste registry — which would
-    /// turn a live `[paste #1 …]` marker in the half-typed replacement into dead
-    /// literal text. The restored string is the EXPANDED text, so nothing is lost.
+    /// Restoring lands at the END of the document, on its own line — never at the
+    /// caret. A failure can arrive asynchronously, by which time the user may
+    /// already be typing the next thing, and the caret is by definition in the
+    /// middle of it: splicing there produced `"abc the failed messagedef"` out of
+    /// `"abcdef"` with the caret three back. A newline rather than a space keeps two
+    /// messages legible when several refusals land in a row.
+    ///
+    /// The append goes through `setText` on the EXPANDED text, because `setText`
+    /// clears the paste registry and a live `[paste #1 …]` marker left behind would
+    /// become dead literal text. Expanding costs the fold — a big paste unfolds in
+    /// the draft — but never loses or corrupts the payload, and it is the only
+    /// end-anchored write `Editor` exposes.
     func restore(_ restored: String, attachments restoredAttachments: [PromptAttachment] = []) {
         for attachment in restoredAttachments { addAttachment(attachment) }
         guard !restored.isEmpty else { return }
-        if editor.getText().isEmpty {
-            editor.setText(restored)
-        } else {
-            editor.insertTextAtCursor(" " + restored)
-        }
+        let existing = editor.getExpandedText()
+        editor.setText(existing.isEmpty ? restored : existing + "\n" + restored)
     }
 
     // MARK: History
@@ -121,8 +125,40 @@ final class PromptInput: @MainActor Focusable {
     /// `entries` must be OLDEST FIRST. `Editor.addToHistory` inserts at index 0 and
     /// dedups against the newest entry, so replaying in that order reproduces the
     /// on-disk order exactly and needs no new editor API.
+    ///
+    /// Sanitized here, not only in the store: an entry goes into a live terminal the
+    /// moment Up recalls it, and `PromptHistoryStore.load()` being careful is a
+    /// guarantee that lives in a different type from the one that depends on it.
     func seedHistory(_ entries: [String]) {
-        for entry in entries { editor.addToHistory(entry) }
+        for entry in entries {
+            let clean = Self.sanitizedForInsertion(entry)
+            if !clean.isEmpty { editor.addToHistory(clean) }
+        }
+    }
+
+    /// Strip everything a terminal would ACT on, keeping newlines.
+    ///
+    /// `Editor.handlePaste` applies exactly this filter, but `onPaste` returning
+    /// `true` short-circuits it, so every route that puts foreign text into the
+    /// document — a rejected drop's raw payload, a seeded history entry — has to
+    /// apply it itself. Line endings and tabs are folded first, the way
+    /// `Editor.normalizeText` would, so a CR-separated drop keeps its line breaks
+    /// instead of collapsing into one line.
+    static func sanitizedForInsertion(_ text: String) -> String {
+        var folded = text.replacingOccurrences(of: "\r\n", with: "\n")
+        folded = folded.replacingOccurrences(of: "\r", with: "\n")
+        folded = folded.replacingOccurrences(of: "\t", with: "    ")
+        var scalars = String.UnicodeScalarView()
+        for scalar in folded.unicodeScalars {
+            let value = scalar.value
+            if value == 0x0a {
+                scalars.append(scalar)
+                continue
+            }
+            if value < 0x20 || value == 0x7f || (value >= 0x80 && value <= 0x9f) { continue }
+            scalars.append(scalar)
+        }
+        return String(scalars)
     }
 
     // MARK: Attachments
@@ -143,9 +179,12 @@ final class PromptInput: @MainActor Focusable {
     enum DropOutcome {
         case attached([PromptAttachment])
         /// The paste was not (or not entirely) a droppable file. `rawText` is
-        /// inserted at the caret VERBATIM — the "never silently eat a path the user
-        /// meant as text" guarantee. `notice` is the app's to display; the prompt
-        /// has no status line of its own.
+        /// inserted at the caret — the "never silently eat a path the user meant as
+        /// text" guarantee — with control characters stripped, because it is a
+        /// clipboard/drag payload rather than the user's keystrokes and the paste
+        /// filter it would otherwise have gone through was short-circuited by the
+        /// drop hook. `notice` is the app's to display; the prompt has no status
+        /// line of its own.
         case rejected(rawText: String, notice: String)
     }
 
@@ -167,17 +206,28 @@ final class PromptInput: @MainActor Focusable {
         case .attached(let resolved):
             for attachment in resolved { addAttachment(attachment) }
         case .rejected(let rawText, _):
-            guard !rawText.isEmpty else { return }
-            editor.insertTextAtCursor(rawText)
+            let clean = Self.sanitizedForInsertion(rawText)
+            guard !clean.isEmpty else { return }
+            editor.insertTextAtCursor(clean)
         }
     }
 
+    /// How many chip rows the last `height(forWidth:maxRows:)` call budgeted.
+    ///
+    /// Stored for the same reason `showBorders`/`maxVisibleLines` are: measure and
+    /// paint have to agree on ONE number. They did not — `height` clamped the chip
+    /// count to `maxRows - 1` and `render` emitted every chip, so six chips in a
+    /// six-row slot promised 6 rows and painted 7. `ComponentBox.place` builds
+    /// exactly `rect.height` rows and drops the rest, and chips come FIRST, so what
+    /// the overflow clipped away was the editor: the user's text and the caret.
+    private var chipBudget = 0
+
     /// One chip per row.
     ///
-    /// The SINGLE height and rendering source for chips: `height(forWidth:maxRows:)`
-    /// budgets exactly this many rows, so a chip can never push the caret off the
-    /// bottom of the slot. One per row keeps that arithmetic exact and keeps a long
-    /// filename readable.
+    /// The SINGLE height and rendering source for chips. One per row keeps the
+    /// arithmetic exact and keeps a long filename readable; what actually reaches
+    /// the frame is `budgetedChipRows(width:)`, which holds this to the row count
+    /// `height(forWidth:maxRows:)` promised.
     func chipRows(width: Int) -> [String] {
         guard width > 0, !attachments.isEmpty else { return [] }
         return attachments.map { attachment in
@@ -187,6 +237,22 @@ final class PromptInput: @MainActor Focusable {
             let detail = Self.byteLabel(attachment.byteCount)
             return truncateToWidth(dim("📎 " + label + "  " + detail), width, ellipsis: "…")
         }
+    }
+
+    /// The chip rows that fit the budget, with the overflow named rather than
+    /// silently dropped.
+    ///
+    /// Eight images dropped on a 24-row terminal is the realistic case — the cap
+    /// there is 8 rows — and a chip that vanishes with no trace is a file the user
+    /// believes they attached. The last budgeted row becomes `+N more` instead.
+    private func budgetedChipRows(width: Int) -> [String] {
+        let all = chipRows(width: width)
+        guard chipBudget > 0, !all.isEmpty else { return [] }
+        if all.count <= chipBudget { return all }
+        var kept = Array(all.prefix(chipBudget - 1))
+        let hidden = all.count - kept.count
+        kept.append(truncateToWidth(dim("📎 +\(hidden) more"), width, ellipsis: "…"))
+        return kept
     }
 
     /// A chip's size label.
@@ -215,8 +281,12 @@ final class PromptInput: @MainActor Focusable {
     /// tests (which drive history recall) are computed against the last width it
     /// rendered at.
     func height(forWidth width: Int, maxRows: Int) -> Int {
-        guard width > 0, maxRows > 0 else { return 1 }
+        guard width > 0, maxRows > 0 else {
+            chipBudget = 0
+            return 1
+        }
         let chips = min(chipRows(width: width).count, max(0, maxRows - 1))
+        chipBudget = chips
         let forEditor = max(1, maxRows - chips)
         // Borders cost two rows and carry the "↑ N more" scroll affordance. Shed
         // them rather than lose the only row that can show text.
@@ -231,7 +301,7 @@ final class PromptInput: @MainActor Focusable {
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [] }
-        var lines = chipRows(width: width)
+        var lines = budgetedChipRows(width: width)
         var editorLines = editor.render(width: width)
         // The placeholder stands in for the single text row only when there is
         // nothing to show and no caret hiding behind it.

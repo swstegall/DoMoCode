@@ -9,6 +9,7 @@
 // The same `TerminalDriver` that runs the inline `TUI` runs this.
 
 import DoMoCore
+import DoMoLLM
 import DoMoPermissions
 import Foundation
 import DoMoServer
@@ -87,9 +88,25 @@ public final class ClientApp {
     /// Whether the app currently owns mouse reporting. Toggling it off hands
     /// drag-select back to the terminal's own selection.
     private var mouseOwned: Bool
+    /// Why the event stream is down, as the status line should say it. `nil` while
+    /// connected. "disconnected — reconnecting…" on its own is indistinguishable
+    /// from a slow model; the reason is what makes it actionable.
+    private var lastStreamError: String?
+    /// Whether the current outage has already produced a transcript row, so a
+    /// reconnect loop that runs for an hour posts one row and not four hundred.
+    /// Reset when the stream comes back.
+    private var reportedStreamFailure = false
+    /// How long a stream outage must last before it earns a persistent transcript row
+    /// rather than just the status line.
+    private static let streamOutageNoticeDelay: TimeInterval = 8
 
     private static let ctrlC: [UInt8] = [0x03]
     private static let escape: [UInt8] = [0x1b]
+    /// `^O` toggles expanded error/tool detail. A raw byte compare, matching the
+    /// `ctrlC` precedent above and deliberately NOT a new `Keybinding`: ^O is
+    /// unbound everywhere in this package, and adding a binding would mean
+    /// editing a file three other areas also want.
+    private static let ctrlO: [UInt8] = [0x0f]
 
     public init(
         client: ServerClient,
@@ -218,7 +235,11 @@ public final class ClientApp {
     private func statusText() -> String {
         var parts: [String] = []
         if !streamConnected {
-            parts.append("\u{1b}[31mdisconnected — reconnecting…\u{1b}[0m")
+            // Name the reason. "disconnected — reconnecting…" says only that
+            // something is wrong; "connection refused" says the runtime is gone,
+            // and "HTTP 401" says the token is.
+            let reason = lastStreamError.map { " — \(sanitizeUntrustedText(collapseToOneLine($0)))" } ?? ""
+            parts.append("\u{1b}[31mdisconnected\(reason) — reconnecting…\u{1b}[0m")
         }
         if let active = store.activeToolCall {
             let label = active.detail.isEmpty ? active.name : "\(active.name) \(active.detail)"
@@ -259,6 +280,19 @@ public final class ClientApp {
             // advertising a key that submits.
             parts.append("Alt+↵/^J: newline")
             parts.append("↑/↓: history")
+            // Advertised only when there is capped-able detail on screen at all,
+            // rather than on every session: a hint for a key that has nothing to
+            // act on is how a status line stops being believed.
+            //
+            // Deliberately width-INDEPENDENT, and therefore very slightly
+            // generous — a short body that happens to fit shows the hint too. The
+            // precise question ("is anything capped at THIS width?") is only
+            // answerable after the transcript renders, which happens after the
+            // status line is built; using it would leave the hint one frame stale,
+            // and after a failure the run goes idle and there is no next frame.
+            if store.hasExpandableDetail {
+                parts.append(transcriptView.expandErrors ? "^O: collapse" : "^O: expand")
+            }
             parts.append("Esc: abort")
             parts.append("^C: quit")
         }
@@ -274,6 +308,52 @@ public final class ClientApp {
         notice = text
         noticeExpiry = Date().addingTimeInterval(seconds)
         surface?.requestRender()
+    }
+
+    /// One line describing anything the transport threw.
+    ///
+    /// Three shapes, because three things are actually thrown here. An HTTP
+    /// status keeps the endpoint AND the body — a 500 and a 502 look identical
+    /// until you read what the server said about it. A ``DoMoError`` keeps its
+    /// whole cause chain, which is the one line it was designed to produce.
+    /// Anything else falls back to `String(describing:)`, which for a
+    /// `NIOConnectionError` is at least the address that refused.
+    private static func describe(_ error: any Error) -> String {
+        if case ServerClientError.unexpectedStatus(let status, let path, let body) = error {
+            return "HTTP \(status) from \(path)" + (body.map { ": \($0)" } ?? "")
+        }
+        if case ServerClientError.timedOut(let path) = error { return "timed out: \(path)" }
+        if case ServerClientError.streamIdle(let path) = error { return "stream went silent: \(path)" }
+        if let domo = error as? DoMoError { return domo.description }
+        return String(describing: error)
+    }
+
+    /// Put a failure on the transcript, where it stays.
+    ///
+    /// The rule this file now follows: a transient notice is for an action that
+    /// was REFUSED with nothing lost and an obvious remedy ("no session is
+    /// open"); a transcript row is for anything the user has to read, act on, or
+    /// copy. A four-second status message is not a delivery mechanism for
+    /// "prompts will not work until you reopen this session".
+    ///
+    /// The session file is appended to the hint because it is the only "where do
+    /// I see more" this program can honestly offer: there is no log file, and
+    /// stderr under the alternate screen is invisible.
+    private func postError(_ headline: String, _ error: any Error, hint: String? = nil) {
+        postError(headline, reason: Self.describe(error), hint: hint)
+    }
+
+    /// The same row, for a failure that is already a sentence rather than a
+    /// thrown value — a stream that ended cleanly has nothing to `describe`.
+    private func postError(_ headline: String, reason: String, hint: String? = nil) {
+        var hints: [String] = []
+        if let hint { hints.append(hint) }
+        if let path = store.sessionPath { hints.append("Full transcript: \(path)") }
+        store.postError(
+            headline: headline,
+            message: reason,
+            hint: hints.isEmpty ? nil : hints.joined(separator: " ")
+        )
     }
 
     private func spinnerGlyph() -> String {
@@ -347,7 +427,20 @@ public final class ClientApp {
         if let historyStore {
             promptInput.seedHistory(await historyStore.load())
         }
-        let sessions = (try? await client.listSessions()) ?? []
+        let sessions: [SessionSummary]
+        do {
+            sessions = try await client.listSessions()
+        } catch {
+            // Everything below this needs the runtime. Reporting and stopping is
+            // honest; carrying on with an empty list produced an empty sidebar,
+            // an empty pane, and a prompt box that silently 404'd every send.
+            postError(
+                "Could not reach the runtime",
+                error,
+                hint: "The server may not be running, or the token may be wrong."
+            )
+            return
+        }
         store.setSessions(sessions)
         if let first = sessions.first {
             await open(first.id)
@@ -357,9 +450,25 @@ public final class ClientApp {
     }
 
     private func createAndOpen() async {
-        guard let ref = try? await client.createSession() else { return }
-        let sessions = (try? await client.listSessions()) ?? store.sessions
-        store.setSessions(sessions)
+        let ref: SessionRef
+        do {
+            ref = try await client.createSession()
+        } catch {
+            // A `guard … else { return }` here left the app with no session at
+            // all: no transcript, no target for a prompt, and no explanation.
+            postError("Could not create a session", error)
+            return
+        }
+        // No `setSessionPath` here: `open` selects the session, which clears it,
+        // and then re-learns it from the idempotent resume. One producer.
+        do {
+            store.setSessions(try await client.listSessions())
+        } catch {
+            // The sidebar's CONTENT is intact — it is missing one new row, and
+            // the session we just made is about to be opened anyway. A transient
+            // notice is the right weight for that.
+            post(notice: "the session list did not refresh")
+        }
         await open(ref.id)
     }
 
@@ -380,10 +489,43 @@ public final class ClientApp {
         // worked and nothing said so. `createSession(resume:)` is idempotent — it
         // returns the existing reference when the session is already live — so this is
         // also correct for the session we just created.
-        _ = try? await client.createSession(resume: sessionID)
+        // Both failures below are held and posted AFTER `seed`, never before:
+        // `seed` replaces the whole transcript, so a row appended first would be
+        // silently deleted by the very next statement — a report that reports
+        // nothing is worse than the `try?` it replaced.
+        var failures: [(headline: String, error: any Error, hint: String?)] = []
+
+        do {
+            // The path comes back on the reference; it is the only durable record
+            // of this conversation there is, so a failure row can point at it.
+            let ref = try await client.createSession(resume: sessionID)
+            guard store.selectedSessionID == sessionID else { return }
+            store.setSessionPath(ref.path)
+        } catch {
+            guard store.selectedSessionID == sessionID else { return }
+            // The highest-value row in this file. Without it the session opens
+            // looking completely normal and then refuses everything: prompts,
+            // aborts and approvals all 404 into a `try?`, the stream never
+            // attaches, and no permission_request can arrive. The user sees a
+            // working-looking UI that does nothing.
+            failures.append((
+                "This session is not live on the server",
+                error,
+                "Prompts, aborts and approvals will not work until it is reopened."
+            ))
+        }
         guard store.selectedSessionID == sessionID else { return }
 
-        let history = (try? await client.messages(sessionID: sessionID)) ?? []
+        var history: [Message] = []
+        do {
+            history = try await client.messages(sessionID: sessionID)
+        } catch {
+            guard store.selectedSessionID == sessionID else { return }
+            // An empty pane is indistinguishable from a brand-new session, so a
+            // history that would not load must say so — and the stream still gets
+            // attached below, because live events are useful even without the past.
+            failures.append(("Could not load this session's history", error, nil))
+        }
         // A newer selection may have superseded this one while messages() was in
         // flight (a slow session opened, then a fast one). Drop this stale
         // completion so it cannot clobber the newer session's transcript or attach
@@ -391,6 +533,7 @@ public final class ClientApp {
         // pane shows A and a prompt silently targets B.
         guard store.selectedSessionID == sessionID else { return }
         store.seed(history)
+        for failure in failures { postError(failure.headline, failure.error, hint: failure.hint) }
         attachEvents(sessionID)
     }
 
@@ -409,6 +552,10 @@ public final class ClientApp {
         eventTask = Task { @MainActor [weak self] in
             var backoffMS = 125
             var isReconnect = false
+            // When the CURRENT outage began, or nil while the stream is up. The
+            // escalation below is a statement about elapsed time, so it has to be
+            // measured in elapsed time.
+            var outageStartedAt: Date?
             while !Task.isCancelled {
                 guard let self, self.store.selectedSessionID == sessionID else { return }
                 do {
@@ -419,6 +566,12 @@ public final class ClientApp {
                             // server sends `connected` first). Doing the GET before
                             // subscribing would lose a prompt asked in the gap.
                             backoffMS = 125
+                            self.lastStreamError = nil
+                            // Armed again: the NEXT outage gets its own row. An
+                            // outage that recovered is a different event from the
+                            // one that follows it.
+                            self.reportedStreamFailure = false
+                            outageStartedAt = nil
                             self.setStreamConnected(true)
                             // Re-seed after an OUTAGE: the stream is delta-only, so
                             // everything that streamed while we were away is simply
@@ -428,9 +581,18 @@ public final class ClientApp {
                             // partial streamed text. Before `apply`, because `seed`
                             // clears the transcript (and the run state with it), which
                             // would wipe the `running` this very frame carries.
-                            if isReconnect, let history = try? await self.client.messages(sessionID: sessionID) {
-                                guard self.store.selectedSessionID == sessionID else { return }
-                                self.store.seed(history)
+                            if isReconnect {
+                                do {
+                                    let history = try await self.client.messages(sessionID: sessionID)
+                                    guard self.store.selectedSessionID == sessionID else { return }
+                                    self.store.seed(history)
+                                } catch {
+                                    // The pane keeps what it has; what it is missing
+                                    // is whatever streamed while we were away. A
+                                    // transient notice, because nothing the user
+                                    // typed was lost and the next reconnect retries.
+                                    self.post(notice: "history refresh failed — the pane may be missing what streamed while you were away")
+                                }
                             }
                             isReconnect = false
                             self.store.apply(event)
@@ -440,12 +602,37 @@ public final class ClientApp {
                         self.store.apply(event)
                     }
                 } catch {
-                    // Fall through to the same retry as a clean end.
+                    // Fall through to the same retry as a clean end — but KEEP the
+                    // reason. A thrown transport error and a clean end-of-body are
+                    // the same recovery and very different diagnoses, and the
+                    // status line can only say which if this records it.
+                    self.lastStreamError = Self.describe(error)
                 }
                 guard !Task.isCancelled, self.store.selectedSessionID == sessionID else { return }
                 // The stream is down. Say so — a silent disconnect is exactly what made
                 // this look like a freeze — then retry with bounded backoff.
                 self.setStreamConnected(false)
+                let outageStart = outageStartedAt ?? Date()
+                outageStartedAt = outageStart
+                // Escalate from the status line to a persistent row ONCE the outage
+                // has genuinely lasted a while, so scrolling away from a spinner no
+                // longer hides the fact that nothing is connected.
+                //
+                // Measured against the CLOCK, not against the backoff counter. The
+                // counter only tracks elapsed time if each failed attempt returns
+                // instantly, and the case that matters most — a runtime whose port is
+                // gone — costs about ten seconds per attempt to surface ECONNREFUSED.
+                // Six of those put the row nearly a minute after the outage, long past
+                // the point the user has decided the client is broken.
+                if Date().timeIntervalSince(outageStart) >= Self.streamOutageNoticeDelay,
+                   !self.reportedStreamFailure {
+                    self.reportedStreamFailure = true
+                    self.postError(
+                        "Lost the connection to the runtime",
+                        reason: self.lastStreamError ?? "the event stream ended without an error",
+                        hint: "Reconnecting automatically; nothing you typed was lost."
+                    )
+                }
                 isReconnect = true
                 try? await Task.sleep(for: .milliseconds(backoffMS))
                 backoffMS = min(backoffMS * 2, 4000)
@@ -464,10 +651,18 @@ public final class ClientApp {
     /// missed on the drop-oldest SSE stream, or one left over on reconnect). The store
     /// drops events for the wrong session and already-resolved ids, so this is safe.
     private func reconcilePendingPermissions(_ sessionID: String) async {
-        guard store.selectedSessionID == sessionID,
-              let pending = try? await client.pendingPermissions(sessionID: sessionID),
-              store.selectedSessionID == sessionID
-        else { return }
+        guard store.selectedSessionID == sessionID else { return }
+        let pending: [ServerEvent]
+        do {
+            pending = try await client.pendingPermissions(sessionID: sessionID)
+        } catch {
+            // A parked run stays unanswerable until the next reconnect retries
+            // this, so the user has to know the modal they are waiting for may
+            // never arrive. Transient: the retry is automatic and close.
+            post(notice: "could not check for pending approvals")
+            return
+        }
+        guard store.selectedSessionID == sessionID else { return }
         for event in pending { store.apply(event) }
     }
 
@@ -517,11 +712,21 @@ public final class ClientApp {
                 // rather than the producer arriving first and silently discarding.
                 try await self.client.sendPrompt(sessionID: id, prompt: text)
             } catch ServerClientError.unexpectedStatus(409, _, _) {
+                // Expected, recoverable, and already explained by the notice: the
+                // server allows one turn at a time. No transcript row — a red
+                // block for "wait a moment" is noise.
                 self.promptInput.restore(text, attachments: attachments)
                 self.post(notice: "a turn is already running — Esc to abort it, or wait")
             } catch {
                 self.promptInput.restore(text, attachments: attachments)
                 self.post(notice: "could not send — the message was put back")
+                // The notice says the text is safe; the row says WHY it did not
+                // send, which is the part that survives long enough to act on.
+                self.postError(
+                    "Could not send the message",
+                    error,
+                    hint: "Your text was put back in the prompt."
+                )
             }
         }
     }
@@ -545,6 +750,9 @@ public final class ClientApp {
                 }
             } catch {
                 self.post(notice: "could not abort — the run may still be going")
+                // A run the user asked to stop and could not is something they
+                // have to decide about; that decision outlives four seconds.
+                self.postError("Could not abort the run", error)
             }
         }
     }
@@ -709,6 +917,11 @@ public final class ClientApp {
                 // The answer never landed, so the server run is still parked with no
                 // modal. Re-fetch the pending prompt so it returns and can be
                 // re-answered, rather than leaving the run hung.
+                //
+                // Say so first: the modal is about to reappear on its own, and a
+                // prompt that silently re-asks the question you just answered
+                // reads as the UI having lost the answer rather than the network.
+                self.post(notice: "the approval did not reach the server — re-asking")
                 await self.reconcilePendingPermissions(sessionID)
             }
         }
@@ -786,6 +999,15 @@ extension ClientApp: TerminalApp {
         // agent that re-asks on every tool call left the session genuinely unquittable
         // while the status bar still advertised "^C: quit".
         if data == Self.ctrlC { quit.quit(); return }
+        // ^O expands capped error and failed-tool detail. ABOVE the modal branch
+        // deliberately: reading the failure that is being re-tried, or the tool
+        // output that prompted the approval you are being asked for, is exactly
+        // what you want while a modal is up.
+        if data == Self.ctrlO {
+            transcriptView.expandErrors.toggle()
+            surface?.requestRender()
+            return
+        }
         // A permission prompt captures the rest of the keyboard: arrows move, Enter
         // confirms, Escape rejects; everything else is swallowed while a tool waits.
         if let list = permissionList {

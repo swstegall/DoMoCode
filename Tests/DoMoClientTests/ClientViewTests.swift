@@ -427,10 +427,155 @@ struct ClientViewTests {
         input.resolveDrop(token: second, outcome: .rejected(rawText: "/tmp/notanimage.txt", notice: "nope"))
         #expect(input.text == "/tmp/notanimage.txt")
     }
+
+    @Test("Chips never paint more rows than the height they were budgeted")
+    func promptInputChipsNeverOverrunTheMeasuredHeight() {
+        // The measure path clamped the chip count and the paint path did not, and
+        // chips are emitted FIRST — so `ComponentBox.place`, which builds exactly
+        // `rect.height` rows and drops the rest, clipped away the EDITOR: the text
+        // being typed and the caret vanished. Eight images on a 24-row terminal
+        // (cap 8) is the case the drag-and-drop work lands on.
+        for chipCount in 0...10 {
+            for maxRows in 1...10 {
+                let input = PromptInput()
+                input.focused = true
+                for index in 0..<chipCount {
+                    input.addAttachment(attachment(UInt32(index + 1), "shot\(index).png"))
+                }
+                type(input, "typed text the user must not lose")
+
+                let rows = input.height(forWidth: 40, maxRows: maxRows)
+                let lines = input.render(width: 40)
+                #expect(rows <= maxRows, "chips=\(chipCount) maxRows=\(maxRows)")
+                #expect(
+                    lines.count == rows,
+                    "chips=\(chipCount) maxRows=\(maxRows): promised \(rows), painted \(lines.count)"
+                )
+            }
+        }
+    }
+
+    @Test("A chip dropped for want of rows is announced, not silently lost")
+    func promptInputOverflowingChipsShowAMoreAffordance() {
+        let input = PromptInput()
+        input.focused = true
+        for index in 0..<8 { input.addAttachment(attachment(UInt32(index + 1), "shot\(index).png")) }
+
+        // 8 chips into a 4-row slot: 3 chips fit, the 4th row names the other 5.
+        let rows = input.height(forWidth: 40, maxRows: 4)
+        let lines = input.render(width: 40)
+        #expect(rows == 4)
+        #expect(lines.count == 4)
+        #expect(lines[0].contains("shot0.png"))
+        #expect(lines[2].contains("+6 more"), "the chips that did not fit are still visible")
+        #expect(!lines.contains { $0.contains("shot7.png") })
+    }
+
+    @Test("A rejected drop cannot paint escape sequences into the terminal")
+    func promptInputRejectedDropStripsControlCharacters() {
+        // `handlePastedText` returning true short-circuits `Editor.handlePaste`
+        // BEFORE its control-character filter, so a rejected drop would re-insert
+        // the ORIGINAL unfiltered payload. The source is a clipboard/drag payload,
+        // not the user's keystrokes.
+        let input = PromptInput()
+        input.focused = true
+        let token = input.beginDrop()
+        input.resolveDrop(
+            token: token,
+            outcome: .rejected(rawText: "x\u{1b}[2J\u{1b}]0;pwned\u{7}y", notice: "nope")
+        )
+        #expect(!input.text.unicodeScalars.contains { $0.value == 0x1b })
+        #expect(!input.text.unicodeScalars.contains { $0.value == 0x07 })
+        #expect(input.text == "x[2J]0;pwnedy")
+
+        // CR-separated payloads keep their line breaks rather than collapsing.
+        input.clear()
+        let second = input.beginDrop()
+        input.resolveDrop(token: second, outcome: .rejected(rawText: "a\r\nb\rc", notice: ""))
+        #expect(input.text == "a\nb\nc")
+    }
+
+    @Test("A seeded history entry cannot paint escape sequences on recall")
+    func promptInputSeededHistoryStripsControlCharacters() {
+        // Defence in depth: the store sanitizes on load, but the guarantee has to
+        // live in the type that depends on it — a recalled entry goes into a live
+        // terminal.
+        let input = PromptInput()
+        input.focused = true
+        input.seedHistory(["evil\u{1b}[2Jtext"])
+        _ = input.height(forWidth: 40, maxRows: 8)
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "evil[2Jtext")
+        #expect(!input.text.unicodeScalars.contains { $0.value == 0x1b })
+    }
+
+    // MARK: History is recorded BY SUBMITTING — not only by replaying disk
+
+    @Test("A submitted prompt is recalled by Up in the same session")
+    func promptSubmitRecordsItsOwnHistory() {
+        // Nothing here may call `seedHistory`: the disk-replay path was the only
+        // one under test, so deleting `editor.addToHistory` from the submit path
+        // left the whole suite green while a submitted prompt was recorded nowhere.
+        let input = PromptInput()
+        input.focused = true
+        type(input, "remember me")
+        input.handleInput(Self.enter)
+        #expect(input.text.isEmpty)
+
+        _ = input.height(forWidth: 40, maxRows: 8)
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "remember me", "the just-submitted prompt has to be one Up away")
+
+        // And a second submit is the newer entry.
+        input.handleInput(Self.enter)          // resubmits the recalled text
+        type(input, "second thing")
+        input.handleInput(Self.enter)
+        _ = input.height(forWidth: 40, maxRows: 8)
+        input.handleInput(ArrowKeys.up)
+        #expect(input.text == "second thing")
+    }
+
+    @Test("onHistoryAdd fires exactly once per accepted submit, with the trimmed text")
+    func promptSubmitNotifiesThePersistenceHookOnce() {
+        let input = PromptInput()
+        input.focused = true
+        var added: [String] = []
+        input.onHistoryAdd = { added.append($0) }
+
+        type(input, "  keep me  ")
+        input.handleInput(Self.enter)
+        #expect(added == ["keep me"], "the store is fed the trimmed text, exactly once")
+
+        // A bare Enter is not a message and must not reach the store.
+        input.handleInput(Self.enter)
+        #expect(added == ["keep me"])
+
+        type(input, "another")
+        input.handleInput(Self.enter)
+        #expect(added == ["keep me", "another"])
+    }
+
+    @Test("An 8-bit CSI or OSC in a rejected drop never reaches the document")
+    @MainActor
+    func rejectedDropStripsEightBitControls() {
+        // U+009B is CSI and U+009D is OSC in their 8-bit forms: an xterm-family
+        // terminal in 8-bit mode acts on them directly, with no ESC to spot. The
+        // payload here is one the user never typed — it is a drag or clipboard
+        // payload being handed back verbatim — so the filter has to cover the range
+        // the 7-bit check alone misses.
+        let input = PromptInput()
+        let token = input.beginDrop()
+        input.resolveDrop(
+            token: token,
+            outcome: .rejected(rawText: "a\u{9b}2Jb\u{9d}0;titl\u{7}c", notice: "not an image")
+        )
+        #expect(input.text == "a2Jb0;titlc", "an 8-bit control reached the document: \(String(reflecting: input.text))")
+    }
 }
 
 /// The arrow-key byte sequences, named once.
 private enum ArrowKeys {
     static let up: [UInt8] = Array("\u{1b}[A".utf8)
     static let down: [UInt8] = Array("\u{1b}[B".utf8)
+
 }

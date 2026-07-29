@@ -23,13 +23,11 @@ import Foundation
 public enum ServerClientError: Error, Sendable, Equatable {
     /// A response arrived with a status the endpoint's contract does not use.
     ///
-    /// `body` is the first of what the server said about it. Without it a 500 is
-    /// indistinguishable from a 502 that carried a real explanation, and the
+    /// `body` is the readable head of what the server said about it (a couple
+    /// of KiB — enough for a proxy's explanation, bounded because it ends up in
+    /// a transcript), or `nil` when there was nothing to read. Without it a 500
+    /// is indistinguishable from a 502 that carried a real explanation, and the
     /// user is told only that a number happened.
-    ///
-    /// NOT YET POPULATED: every throw site currently passes `nil`. The wave that
-    /// threads the response body through `expect` fills it in; the parameter
-    /// ships now so nothing downstream is written against the two-value shape.
     case unexpectedStatus(UInt, path: String, body: String?)
 
     /// A REST call whose body never completed within the request timeout.
@@ -80,16 +78,19 @@ public struct ServerClient: Sendable {
     /// Create a session. `resume` names an existing session *id* to reopen (a fresh
     /// session when nil). `POST /session` → 201 → ``SessionRef``.
     public func createSession(resume: String? = nil) async throws -> SessionRef {
-        let body = resume.map { try? JSONEncoder().encode(CreateBody(resume: $0)) } ?? nil
-        let (status, data) = try await send(.post, "/session", body: body ?? nil)
-        try expect(status, 201, "/session")
+        // `try`, not `try?`. A failed encode used to degrade a RESUME silently
+        // into a NEW-session create: the caller asked to reopen a session and got
+        // an empty one, with the same 201 and the same shape, and nothing said so.
+        let body = try resume.map { try JSONEncoder().encode(CreateBody(resume: $0)) }
+        let (status, data) = try await send(.post, "/session", body: body)
+        try expect(status, 201, "/session", body: data)
         return try JSONDecoder().decode(SessionRef.self, from: data)
     }
 
     /// List every known session for the sidebar. `GET /sessions` → 200.
     public func listSessions() async throws -> [SessionSummary] {
         let (status, data) = try await send(.get, "/sessions")
-        try expect(status, 200, "/sessions")
+        try expect(status, 200, "/sessions", body: data)
         return try JSONDecoder().decode([SessionSummary].self, from: data)
     }
 
@@ -98,7 +99,7 @@ public struct ServerClient: Sendable {
     public func messages(sessionID: String) async throws -> [Message] {
         let path = "/session/\(sessionID)/messages"
         let (status, data) = try await send(.get, path)
-        try expect(status, 200, path)
+        try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([Message].self, from: data)
     }
 
@@ -108,7 +109,7 @@ public struct ServerClient: Sendable {
         var path = "/session/\(sessionID)/children"
         if let parent { path += "?parent=\(parent)" }
         let (status, data) = try await send(.get, path)
-        try expect(status, 200, path)
+        try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([SessionTreeEntry].self, from: data)
     }
 
@@ -117,8 +118,8 @@ public struct ServerClient: Sendable {
     public func sendPrompt(sessionID: String, prompt: String, images: [ImageBlock] = []) async throws {
         let path = "/session/\(sessionID)/prompt"
         let body = try JSONEncoder().encode(PromptBody(prompt: prompt, images: images.isEmpty ? nil : images))
-        let (status, _) = try await send(.post, path, body: body)
-        try expect(status, 202, path)
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 202, path, body: data)
     }
 
     /// Abort the running turn. `POST /session/{id}/abort` → 200. Cooperative —
@@ -132,7 +133,7 @@ public struct ServerClient: Sendable {
     public func abort(sessionID: String) async throws -> Bool {
         let path = "/session/\(sessionID)/abort"
         let (status, data) = try await send(.post, path)
-        try expect(status, 200, path)
+        try expect(status, 200, path, body: data)
         guard let result = try? JSONDecoder().decode(AbortResult.self, from: data) else { return true }
         return result.aborted
     }
@@ -141,7 +142,7 @@ public struct ServerClient: Sendable {
     public func fork(sessionID: String) async throws -> SessionRef {
         let path = "/session/\(sessionID)/fork"
         let (status, data) = try await send(.post, path)
-        try expect(status, 201, path)
+        try expect(status, 201, path, body: data)
         return try JSONDecoder().decode(SessionRef.self, from: data)
     }
 
@@ -158,8 +159,8 @@ public struct ServerClient: Sendable {
         case .reject(let text): replyString = "reject"; message = text
         }
         let body = try JSONEncoder().encode(PermissionReplyBody(requestID: requestID, reply: replyString, message: message))
-        let (status, _) = try await send(.post, path, body: body)
-        try expect(status, 200, path)
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
     }
 
     /// The still-open permission prompts for a session, so a (re)connecting client
@@ -168,7 +169,7 @@ public struct ServerClient: Sendable {
     public func pendingPermissions(sessionID: String) async throws -> [ServerEvent] {
         let path = "/session/\(sessionID)/permissions"
         let (status, data) = try await send(.get, path)
-        try expect(status, 200, path)
+        try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([ServerEvent].self, from: data)
     }
 
@@ -249,8 +250,37 @@ public struct ServerClient: Sendable {
         return (response.status.code, Data(bytes))
     }
 
-    private func expect(_ status: UInt, _ wanted: UInt, _ path: String) throws {
-        guard status == wanted else { throw ServerClientError.unexpectedStatus(status, path: path, body: nil) }
+    /// How much of an error body is carried into the thrown error.
+    ///
+    /// A gateway or a proxy in front of the runtime can answer a 502 with an
+    /// entire HTML page; this row ends up in a transcript, so the cap is a
+    /// display budget, not a protocol one.
+    static let errorBodyCharacterCap = 2048
+
+    /// Assert the status the endpoint's contract promises, carrying what the
+    /// server said when it is something else.
+    ///
+    /// `body` is the response bytes the caller already collected. Passing them
+    /// is the whole point: the status number alone tells a user that a number
+    /// happened, while the body is the sentence that says which credential was
+    /// rejected or which path was not found.
+    private func expect(_ status: UInt, _ wanted: UInt, _ path: String, body: Data? = nil) throws {
+        guard status != wanted else { return }
+        throw ServerClientError.unexpectedStatus(status, path: path, body: Self.errorBody(body))
+    }
+
+    /// The readable prefix of an error body, or `nil` when there is nothing to
+    /// show. Decoded leniently — an error body is exactly where a server is
+    /// least likely to have produced well-formed UTF-8 — and trimmed, so an
+    /// empty JSON envelope does not become an empty ": " in the message.
+    static func errorBody(_ data: Data?) -> String? {
+        guard let data, !data.isEmpty else { return nil }
+        let text = String(decoding: data.prefix(errorBodyCharacterCap * 4), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        return text.count > errorBodyCharacterCap
+            ? String(text.prefix(errorBodyCharacterCap)) + "…"
+            : text
     }
 }
 

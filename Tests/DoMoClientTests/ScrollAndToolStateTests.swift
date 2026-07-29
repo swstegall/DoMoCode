@@ -100,6 +100,34 @@ struct ScrollAndToolStateTests {
         }
     }
 
+    @Test("The prompt may take about a third of the screen, and not a row more")
+    func promptRowCapIsAThirdOfTheScreen() {
+        // Pinned with literals on purpose. The two invariant tests either side of
+        // this one are both satisfied WITHOUT the ceiling — `transcriptHeight >= 1`
+        // is the separate one-row clamp's doing, and asserting `rows <= cap` against
+        // `promptRowCap`'s own return value is tautological — so deleting
+        // `height / 3` left the suite green while a 60-row terminal gave the prompt
+        // 58 rows and the transcript 1.
+        #expect(ClientLayout.promptRowCap(for: 10) == 3)
+        #expect(ClientLayout.promptRowCap(for: 24) == 8)
+        #expect(ClientLayout.promptRowCap(for: 30) == 10)
+        #expect(ClientLayout.promptRowCap(for: 40) == 13)
+        #expect(ClientLayout.promptRowCap(for: 60) == 20)
+        // Never below the 3 rows a bordered single-line editor wants, until the
+        // screen itself is too short to give them.
+        #expect(ClientLayout.promptRowCap(for: 6) == 3)
+        #expect(ClientLayout.promptRowCap(for: 5) == 3)
+        #expect(ClientLayout.promptRowCap(for: 4) == 2)
+        // And the ceiling really is a ceiling, at every size the transcript clamp is
+        // not the binding constraint.
+        for height in 9...120 {
+            #expect(
+                ClientLayout.promptRowCap(for: height) == height / 3,
+                "h=\(height) is no longer a third of the screen"
+            )
+        }
+    }
+
     @Test("A prompt asked for more rows than the cap allows is held to the cap")
     func promptHeightHonoursTheCap() {
         let input = PromptInput()
@@ -404,9 +432,31 @@ struct ScrollAndToolStateTests {
 
         // Restoring must not clobber something typed in the meantime: a failure can
         // arrive asynchronously.
+        input.clear()
         for byte in Array("new".utf8) { input.handleInput([byte]) }
         input.restore("older")
-        #expect(input.text.contains("older") && input.text.contains("new"))
+        #expect(input.text == "new\nolder", "the refusal lands at the END, on its own line")
+    }
+
+    @Test("A refused message is never spliced into the word being typed")
+    func promptInputRestoreDoesNotSpliceAtTheCaret() {
+        // The async catch fires after a network round trip, by which time the caret
+        // is wherever the user's next thought put it. Restoring THERE produced
+        // "abc the failed messagedef" out of "abcdef" — both strings corrupted.
+        let input = PromptInput()
+        input.focused = true
+        for byte in Array("abcdef".utf8) { input.handleInput([byte]) }
+        let left: [UInt8] = Array("\u{1b}[D".utf8)
+        for _ in 0..<3 { input.handleInput(left) }   // caret between "abc" and "def"
+
+        input.restore("the failed message")
+        #expect(input.text == "abcdef\nthe failed message")
+        #expect(!input.text.contains("abc the failed messagedef"))
+
+        // Two refusals in a row stay legible and in arrival order, one per line,
+        // instead of space-joining into an unsendable scramble.
+        input.restore("and another")
+        #expect(input.text == "abcdef\nthe failed message\nand another")
     }
 
     @Test("An abort the server reports as a no-op self-corrects a stale run state")
@@ -468,6 +518,13 @@ struct ScrollAndToolStateTests {
         store.apply(.messageDelta(text: "hi\u{1b}[2J", reasoning: nil))
         store.apply(.toolStart(id: "t1", name: "read", arguments: .object(["path": .string("a\u{1b}[2J.txt")])))
         store.apply(.toolEnd(id: "t1", name: "read", output: "out\u{1b}[2Jput", isError: false, imageCount: 0))
+        // A failure frame is ingress too, and its text is the far side of the wire
+        // talking: `ErrorPresentation` cannot sanitise (DoMoCore cannot reach the
+        // sanitiser), so the store has to.
+        store.apply(.notice(ServerNotice(
+            level: .error, code: "provider_error",
+            text: "boom\u{1b}[2Jed", detail: "why\u{1b}[5Anot", kind: "provider"
+        )))
         let rendered = TranscriptView()
         rendered.items = store.transcript
         // The rendered rows still carry the app's OWN styling escapes; what must not
@@ -479,10 +536,8 @@ struct ScrollAndToolStateTests {
             case .assistant(let t), .user(let t), .reasoning(let t): return !t.contains("\u{1b}")
             case .tool(let n, let d, let o, _, _): return ![n, d, o].contains { $0.contains("\u{1b}") }
             case .image: return true
-            // Nothing produces `.error` yet, so this arm is unreachable from this
-            // fixture — but the invariant it asserts is the one that will matter
-            // when a producer lands: an error row's three parts are as untrusted
-            // as any other ingress and must carry no ESC introducer.
+            // An error row's three parts are as untrusted as any other ingress
+            // and must carry no ESC introducer.
             case .error(let headline, let message, let hint):
                 return ![headline, message, hint ?? ""].contains { $0.contains("\u{1b}") }
             }

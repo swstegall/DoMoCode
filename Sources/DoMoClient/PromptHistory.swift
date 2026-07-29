@@ -62,17 +62,34 @@ public actor PromptHistoryStore {
 
     private static let currentVersion = 1
 
+    /// What is on disk right now.
+    ///
+    /// "Newer than I understand" is kept separate from "absent or corrupt" because
+    /// the two want opposite things from the WRITE path: a corrupt file may be
+    /// replaced, a file a future build wrote may not.
+    private enum StoredState {
+        case none
+        case current([String])
+        case newerVersion
+    }
+
+    private func read() -> StoredState {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path.string)),
+              let file = try? JSONDecoder().decode(StoredFile.self, from: data)
+        else { return .none }
+        if file.version > Self.currentVersion { return .newerVersion }
+        guard file.version == Self.currentVersion else { return .none }
+        return .current(file.entries)
+    }
+
     /// Every entry, OLDEST FIRST — the order ``PromptInput/seedHistory(_:)`` wants.
     ///
     /// Never throws. A missing, unreadable, corrupt or future-versioned file is
     /// simply "no history": losing it is an annoyance, and refusing to start the
     /// client over an annoyance is not a trade worth making.
     func load() -> [String] {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path.string)),
-              let file = try? JSONDecoder().decode(StoredFile.self, from: data),
-              file.version == Self.currentVersion
-        else { return [] }
-        return Self.sanitize(file.entries, maxEntries: maxEntries, maxEntryBytes: maxEntryBytes)
+        guard case .current(let entries) = read() else { return [] }
+        return Self.sanitize(entries, maxEntries: maxEntries, maxEntryBytes: maxEntryBytes)
     }
 
     /// Append one prompt.
@@ -81,13 +98,25 @@ public actor PromptHistoryStore {
     /// `Editor.addToHistory` applies in memory — and trims the oldest past
     /// `maxEntries`. Best effort: a write failure is silent, because a full disk
     /// must not eat a keystroke or pop an error over the transcript.
+    ///
+    /// A file a NEWER build wrote is left exactly as it is. `load()` reads it as no
+    /// history, and rewriting from that empty base would truncate away every entry a
+    /// user had — running an old `domo` once after a schema bump would be permanent
+    /// data loss, which is a much worse trade than losing one appended prompt.
     func append(_ prompt: String) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.utf8.count <= maxEntryBytes,
               !Self.hasForbiddenControls(trimmed)
         else { return }
-        var entries = load()
+        let existing: [String]
+        switch read() {
+        case .newerVersion: return
+        case .none: existing = []
+        case .current(let stored):
+            existing = Self.sanitize(stored, maxEntries: maxEntries, maxEntryBytes: maxEntryBytes)
+        }
+        var entries = existing
         if entries.last == trimmed { return }
         entries.append(trimmed)
         if entries.count > maxEntries { entries.removeFirst(entries.count - maxEntries) }
@@ -104,7 +133,88 @@ public actor PromptHistoryStore {
         guard let data = try? encoder.encode(
             StoredFile(version: Self.currentVersion, entries: entries)
         ) else { return }
-        try? data.write(to: URL(fileURLWithPath: path.string), options: .atomic)
+        writeOwnerOnly(data)
+    }
+
+    /// Replace the file's contents, atomically, mode 0600.
+    ///
+    /// NOT `Data.write(options: .atomic)`. Foundation's atomic write creates a fresh
+    /// temp through `open(2)` at 0666 and renames it into place, so the file came out
+    /// 0644 under the usual umask — world-readable, in the same directory where
+    /// `JSONLSessionStore` deliberately threads `permissions: .ownerReadWrite` for
+    /// exactly this class of content — and it was RE-created on every single append,
+    /// so a user who chmodded it back lost that on the next Enter. Prompt text is
+    /// where people paste tokens, internal hostnames and paths.
+    ///
+    /// The temp is created 0600 by `open(2)` itself rather than chmodded afterwards,
+    /// so the bytes are never on disk world-readable even for an instant, and
+    /// `.usingNewMetadataOnly` is what carries that mode across the replace instead
+    /// of inheriting whatever the old file had.
+    private func writeOwnerOnly(_ data: Data) {
+        // Write THROUGH a symlink, not over it. `replaceItemAt` does not follow one
+        // (while the `fileExists` probe below does), so a symlinked history file —
+        // an ordinary dotfiles arrangement — took the replace branch, threw, and,
+        // because this whole path is best-effort, silently stopped recording
+        // forever. Resolving first also stops the plain-write fallback from
+        // REPLACING the user's symlink with a regular file, which is what
+        // `Data.write(options: .atomic)` did here before any of this.
+        let path = resolvingSymlink(path)
+        let directory = path.removingLastComponent()
+        let temporary = directory.appending(".prompt-history-\(UUID().uuidString).tmp")
+        guard let descriptor = try? FileDescriptor.open(
+            temporary,
+            .writeOnly,
+            options: [.create, .truncate, .exclusiveCreate],
+            permissions: .ownerReadWrite
+        ) else { return }
+        do {
+            try descriptor.writeAll(data)
+            try descriptor.close()
+        } catch {
+            try? descriptor.close()
+            try? FileManager.default.removeItem(atPath: temporary.string)
+            return
+        }
+        let destination = URL(fileURLWithPath: path.string)
+        let source = URL(fileURLWithPath: temporary.string)
+        do {
+            if FileManager.default.fileExists(atPath: path.string) {
+                _ = try FileManager.default.replaceItemAt(
+                    destination,
+                    withItemAt: source,
+                    backupItemName: nil,
+                    options: [.usingNewMetadataOnly]
+                )
+            } else {
+                try FileManager.default.moveItem(at: source, to: destination)
+            }
+        } catch {
+            try? FileManager.default.removeItem(atPath: temporary.string)
+            // `replaceItemAt` refuses destinations `rename(2)` accepts — notably a
+            // SYMLINK, which it does not follow even though the `fileExists` probe
+            // above does, and a file whose mode denies writing. Without this fallback
+            // a symlinked history file (an ordinary dotfiles arrangement) silently
+            // stopped recording forever: every append failed into this catch, and
+            // because the whole path is best-effort, nothing said so.
+            //
+            // The fallback costs a brief 0644 window before the chmod, which is
+            // strictly better than losing every prompt the user types. The normal
+            // path never reaches it.
+            guard (try? data.write(to: destination, options: .atomic)) != nil else { return }
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: path.string
+            )
+        }
+    }
+
+    /// `path` with a final symlink component followed to its target, or `path`
+    /// unchanged when it is not a symlink (including when it does not exist yet).
+    private func resolvingSymlink(_ path: FilePath) -> FilePath {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path.string)
+        guard (attributes?[.type] as? FileAttributeType) == .typeSymbolicLink else { return path }
+        let resolved = URL(fileURLWithPath: path.string).resolvingSymlinksInPath().path
+        return resolved.isEmpty ? path : FilePath(resolved)
     }
 
     /// Drop anything that must never reach the editor or the model, then keep only
