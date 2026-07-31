@@ -45,13 +45,28 @@ public struct ResponseMetadata: Sendable, Hashable {
     /// A server-requested retry delay, if the head carried one.
     public var retryAfter: Duration?
 
+    /// `x-litellm-response-cost`, in USD, when the gateway priced the request in
+    /// its header block.
+    ///
+    /// Usually `nil`, and that is expected rather than a bug: LiteLLM works out
+    /// a request's cost once the response is complete, which on a *streamed*
+    /// request is long after the head was flushed. The header is read here
+    /// because doing so is nearly free and because a non-streaming call can
+    /// legitimately carry it; the primary source of cost in this harness remains
+    /// the per-alias ``ModelCostRates``.
+    ///
+    /// Last in the initializer below, and defaulted, because that initializer
+    /// has positional callers.
+    public var responseCost: Decimal?
+
     public init(
         status: Int,
         headers: [String: String] = [:],
         callID: String? = nil,
         modelID: String? = nil,
         attemptedFallbacks: Int? = nil,
-        retryAfter: Duration? = nil
+        retryAfter: Duration? = nil,
+        responseCost: Decimal? = nil
     ) {
         self.status = status
         self.headers = headers
@@ -59,6 +74,7 @@ public struct ResponseMetadata: Sendable, Hashable {
         self.modelID = modelID
         self.attemptedFallbacks = attemptedFallbacks
         self.retryAfter = retryAfter
+        self.responseCost = responseCost
     }
 
     /// True when a fallback fired and a different model answered.
@@ -75,7 +91,8 @@ public struct ResponseMetadata: Sendable, Hashable {
             callID: head.headerValue("x-litellm-call-id"),
             modelID: head.headerValue("x-litellm-model-id"),
             attemptedFallbacks: head.headerValue("x-litellm-attempted-fallbacks").flatMap(Int.init),
-            retryAfter: LiteLLMClient.retryAfter(from: head)
+            retryAfter: LiteLLMClient.retryAfter(from: head),
+            responseCost: LiteLLMClient.parseResponseCost(head.headerValue("x-litellm-response-cost"))
         )
     }
 }
@@ -501,7 +518,17 @@ public struct LiteLLMClient: Sendable {
 
             // A 2xx commits us to a stream: no more retries. A failure now keeps
             // whatever content arrived rather than replaying it.
-            onResponse?(ResponseMetadata(head: response.head))
+            let metadata = ResponseMetadata(head: response.head)
+            // Stamped into the assembler *before* the callback fires, and before
+            // a single body byte is read. Two things fall out of that ordering.
+            // A turn that dies mid-stream still reports what it was billed,
+            // because the `.failed` message is built from this same assembler.
+            // And the cost reaches every caller: only one of the three
+            // production call sites passes `onResponse` at all, so a cost routed
+            // solely through `ResponseMetadata` would reach `-p` and neither the
+            // TUI nor the server.
+            assembly.setReportedCost(metadata.responseCost)
+            onResponse?(metadata)
             do {
                 try await consumeSSE(response.body, into: assembly, continuation: continuation)
                 continuation.finish()
@@ -673,7 +700,8 @@ public struct LiteLLMClient: Sendable {
                 throw error
             }
 
-            onResponse?(ResponseMetadata(head: response.head))
+            let metadata = ResponseMetadata(head: response.head)
+            onResponse?(metadata)
             let decoded: ChatCompletionResponse
             do {
                 decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: Data(bodyText.utf8))
@@ -684,7 +712,14 @@ public struct LiteLLMClient: Sendable {
                     cause: error
                 )
             }
-            return AssistantMessage(response: decoded, model: model, rates: rates)
+            // The billed cost rides on the message's usage rather than only on
+            // `onResponse`, so a caller that passed no callback still gets it.
+            return AssistantMessage(
+                response: decoded,
+                model: model,
+                rates: rates,
+                reportedCost: metadata.responseCost
+            )
         }
     }
 
@@ -951,6 +986,30 @@ extension LiteLLMClient {
             retryAfter: head.headerValue("retry-after") ?? head.headerValue("llm_provider-retry-after"),
             retryAfterMilliseconds: head.headerValue("retry-after-ms")
         )
+    }
+
+    /// Parses `x-litellm-response-cost` — a USD amount the gateway billed for
+    /// this request — or `nil` if the header is absent or is anything other than
+    /// a plain non-negative number.
+    ///
+    /// Every rejection here is a case that would otherwise put a fabricated
+    /// price in front of the user:
+    ///
+    /// - `Decimal(string:)` prefix-parses, so `"1.5x"` would silently become
+    ///   `1.5`. The whole string must match the grammar.
+    /// - A header sent twice comes back from `HTTPField` subscripting
+    ///   comma-joined as `"0.001, 0.001"`. That is two claims, not one, and
+    ///   taking the prefix would under-report the request; it is rejected.
+    /// - `Decimal(string:)` is locale-sensitive, so the same header would read
+    ///   differently on a Linux host under a comma-decimal locale.
+    /// - A negative price is not a price.
+    ///
+    /// Exponent notation is accepted deliberately: LiteLLM stringifies a Python
+    /// float, so a small per-request cost genuinely arrives as `1e-05`, and
+    /// rejecting that would throw away most of the values this can ever see.
+    public static func parseResponseCost(_ raw: String?) -> Decimal? {
+        guard let raw, let value = DecimalText.strict(raw), value >= 0 else { return nil }
+        return value
     }
 
     /// Pulls a ``WireError`` out of an error body, trying the shapes LiteLLM uses:

@@ -492,13 +492,36 @@ public struct Usage: Sendable, Hashable, Codable {
     public var reasoning: Int?
     public var cost: Cost
 
+    /// A total the gateway itself billed, when it said one.
+    ///
+    /// Kept beside ``cost`` rather than folded into it, because it is a single
+    /// number and ``cost`` is a four-way breakdown: splitting one total across
+    /// four buckets would require inventing a division nobody reported. When
+    /// both exist the gateway's number is the one to believe — it knows the
+    /// deployment that answered, and the local ``ModelCostRates`` are a
+    /// per-alias approximation of it — so readers ask ``effectiveCostTotal``
+    /// rather than `cost.total`.
+    ///
+    /// `nil` is the overwhelmingly common case. LiteLLM computes a request's
+    /// cost after the response is complete, and on a streamed request the header
+    /// block has already been flushed by then, so `x-litellm-response-cost` is
+    /// normally absent on exactly the path this harness uses. Per-alias rates
+    /// are the primary source; this is the free win when it happens to be there.
+    ///
+    /// Optional with the synthesized `Codable`, which means `encodeIfPresent`:
+    /// a turn without a reported cost writes no key at all, so every session
+    /// file already on disk still decodes and every new line written for such a
+    /// turn is byte-identical to what the previous version wrote.
+    public var reportedCost: Decimal?
+
     public init(
         input: Int = 0,
         output: Int = 0,
         cacheRead: Int = 0,
         cacheWrite: Int = 0,
         reasoning: Int? = nil,
-        cost: Cost = .zero
+        cost: Cost = .zero,
+        reportedCost: Decimal? = nil
     ) {
         self.input = input
         self.output = output
@@ -506,11 +529,19 @@ public struct Usage: Sendable, Hashable, Codable {
         self.cacheWrite = cacheWrite
         self.reasoning = reasoning
         self.cost = cost
+        self.reportedCost = reportedCost
     }
 
     public static let zero = Usage()
 
     public var totalTokens: Int { input + output + cacheRead + cacheWrite }
+
+    /// What this turn actually cost: the gateway's number when it gave one,
+    /// otherwise the rate-derived total.
+    ///
+    /// Every accumulator and every display reads this. Reading `cost.total`
+    /// instead silently discards a gateway-reported price whenever one arrives.
+    public var effectiveCostTotal: Decimal { reportedCost ?? cost.total }
 
     /// This usage with ``cost`` recomputed from `rates`.
     ///
@@ -531,6 +562,17 @@ public struct Usage: Sendable, Hashable, Codable {
         return copy
     }
 
+    /// Sums two turns.
+    ///
+    /// ``reportedCost`` folds the same way ``reasoning`` does — `nil` only when
+    /// *neither* side said anything — but with one difference that matters: the
+    /// side that said nothing contributes its own `cost.total` rather than zero.
+    /// A session that mixes a turn the gateway priced with a turn it did not
+    /// would otherwise report a running total that is missing the unpriced
+    /// turns entirely, which reads as the session getting cheaper the longer it
+    /// runs. In other words the sum is always the sum of both sides'
+    /// ``effectiveCostTotal``, and it only becomes visible as a reported cost
+    /// once at least one side had one.
     public static func + (lhs: Usage, rhs: Usage) -> Usage {
         Usage(
             input: lhs.input + rhs.input,
@@ -539,7 +581,9 @@ public struct Usage: Sendable, Hashable, Codable {
             cacheWrite: lhs.cacheWrite + rhs.cacheWrite,
             reasoning: lhs.reasoning == nil && rhs.reasoning == nil
                 ? nil : (lhs.reasoning ?? 0) + (rhs.reasoning ?? 0),
-            cost: lhs.cost + rhs.cost
+            cost: lhs.cost + rhs.cost,
+            reportedCost: lhs.reportedCost == nil && rhs.reportedCost == nil
+                ? nil : lhs.effectiveCostTotal + rhs.effectiveCostTotal
         )
     }
 }
