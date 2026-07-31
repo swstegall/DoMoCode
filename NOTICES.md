@@ -52,16 +52,18 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### OpenTUI (via pi-tui `stdin-buffer.ts`)
+### OpenTUI (via pi-tui)
 
-`packages/tui/src/stdin-buffer.ts`, from which `DoMoTermIO`'s escape-sequence reassembly is ported,
-is itself derived from OpenTUI and carries that project's copyright line upstream.
+Two pi-tui files from which `DoMoTermIO` is ported are themselves derived from OpenTUI and carry that
+project's copyright line upstream: `packages/tui/src/stdin-buffer.ts` (escape-sequence reassembly, ported
+to `StdinFraming.swift`) and `packages/tui/src/keys.ts` (key decoding, ported to `KeyDecoding.swift`).
 
 - **Repository:** https://github.com/anomalyco/opentui
 - **License:** MIT
 - **Copyright:** (c) 2025 opentui
 
-Swift files deriving from that path carry OpenTUI's copyright line in addition to the two below.
+Both Swift files carry OpenTUI's copyright line in addition to pi's and DoMoCode's; they are the only
+two in the package that do.
 
 ### string-width (via pi-tui `utils.ts`)
 
@@ -75,24 +77,25 @@ than inheriting that gap.
 
 ### Scope of the derivation
 
-DoMoCode is a narrowed port. The table below records which planned modules derive from which
-upstream packages. It will be kept current as implementation lands.
+DoMoCode is a narrowed port. The table below records which module derives from which upstream package.
+Every module listed here ships.
 
 | DoMoCode module | Derived from (upstream path) |
 |---|---|
 | `DoMoTermIO` | `packages/tui/src/terminal.ts`, `packages/tui/src/stdin-buffer.ts` |
-| `DoMoTUI` | `packages/tui/src/tui.ts`, `keys.ts`, `keybindings.ts`, `utils.ts`, `fuzzy.ts`, `autocomplete.ts`, `kill-ring.ts`, `undo-stack.ts`, `word-navigation.ts`, `components/` |
+| `DoMoTUI` | `packages/tui/src/tui.ts`, `keys.ts`, `keybindings.ts`, `utils.ts`, `fuzzy.ts`, `autocomplete.ts`, `kill-ring.ts`, `undo-stack.ts`, `word-navigation.ts`, `components/`. Its full-screen (alternate-screen) layer — `AltScreenCore`, `CellBuffer`, `LayoutNode`, `FocusRing`, `ScreenSurface` — is original to DoMoCode; OpenTUI's retained-cell-buffer + flexbox *design* is referenced as architecture only, and no OpenTUI code is used (it is TypeScript) |
 | `DoMoLLM` | `packages/ai/src/` — type model, streaming assembly, retry and overflow classification, and cost accounting, narrowed to the OpenAI Chat Completions API |
 | `DoMoAgent` | `packages/agent/src/agent-loop.ts`, `agent.ts`, `types.ts` |
 | `DoMoHarness` | `packages/agent/src/harness/` |
 | `DoMoExec` | `packages/agent/src/harness/env/`, file mutation queue |
 | `DoMoTools`, `DoMoToolsUI` | `packages/coding-agent/src/core/tools/` |
-| `DoMoCLI` | `packages/coding-agent/src/` — session orchestration, settings, project trust, resource loading, slash commands, output modes |
+| `DoMoCLI` | `packages/coding-agent/src/` — session orchestration, settings, project trust, output modes |
 | `DoMoCore` | Original to DoMoCode, with the tolerant JSON repair behavior modeled on upstream's |
-| `DoMoTermGraphics` (planned) | `packages/tui/src/terminal-image.ts` — Kitty/iTerm2 image encoders and header-only dimension parsers (a direct port; see the [README roadmap](README.md#roadmap), Phase 7.5) |
-| `DoMoTUIKit` (planned) | Original to DoMoCode — an in-house full-screen (alternate-screen) layer. OpenTUI's retained-cell-buffer + flexbox *design* is referenced as architecture only; no OpenTUI code is used (it is TypeScript) |
-| `DoMoServer` (planned) | Original to DoMoCode — a local HTTP/SSE server. Its shape is modeled on opencode's server (studied prior art, no code derived); pi's own `packages/server` is *not* ported |
-| `DoMoMCP` (planned) | Original to DoMoCode — an MCP client on the MCP Swift SDK. Modeled on opencode/kilocode `mcp/` (studied prior art, no code derived); pi has no MCP |
+| `DoMoTermGraphics` | `packages/tui/src/terminal-image.ts` — Kitty/iTerm2 image encoders and header-only dimension parsers (a direct port; the BMP reader is a DoMoCode addition, as pi has none) |
+| `DoMoServer` | Original to DoMoCode — a local HTTP/SSE server. Its shape is modeled on opencode's server (studied prior art, no code derived); pi's own `packages/server` is *not* ported |
+| `DoMoClient` | Original to DoMoCode — the full-screen terminal client for `DoMoServer`. No upstream: pi has no client/server split |
+| `DoMoPermissions` | **Not pi.** pi has no permission engine; the allow/ask/deny policy core is ported from **opencode**, and the saved-versus-base layering and config writer from **kilocode**. Both are MIT and both are credited in the dual-copyright headers of the files concerned — see [Other prior art](#other-prior-art) for the file-by-file list |
+| `DoMoMCP` | Original to DoMoCode — a hand-rolled stdio MCP client (no SDK). Modeled on opencode/kilocode `mcp/` (studied prior art, no code derived); pi has no MCP |
 
 Swift source files that closely follow a specific upstream TypeScript file carry a dual copyright
 header naming that file and the commit it was read at, in the following form:
@@ -120,13 +123,19 @@ non-OpenAI provider implementations in `packages/ai`.
 
 ---
 
-## Studied prior art (no code derived)
+## Other prior art
 
 Beyond its upstream, DoMoCode was informed by three other open-source coding-agent harnesses, read
-closely during design for feature and interaction ideas. **No code from any of them is copied,
-vendored, or derived** in DoMoCode; they are recorded here for completeness and credit. Each remains
-the property of its authors under its own license. The features taken as *ideas* are catalogued in
-the project's [README](README.md#sibling-harnesses-and-prior-art).
+closely during design. Each remains the property of its authors under its own license. The features
+taken as *ideas* are catalogued in the project's
+[README](README.md#sibling-harnesses-and-prior-art).
+
+Two of the three are more than idea sources, and this section used to say otherwise. **`DoMoPermissions`
+contains code derived from opencode and from kilocode**, ported in Phase 8a: the wildcard matcher, the
+bash arity table, the policy evaluator, the config codec, the engine, the request vocabulary and the
+request factory all carry opencode's copyright, and the config codec and the settings-file writer carry
+kilocode's. Those files carry dual copyright headers in the same form as the pi-derived sources above —
+see the table below for the exact per-file record. Nothing is derived from OpenHands.
 
 ### opencode
 
@@ -140,10 +149,34 @@ from pi-tui's `stdin-buffer.ts`, which upstream derives from **OpenTUI** — a p
 authors (the `anomalyco` org). OpenTUI's own attribution is recorded above under the Pi Agent
 Harness section.
 
-The planned `DoMoServer` and `DoMoMCP` modules model their *architecture* on opencode's server
+The `DoMoServer` and `DoMoMCP` modules model their *architecture* on opencode's server
 (`server.ts` / `event.ts` / `session.ts`) and `mcp/` respectively — design reference only, no code
-derived — and the planned full-screen `DoMoTUIKit` re-derives OpenTUI's retained-cell-buffer + flexbox
-design without using OpenTUI, which is TypeScript.
+derived — and `DoMoTUI`'s full-screen layer re-derives OpenTUI's retained-cell-buffer + flexbox design
+without using OpenTUI, which is TypeScript.
+
+**`DoMoPermissions` is different: it contains ported code.** The table below is transcribed from the
+copyright headers of the files themselves, which are the authoritative record; four of them also cite
+the upstream path, and the rest name only the holder.
+
+| DoMoCode file | Copyright lines it carries, besides DoMoCode's | Upstream path cited in the header |
+|---|---|---|
+| `Wildcard.swift` | opencode contributors | `packages/core/src/util/wildcard.ts` |
+| `BashArity.swift` | opencode contributors | `packages/opencode/src/permission/arity.ts` |
+| `PermissionPolicy.swift` | opencode contributors | `packages/opencode/src/permission/index.ts` |
+| `PermissionConfig.swift` | opencode contributors **and** Kilo Code / opencode contributors | `permission/index.ts` (`fromConfig` / `toConfig` / `expand`) |
+| `PermissionConfigWriter.swift` | Kilo Code / opencode contributors | — |
+| `PermissionEngine.swift` | opencode contributors | — |
+| `PermissionRequest.swift` | opencode contributors | — |
+| `PermissionRequestFactory.swift` | opencode contributors | — |
+
+The remaining five files — `OrderedJSON.swift`, `PermissionConfigLoader.swift`, `PermissionHook.swift`,
+`PrompterBox.swift` and `ShellCommand.swift` — carry DoMoCode's copyright alone. Two of them describe
+their behavior by reference to opencode (`PermissionConfigLoader` follows its `normalizeInput`
+normalization; `ShellCommand` deliberately replaces its tree-sitter parse with a hand-rolled scanner),
+but neither reproduces its code.
+
+Note that the headers cite `github.com/sst/opencode`, the organization's name when they were written;
+the repository is now at `github.com/anomalyco/opencode`. Both refer to the same project.
 
 ### kilocode
 
@@ -153,8 +186,12 @@ design without using OpenTUI, which is TypeScript.
   (`@kilocode/cli`, binary `kilo`) is itself a fork of opencode, so its root `LICENSE` carries both
   copyright lines verbatim; were any snippet ever adopted, both holders would need crediting. The
   repository's VS Code and JetBrains extensions descend from a separate Cline → Roo Code → Kilo Code
-  lineage. kilocode's `mcp/` (itself an opencode fork) was read as a cross-reference for the planned
-  `DoMoMCP` client — design reference only, no code derived.
+  lineage. kilocode's `mcp/` (itself an opencode fork) was read as a cross-reference for the
+  `DoMoMCP` client — design reference only, no code derived. **Two `DoMoPermissions` files are ported
+  from it**, not merely referenced: `PermissionConfig.swift` and `PermissionConfigWriter.swift` carry
+  `Copyright (c) 2025 Kilo Code / opencode contributors`. Because kilocode's CLI is an opencode fork,
+  both holders are named, exactly as its own `LICENSE` does. (`PermissionPolicy.swift`'s `.env` read
+  guard and saved-versus-base resolution also follow kilocode's, under opencode's copyright line.)
 
 ### OpenHands
 
@@ -173,8 +210,9 @@ design without using OpenTUI, which is TypeScript.
 
 ## Third-party dependencies
 
-Planned Swift Package Manager dependencies. Entries will be confirmed and pinned as they are added
-to `Package.swift`.
+The Swift Package Manager dependencies declared in `Package.swift`, plus — clearly marked as such —
+the few that were considered and not taken. The Apache-2.0 entries carry live section 4(d)
+obligations: their notices must travel with any redistributed binary.
 
 ### swift-argument-parser
 
@@ -260,7 +298,8 @@ Arrives transitively via swift-markdown.
 - **License:** MIT
 - **Copyright:** Gwendal Roué
 
-Planned for optional SQLite session storage.
+**Not a declared dependency.** Held for optional SQLite session storage, which remains unbuilt — JSONL
+is still the only `SessionStorage` implementation. Listed here so the license is on record if it lands.
 
 ### SwiftTerm
 
@@ -271,43 +310,29 @@ Planned for optional SQLite session storage.
 
 Used in test targets only, as a headless terminal emulator against which renderer output is asserted.
 
-The following four are introduced by the [scope expansion](README.md#what-expanded-and-what-did-not).
-They are planned, not yet in `Package.swift`; each license below will be confirmed and pinned when the
-dependency is actually added.
-
 ### Hummingbird
 
 - **Repository:** https://github.com/hummingbird-project/hummingbird
 - **License:** Apache-2.0
 - **Copyright:** the Hummingbird project authors
 
-Planned for the `DoMoServer` HTTP/SSE server (Phase 6). Built on SwiftNIO, which is already resolved
-transitively via async-http-client.
+The HTTP/SSE server for `DoMoServer`, added in Phase 6 at `from: "2.25.1"`. Built on SwiftNIO, which
+was already resolved transitively via async-http-client.
 
-### modelcontextprotocol/swift-sdk (MCP)
+### Considered and not taken
 
-- **Repository:** https://github.com/modelcontextprotocol/swift-sdk (formerly `loopwork-ai/mcp-swift-sdk`)
-- **License:** MIT (the project notes some contributions under Apache-2.0 — to be confirmed at pin time)
-- **Copyright:** the Model Context Protocol authors and contributors
+The [scope expansion](README.md#what-expanded-and-what-did-not) was expected to add three more
+dependencies. None was: no code from any of them is used, and none appears in `Package.swift` or
+`Package.resolved`. They are recorded here only so the reasoning is not lost.
 
-Planned for the `DoMoMCP` client (Phase 8, stdio transport first).
-
-### swift-png
-
-- **Repository:** https://github.com/tayloraswift/swift-png
-- **License:** Apache-2.0
-- **Copyright:** tayloraswift and the swift-png authors
-
-Planned, optional — pure-Swift PNG decode/encode for resizing image attachments (Phase 7.5). Skipped
-entirely for pass-through images.
-
-### swift-jpeg
-
-- **Repository:** https://github.com/tayloraswift/swift-jpeg
-- **License:** Apache-2.0
-- **Copyright:** tayloraswift and the swift-jpeg authors
-
-Planned, optional companion to swift-png for normalizing JPEG attachments (Phase 7.5).
+- **[modelcontextprotocol/swift-sdk](https://github.com/modelcontextprotocol/swift-sdk)** (MIT) — was
+  to be the MCP client for Phase 8. Its `StdioTransport` does not spawn the server subprocess, and it
+  pins `swift-docc-plugin` to a git branch. `DoMoMCP` is a hand-rolled JSON-RPC-2.0-over-stdio client
+  instead, built on the already-present `JSONValue` and swift-subprocess.
+- **[swift-png](https://github.com/tayloraswift/swift-png)** and
+  **[swift-jpeg](https://github.com/tayloraswift/swift-jpeg)** (both Apache-2.0) — were to resize
+  image attachments for Phase 7.5. Images are passed through unresized and an oversized one is
+  rejected, so nothing decodes pixels; only hand-written header readers touch image bytes.
 
 ---
 
@@ -318,6 +343,11 @@ notices to travel with redistributed works. A file in this repository does not t
 tarball or a package-manager bottle, so binary distributions will ship a generated
 `THIRD-PARTY-NOTICES.txt` alongside the executable, and `domo --licenses` will print the same
 content.
+
+That generated file must be built from the dual-copyright headers in `Sources/`, not from the
+dependency list alone: the MIT-licensed code DoMoCode *ports* — pi throughout, and opencode/kilocode
+in `DoMoPermissions` — is not a package-manager dependency and would otherwise be omitted, which is
+exactly the attribution MIT requires to travel with the binary.
 
 ---
 

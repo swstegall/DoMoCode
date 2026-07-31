@@ -40,7 +40,7 @@ public func fullScreenClientLifecycle(enableMouse: Bool = true) -> TerminalLifec
     TerminalLifecycle(useAlternateScreen: true, enableMouse: enableMouse)
 }
 
-/// Run the two-pane full-screen client against a `domo serve` runtime at
+/// Run the two-pane full-screen client against a `domo --serve` runtime at
 /// `baseURL`, authenticated with `token`, until the user quits.
 ///
 /// Creates and tears down the shared ``HTTPClient`` (a leaked one traps on

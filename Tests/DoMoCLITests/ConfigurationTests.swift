@@ -31,8 +31,7 @@ struct ConfigurationTests {
         #expect(config.apiKey == nil)
         #expect(config.maxRetries == 10)
         #expect(config.timeout == .milliseconds(600_000))
-        #expect(config.streamTimeout == .milliseconds(30_000))
-        #expect(config.offline == false)
+        #expect(config.streamTimeout == .milliseconds(120_000))
         #expect(config.logLevel == .warning)
     }
 
@@ -147,13 +146,60 @@ struct ConfigurationTests {
         }
     }
 
+    /// `0` disables the stream idle bound; it must never mean "fail instantly".
+    ///
+    /// Threaded through literally, a zero idle window fails every turn a few
+    /// milliseconds after the response head — every request, against every
+    /// gateway. `DOMOCODE_RETRY_BUDGET_MS` already established that 0 means
+    /// "stop enforcing this", and this knob follows it.
     @Test
-    func offlineAndLogLevelAreLooselyParsed() throws {
-        #expect(try resolve(env: [EnvName.offline: "1"]).offline == true)
-        #expect(try resolve(env: [EnvName.offline: "true"]).offline == true)
-        #expect(try resolve(env: [EnvName.offline: "0"]).offline == false)
+    func aZeroStreamTimeoutDisablesTheBoundRatherThanFailingEveryTurn() throws {
+        // Asserted as the value the TRANSPORT receives, not merely as the value
+        // the resolver holds. An earlier version of this fix mapped 0 to `nil`
+        // and passed that down, where `?? defaultIdleTimeout` turned it straight
+        // back into 120s — the config-level assertion still passed, and the
+        // behaviour was the opposite of what the operator asked for.
+        let disabled = try resolve(env: [EnvName.streamTimeoutMS: "0"])
+        #expect(disabled.streamTimeout == .zero)
+        #expect(disabled.clientConfiguration.streamIdleTimeout == .zero)
+
+        let set = try resolve(env: [EnvName.streamTimeoutMS: "45000"])
+        #expect(set.streamTimeout == .milliseconds(45_000))
+        #expect(set.clientConfiguration.streamIdleTimeout == .milliseconds(45_000))
+    }
+
+    /// `DOMOCODE_TIMEOUT_MS=0` must not brick every request either.
+    ///
+    /// The overall deadline bounds time-to-response-head, so a literal zero fails
+    /// each attempt in about a second — and it is the value the stream knob's
+    /// "disabled" case falls back to, so a zero here would silently re-tighten the
+    /// bound the operator just switched off. Unlike the stream knob there is no
+    /// "no deadline" to express: AsyncHTTPClient needs one, so 0 means the default.
+    @Test
+    func aZeroOverallTimeoutFallsBackToTheDefault() throws {
+        #expect(try resolve(env: [EnvName.timeoutMS: "0"]).timeout == ResolvedConfiguration.defaultTimeout)
+        #expect(try resolve(env: [EnvName.timeoutMS: "5000"]).timeout == .milliseconds(5000))
+    }
+
+    @Test
+    func logLevelIsLooselyParsed() throws {
         #expect(try resolve(env: [EnvName.logLevel: "DEBUG"]).logLevel == .debug)
         #expect(try resolve(env: [EnvName.logLevel: "nonsense"]).logLevel == .warning)
+    }
+
+    /// A settings.json written against an older build still loads.
+    ///
+    /// `DOMOCODE_OFFLINE` was removed rather than wired: nothing consumed it,
+    /// and there was nothing for it to skip — no run path calls the model
+    /// catalog and there are no version lookups. Decoding is `decodeIfPresent`
+    /// per declared key and never enumerates the container, so a stale
+    /// `"offline"` is ignored instead of throwing. This pins that, because the
+    /// alternative is a user's config file failing to load after an upgrade.
+    @Test
+    func settingsIgnoresKeysThisBuildNoLongerKnows() throws {
+        let json = #"{"model": "gpt-5", "offline": true, "somethingElse": 3}"#
+        let settings = try JSONDecoder().decode(Settings.self, from: Data(json.utf8))
+        #expect(settings.model == "gpt-5")
     }
 
     @Test

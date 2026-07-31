@@ -1435,6 +1435,64 @@ struct InteractiveModeEndToEndTests {
         inputCont.finish()
         try await runTask.value
     }
+
+    /// The inline REPL reports a retry too, without any REPL-specific code: the
+    /// loop emits an `AgentEvent.notice` and `handle(_:)` already routes every
+    /// notice to the transcript. This pins that, because "it works by
+    /// inheritance" is exactly the kind of coverage that silently disappears.
+    @Test
+    func inlineReplShowsARetryWhileItWaits() async throws {
+        let gateway = try MockGateway(
+            chatCompletionBodies: [Self.singleTextTurn],
+            refuseWith: (
+                status: 503,
+                reason: "Service Unavailable",
+                body: #"{"error":{"message":"upstream is at capacity","type":"server_error"}}"#
+            ),
+            refusalLimit: 1
+        )
+        gateway.start()
+        defer { gateway.stop() }
+
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(
+                baseURL: gateway.baseURL,
+                apiKey: "sk-test",
+                // Keep the wait to the shortest possible backoff — the test is
+                // about the message, not the sleep.
+                baseRetryDelay: .milliseconds(1),
+                maxRetryDelay: .milliseconds(1)
+            ),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 100, rows = 24
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("hello"))
+        inputCont.yield(bytes("\r"))
+
+        let shown = await waitUntil {
+            screenContains(target, rows: rows, cols: cols, "Retrying in")
+        }
+        #expect(shown, "the REPL never said it was retrying")
+        #expect(screenContains(target, rows: rows, cols: cols, "provider busy"))
+
+        inputCont.finish()
+        try await runTask.value
+    }
 }
 
 /// A tiny thread-safe done flag: the run task marks it on the main actor, the test

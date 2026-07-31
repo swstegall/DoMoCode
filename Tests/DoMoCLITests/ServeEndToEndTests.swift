@@ -121,7 +121,11 @@ final class ServeProcess: @unchecked Sendable {
         environment["HOME"] = workspace.homeDirectory.path
         environment["DOMOCODE_API_KEY"] = "sk-mock-test-key"
         environment["DOMOCODE_LOG_LEVEL"] = "error"
-        for key in ["OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL", "DOMOCODE_OFFLINE"] {
+        for key in [
+            "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
+            // Live since the stream idle bound was wired.
+            "DOMOCODE_STREAM_TIMEOUT_MS",
+        ] {
             environment.removeValue(forKey: key)
         }
         process.environment = environment

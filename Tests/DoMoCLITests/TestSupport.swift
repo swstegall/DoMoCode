@@ -82,7 +82,14 @@ func domoBinaryURL() -> URL {
 /// toolchain's `DYLD_*` runtime paths `swift test` sets up, without which the
 /// binary cannot load its Swift runtime — and then overrides only the
 /// configuration-relevant variables to isolate the run.
-func runDomo(arguments: [String], workspace: Workspace) throws -> ProcessRunResult {
+/// - Parameter environment: extra variables, applied last so a test can override
+///   the isolation defaults below. Exists so a test that must exercise the retry
+///   loop can shrink the backoff instead of paying seconds of real sleep.
+func runDomo(
+    arguments: [String],
+    workspace: Workspace,
+    environment extra: [String: String] = [:]
+) throws -> ProcessRunResult {
     let process = Process()
     process.executableURL = domoBinaryURL()
     process.arguments = arguments
@@ -94,9 +101,15 @@ func runDomo(arguments: [String], workspace: Workspace) throws -> ProcessRunResu
     environment["DOMOCODE_API_KEY"] = "sk-mock-test-key"
     environment["DOMOCODE_LOG_LEVEL"] = "error"
     // Strip anything from the developer's shell that would leak into resolution.
-    for key in ["OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL", "DOMOCODE_OFFLINE"] {
+    for key in [
+        "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
+        // Live since the stream idle bound was wired: a developer's exported
+        // value would otherwise apply to every end-to-end run.
+        "DOMOCODE_STREAM_TIMEOUT_MS",
+    ] {
         environment.removeValue(forKey: key)
     }
+    for (key, value) in extra { environment[key] = value }
     process.environment = environment
 
     let outputPipe = Pipe()

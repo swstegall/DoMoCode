@@ -30,7 +30,6 @@ public enum EnvName {
     public static let configDir = "DOMOCODE_CONFIG_DIR"
     public static let sessionDir = "DOMOCODE_SESSION_DIR"
     public static let logLevel = "DOMOCODE_LOG_LEVEL"
-    public static let offline = "DOMOCODE_OFFLINE"
 
     /// The secret-key fallback chain. `DOMOCODE_API_KEY` first, then the two
     /// names other tools already set, so an existing LiteLLM or OpenAI
@@ -61,7 +60,6 @@ public struct Settings: Sendable, Hashable, Codable {
     public var retryMaxMS: Int?
     public var retryBudgetMS: Int?
     public var logLevel: String?
-    public var offline: Bool?
     public var sessionDir: String?
 
     /// The *name* of the environment variable holding the API key. Never the key.
@@ -85,7 +83,6 @@ public struct Settings: Sendable, Hashable, Codable {
         retryMaxMS: Int? = nil,
         retryBudgetMS: Int? = nil,
         logLevel: String? = nil,
-        offline: Bool? = nil,
         sessionDir: String? = nil,
         apiKeyEnv: String? = nil,
         mcpServers: [String: MCPServerConfig]? = nil
@@ -103,7 +100,6 @@ public struct Settings: Sendable, Hashable, Codable {
         self.retryMaxMS = retryMaxMS
         self.retryBudgetMS = retryBudgetMS
         self.logLevel = logLevel
-        self.offline = offline
         self.sessionDir = sessionDir
         self.apiKeyEnv = apiKeyEnv
         self.mcpServers = mcpServers
@@ -123,7 +119,6 @@ public struct Settings: Sendable, Hashable, Codable {
         case retryMaxMS = "retryMaxMs"
         case retryBudgetMS = "retryBudgetMs"
         case logLevel
-        case offline
         case sessionDir
         case apiKeyEnv
         case mcpServers
@@ -191,6 +186,7 @@ public struct ResolvedConfiguration: Sendable {
     public var smallModel: String?
     public var reasoningEffort: ReasoningEffort?
     public var timeout: Duration
+    /// `0` means "no idle bound" — see ``DoMoLLM/AsyncHTTPClientTransport``.
     public var streamTimeout: Duration
     public var maxRetries: Int
     /// First retry backoff; each further attempt doubles it before jitter.
@@ -203,7 +199,6 @@ public struct ResolvedConfiguration: Sendable {
     public var configDirectory: FilePath
     public var sessionDirectory: FilePath
     public var logLevel: Logger.Level
-    public var offline: Bool
     /// The enabled stdio MCP servers, project merged over user (Phase 8c).
     public var mcpServers: [String: MCPServerConfig]
 
@@ -224,7 +219,6 @@ public struct ResolvedConfiguration: Sendable {
         configDirectory: FilePath,
         sessionDirectory: FilePath,
         logLevel: Logger.Level,
-        offline: Bool,
         mcpServers: [String: MCPServerConfig] = [:]
     ) {
         self.baseURL = baseURL
@@ -243,7 +237,6 @@ public struct ResolvedConfiguration: Sendable {
         self.configDirectory = configDirectory
         self.sessionDirectory = sessionDirectory
         self.logLevel = logLevel
-        self.offline = offline
         self.mcpServers = mcpServers
     }
 
@@ -253,7 +246,18 @@ public struct ResolvedConfiguration: Sendable {
     public static let defaultAuthHeaderName = "Authorization"
     public static let defaultAuthScheme = "Bearer"
     public static let defaultTimeout = Duration.milliseconds(600_000)
-    public static let defaultStreamTimeout = Duration.milliseconds(30_000)
+
+    /// How long a committed stream may deliver nothing before the turn is failed.
+    ///
+    /// This deliberately equals ``DoMoLLM/AsyncHTTPClientTransport/defaultIdleTimeout``.
+    /// The value used to be 30s, which was harmless only because nothing read
+    /// it; the moment it reached the transport, that default would have quartered
+    /// every user's silence tolerance without anyone asking for it. A model can
+    /// legitimately go quiet for a long reasoning block behind a proxy that does
+    /// not forward keepalives, and a false positive there costs a whole turn —
+    /// a 2xx has already committed the stream, so exceeding this fails the turn
+    /// rather than retrying it.
+    public static let defaultStreamTimeout = AsyncHTTPClientTransport.defaultIdleTimeout
     /// Ten, not three. A busy or overloaded provider is the one failure that
     /// reliably clears on its own, and giving up after three attempts turns a
     /// provider's bad ninety seconds into a failed turn the user has to retype.
@@ -280,7 +284,8 @@ public struct ResolvedConfiguration: Sendable {
             baseRetryDelay: retryBaseDelay,
             maxRetryDelay: retryMaxDelay,
             retryDelayBudget: retryDelayBudget,
-            timeout: timeout
+            timeout: timeout,
+            streamIdleTimeout: streamTimeout
         )
     }
 }
@@ -324,10 +329,23 @@ extension ResolvedConfiguration {
             string(cli: nil, env: EnvName.reasoningEffort, \.reasoningEffort)
             .map(ReasoningEffort.init(rawValue:))
 
-        let timeout = try durationMS(
+        // Zero here is the default, not a literal zero deadline. This bound is
+        // time-to-response-head, so a literal zero fails every attempt in about a
+        // second against a perfectly healthy gateway — and it is also what the
+        // stream knob's "disabled" case falls back to, so a zero would silently
+        // re-tighten the very bound the operator switched off. Unlike that knob
+        // there is no "no deadline" to express: AsyncHTTPClient requires one.
+        let timeoutRaw = try durationMS(
             environment[EnvName.timeoutMS], project?.timeoutMS ?? user?.timeoutMS,
             name: EnvName.timeoutMS, default: defaultTimeout
         )
+        let timeout = timeoutRaw == .zero ? defaultTimeout : timeoutRaw
+        // Zero is carried through verbatim and means "no idle bound", matching
+        // `DOMOCODE_RETRY_BUDGET_MS` above. It is NOT mapped to nil here: nil
+        // already means "the caller expressed no preference, use the transport
+        // default", and collapsing the two would turn an explicit 0 back into
+        // the 120s default — the opposite of what an operator typing 0 asked
+        // for. The sentinel is interpreted once, at the transport.
         let streamTimeout = try durationMS(
             environment[EnvName.streamTimeoutMS], project?.streamTimeoutMS ?? user?.streamTimeoutMS,
             name: EnvName.streamTimeoutMS, default: defaultStreamTimeout
@@ -357,10 +375,6 @@ extension ResolvedConfiguration {
             ?? (project?.logLevel).flatMap(Logger.Level.init(caseInsensitive:))
             ?? (user?.logLevel).flatMap(Logger.Level.init(caseInsensitive:))
             ?? defaultLogLevel
-
-        let offline =
-            environment[EnvName.offline].map(boolFromFlag)
-            ?? project?.offline ?? user?.offline ?? false
 
         let configDirectory = resolveConfigDirectory(environment: environment)
         let sessionDirectory =
@@ -397,7 +411,6 @@ extension ResolvedConfiguration {
             configDirectory: configDirectory,
             sessionDirectory: sessionDirectory,
             logLevel: logLevel,
-            offline: offline,
             mcpServers: mcpServers
         )
     }
@@ -484,14 +497,6 @@ extension ResolvedConfiguration {
         return defaultMaxRetries
     }
 
-    /// `1`/`true`/`yes`/`on` (case-insensitive) is true; everything else false.
-    /// Matches the loose truthiness a shell-set `DOMOCODE_OFFLINE=1` implies.
-    private static func boolFromFlag(_ raw: String) -> Bool {
-        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
-        case "1", "true", "yes", "on": return true
-        default: return false
-        }
-    }
 }
 
 // MARK: - Log level parsing

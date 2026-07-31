@@ -420,6 +420,22 @@ private func streamAssistantResponse(
                 continue
             }
 
+            // MUST stay above the `startEmitted` guard. A retry is only ever
+            // yielded before a 2xx commits the stream, so it always arrives
+            // before `.start` — a guard placed above this drops every one of
+            // them, which is precisely the bug this ordering fixes. See
+            // ``AssemblyEvent/retrying(_:)``, which documents the requirement
+            // at the producer.
+            //
+            // It rides the notice channel rather than `messageUpdate` because
+            // every consumer's assembly switch has a `default:` that discards
+            // an unrecognized case, and because a retry is not transcript
+            // content: it is display-only and must not be persisted.
+            if case .retrying(let retry) = event {
+                await sink.emit(.notice(AgentNotice(retry)))
+                continue
+            }
+
             guard startEmitted else { continue }
             if let snapshot = event.boundarySnapshot {
                 current = snapshot.message
