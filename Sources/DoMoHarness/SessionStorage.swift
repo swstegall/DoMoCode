@@ -57,9 +57,15 @@ public protocol SessionStorage: Sendable {
     /// replay all depend on.
     func createEntryID() -> String
 
-    /// Durably appends one fully-formed entry. The caller owns id/parentId; the
-    /// store only writes. Crash-safe: an interrupted append damages at most the
-    /// final line.
+    /// Durably appends one fully-formed entry. The caller owns
+    /// id/parentId/seq/elapsedMs; the store only writes. Crash-safe: an
+    /// interrupted append damages at most the final line.
+    ///
+    /// In particular the store does **not** assign ``SessionTreeEntry/seq``.
+    /// Numbering belongs to the writing harness, which holds a counter across a
+    /// run; a store that stamped a number here would have to re-read the file
+    /// per append, and two stores over one file would still collide. See
+    /// ``JSONLSessionStore/nextSequenceNumber()`` for seeding that counter.
     func appendEntry(_ entry: SessionTreeEntry) throws
 
     /// Reads every entry, skipping (and reporting) any line that will not decode.

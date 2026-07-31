@@ -10,15 +10,79 @@ import DoMoLLM
 
 // MARK: - Summarization seam
 
-/// The LLM call that turns a slice of history into summary text.
+/// What a summarization call produced: the prose, and what the call itself cost.
+///
+/// The usage rides back with the text rather than being supplied separately by
+/// the orchestrator because the summarizer is the only thing that *knows* it.
+/// Before this existed, ``Compaction/usage`` and ``BranchSummary/usage`` were
+/// documented as "folded into session totals" and were unconditionally `nil` in
+/// every session file ever written — the harness called ``compact(_:id:parentId:timestamp:usage:summarize:)``
+/// without a `usage:` argument, and had nothing to pass even if it had. A
+/// summarization request is a real, billable model call; leaving it out of the
+/// total made every session look cheaper than it was, by exactly the turns it
+/// worked hardest on.
+///
+/// `usage` is optional because a summarizer legitimately may not know: a
+/// hand-written test double, or a cached summary, has no token counts to report.
+/// `nil` means "not measured" and is never treated as zero.
+public struct SummarizerResult: Sendable, Hashable {
+    /// The summary prose. The only part the entry builder puts in front of the
+    /// model.
+    public var text: String
+
+    /// Token/cost accounting for the summarization call, when the summarizer
+    /// knows it.
+    public var usage: Usage?
+
+    public init(text: String, usage: Usage? = nil) {
+        self.text = text
+        self.usage = usage
+    }
+}
+
+/// The LLM call that turns a slice of history into a summary.
 ///
 /// It is injected rather than performed here so this whole file stays pure and
 /// synchronous to test: the selection of what to summarize, the token math and
 /// the entry it builds are all decided without a model, and only the summary
-/// prose comes from outside. The orchestrator that owns the model and its usage
-/// accounting supplies the closure; anything it wants folded into the session's
-/// running totals it attaches via the `usage` parameter on ``compact(_:id:parentId:timestamp:usage:summarize:)``.
-public typealias Summarizer = @Sendable ([Message]) async throws -> String
+/// prose — and the price of producing it — come from outside.
+public typealias Summarizer = @Sendable ([Message]) async throws -> SummarizerResult
+
+// MARK: - Prompts
+
+/// The text of the summarization request.
+///
+/// It lives here, beside the compaction logic, rather than on the harness that
+/// happens to construct the default model call, because it is not the harness's
+/// property: a CLI that points compaction at a cheaper small model builds its own
+/// summarizer and must send the *same* words, or two sessions of the same
+/// conversation compact into differently-shaped summaries depending on which
+/// component made the request. One text, two callers.
+public enum CompactionPrompts {
+    /// The system prompt for a summarization request.
+    public static let system =
+        "You are summarizing a conversation so it can be continued with less context. "
+        + "Produce a concise, faithful summary that preserves decisions, open questions, and any "
+        + "facts the assistant will need to continue the task."
+
+    /// The trailing user instruction appended after the history to summarize.
+    public static let instruction =
+        "Summarize the conversation so far, preserving everything needed to continue."
+
+    /// A running summary that predates the messages being compacted, wrapped as
+    /// the leading message of the next summarization request.
+    ///
+    /// Without it the second compaction of a path silently drops everything the
+    /// first checkpoint stood for: the older messages are already gone from the
+    /// path, so only the standing summary still represents them.
+    public static func priorSummaryPreamble(_ previous: String) -> String {
+        """
+        The following is the running summary of the conversation before this point. \
+        Fold it into the new summary so nothing it records is lost:
+
+        """ + previous
+    }
+}
 
 // MARK: - Token estimation
 
@@ -101,20 +165,6 @@ private func assistantContextUsage(_ message: Message) -> Usage? {
     return usage
 }
 
-/// The ``Usage`` of the most recent valid assistant turn among `entries`, or `nil`.
-///
-/// This is the anchor the running context size is measured from: the provider's
-/// own token count for the last real turn, which is more accurate than any
-/// character heuristic for everything up to that point.
-public func getLastAssistantUsage(_ entries: [SessionTreeEntry]) -> Usage? {
-    for entry in entries.reversed() {
-        if case .message(let message) = entry.payload, let usage = assistantContextUsage(message) {
-            return usage
-        }
-    }
-    return nil
-}
-
 /// A context-size estimate for a message list, split into its trusted and
 /// estimated halves.
 public struct ContextUsageEstimate: Sendable, Hashable {
@@ -190,14 +240,207 @@ public struct CompactionSettings: Sendable, Hashable, Codable {
     /// so the summary never swallows the turn in progress.
     public var keepRecentTokens: Int
 
+    /// Negative budgets are clamped to zero rather than rejected, because this
+    /// initializer cannot throw and a negative reserve is not merely odd — it
+    /// pushes the trigger threshold *above* the window, so compaction never fires
+    /// and the run grows into a provider overflow. The decoder below, which can
+    /// throw, refuses them outright so a settings file is told about its mistake
+    /// instead of having it silently corrected.
     public init(enabled: Bool = true, reserveTokens: Int = 16384, keepRecentTokens: Int = 20000) {
         self.enabled = enabled
-        self.reserveTokens = reserveTokens
-        self.keepRecentTokens = keepRecentTokens
+        self.reserveTokens = max(0, reserveTokens)
+        self.keepRecentTokens = max(0, keepRecentTokens)
     }
 
     /// pi's defaults: a 16K reserve and ~20K of retained recent context.
     public static let `default` = CompactionSettings()
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case reserveTokens
+        case keepRecentTokens
+    }
+
+    /// Decodes a **partial** settings object, filling anything absent from the
+    /// defaults.
+    ///
+    /// The synthesized decoder this replaces required all three keys, so the most
+    /// natural thing a user could write — `"compaction": {"enabled": false}` — was
+    /// a hard parse failure of the whole settings file. Every key is now
+    /// `decodeIfPresent`, which is also what makes ``CompactionOverrides`` and this
+    /// type decode from the same JSON shape.
+    ///
+    /// A negative budget is refused rather than clamped: this is authored
+    /// configuration, and telling the author their number was ignored is worth
+    /// more than quietly starting up with a different one.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        let reserveTokens = try container.decodeIfPresent(Int.self, forKey: .reserveTokens) ?? 16384
+        let keepRecentTokens = try container.decodeIfPresent(Int.self, forKey: .keepRecentTokens) ?? 20000
+        guard reserveTokens >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .reserveTokens,
+                in: container,
+                debugDescription: "reserveTokens must not be negative; got \(reserveTokens)"
+            )
+        }
+        guard keepRecentTokens >= 0 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .keepRecentTokens,
+                in: container,
+                debugDescription: "keepRecentTokens must not be negative; got \(keepRecentTokens)"
+            )
+        }
+        self.init(enabled: enabled, reserveTokens: reserveTokens, keepRecentTokens: keepRecentTokens)
+    }
+
+    /// These settings made workable against a known `contextWindow`.
+    ///
+    /// The two budgets are absolute token counts while the window is per-model, so
+    /// nothing stops them from claiming the whole thing. The shipped defaults do
+    /// exactly that on a 32K model: `16384 + 20000 = 36384` exceeds the window, so
+    /// ``shouldCompact(contextTokens:contextWindow:settings:)`` fires at 15,616
+    /// tokens, ``prepareCompaction(pathEntries:settings:)`` then finds nothing
+    /// older than the 20,000-token recent budget and returns `nil`, and the run
+    /// proceeds over-full with no entry written and nothing said. Silence is the
+    /// worst part: the session simply grows until the provider rejects it.
+    ///
+    /// The rule is that the reserve and the recent budget together may claim at
+    /// most **half** the window. That makes the post-compaction context at most
+    /// half the window by construction, so every compaction demonstrably makes
+    /// room, and the next turn always has the other half to work in. When they
+    /// claim more, both are scaled down by the same factor so their sum lands on
+    /// that budget — the ratio the caller asked for is preserved, only its scale
+    /// is not.
+    ///
+    /// A window that already leaves the budgets room is returned **unchanged**, so
+    /// the default 200K path is byte-for-byte what it was. Applying this twice is
+    /// a no-op, since the first application already satisfies the bound.
+    public func clamped(toContextWindow contextWindow: Int) -> CompactionSettings {
+        guard contextWindow > 0 else { return self }
+        let budget = contextWindow / 2
+        let (sum, overflowed) = reserveTokens.addingReportingOverflow(keepRecentTokens)
+        if overflowed {
+            // Nothing meaningful to preserve about the ratio of two numbers whose
+            // sum does not fit in an Int; split the budget evenly.
+            return CompactionSettings(
+                enabled: enabled,
+                reserveTokens: budget / 2,
+                keepRecentTokens: budget - budget / 2
+            )
+        }
+        guard sum > budget else { return self }
+        return CompactionSettings(
+            enabled: enabled,
+            reserveTokens: Self.scale(reserveTokens, into: budget, of: sum),
+            keepRecentTokens: Self.scale(keepRecentTokens, into: budget, of: sum)
+        )
+    }
+
+    /// `value * budget / total`, without trusting the product to fit.
+    private static func scale(_ value: Int, into budget: Int, of total: Int) -> Int {
+        guard total > 0 else { return 0 }
+        let (product, overflowed) = value.multipliedReportingOverflow(by: budget)
+        // Dividing first loses precision, which is strictly better than trapping.
+        guard !overflowed else { return (value / total) * budget }
+        return product / total
+    }
+}
+
+// MARK: - Settings overrides
+
+/// A settings file's partial statement about compaction: every field optional,
+/// so "say nothing" and "say `false`" are different answers.
+///
+/// It is a separate type from ``CompactionSettings`` rather than an
+/// all-optional version of it because the two answer different questions. The
+/// settings value is what the harness runs on and always has all three numbers;
+/// the override is what a *layer* of configuration said, and merging layers
+/// requires being able to tell an absent key from a defaulted one — a project
+/// file that omits `enabled` must not overwrite a user file that set it.
+///
+/// ``model`` has no counterpart on ``CompactionSettings`` on purpose: the harness
+/// does not select models, it runs an injected ``Summarizer``. The name is
+/// consumed one layer up, where a small-model summarizer is built and installed.
+public struct CompactionOverrides: Sendable, Hashable, Codable {
+    public var enabled: Bool?
+    public var reserveTokens: Int?
+    public var keepRecentTokens: Int?
+
+    /// The model alias to summarize with. Read by whoever builds the summarizer;
+    /// ``applied(to:)`` cannot carry it, because its result has nowhere to put it.
+    public var model: String?
+
+    public init(
+        enabled: Bool? = nil,
+        reserveTokens: Int? = nil,
+        keepRecentTokens: Int? = nil,
+        model: String? = nil
+    ) {
+        self.enabled = enabled
+        self.reserveTokens = reserveTokens
+        self.keepRecentTokens = keepRecentTokens
+        self.model = model
+    }
+
+    /// `base` with every field this override actually states replaced.
+    ///
+    /// ``model`` is deliberately dropped — see the note on the property.
+    public func applied(to base: CompactionSettings) -> CompactionSettings {
+        CompactionSettings(
+            enabled: enabled ?? base.enabled,
+            reserveTokens: reserveTokens ?? base.reserveTokens,
+            keepRecentTokens: keepRecentTokens ?? base.keepRecentTokens
+        )
+    }
+
+    /// This override layered on top of a weaker one, **field by field**: each
+    /// field this one states wins, each field it is silent about falls through.
+    ///
+    /// Field-by-field and not whole-entry, matching how every other numeric knob
+    /// in this configuration merges: a project file that only tunes
+    /// `keepRecentTokens` must not silently discard the user's `model` choice.
+    public func merged(over other: CompactionOverrides) -> CompactionOverrides {
+        CompactionOverrides(
+            enabled: enabled ?? other.enabled,
+            reserveTokens: reserveTokens ?? other.reserveTokens,
+            keepRecentTokens: keepRecentTokens ?? other.keepRecentTokens,
+            model: model ?? other.model
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case reserveTokens
+        case keepRecentTokens
+        case model
+    }
+
+    /// Same validation as ``CompactionSettings/init(from:)``, so a negative budget
+    /// is caught in whichever of the two shapes it was written in.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled)
+        let reserve = try container.decodeIfPresent(Int.self, forKey: .reserveTokens)
+        let keepRecent = try container.decodeIfPresent(Int.self, forKey: .keepRecentTokens)
+        let model = try container.decodeIfPresent(String.self, forKey: .model)
+        if let reserve, reserve < 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .reserveTokens,
+                in: container,
+                debugDescription: "reserveTokens must not be negative; got \(reserve)"
+            )
+        }
+        if let keepRecent, keepRecent < 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .keepRecentTokens,
+                in: container,
+                debugDescription: "keepRecentTokens must not be negative; got \(keepRecent)"
+            )
+        }
+        self.init(enabled: enabled, reserveTokens: reserve, keepRecentTokens: keepRecent, model: model)
+    }
 }
 
 /// Whether the running context has grown close enough to the window to compact.
@@ -491,15 +734,6 @@ public func makeCompactionEntry(
     return SessionTreeEntry(id: id, parentId: parentId, timestamp: timestamp, payload: .compaction(compaction))
 }
 
-/// A running summary that predates the messages being compacted is carried into
-/// the summarizer as a leading message so the new summary can *update* it rather
-/// than silently drop everything the prior checkpoint stood for.
-let priorSummaryPreamble = """
-The following is the running summary of the conversation before this point. \
-Fold it into the new summary so nothing it records is lost:
-
-"""
-
 /// Run the injected summarizer over the prepared history and return the finished
 /// compaction entry.
 ///
@@ -512,6 +746,11 @@ Fold it into the new summary so nothing it records is lost:
 /// A summarizer that throws propagates unchanged — the caller gets a real error
 /// and writes no entry, which is the correct outcome for a context that could not
 /// be summarized.
+///
+/// - Parameter usage: An accounting override. `nil` — the normal case — means the
+///   entry carries whatever the summarizer reported on its ``SummarizerResult``,
+///   which is the only party that actually measured the call. A non-`nil` value
+///   wins, for a caller that wraps a summarizer and measures the request itself.
 public func compact(
     _ preparation: CompactionPreparation,
     id: String,
@@ -522,15 +761,15 @@ public func compact(
 ) async throws -> SessionTreeEntry {
     var toSummarize = preparation.messagesToSummarize
     if let previousSummary = preparation.previousSummary {
-        toSummarize.insert(.user(priorSummaryPreamble + previousSummary), at: 0)
+        toSummarize.insert(.user(CompactionPrompts.priorSummaryPreamble(previousSummary)), at: 0)
     }
-    let summary = try await summarize(toSummarize)
+    let summarized = try await summarize(toSummarize)
     return makeCompactionEntry(
         from: preparation,
         id: id,
         parentId: parentId,
         timestamp: timestamp,
-        summary: summary,
-        usage: usage
+        summary: summarized.text,
+        usage: usage ?? summarized.usage
     )
 }

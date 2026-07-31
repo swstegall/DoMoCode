@@ -154,6 +154,54 @@ struct JSONLSessionStoreTests {
 
         let read = try store.readEntries()
         #expect(read == built)
+        // Nothing in this store assigns `seq`; the writing harness does.
+        #expect(read.allSatisfy { $0.seq == nil && $0.elapsedMs == nil })
+    }
+
+    @Test("seq and elapsedMs round-trip on every payload shape without colliding with its fields")
+    func envelopeFieldsRoundTripOnEveryPayload() throws {
+        // `SessionTreeEntry`'s CodingKeys are one flat namespace shared by all
+        // seven payload shapes, so a collision would corrupt only the payload
+        // that shares the name. Writing every shape with both envelope fields
+        // set is what makes such a collision visible.
+        let dir = makeSessionDirectory()
+        let store = try JSONLSessionStore.create(cwd: "/w", sessionDirectory: dir, now: fixedClock(fixedDate))
+
+        let payloads: [SessionTreeEntry.Payload] = [
+            .message(.user("hello")),
+            .modelChange(provider: "openai", modelId: "gpt-4o"),
+            .compaction(
+                Compaction(summary: "s", tokensBefore: 100, retainedTail: [.user("kept")], usage: Usage(input: 3, output: 4))
+            ),
+            .branchSummary(BranchSummary(fromId: "x", summary: "b", usage: Usage(input: 1, output: 2))),
+            .label(targetId: "x", label: "mark"),
+            .sessionInfo(name: "My session"),
+            .leaf(targetId: "x"),
+        ]
+
+        var built: [SessionTreeEntry] = []
+        var parent: String? = nil
+        for (index, payload) in payloads.enumerated() {
+            let id = store.createEntryID()
+            let entry = SessionTreeEntry(
+                id: id,
+                parentId: parent,
+                timestamp: "2026-07-23T12:00:00.000Z",
+                payload: payload,
+                seq: index,
+                elapsedMs: index * 7
+            )
+            try store.appendEntry(entry)
+            built.append(entry)
+            parent = id
+        }
+
+        let read = try store.readEntries()
+        #expect(read == built)
+        #expect(read.map(\.seq) == [0, 1, 2, 3, 4, 5, 6])
+        #expect(read.map(\.elapsedMs) == [0, 7, 14, 21, 28, 35, 42])
+        // The payloads themselves came back intact, not just the envelope.
+        #expect(read.map(\.payload) == payloads)
     }
 
     // MARK: - Crash safety

@@ -19,7 +19,7 @@ import SystemPackage
 /// It is an `actor` for one reason: the mutable tip of the session — the leaf that
 /// moves every time the loop appends a message — is touched *across* the loop's
 /// awaits. ``run(prompt:sink:)`` suspends on ``runAgentLoop(prompts:context:config:sink:streamFn:)``
-/// while the ``SessionPersistenceSink`` reentrantly calls ``persistMessage(_:)``
+/// while the ``SessionPersistenceSink`` reentrantly calls ``persistMessage(_:elapsedMs:)``
 /// to advance the leaf; making the harness an actor is what serializes those
 /// appends without ever holding a lock across the loop's suspension. The store
 /// itself is a stateless value (``JSONLSessionStore``) — everything durable lives
@@ -43,7 +43,7 @@ public actor AgentHarness {
     /// with (if any), then each entry it has appended since.
     ///
     /// This is a **parent chain by construction**, not a log that happens to look
-    /// like one: the only two places that move the tip — ``persistMessage(_:)`` and
+    /// like one: the only two places that move the tip — ``persistMessage(_:elapsedMs:)`` and
     /// ``compactIfNeeded()`` — both write the new entry with `parentId: leaf` and
     /// then make it the tip, so element *i* is the parent of element *i+1*. That is
     /// what makes ``leafLineage`` a usable answer to "which ancestor of this tip
@@ -67,10 +67,86 @@ public actor AgentHarness {
     /// before its first await — pi's `phase !== "idle"` busy check.
     private var isRunning = false
 
-    private init(store: JSONLSessionStore, leaf: String?, configuration: Configuration) {
+    /// The ordering key the next appended entry gets, seeded from the file so a
+    /// resumed session continues its numbering instead of restarting it and
+    /// colliding with every entry already written.
+    ///
+    /// Incremented only *after* a successful append, so a write that throws does
+    /// not burn a number and leave a gap that means nothing. (Gaps are legal — the
+    /// key is an ordering key, not a count — but a gap should at least correspond
+    /// to an entry that existed somewhere.)
+    private var nextSeq: Int
+
+    /// Everything this session has spent, cumulative across the whole file.
+    ///
+    /// One accumulator and one only. Two would mean `--serve` and `--inline`
+    /// reporting different numbers for the same session the moment either drifted.
+    private var accumulatedUsage: Usage
+
+    /// Assistant turns recorded in this session file, seeded on open the same way
+    /// ``accumulatedUsage`` is.
+    private var recordedTurns: Int
+
+    private init(store: JSONLSessionStore, leaf: String?, configuration: Configuration, seed: Seed) {
         self.store = store
         self.leafChain = leaf.map { [$0] } ?? []
         self.configuration = configuration
+        self.nextSeq = seed.nextSeq
+        self.accumulatedUsage = seed.usage
+        self.recordedTurns = seed.turns
+    }
+
+    // MARK: - Seeding from a file
+
+    /// What a harness has to recover from a session file before it can extend it.
+    private struct Seed: Sendable {
+        var nextSeq: Int
+        var usage: Usage
+        var turns: Int
+
+        /// A brand-new file: numbering starts at zero and nothing has been spent.
+        static let fresh = Seed(nextSeq: 0, usage: .zero, turns: 0)
+    }
+
+    /// Everything a harness resumes with: the file's running totals, plus the
+    /// ordering key its next append should carry.
+    ///
+    /// The counter comes from ``JSONLSessionStore/nextSequenceNumber()`` rather
+    /// than from a `max` over `entries`, because the two disagree on exactly the
+    /// case that matters: `entries` is the *tolerant* read, so a malformed or
+    /// crash-truncated line is missing from it, and a file written before ordering
+    /// keys existed has no `seq` to take a maximum of at all. The store counts raw
+    /// lines for those, which over-counts — the safe direction.
+    private static func seed(store: JSONLSessionStore, entries: [SessionTreeEntry]) throws -> Seed {
+        let recovered = totals(from: entries)
+        return Seed(nextSeq: try store.nextSequenceNumber(), usage: recovered.usage, turns: recovered.turns)
+    }
+
+    /// Walk the file's entries once and recover what the session has spent.
+    ///
+    /// Over **every** entry in the file, not the active branch: the accounting is
+    /// documented as cumulative across the session file, an abandoned branch was
+    /// still paid for, and — the part that is not a preference — a branch walk
+    /// throws on a structural hole, which would make opening a damaged session
+    /// fail where it used to succeed. ``open(path:configuration:preferring:)``
+    /// exists precisely because that refusal is unacceptable on the recovery path.
+    private static func totals(from entries: [SessionTreeEntry]) -> (usage: Usage, turns: Int) {
+        var usage = Usage.zero
+        var turns = 0
+        for entry in entries {
+            switch entry.payload {
+            case .message(.assistant(let assistant)):
+                usage = usage + assistant.usage
+                turns += 1
+            case .compaction(let compaction):
+                if let compactionUsage = compaction.usage { usage = usage + compactionUsage }
+            case .branchSummary(let branch):
+                if let branchUsage = branch.usage { usage = usage + branchUsage }
+            case .message, .modelChange, .label, .sessionInfo, .leaf:
+                break
+            }
+        }
+        return (usage, turns)
     }
 
     // MARK: - Configuration
@@ -109,13 +185,38 @@ public actor AgentHarness {
         public var maxTurns: Int?
 
         /// When and how aggressively automatic pre-turn compaction fires.
+        ///
+        /// Clamped at construction against ``contextWindow`` (see
+        /// ``CompactionSettings/clamped(toContextWindow:)``), so a small model can
+        /// never end up with budgets that swallow its whole window and make
+        /// compaction a no-op. On a window the budgets already fit in — every
+        /// default path — this is what the caller passed, unchanged.
         public var compaction: CompactionSettings
 
-        /// The model's context window in tokens, the ceiling compaction measures
-        /// the running context against.
-        public var contextWindow: Int
+        /// The model's context window in tokens.
+        ///
+        /// `nil` means **genuinely unknown**, which is the default because behind a
+        /// gateway it usually is: an alias names a deployment whose window this
+        /// process was never told. A meter renders `nil` as `?`; it must never
+        /// print a percentage of a guess, because a made-up denominator is
+        /// indistinguishable from a measured one on screen.
+        ///
+        /// This is the meter's truth. It is *not* what compaction falls back on:
+        /// ``fallbackContextWindow`` is, and only inside `compactIfNeeded`, where a
+        /// guess is strictly better than nothing — an unknown small alias with no
+        /// ceiling grows until the provider rejects the request, and a session that
+        /// dies of context overflow is worse than one compacted a little early.
+        public var contextWindow: Int?
 
         public var now: @Sendable () -> Date
+
+        /// The monotonic clock elapsed times are measured against.
+        ///
+        /// Separate from ``now`` and not derived from it, for two independent
+        /// reasons: a `Date` delta can go *negative* across an NTP step, and every
+        /// harness test pins `now` to a single constant — which would make every
+        /// elapsed assertion in the suite a vacuously passing `0`.
+        public var monotonicNow: @Sendable () -> ContinuousClock.Instant
 
         public var entryIDFactory: @Sendable () -> String
 
@@ -152,8 +253,9 @@ public actor AgentHarness {
             toolExecution: ToolExecutionMode = .parallel,
             maxTurns: Int? = nil,
             compaction: CompactionSettings = .default,
-            contextWindow: Int = 200_000,
+            contextWindow: Int? = nil,
             now: @escaping @Sendable () -> Date = { Date() },
+            monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
             entryIDFactory: @escaping @Sendable () -> String = { UUIDv7.generate().description },
             getSteeringMessages: (@Sendable () async -> [Message])? = nil,
             getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
@@ -167,15 +269,31 @@ public actor AgentHarness {
             self.summarizer = summarizer
             self.toolExecution = toolExecution
             self.maxTurns = maxTurns
-            self.compaction = compaction
+            // Clamped here as well as at the point of use, because this value is a
+            // `var` a caller can set afterwards; the check in `compactIfNeeded` is
+            // the one that cannot be walked around, and this one is what makes the
+            // effective settings inspectable.
+            self.compaction = compaction.clamped(
+                toContextWindow: contextWindow ?? Configuration.fallbackContextWindow
+            )
             self.contextWindow = contextWindow
             self.now = now
+            self.monotonicNow = monotonicNow
             self.entryIDFactory = entryIDFactory
             self.getSteeringMessages = getSteeringMessages
             self.getFollowUpMessages = getFollowUpMessages
             self.shouldStopAfterTurn = shouldStopAfterTurn
             self.beforeToolCall = beforeToolCall
         }
+
+        /// The window compaction assumes when ``contextWindow`` is `nil`.
+        ///
+        /// A safety net, not a measurement. It is read only by compaction — the
+        /// pre-turn check, and the budget clamp this initializer applies for it.
+        /// Everything that *displays* a window reads ``contextWindow`` and renders
+        /// `nil` as unknown, because a percentage computed against this number
+        /// would look exactly like a real one.
+        public static let fallbackContextWindow = 200_000
     }
 
     // MARK: - Lifecycle
@@ -196,7 +314,7 @@ public actor AgentHarness {
             now: configuration.now,
             entryIDFactory: configuration.entryIDFactory
         )
-        return AgentHarness(store: store, leaf: nil, configuration: configuration)
+        return AgentHarness(store: store, leaf: nil, configuration: configuration, seed: .fresh)
     }
 
     /// Opens an existing session file and reconstructs the tip.
@@ -217,7 +335,8 @@ public actor AgentHarness {
             entryIDFactory: configuration.entryIDFactory
         )
         let tree = try SessionTree.load(from: store)
-        return AgentHarness(store: store, leaf: tree.leafID, configuration: configuration)
+        let seed = try Self.seed(store: store, entries: tree.entries)
+        return AgentHarness(store: store, leaf: tree.leafID, configuration: configuration, seed: seed)
     }
 
     /// Opens an existing session file and continues from a tip the **caller**
@@ -258,11 +377,16 @@ public actor AgentHarness {
             now: configuration.now,
             entryIDFactory: configuration.entryIDFactory
         )
+        // Loaded unconditionally, including for `leaf: nil`. The tip check below
+        // is only one of the two things the file is needed for: the ordering-key
+        // and accounting seeds are the other, and a harness pinned to an empty tip
+        // over a written file that skipped the load would restart `seq` at zero and
+        // collide with every entry already in it.
+        let tree = try SessionTree.load(from: store)
         // Checked here rather than trusted: a harness whose tip is not in its file
         // cannot build a context or persist a child, and every read of it would
         // throw far from the call that chose the tip.
         if let leaf {
-            let tree = try SessionTree.load(from: store)
             guard tree.entry(withID: leaf) != nil else {
                 throw DoMoError(
                     .file(path: path, errno: nil),
@@ -270,7 +394,8 @@ public actor AgentHarness {
                 )
             }
         }
-        return AgentHarness(store: store, leaf: leaf, configuration: configuration)
+        let seed = try Self.seed(store: store, entries: tree.entries)
+        return AgentHarness(store: store, leaf: leaf, configuration: configuration, seed: seed)
     }
 
     /// Opens an existing session file and continues from the **first tip in
@@ -285,7 +410,7 @@ public actor AgentHarness {
     /// it — `JSONLines`' own append ("the previous process died between writing an
     /// entry and writing its newline"), ``SessionTree/load(from:onSkippedLine:)``
     /// ("a crash-truncated tail … never fatal — because this is the resume path"),
-    /// ``persistMessage(_:)`` ("an interruption damages at most the final line").
+    /// ``persistMessage(_:elapsedMs:)`` ("an interruption damages at most the final line").
     /// A tip the file lost can never come
     /// back, so a refusal there is not retryable the way every other re-open failure
     /// is: it is permanent, and it welds shut the one escape hatch the session has.
@@ -334,7 +459,8 @@ public actor AgentHarness {
         // chosen leaf is on the live branch and can never be another harness's.
         let pinned = preferredLeaves.first { (try? tree.branch(from: $0)) != nil }
             ?? preferredLeaves.first { (try? tree.pathToRootOrCompaction(from: $0)) != nil }
-        return AgentHarness(store: store, leaf: pinned, configuration: configuration)
+        let seed = try Self.seed(store: store, entries: tree.entries)
+        return AgentHarness(store: store, leaf: pinned, configuration: configuration, seed: seed)
     }
 
     /// Forks the active path into a new session file whose header names this
@@ -354,7 +480,13 @@ public actor AgentHarness {
             now: configuration.now,
             entryIDFactory: configuration.entryIDFactory
         )
-        return AgentHarness(store: forked, leaf: try forked.leafID(), configuration: configuration)
+        // Seeded from the fork's OWN file, not from this harness's counters: the
+        // fork is a different session file whose entries were re-chained on the way
+        // in, so what it already contains is the only authority on where its
+        // numbering and its totals stand.
+        let forkedTree = try SessionTree.load(from: forked)
+        let seed = try Self.seed(store: forked, entries: forkedTree.entries)
+        return AgentHarness(store: forked, leaf: forkedTree.leafID, configuration: configuration, seed: seed)
     }
 
     // MARK: - Inspection
@@ -381,6 +513,37 @@ public actor AgentHarness {
     /// harness reconstructs the identical context an uninterrupted run held.
     public func contextMessages() throws -> [Message] {
         try buildContextMessages()
+    }
+
+    /// What this session has spent and how full its context is.
+    ///
+    /// The single accounting surface. Every renderer of a footer, a `/cost`
+    /// command, or a server status payload reads it here rather than keeping its
+    /// own running sum, because two accumulators over the same session is how
+    /// `--serve` and `--inline` come to report different numbers for it.
+    ///
+    /// Throws for the same reason ``contextMessages()`` does: the context size is
+    /// measured off the resolved path, and a path with a structural hole cannot be
+    /// resolved. Reporting a size for a conversation that cannot be rebuilt would
+    /// be a number about nothing.
+    ///
+    /// **On resumed sessions.** The totals are seeded by walking the file, so they
+    /// are only as good as what the file records. Entries written before Phase 5a
+    /// carry a `usage` whose `cost` is zero and no gateway-reported cost at all —
+    /// no rate table ever reached the client that wrote them — so a session
+    /// resumed across that boundary under-reports the cost of its earlier half.
+    /// Token counts are unaffected; they were always real.
+    public func accounting() async throws -> SessionAccounting {
+        let contextTokens = estimateContextTokens(try buildContextMessages()).tokens
+        return SessionAccounting(
+            usage: accumulatedUsage,
+            // `effectiveCostTotal`, never `cost.total`: the latter silently drops a
+            // price the gateway itself reported.
+            costTotal: accumulatedUsage.effectiveCostTotal,
+            contextTokens: contextTokens,
+            contextWindow: configuration.contextWindow,
+            turns: recordedTurns
+        )
     }
 
     // MARK: - Sealing an interrupted branch
@@ -422,12 +585,17 @@ public actor AgentHarness {
     public func sealUnansweredToolCalls(reason: String) throws -> [String] {
         let unanswered = Self.unansweredToolCalls(in: try buildContextMessages())
         for call in unanswered {
-            try persistMessage(.tool(ToolResultBlock(
-                toolCallID: call.id,
-                toolName: call.name,
-                output: reason,
-                isError: true
-            )))
+            // `elapsedMs: nil` — a seal is synthesized, not produced by a tool that
+            // ran, so there is no interval to report and `0` would be a claim.
+            try persistMessage(
+                .tool(ToolResultBlock(
+                    toolCallID: call.id,
+                    toolName: call.name,
+                    output: reason,
+                    isError: true
+                )),
+                elapsedMs: nil
+            )
         }
         return unanswered.map(\.id)
     }
@@ -504,7 +672,12 @@ public actor AgentHarness {
             shouldStopAfterTurn: configuration.shouldStopAfterTurn
         )
         let errorBox = PersistenceErrorBox()
-        let persistenceSink = SessionPersistenceSink(persister: self, forward: sink, errorBox: errorBox)
+        let persistenceSink = SessionPersistenceSink(
+            persister: self,
+            forward: sink,
+            errorBox: errorBox,
+            monotonicNow: configuration.monotonicNow
+        )
 
         // The turn's user message carries the typed prompt plus any image
         // attachments (Phase 5.5). A text-only turn is byte-for-byte what it was.
@@ -535,7 +708,7 @@ public actor AgentHarness {
         // An empty tip means an empty branch — NOT "ask the file". The resolvers
         // below read `nil` as "start from the file's leaf", which is right for a
         // cold read of a file and wrong for a harness that knows its own branch has
-        // nothing on it: ``persistMessage(_:)`` writes the next entry with
+        // nothing on it: ``persistMessage(_:elapsedMs:)`` writes the next entry with
         // `parentId: leaf`, i.e. as a new root, so a context resolved from someone
         // else's leaf would seed a turn with a conversation this branch is not on
         // and then answer it in a different place. Same-answering for every harness
@@ -552,8 +725,10 @@ public actor AgentHarness {
     ///
     /// Building it from `streamFn` rather than a stored `LiteLLMClient` is what lets
     /// "default to the same LLM client" hold without this module depending on a
-    /// concrete client. The request carries a summarization system prompt and a
-    /// trailing instruction; the terminal assistant message's text is the summary.
+    /// concrete client. The request carries ``CompactionPrompts/system`` and a
+    /// trailing ``CompactionPrompts/instruction``; the terminal assistant message's
+    /// text is the summary and **its usage is the price of producing it**, which is
+    /// the only point at which summarization cost can enter the session's totals.
     /// A failed terminal turn throws, so compaction that could not summarize writes
     /// no entry — the correct outcome for a context that cannot be bounded.
     private var effectiveSummarizer: Summarizer {
@@ -561,8 +736,8 @@ public actor AgentHarness {
         let streamFn = configuration.streamFn
         return { messages in
             let request = Context(
-                systemPrompt: Self.summarizationSystemPrompt,
-                messages: messages + [.user(Self.summarizationInstruction)],
+                systemPrompt: CompactionPrompts.system,
+                messages: messages + [.user(CompactionPrompts.instruction)],
                 tools: []
             )
             var terminal: AssistantMessage?
@@ -573,7 +748,7 @@ public actor AgentHarness {
                 throw DoMoError(.provider(status: nil, isRetryable: false), "Summarization produced no response")
             }
             if let failure = terminal.failure { throw failure }
-            return terminal.text
+            return SummarizerResult(text: terminal.text, usage: terminal.usage)
         }
     }
 
@@ -586,8 +761,19 @@ public actor AgentHarness {
     /// module; this method only decides *whether* to fire (from the last assistant
     /// `Usage`-anchored estimate) and appends the result. A path that has nothing
     /// older than the recent budget yields no preparation and nothing is written.
+    ///
+    /// This is where ``AgentHarness/Configuration/fallbackContextWindow`` earns its
+    /// place. An unknown window is not a reason to stop bounding the context: an
+    /// unbounded session grows until the provider rejects it, which is a harder
+    /// failure than compacting a little early against a guess.
     private func compactIfNeeded() async throws {
-        guard configuration.compaction.enabled else { return }
+        // Re-clamped rather than trusting the constructor's clamp: `contextWindow`
+        // and `compaction` are both `var`s on a struct the caller keeps, so the
+        // pairing can be broken after construction. Idempotent when it already
+        // holds.
+        let window = configuration.contextWindow ?? Configuration.fallbackContextWindow
+        let settings = configuration.compaction.clamped(toContextWindow: window)
+        guard settings.enabled else { return }
         // Same reason as ``buildContextMessages()``: an empty tip is an empty branch,
         // and resolving `nil` here would measure — and then summarize — a path this
         // harness is not on, anchoring the checkpoint it writes at the root.
@@ -596,39 +782,71 @@ public actor AgentHarness {
         let pathEntries = try tree.pathToRootOrCompaction(from: tip)
         let messages = ContextBuilder.messages(for: pathEntries)
         let estimate = estimateContextTokens(messages)
-        guard
-            shouldCompact(
-                contextTokens: estimate.tokens,
-                contextWindow: configuration.contextWindow,
-                settings: configuration.compaction
-            )
-        else { return }
-        guard let preparation = prepareCompaction(pathEntries: pathEntries, settings: configuration.compaction) else {
+        guard shouldCompact(contextTokens: estimate.tokens, contextWindow: window, settings: settings) else { return }
+        guard let preparation = prepareCompaction(pathEntries: pathEntries, settings: settings) else {
             return
         }
-        let entry = try await compact(
+        // Timed here rather than in the sink, because a compaction checkpoint is
+        // not a `Message` and never passes through the event stream — the sink can
+        // never see it, so this is the only place its duration exists.
+        let startedAt = configuration.monotonicNow()
+        var entry = try await compact(
             preparation,
             id: store.createEntryID(),
             parentId: leaf,
             timestamp: timestamp(),
             summarize: effectiveSummarizer
         )
+        entry.elapsedMs = elapsedMilliseconds(from: startedAt, to: configuration.monotonicNow())
+        entry.seq = nextSeq
         try store.appendEntry(entry)
+        nextSeq += 1
         leafChain.append(entry.id)
+        // The summarization request is a billable model call. Folded here, at the
+        // one place a compaction entry is appended, so it reaches the same total
+        // every assistant turn does.
+        if case .compaction(let compaction) = entry.payload, let usage = compaction.usage {
+            accumulatedUsage = accumulatedUsage + usage
+        }
     }
+}
 
-    // MARK: - Summarization prompt
+// MARK: - Session accounting
 
-    /// The summarization prompt is intentionally terse and lives here, at the
-    /// orchestrator that constructs the model call, not in the pure compaction
-    /// layer. pi's richer templates would slot in the same place.
-    private static let summarizationSystemPrompt =
-        "You are summarizing a conversation so it can be continued with less context. "
-        + "Produce a concise, faithful summary that preserves decisions, open questions, and any "
-        + "facts the assistant will need to continue the task."
+/// What a session has spent, and how much room it has left.
+///
+/// A snapshot value, produced by ``AgentHarness/accounting()``, so a renderer
+/// holds a consistent set of numbers rather than sampling four properties that
+/// can move between reads.
+public struct SessionAccounting: Sendable, Hashable, Codable {
+    /// Cumulative token usage across the whole session file: every assistant turn,
+    /// plus every compaction and branch summary the session paid for.
+    public var usage: Usage
 
-    private static let summarizationInstruction =
-        "Summarize the conversation so far, preserving everything needed to continue."
+    /// Cumulative cost, always ``DoMoLLM/Usage/effectiveCostTotal`` and never
+    /// `cost.total` — the latter silently discards a price the gateway reported.
+    public var costTotal: Decimal
+
+    /// The size of the context the *next* turn would send.
+    public var contextTokens: Int
+
+    /// The model's window, or `nil` when it is genuinely unknown.
+    ///
+    /// A meter must render `nil` as "unknown" and not as a percentage: the
+    /// fallback compaction uses is a safety net, and a percentage computed against
+    /// it is indistinguishable on screen from one computed against a real number.
+    public var contextWindow: Int?
+
+    /// Assistant turns recorded in the session file.
+    public var turns: Int
+
+    public init(usage: Usage, costTotal: Decimal, contextTokens: Int, contextWindow: Int?, turns: Int) {
+        self.usage = usage
+        self.costTotal = costTotal
+        self.contextTokens = contextTokens
+        self.contextWindow = contextWindow
+        self.turns = turns
+    }
 }
 
 // MARK: - Persistence conformance
@@ -641,14 +859,28 @@ extension AgentHarness: SessionMessagePersisting {
     /// loop produces, which is transcript order, so the file is a faithful,
     /// resumable replay. The append is crash-safe (one line, `write`-then-return),
     /// so an interruption damages at most the final line.
-    public func persistMessage(_ message: Message) throws {
+    ///
+    /// This is also the single funnel every assistant turn passes through, which is
+    /// why the session's running totals are folded here: one call site, so no
+    /// future append path can add a turn to the transcript and forget to add it to
+    /// the bill.
+    public func persistMessage(_ message: Message, elapsedMs: Int?) throws {
         let entry = SessionTreeEntry(
             id: store.createEntryID(),
             parentId: leaf,
             timestamp: timestamp(),
-            payload: .message(message)
+            payload: .message(message),
+            seq: nextSeq,
+            elapsedMs: elapsedMs
         )
         try store.appendEntry(entry)
+        // After the append, never before: a throwing write must not burn an
+        // ordering key, and must not bill a turn that was never recorded.
+        nextSeq += 1
         leafChain.append(entry.id)
+        if case .assistant(let assistant) = message {
+            accumulatedUsage = accumulatedUsage + assistant.usage
+            recordedTurns += 1
+        }
     }
 }

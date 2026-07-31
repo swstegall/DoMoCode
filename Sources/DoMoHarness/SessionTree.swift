@@ -155,8 +155,18 @@ extension SessionStorage {
     /// `timestamp` is supplied by the caller because this layer mints ids but not
     /// clock values — the harness owns the injected clock. A non-`nil` `targetID`
     /// that names no entry throws rather than stranding the leaf on a phantom id.
+    ///
+    /// `seq` and `elapsedMs` are passed through unchanged for the same reason as
+    /// `timestamp`: this layer does not own the sequence counter (the writing
+    /// harness does) and a leaf move is not a timed turn, so both default to
+    /// `nil` and a caller that has a number supplies it.
     @discardableResult
-    public func moveLeaf(to targetID: String?, timestamp: String) throws -> String {
+    public func moveLeaf(
+        to targetID: String?,
+        timestamp: String,
+        seq: Int? = nil,
+        elapsedMs: Int? = nil
+    ) throws -> String {
         if let targetID, try entry(withID: targetID) == nil {
             throw DoMoError(.file(path: path, errno: nil), "Session entry not found: \(targetID)")
         }
@@ -165,7 +175,9 @@ extension SessionStorage {
             id: id,
             parentId: try leafID(),
             timestamp: timestamp,
-            payload: .leaf(targetId: targetID)
+            payload: .leaf(targetId: targetID),
+            seq: seq,
+            elapsedMs: elapsedMs
         )
         try appendEntry(entry)
         return id
@@ -210,8 +222,20 @@ extension JSONLSessionStore {
         // entry can be a child of a label, so removing labels without relinking
         // would orphan the tail. Each survivor's parent becomes the previous
         // survivor (nil for the first), preserving order and ids.
+        //
+        // `seq` is RENUMBERED contiguously from 0 rather than carried over,
+        // because `seq` is scoped to a session file and this is a new one: the
+        // dropped labels would leave holes, and the source path is a branch, so
+        // its numbers were never contiguous to begin with. Nothing is lost by
+        // renumbering — entry ids are preserved, so every reference into the
+        // branch still resolves and provenance survives the fork.
+        //
+        // `elapsedMs` is PRESERVED, because it is a measurement of how long the
+        // original turn actually took. It did not become untrue by being copied
+        // into another file, and it cannot be re-derived here.
         var rechained: [SessionTreeEntry] = []
         var parentID: String? = nil
+        var nextSeq = 0
         for entry in path {
             if case .label = entry.payload { continue }
             rechained.append(
@@ -219,9 +243,12 @@ extension JSONLSessionStore {
                     id: entry.id,
                     parentId: parentID,
                     timestamp: entry.timestamp,
-                    payload: entry.payload
+                    payload: entry.payload,
+                    seq: nextSeq,
+                    elapsedMs: entry.elapsedMs
                 )
             )
+            nextSeq += 1
             parentID = entry.id
         }
 

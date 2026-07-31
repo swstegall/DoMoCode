@@ -211,11 +211,59 @@ public struct SessionTreeEntry: Sendable, Hashable {
 
     public var payload: Payload
 
-    public init(id: String, parentId: String?, timestamp: String, payload: Payload) {
+    /// A 0-based ordering key, assigned by the writing harness at append time,
+    /// scoped to this session **file**.
+    ///
+    /// It exists because neither `timestamp` nor `id` can answer "how much of
+    /// this file have I already seen?" cheaply and correctly: timestamps repeat
+    /// within a millisecond and are pinned to a constant in every harness test,
+    /// and comparing UUIDv7 ids only works while nothing renumbers. A small
+    /// integer lets a reader resume mid-file and lets throughput be reported per
+    /// entry.
+    ///
+    /// It is an **ordering key, never an index or a count**. Gaps are normal and
+    /// expected: the tolerant bulk read drops a line that will not decode, a
+    /// fork renumbers the surviving path from 0, and a process can die between
+    /// minting a number and appending the entry that carries it. Indexing
+    /// `entries[entry.seq!]` is therefore wrong, and so is treating the largest
+    /// `seq` as "the number of entries".
+    ///
+    /// Uniqueness within a file is only best effort. The value is monotonic per
+    /// *writer*, and nothing in this layer prevents two writers from resuming one
+    /// file — `ServerRuntime.forceClearRun` deliberately opens a second harness
+    /// on a live session — so two entries can legitimately carry the same number.
+    ///
+    /// `nil` on every entry written before this field existed, and on any entry
+    /// whose writer did not assign one; it is not backfillable, because the
+    /// information was never recorded.
+    public var seq: Int?
+
+    /// Wall-clock milliseconds this entry's turn took, measured by the writing
+    /// harness off a monotonic clock.
+    ///
+    /// `nil` means "not measured", which is a different claim from `0`
+    /// ("measured, and it took under a millisecond") — so a consumer that wants
+    /// an average must skip `nil` rather than coalesce it. Entries that are not
+    /// the product of a timed turn (a `leaf` move, a `label`) leave it `nil`.
+    ///
+    /// Preserved verbatim across a fork: it is a real measurement of the original
+    /// turn and re-deriving it in the new file is impossible.
+    public var elapsedMs: Int?
+
+    public init(
+        id: String,
+        parentId: String?,
+        timestamp: String,
+        payload: Payload,
+        seq: Int? = nil,
+        elapsedMs: Int? = nil
+    ) {
         self.id = id
         self.parentId = parentId
         self.timestamp = timestamp
         self.payload = payload
+        self.seq = seq
+        self.elapsedMs = elapsedMs
     }
 
     /// The type-specific body of an entry.
@@ -289,6 +337,13 @@ extension SessionTreeEntry: Codable {
         case id
         case parentId
         case timestamp
+        // Envelope, added after the format shipped. This is ONE FLAT namespace
+        // shared by all seven payload shapes (`summary` and `usage` are each
+        // used by two of them, `targetId` by two), so a new envelope key has to
+        // be checked against every payload's fields, not just the envelope's:
+        // neither `seq` nor `elapsedMs` appears in any payload below.
+        case seq
+        case elapsedMs
         // Payload-specific:
         case message
         case provider
@@ -317,6 +372,14 @@ extension SessionTreeEntry: Codable {
         self.id = try container.decode(String.self, forKey: .id)
         self.parentId = try container.decodeIfPresent(String.self, forKey: .parentId)
         self.timestamp = try container.decode(String.self, forKey: .timestamp)
+        // `decodeIfPresent` so every line written before these fields existed
+        // still decodes — the same backward-compatibility move
+        // `ToolResultBlock`'s hand-written Codable makes for `images`
+        // (`Sources/DoMoLLM/Message.swift`). The encode side omits them when
+        // `nil`, so an entry that carries neither is byte-identical to what this
+        // format produced before they were added.
+        self.seq = try container.decodeIfPresent(Int.self, forKey: .seq)
+        self.elapsedMs = try container.decodeIfPresent(Int.self, forKey: .elapsedMs)
 
         switch entryType {
         case .message:
@@ -364,6 +427,14 @@ extension SessionTreeEntry: Codable {
         // distinguish "no parent" from "field forgotten".
         try container.encode(parentId, forKey: .parentId)
         try container.encode(timestamp, forKey: .timestamp)
+        // Omitted when nil, unlike `parentId` above: a missing `seq` is not a
+        // distinct state that a reader has to tell apart from anything, and
+        // omitting keeps an entry without them byte-for-byte identical to the
+        // lines already on disk. `ToolResultBlock.images` omits for the same
+        // reason; the `leaf` payload's explicit `null` targetId does not,
+        // because there "reset to before the first entry" IS a distinct state.
+        try container.encodeIfPresent(seq, forKey: .seq)
+        try container.encodeIfPresent(elapsedMs, forKey: .elapsedMs)
 
         switch payload {
         case .message(let message):

@@ -25,7 +25,72 @@ public protocol SessionMessagePersisting: Sendable {
     /// Throwing is a real disk failure — the sink cannot surface it through the
     /// non-throwing ``AgentEventSink/emit(_:)``, so it is captured instead (see
     /// ``PersistenceErrorBox``).
-    func persistMessage(_ message: Message) async throws
+    ///
+    /// - Parameter elapsedMs: How long this message took to produce, measured
+    ///   from its `messageStart` to its `messageEnd`. `nil` means **nothing was
+    ///   measured**, which is not the same as "it took no time": a caller that
+    ///   appends a message outside the event stream has no interval to report, and
+    ///   writing `0` there would be a claim about a stopwatch nobody started.
+    func persistMessage(_ message: Message, elapsedMs: Int?) async throws
+}
+
+extension SessionMessagePersisting {
+    /// The pre-timing spelling, kept because this is a public protocol and an
+    /// embedding's call sites are not ours to break. It reports no measurement,
+    /// which is exactly what a caller outside the event stream has.
+    public func persistMessage(_ message: Message) async throws {
+        try await persistMessage(message, elapsedMs: nil)
+    }
+}
+
+// MARK: - Monotonic elapsed time
+
+/// Whole milliseconds between two monotonic instants, or `nil` when the interval
+/// is not a measurement.
+///
+/// Milliseconds and not a `Duration` because this ends up in a JSON field that
+/// other tools read, and a fixed integer unit is the only shape that survives that
+/// trip unambiguously.
+///
+/// A negative interval returns `nil` rather than being floored to `0`. A
+/// `ContinuousClock` cannot run backwards, so the only way to get one is an
+/// injected clock that is not a clock — and answering `0` there would launder a
+/// broken measurement into a plausible-looking one.
+func elapsedMilliseconds(from start: ContinuousClock.Instant, to end: ContinuousClock.Instant) -> Int? {
+    let components = (end - start).components
+    let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
+    let milliseconds = components.seconds * 1_000 + components.attoseconds / attosecondsPerMillisecond
+    guard milliseconds >= 0 else { return nil }
+    return Int(clamping: milliseconds)
+}
+
+// MARK: - Message-scoped stopwatch
+
+/// The instant the message currently being assembled started.
+///
+/// A class around a `Mutex` for the same reason ``PersistenceErrorBox`` is one:
+/// ``SessionPersistenceSink`` is a `struct` and its `emit` is non-mutating, so it
+/// cannot hold the stopwatch itself. The event pairs it tracks are strictly
+/// non-overlapping — every `messageStart` is followed by its own `messageEnd`
+/// before another `messageStart`, in ``AgentLoop`` and in ``ToolDispatch`` alike,
+/// including the parallel tool path, which emits result messages serially in phase
+/// C — so a single slot is enough and a stack would be dead structure.
+private final class MessageStopwatch: Sendable {
+    private let startedAt = Mutex<ContinuousClock.Instant?>(nil)
+
+    func start(_ instant: ContinuousClock.Instant) {
+        startedAt.withLock { $0 = instant }
+    }
+
+    /// The pending start, cleared. A second `messageEnd` with no start between
+    /// them therefore measures nothing rather than re-using a stale instant.
+    func takeStart() -> ContinuousClock.Instant? {
+        startedAt.withLock { pending in
+            let taken = pending
+            pending = nil
+            return taken
+        }
+    }
 }
 
 // MARK: - Deferred-error box
@@ -71,28 +136,57 @@ public final class PersistenceErrorBox: Sendable {
 /// Persist-then-forward mirrors pi, where `appendMessage` precedes the listener
 /// dispatch for `message_end`: the durable write lands before the UI is told the
 /// message is done, so a UI that reacts by re-reading the file always sees it.
+///
+/// This is also where a message's wall time is measured, because this is the only
+/// place both ends of it are visible. The interval is **message**-scoped
+/// (`messageStart` → `messageEnd`) and not turn-scoped: the turn events are not
+/// balanced — the `maxTurns` return sits before a `turnStart`, and an aborted
+/// settle emits a `turnEnd` for an iteration whose `turnStart` never fired — so a
+/// turn-scoped stopwatch would silently mis-pair on exactly the runs whose timings
+/// matter most.
 public struct SessionPersistenceSink: AgentEventSink {
     private let persister: any SessionMessagePersisting
     private let forward: (any AgentEventSink)?
     private let errorBox: PersistenceErrorBox
 
+    /// The clock the stopwatch reads.
+    ///
+    /// Monotonic and injected, never `Configuration.now`: a `Date` delta can go
+    /// negative across an NTP step, and every harness test pins `now` to one
+    /// constant, which would make every elapsed assertion a vacuous `0`.
+    private let monotonicNow: @Sendable () -> ContinuousClock.Instant
+
+    private let stopwatch = MessageStopwatch()
+
     public init(
         persister: any SessionMessagePersisting,
         forward: (any AgentEventSink)? = nil,
-        errorBox: PersistenceErrorBox
+        errorBox: PersistenceErrorBox,
+        monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
     ) {
         self.persister = persister
         self.forward = forward
         self.errorBox = errorBox
+        self.monotonicNow = monotonicNow
     }
 
     public func emit(_ event: AgentEvent) async {
-        if case .messageEnd(let message) = event {
+        switch event {
+        case .messageStart:
+            stopwatch.start(monotonicNow())
+        case .messageEnd(let message):
+            // `nil` when no start was seen for this message — a message appended
+            // by something other than the loop is not timed, and is not claimed
+            // to have taken zero.
+            let elapsed = stopwatch.takeStart().flatMap { elapsedMilliseconds(from: $0, to: monotonicNow()) }
             do {
-                try await persister.persistMessage(message)
+                try await persister.persistMessage(message, elapsedMs: elapsed)
             } catch {
                 errorBox.recordIfFirst(error)
             }
+        case .agentStart, .agentEnd, .turnStart, .turnEnd, .messageUpdate,
+            .toolExecutionStart, .toolExecutionEnd, .notice:
+            break
         }
         await forward?.emit(event)
     }

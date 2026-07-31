@@ -38,19 +38,24 @@ private final class ScriptedResponder: Sendable {
     }
 }
 
-/// Records the message lists handed to the summarizer and returns a fixed summary.
+/// Records the message lists handed to the summarizer and returns a fixed summary,
+/// optionally with the usage a real summarization call would report.
 private final class SummarizerSpy: Sendable {
     private let calls = Mutex<[[Message]]>([])
     let text: String
+    let usage: Usage?
 
-    init(text: String) { self.text = text }
+    init(text: String, usage: Usage? = nil) {
+        self.text = text
+        self.usage = usage
+    }
 
     var recorded: [[Message]] { calls.withLock { $0 } }
 
     func fn() -> Summarizer {
         { [self] messages in
             calls.withLock { $0.append(messages) }
-            return text
+            return SummarizerResult(text: text, usage: usage)
         }
     }
 }
@@ -143,7 +148,7 @@ struct AgentHarnessTests {
         tools: [any AgentTool] = [],
         summarizer: Summarizer? = nil,
         compaction: CompactionSettings = CompactionSettings(enabled: false),
-        contextWindow: Int = 200_000,
+        contextWindow: Int? = nil,
         ids: SequentialIDs
     ) -> AgentHarness.Configuration {
         AgentHarness.Configuration(
@@ -860,6 +865,183 @@ struct AgentHarnessTests {
                 "a compaction checkpoint was written for a branch the harness is not on")
         // And its own turn really did land, as a new root.
         #expect(try await pinned.contextMessages().first == .user("fresh"))
+    }
+
+    /// ``Compaction/usage`` shipped with a doc comment saying it is "folded into
+    /// session totals" and was `nil` in every session file ever written: the harness
+    /// called `compact` without a `usage:` argument and had nothing to pass, because
+    /// the summarizer returned only prose. This is the whole point of widening it.
+    @Test("the summarizer's usage lands on the compaction entry it produced")
+    func summarizerUsageReachesTheCompactionEntry() async throws {
+        let text = String(repeating: "a", count: 40)
+        let responder = ScriptedResponder([
+            assistant(text, usageInput: 5000),
+            assistant(text, usageInput: 5000),
+            assistant(text, usageInput: 5000),
+        ])
+        let spy = SummarizerSpy(text: "SUMMARY", usage: Usage(input: 321, output: 12))
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: responder.fn(),
+                summarizer: spy.fn(),
+                compaction: CompactionSettings(enabled: true, reserveTokens: 100, keepRecentTokens: 25),
+                contextWindow: 1000,
+                ids: SequentialIDs(prefix: "cu")
+            )
+        )
+        let user = String(repeating: "b", count: 40)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+
+        let recorded = try entries(of: await harness.sessionFilePath)
+        let compactions = recorded.compactMap { entry -> Compaction? in
+            if case .compaction(let compaction) = entry.payload { return compaction }
+            return nil
+        }
+        #expect(compactions.count == 1)
+        let usage = try #require(compactions.first?.usage, "the summarization call's usage was dropped on the floor")
+        #expect(usage.input == 321)
+        #expect(usage.output == 12)
+    }
+
+    /// The harness's own fallback summarizer drains the run's `streamFn`; the
+    /// terminal assistant message it holds is the *only* place the price of that
+    /// request exists. It also has to send the shared prompt text, or a session
+    /// compacted by the CLI's small-model summarizer and one compacted here would
+    /// be asking two different questions.
+    @Test("the default summarizer sends the shared prompt text and reports the call's usage")
+    func defaultSummarizerCarriesPromptAndUsage() async throws {
+        let sawInstruction = Mutex<Bool>(false)
+        let sawSystemPrompt = Mutex<Bool>(false)
+        let text = String(repeating: "a", count: 40)
+        let streamFn: AgentStreamFn = { context in
+            let isSummarization = context.messages.contains(.user(CompactionPrompts.instruction))
+            if isSummarization {
+                sawInstruction.withLock { $0 = true }
+                sawSystemPrompt.withLock { $0 = context.systemPrompt == CompactionPrompts.system }
+                return terminalStream(AssistantMessage(
+                    content: [.text("AUTOSUMMARY")],
+                    model: "test-model",
+                    usage: Usage(input: 777),
+                    stopReason: .stop
+                ))
+            }
+            return terminalStream(AssistantMessage(
+                content: [.text(text)],
+                model: "test-model",
+                usage: Usage(input: 5000),
+                stopReason: .stop
+            ))
+        }
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: streamFn,
+                summarizer: nil,
+                compaction: CompactionSettings(enabled: true, reserveTokens: 100, keepRecentTokens: 25),
+                contextWindow: 1000,
+                ids: SequentialIDs(prefix: "ds")
+            )
+        )
+        let user = String(repeating: "b", count: 40)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+
+        let instructionSeen = sawInstruction.withLock { $0 }
+        let systemPromptSeen = sawSystemPrompt.withLock { $0 }
+        #expect(instructionSeen, "the default summarizer did not send the shared instruction")
+        #expect(systemPromptSeen, "the default summarizer did not send the shared system prompt")
+
+        let recorded = try entries(of: await harness.sessionFilePath)
+        let compaction = try #require(
+            recorded.compactMap { entry -> Compaction? in
+                if case .compaction(let compaction) = entry.payload { return compaction }
+                return nil
+            }.first
+        )
+        #expect(compaction.summary.hasPrefix("AUTOSUMMARY"))
+        #expect(compaction.usage?.input == 777, "the default summarizer reported no usage for its own call")
+    }
+
+    /// `nil` means "genuinely unknown", and an unknown window is not a reason to
+    /// let a context grow without limit — an unknown small alias would run until the
+    /// provider rejected the request. The fallback is a compaction-only safety net,
+    /// so a *known* larger window must still win over it.
+    @Test("an unknown context window compacts against the fallback, a known one against itself")
+    func unknownContextWindowUsesTheFallback() async throws {
+        func harness(window: Int?, prefix: String, spy: SummarizerSpy) throws -> AgentHarness {
+            let text = String(repeating: "a", count: 40)
+            let responder = ScriptedResponder([
+                assistant(text, usageInput: 250_000),
+                assistant(text, usageInput: 250_000),
+                assistant(text, usageInput: 250_000),
+            ])
+            return try AgentHarness.start(
+                cwd: "/work/project",
+                sessionDirectory: makeSessionDirectory(),
+                configuration: configuration(
+                    streamFn: responder.fn(),
+                    summarizer: spy.fn(),
+                    compaction: CompactionSettings(enabled: true, reserveTokens: 100, keepRecentTokens: 25),
+                    contextWindow: window,
+                    ids: SequentialIDs(prefix: prefix)
+                )
+            )
+        }
+        let user = String(repeating: "b", count: 40)
+
+        let unknownSpy = SummarizerSpy(text: "SUMMARY")
+        let unknown = try harness(window: nil, prefix: "unk", spy: unknownSpy)
+        #expect(try await unknown.accounting().contextWindow == nil,
+                "an unknown window must not be reported as a number")
+        _ = try await unknown.run(prompt: user)
+        _ = try await unknown.run(prompt: user)
+        _ = try await unknown.run(prompt: user)
+        #expect(!unknownSpy.recorded.isEmpty, "an unknown window let the context grow unbounded")
+
+        // 250K of context is comfortably inside a declared 1M window, so the same
+        // session must NOT compact — proving the fallback is a fallback and not a
+        // constant the check always uses.
+        let knownSpy = SummarizerSpy(text: "SUMMARY")
+        let known = try harness(window: 1_000_000, prefix: "kno", spy: knownSpy)
+        _ = try await known.run(prompt: user)
+        _ = try await known.run(prompt: user)
+        _ = try await known.run(prompt: user)
+        #expect(knownSpy.recorded.isEmpty, "a declared window was overruled by the fallback")
+    }
+
+    /// The shipped defaults (16384 + 20000) already exceed a 32K window, which made
+    /// `shouldCompact` fire and `prepareCompaction` then return `nil` — the run
+    /// proceeding over-full, with no entry written and nothing said.
+    @Test("a window the compaction budgets would swallow clamps them; a roomy one does not")
+    func compactionBudgetsAreClampedToTheWindow() {
+        let stream: AgentStreamFn = { _ in AsyncThrowingStream { $0.finish() } }
+        // The premise, asserted rather than assumed.
+        #expect(CompactionSettings.default.reserveTokens + CompactionSettings.default.keepRecentTokens > 32_000)
+
+        let small = AgentHarness.Configuration(
+            model: "m",
+            streamFn: stream,
+            compaction: .default,
+            contextWindow: 32_000
+        )
+        #expect(small.compaction.reserveTokens + small.compaction.keepRecentTokens <= 16_000)
+        #expect(small.compaction.reserveTokens > 0)
+        #expect(small.compaction.keepRecentTokens > 0)
+        #expect(small.compaction.enabled)
+
+        let roomy = AgentHarness.Configuration(
+            model: "m",
+            streamFn: stream,
+            compaction: .default,
+            contextWindow: 200_000
+        )
+        #expect(roomy.compaction == CompactionSettings.default, "a window with room to spare must change nothing")
     }
 
     @Test("compaction does not fire when disabled even over a tiny window")

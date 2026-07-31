@@ -140,8 +140,13 @@ public func makeBranchSummaryEntry(
 ///
 /// With nothing selected — an empty branch, or one that projected to no messages —
 /// the summarizer is not called and a fixed "No content to summarize" entry is
-/// written, matching pi and sparing a pointless model round-trip. A summarizer
-/// that throws propagates unchanged.
+/// written, matching pi and sparing a pointless model round-trip. That entry
+/// carries only the caller's `usage`, because no call was made to measure. A
+/// summarizer that throws propagates unchanged.
+///
+/// - Parameter usage: An accounting override, with the same precedence as
+///   ``compact(_:id:parentId:timestamp:usage:summarize:)``: `nil` means "use what
+///   the summarizer reported", a value wins over it.
 public func summarizeBranch(
     _ preparation: BranchPreparation,
     fromId: String,
@@ -155,14 +160,14 @@ public func summarizeBranch(
         let branch = BranchSummary(fromId: fromId, summary: "No content to summarize", usage: usage)
         return SessionTreeEntry(id: id, parentId: parentId, timestamp: timestamp, payload: .branchSummary(branch))
     }
-    let summary = try await summarize(preparation.messages)
+    let summarized = try await summarize(preparation.messages)
     return makeBranchSummaryEntry(
         from: preparation,
         fromId: fromId,
         id: id,
         parentId: parentId,
         timestamp: timestamp,
-        summary: summary,
-        usage: usage
+        summary: summarized.text,
+        usage: usage ?? summarized.usage
     )
 }

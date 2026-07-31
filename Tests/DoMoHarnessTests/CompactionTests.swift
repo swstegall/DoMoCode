@@ -96,21 +96,21 @@ struct CompactionTests {
         #expect(estimate.lastUsageIndex == nil)
     }
 
-    @Test("getLastAssistantUsage returns the most recent valid assistant usage")
-    func lastAssistantUsage() {
-        let entries = [
-            entry(.message(assistant(totalTokens: 100)), id: "a", parent: nil),
-            entry(.message(user(chars: 10)), id: "b", parent: "a"),
-            entry(.message(assistant(totalTokens: 300)), id: "c", parent: "b"),
-            entry(.message(assistant(totalTokens: 999, stopReason: .error)), id: "d", parent: "c"),
+    /// The entries-shaped `getLastAssistantUsage` that used to live here had no
+    /// caller in any target and was deleted in Phase 5a rather than left dead for a
+    /// second phase. `estimateContextTokens` performs the same anchoring over
+    /// messages, and that is what the harness has always actually used.
+    @Test("estimateContextTokens anchors on the most recent valid assistant usage, skipping failures")
+    func anchorSkipsFailedTurns() {
+        let messages = [
+            assistant(totalTokens: 100),
+            user(chars: 10),
+            assistant(totalTokens: 300),
+            assistant(totalTokens: 999, stopReason: .error),
         ]
-        #expect(getLastAssistantUsage(entries)?.totalTokens == 300)
-    }
-
-    @Test("getLastAssistantUsage is nil when no assistant turn carries usage")
-    func lastAssistantUsageNone() {
-        let entries = [entry(.message(user(chars: 10)), id: "a", parent: nil)]
-        #expect(getLastAssistantUsage(entries) == nil)
+        let estimate = estimateContextTokens(messages)
+        #expect(estimate.usageTokens == 300)
+        #expect(estimate.lastUsageIndex == 2)
     }
 
     // MARK: - Threshold
@@ -316,7 +316,7 @@ struct CompactionTests {
             id: "comp",
             parentId: path.last?.id,
             timestamp: "2026-07-23T12:00:00.000Z"
-        ) { _ in "SHORT SUMMARY" }
+        ) { _ in SummarizerResult(text: "SHORT SUMMARY") }
 
         guard case .compaction(let compaction) = built.payload else {
             Issue.record("expected a compaction payload")
@@ -362,7 +362,7 @@ struct CompactionTests {
                 }
             }
             await cap.mark(hit)
-            return "NEW SUMMARY"
+            return SummarizerResult(text: "NEW SUMMARY")
         }
         #expect(await cap.seen, "prior summary must be handed to the summarizer")
     }
@@ -376,7 +376,7 @@ struct CompactionTests {
         let box = Box()
         _ = try await compact(prep, id: "c", parentId: nil, timestamp: "t") { messages in
             await box.set(messages.count)
-            return "S"
+            return SummarizerResult(text: "S")
         }
         #expect(await box.count == prep.messagesToSummarize.count)
     }
@@ -389,5 +389,234 @@ struct CompactionTests {
         await #expect(throws: Boom.self) {
             _ = try await compact(prep, id: "c", parentId: nil, timestamp: "t") { _ in throw Boom() }
         }
+    }
+
+    // MARK: - Summarization usage
+
+    /// The whole reason ``Summarizer`` returns a value instead of a `String`: this
+    /// is the only path by which ``Compaction/usage`` — documented as "folded into
+    /// session totals" — can ever be non-nil.
+    @Test("compact carries the summarizer's reported usage onto the entry")
+    func summarizerUsageReachesTheEntry() async throws {
+        let path = alternatingPath(count: 12)
+        let prep = try #require(prepareCompaction(pathEntries: path, settings: CompactionSettings(keepRecentTokens: 30)))
+        let built = try await compact(prep, id: "c", parentId: nil, timestamp: "t") { _ in
+            SummarizerResult(text: "S", usage: Usage(input: 40, output: 7))
+        }
+        guard case .compaction(let compaction) = built.payload else {
+            Issue.record("expected a compaction payload")
+            return
+        }
+        #expect(compaction.usage?.input == 40)
+        #expect(compaction.usage?.output == 7)
+    }
+
+    @Test("an explicit usage argument wins over the summarizer's own report")
+    func explicitUsageOverridesTheSummarizer() async throws {
+        let path = alternatingPath(count: 12)
+        let prep = try #require(prepareCompaction(pathEntries: path, settings: CompactionSettings(keepRecentTokens: 30)))
+        let built = try await compact(
+            prep,
+            id: "c",
+            parentId: nil,
+            timestamp: "t",
+            usage: Usage(input: 999)
+        ) { _ in SummarizerResult(text: "S", usage: Usage(input: 40)) }
+        guard case .compaction(let compaction) = built.payload else {
+            Issue.record("expected a compaction payload")
+            return
+        }
+        #expect(compaction.usage?.input == 999)
+    }
+
+    @Test("a summarizer that reports nothing leaves usage nil rather than zero")
+    func unmeasuredSummarizerLeavesUsageNil() async throws {
+        let path = alternatingPath(count: 12)
+        let prep = try #require(prepareCompaction(pathEntries: path, settings: CompactionSettings(keepRecentTokens: 30)))
+        let built = try await compact(prep, id: "c", parentId: nil, timestamp: "t") { _ in
+            SummarizerResult(text: "S")
+        }
+        guard case .compaction(let compaction) = built.payload else {
+            Issue.record("expected a compaction payload")
+            return
+        }
+        #expect(compaction.usage == nil, "\"not measured\" was recorded as a measurement of zero")
+    }
+
+    // MARK: - Prompts
+
+    /// Moved verbatim out of `AgentHarness` so a CLI-built small-model summarizer
+    /// and the harness fallback ask the same question. A prompt that drifted between
+    /// them would summarize the same conversation two different ways depending on
+    /// which component happened to make the call.
+    @Test("the prior-summary preamble names the standing summary and carries it whole")
+    func priorSummaryPreambleWrapsThePrevious() {
+        let wrapped = CompactionPrompts.priorSummaryPreamble("EARLIER STORY")
+        #expect(wrapped.hasSuffix("EARLIER STORY"))
+        #expect(wrapped.contains("running summary of the conversation before this point"))
+        #expect(wrapped.contains("Fold it into the new summary so nothing it records is lost:"))
+        // The preamble ends its own sentence on its own line, so the previous
+        // summary never runs into it.
+        #expect(wrapped.hasPrefix("The following"))
+        #expect(wrapped.contains("lost:\nEARLIER STORY"))
+    }
+
+    @Test("the summarization prompts are non-empty and distinct")
+    func promptsAreDistinct() {
+        #expect(CompactionPrompts.system.contains("summarizing a conversation"))
+        #expect(CompactionPrompts.instruction.contains("Summarize the conversation so far"))
+        #expect(CompactionPrompts.system != CompactionPrompts.instruction)
+    }
+
+    // MARK: - Settings decoding
+
+    /// The synthesized decoder required all three keys, so the most natural thing a
+    /// user could write was a hard parse failure of the whole settings file.
+    @Test("a partial settings object decodes, filling the rest from the defaults")
+    func partialSettingsDecode() throws {
+        let decoder = JSONDecoder()
+        let onlyEnabled = try decoder.decode(CompactionSettings.self, from: Data(#"{"enabled": false}"#.utf8))
+        #expect(onlyEnabled.enabled == false)
+        #expect(onlyEnabled.reserveTokens == CompactionSettings.default.reserveTokens)
+        #expect(onlyEnabled.keepRecentTokens == CompactionSettings.default.keepRecentTokens)
+
+        let empty = try decoder.decode(CompactionSettings.self, from: Data("{}".utf8))
+        #expect(empty == CompactionSettings.default)
+
+        let onlyReserve = try decoder.decode(CompactionSettings.self, from: Data(#"{"reserveTokens": 42}"#.utf8))
+        #expect(onlyReserve.reserveTokens == 42)
+        #expect(onlyReserve.enabled)
+    }
+
+    @Test("settings round-trip through the wire format")
+    func settingsRoundTrip() throws {
+        let original = CompactionSettings(enabled: false, reserveTokens: 11, keepRecentTokens: 22)
+        let decoded = try JSONDecoder().decode(
+            CompactionSettings.self,
+            from: try JSONEncoder().encode(original)
+        )
+        #expect(decoded == original)
+    }
+
+    @Test("a negative budget is rejected by the decoder rather than silently corrected")
+    func negativeBudgetsRejected() {
+        let decoder = JSONDecoder()
+        #expect(throws: DecodingError.self) {
+            try decoder.decode(CompactionSettings.self, from: Data(#"{"reserveTokens": -1}"#.utf8))
+        }
+        #expect(throws: DecodingError.self) {
+            try decoder.decode(CompactionSettings.self, from: Data(#"{"keepRecentTokens": -1}"#.utf8))
+        }
+        #expect(throws: DecodingError.self) {
+            try decoder.decode(CompactionOverrides.self, from: Data(#"{"reserveTokens": -5}"#.utf8))
+        }
+        #expect(throws: DecodingError.self) {
+            try decoder.decode(CompactionOverrides.self, from: Data(#"{"keepRecentTokens": -5}"#.utf8))
+        }
+    }
+
+    /// The memberwise initializer cannot throw, and a negative reserve is not merely
+    /// odd — it pushes the trigger threshold above the window, so compaction never
+    /// fires at all.
+    @Test("the memberwise initializer clamps a negative budget to zero")
+    func memberwiseClampsNegatives() {
+        let settings = CompactionSettings(reserveTokens: -100, keepRecentTokens: -1)
+        #expect(settings.reserveTokens == 0)
+        #expect(settings.keepRecentTokens == 0)
+    }
+
+    // MARK: - Overrides
+
+    @Test("overrides replace only the fields they state")
+    func overridesApplySelectively() {
+        let base = CompactionSettings(enabled: true, reserveTokens: 100, keepRecentTokens: 200)
+        #expect(CompactionOverrides(enabled: false).applied(to: base)
+            == CompactionSettings(enabled: false, reserveTokens: 100, keepRecentTokens: 200))
+        #expect(CompactionOverrides(reserveTokens: 7).applied(to: base)
+            == CompactionSettings(enabled: true, reserveTokens: 7, keepRecentTokens: 200))
+        #expect(CompactionOverrides().applied(to: base) == base)
+        // `model` has no home on the settings value and must not disturb it.
+        #expect(CompactionOverrides(model: "cheap").applied(to: base) == base)
+    }
+
+    @Test("merging overrides is field by field, with the stronger layer winning per field")
+    func overridesMergeFieldByField() {
+        let user = CompactionOverrides(enabled: true, reserveTokens: 100, keepRecentTokens: 200, model: "user-model")
+        let project = CompactionOverrides(keepRecentTokens: 999)
+        let merged = project.merged(over: user)
+        #expect(merged.keepRecentTokens == 999, "the stronger layer's own field did not win")
+        #expect(merged.enabled == true, "a field the stronger layer is silent about was discarded")
+        #expect(merged.reserveTokens == 100)
+        #expect(merged.model == "user-model", "a whole-entry replacement swallowed the weaker layer's model")
+    }
+
+    @Test("an override decodes from a partial object and round-trips")
+    func overridesDecode() throws {
+        let decoded = try JSONDecoder().decode(
+            CompactionOverrides.self,
+            from: Data(#"{"keepRecentTokens": 5, "model": "small"}"#.utf8)
+        )
+        #expect(decoded.keepRecentTokens == 5)
+        #expect(decoded.model == "small")
+        #expect(decoded.enabled == nil, "an absent key decoded as a stated one")
+        #expect(decoded.reserveTokens == nil)
+
+        let round = try JSONDecoder().decode(
+            CompactionOverrides.self,
+            from: try JSONEncoder().encode(decoded)
+        )
+        #expect(round == decoded)
+    }
+
+    // MARK: - Clamping the budgets to the window
+
+    /// The shipped defaults already exceed a 32K window, which is what made
+    /// `shouldCompact` fire and `prepareCompaction` then find nothing to summarize —
+    /// a run proceeding over-full, silently.
+    @Test("budgets that claim more than half the window are scaled down, keeping their ratio")
+    func clampScalesOversizedBudgets() {
+        let clamped = CompactionSettings.default.clamped(toContextWindow: 32_000)
+        #expect(clamped.reserveTokens + clamped.keepRecentTokens <= 16_000)
+        #expect(clamped.reserveTokens > 0)
+        #expect(clamped.keepRecentTokens > 0)
+        // The ratio survives: the reserve was the smaller of the two and stays so.
+        #expect(clamped.reserveTokens < clamped.keepRecentTokens)
+        #expect(clamped.enabled == CompactionSettings.default.enabled)
+    }
+
+    @Test("budgets that already fit are returned untouched, and clamping twice changes nothing")
+    func clampIsIdentityWhenItFitsAndIsIdempotent() {
+        #expect(CompactionSettings.default.clamped(toContextWindow: 200_000) == CompactionSettings.default)
+        let once = CompactionSettings.default.clamped(toContextWindow: 32_000)
+        #expect(once.clamped(toContextWindow: 32_000) == once)
+        // A non-positive window carries no information to clamp against.
+        #expect(CompactionSettings.default.clamped(toContextWindow: 0) == CompactionSettings.default)
+        #expect(CompactionSettings.default.clamped(toContextWindow: -1) == CompactionSettings.default)
+    }
+
+    @Test("clamping survives budgets whose sum does not fit in an Int")
+    func clampSurvivesOverflow() {
+        let absurd = CompactionSettings(reserveTokens: .max, keepRecentTokens: .max)
+        let clamped = absurd.clamped(toContextWindow: 1000)
+        #expect(clamped.reserveTokens + clamped.keepRecentTokens == 500)
+    }
+
+    /// The point of clamping, stated as behaviour rather than as arithmetic: with
+    /// the raw budgets the recent window covers the entire history, so nothing is
+    /// old enough to summarize and `prepareCompaction` returns `nil` — compaction
+    /// fires, writes nothing, and says nothing.
+    @Test("clamping is what lets a small window's compaction select anything at all")
+    func clampingMakesPreparationPossible() throws {
+        let path = alternatingPath(count: 40)
+        let window = 400
+        let raw = CompactionSettings(reserveTokens: 200, keepRecentTokens: 500)
+        #expect(prepareCompaction(pathEntries: path, settings: raw) == nil,
+                "the premise changed: the raw budgets no longer swallow this history")
+
+        let clamped = raw.clamped(toContextWindow: window)
+        #expect(clamped.reserveTokens + clamped.keepRecentTokens <= window / 2)
+        let prep = try #require(prepareCompaction(pathEntries: path, settings: clamped))
+        #expect(!prep.messagesToSummarize.isEmpty)
+        #expect(!prep.retainedTail.isEmpty)
     }
 }

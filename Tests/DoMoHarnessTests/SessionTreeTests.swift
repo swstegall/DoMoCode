@@ -159,8 +159,17 @@ struct SessionTreeTests {
         #expect(entries[1].parentId == a)
         #expect(entries[2].parentId == b)
 
-        // The source file is untouched by the fork.
-        #expect(try source.readEntries().count == 4)
+        // The re-chain also numbers the new file: `seq` is per session FILE, so
+        // a fork starts at 0 and runs contiguously over the survivors. The
+        // source-already-numbered and elapsedMs-preserved cases live in
+        // `SessionSequencingTests`.
+        #expect(entries.map(\.seq) == [0, 1, 2])
+
+        // The source file is untouched by the fork — including its (absent)
+        // numbering, which the fork must not write back.
+        let sourceEntries = try source.readEntries()
+        #expect(sourceEntries.count == 4)
+        #expect(sourceEntries.map(\.seq) == [nil, nil, nil, nil])
     }
 
     @Test("createBranchedSession throws on an unknown leaf id")

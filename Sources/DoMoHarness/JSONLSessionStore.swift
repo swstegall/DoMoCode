@@ -207,6 +207,78 @@ public struct JSONLSessionStore: SessionStorage {
         return path
     }
 
+    // MARK: - Sequence seeding
+
+    /// The ``SessionTreeEntry/seq`` a writer should give the next entry it
+    /// appends to this file.
+    ///
+    /// Two paths, and the second one is the whole reason this is a method rather
+    /// than a call to `readEntries().count`:
+    ///
+    /// - If **any** entry already carries a `seq`, the answer is the largest one
+    ///   plus one. Largest rather than last, because a fork renumbers and a
+    ///   second writer can interleave, so the final line is not reliably the
+    ///   highest.
+    /// - Otherwise the file predates the field entirely and there is nothing to
+    ///   continue from, so the count of **raw** newline-delimited non-blank
+    ///   lines (less one for the header) is used. That is deliberately not the
+    ///   number of entries ``readEntries(onSkippedLine:)`` returns:
+    ///   that read is tolerant and silently drops a malformed or
+    ///   crash-truncated line, so seeding from it would under-count and the
+    ///   first new entry would reuse a number that a line still on disk already
+    ///   spent.
+    ///
+    /// Over-counting is the safe direction and is chosen on purpose. The result
+    /// is a seed, not a guarantee: `seq` is only best-effort unique per file
+    /// (see ``SessionTreeEntry/seq``), and a caller that appends without
+    /// re-seeding is responsible for incrementing its own copy.
+    ///
+    /// The "less one for the header" adjustment assumes the file's first line is
+    /// the header, which is true of any store obtained from ``create(cwd:sessionDirectory:sessionID:parentSession:permissions:now:entryIDFactory:)``
+    /// or ``open(path:permissions:now:entryIDFactory:)`` — both of which have
+    /// already parsed it.
+    public func nextSequenceNumber() throws -> Int {
+        var highest: Int? = nil
+        for entry in try readEntries() {
+            guard let seq = entry.seq else { continue }
+            if let current = highest {
+                highest = Swift.max(current, seq)
+            } else {
+                highest = seq
+            }
+        }
+        if let highest { return highest + 1 }
+        return try Self.rawEntryLineCount(of: path)
+    }
+
+    /// Counts the file's non-blank newline-delimited lines and subtracts the
+    /// header, without decoding any of them.
+    ///
+    /// Blank lines are excluded because the reader skips them too, so they are
+    /// not entries; a trailing fragment with no newline after it *is* counted,
+    /// because that is exactly the crash-truncated entry whose number must not
+    /// be handed out twice.
+    private static func rawEntryLineCount(of path: FilePath) throws -> Int {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path.string)) else {
+            throw DoMoError(.file(path: path, errno: nil), "Session file not found: \(path.string)")
+        }
+        defer { try? handle.close() }
+        var lines = 0
+        var lineHasContent = false
+        while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
+            for byte in chunk {
+                if byte == 0x0A {
+                    if lineHasContent { lines += 1 }
+                    lineHasContent = false
+                } else if !(byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)) {
+                    lineHasContent = true
+                }
+            }
+        }
+        if lineHasContent { lines += 1 }
+        return Swift.max(0, lines - 1)
+    }
+
     // MARK: - Append
 
     public func appendEntry(_ entry: SessionTreeEntry) throws {
