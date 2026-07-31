@@ -64,16 +64,35 @@ final class MockGateway: @unchecked Sendable {
     /// surface renders the right advice for the wrong-credential case.
     private let refusal: (status: Int, reason: String, body: String)?
 
+    /// How many completion requests are still to be refused. `nil` refuses every
+    /// one of them, which is the original behavior.
+    ///
+    /// A finite count is what lets a test exercise RECOVERY rather than failure:
+    /// a retryable status that clears on the next attempt is the whole premise of
+    /// the retry loop, and refusing forever can only ever prove the giving-up
+    /// path. A refused attempt deliberately does not consume a
+    /// `chatCompletionBodies` entry — the retry re-sends the same request, so it
+    /// must be answered by the same scripted body.
+    private var refusalsRemaining: Int?
+
+    /// Index of the next `chatCompletionBodies` entry to serve. Distinct from
+    /// `served`, which counts every request including `GET /models` and refusals.
+    private var bodyIndex = 0
+
     /// - Parameter chatCompletionBodies: the SSE body for each successive
     ///   `chat/completions` request, `data:`-framed and `[DONE]`-terminated.
-    /// - Parameter refuseWith: answer every completion request with this HTTP
-    ///   status and JSON body instead of a stream.
+    /// - Parameter refuseWith: answer completion requests with this HTTP status
+    ///   and JSON body instead of a stream.
+    /// - Parameter refusalLimit: how many requests to refuse before serving
+    ///   normally. `nil` refuses all of them.
     init(
         chatCompletionBodies: [String],
-        refuseWith refusal: (status: Int, reason: String, body: String)? = nil
+        refuseWith refusal: (status: Int, reason: String, body: String)? = nil,
+        refusalLimit: Int? = nil
     ) throws {
         self.chatBodies = chatCompletionBodies
         self.refusal = refusal
+        self.refusalsRemaining = refusalLimit
 
         let fd = socket(AF_INET, streamSocketType, 0)
         guard fd >= 0 else { throw MockGatewayError("socket() failed: \(errno)") }
@@ -184,19 +203,33 @@ final class MockGateway: @unchecked Sendable {
 
         guard let request = readRequest(fd) else { return }
 
+        let isModelCatalog = request.method == "GET" && request.path.contains("models")
+
         lock.lock()
         recorded.append(request)
-        let index = served
         served += 1
+        // Decide refuse-vs-serve and claim the body index under the same lock, so
+        // two concurrent attempts cannot both be handed the same scripted body.
+        var refuseThis = false
+        var index = 0
+        if !isModelCatalog {
+            if refusal != nil, (refusalsRemaining ?? 1) > 0 {
+                refuseThis = true
+                if let remaining = refusalsRemaining { refusalsRemaining = remaining - 1 }
+            } else {
+                index = bodyIndex
+                bodyIndex += 1
+            }
+        }
         lock.unlock()
 
         let response: [UInt8]
-        if request.method == "GET", request.path.contains("models") {
+        if isModelCatalog {
             response = Self.httpResponse(
                 contentType: "application/json",
                 body: Array(#"{"object":"list","data":[{"id":"mock-model","object":"model","owned_by":"openai"}]}"#.utf8)
             )
-        } else if let refusal {
+        } else if refuseThis, let refusal {
             response = Self.errorResponse(
                 status: refusal.status,
                 reason: refusal.reason,

@@ -182,7 +182,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
     @Option(
         name: .customLong("url"),
-        help: "Attach the full-screen client to an existing `domo serve` at this base URL (e.g. http://127.0.0.1:4100) instead of spawning a local server."
+        help: "Attach the full-screen client to an existing `domo --serve` at this base URL (e.g. http://127.0.0.1:4100) instead of spawning a local server."
     )
     public var serverURL: String?
 
@@ -303,7 +303,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // No `-p`: run interactively. The full-screen two-pane client is the
         // default (it drives a loopback runtime over the same HTTP/SSE surface a
         // remote one would); `--inline` selects the classic inline REPL, and
-        // `--url` attaches the client to an already-running `domo serve`. The live
+        // `--url` attaches the client to an already-running `domo --serve`. The live
         // terminal collaborators are assembled on the main actor so the
         // non-`Sendable` output target never crosses an isolation boundary.
         guard let prompt, !prompt.isEmpty else {
@@ -506,7 +506,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // advertises the real port the OS assigned rather than the literal 0.
         do {
             try await server.run(onReady: { boundPort in
-                Self.writeStderr("domo serve — listening on http://127.0.0.1:\(boundPort) (loopback only)\n")
+                Self.writeStderr("domo --serve — listening on http://127.0.0.1:\(boundPort) (loopback only)\n")
             })
         } catch {
             await mcpManager.shutdown()
@@ -576,7 +576,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     /// Run the default interactive experience — the two-pane full-screen client.
     ///
     /// Remote transport either way: with `--url` it attaches to an already-running
-    /// `domo serve`; otherwise it spawns a loopback ``DoMoServer`` on an ephemeral
+    /// `domo --serve`; otherwise it spawns a loopback ``DoMoServer`` on an ephemeral
     /// port (the real port comes back through `onReady`, so no port guessing) and
     /// drives that. The spawned server is torn down when the client returns. The
     /// terminal collaborators are assembled here on the main actor, exactly as the

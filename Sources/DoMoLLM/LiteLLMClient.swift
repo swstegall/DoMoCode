@@ -172,6 +172,26 @@ public struct LiteLLMClient: Sendable {
         /// Overall per-request deadline. `nil` uses the transport's default.
         public var timeout: Duration?
 
+        /// How long a committed response body may deliver nothing before the
+        /// stream is failed. `nil` uses the transport's default.
+        ///
+        /// This is the bound behind `DOMOCODE_STREAM_TIMEOUT_MS`. It only takes
+        /// effect for a client that builds its own transport — injecting one
+        /// means the caller has already chosen its timeouts, and this is then
+        /// ignored rather than silently overriding them.
+        ///
+        /// Three states, not two: `nil` is "no preference, use the transport's
+        /// default", and **`.zero` is the disable sentinel** — no silence bound
+        /// at all, leaving ``timeout`` as the only limit. `.zero` is never
+        /// enforced literally; see ``AsyncHTTPClientTransport/idleWindow(for:)``.
+        ///
+        /// Note that this is a *silence* budget, not a time-to-first-token
+        /// budget: a 2xx commits the stream, so exceeding it fails the turn
+        /// rather than retrying it. Tightening it trades a hung turn for a lost
+        /// one, which is why the default matches the transport's two minutes
+        /// rather than something eager.
+        public var streamIdleTimeout: Duration?
+
         /// The backoff sleeper, injectable so tests do not pay real wall-clock
         /// time. Throwing (e.g. on cancellation) aborts the retry.
         public var sleep: @Sendable (Duration) async throws -> Void
@@ -188,8 +208,10 @@ public struct LiteLLMClient: Sendable {
             retryDelayBudget: Duration? = .seconds(300),
             jitter: @escaping @Sendable () -> Double = { Double.random(in: Configuration.defaultJitterRange) },
             timeout: Duration? = nil,
+            streamIdleTimeout: Duration? = nil,
             sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
         ) {
+            self.streamIdleTimeout = streamIdleTimeout
             self.baseURL = baseURL
             self.apiKey = apiKey
             self.authHeaderName = authHeaderName
@@ -290,12 +312,21 @@ public struct LiteLLMClient: Sendable {
     public let configuration: Configuration
     private let transport: any StreamingTransport
 
+    /// - Parameter transport: the transport to use. `nil` builds the default
+    ///   one, honouring ``Configuration/streamIdleTimeout``. Pass a transport
+    ///   explicitly and it is used as given: a caller that constructed one has
+    ///   already chosen its bounds, and overriding them from configuration
+    ///   would make an injected fake behave unlike the thing it replaces.
     public init(
         configuration: Configuration = Configuration(),
-        transport: any StreamingTransport = AsyncHTTPClientTransport()
+        transport: (any StreamingTransport)? = nil
     ) {
         self.configuration = configuration
-        self.transport = transport
+        self.transport =
+            transport
+            ?? AsyncHTTPClientTransport(
+                idleTimeout: configuration.streamIdleTimeout ?? AsyncHTTPClientTransport.defaultIdleTimeout
+            )
     }
 
     // MARK: Streaming completion
@@ -891,6 +922,24 @@ extension LiteLLMClient {
         }
         if let domo = error as? DoMoError {
             return domo
+        }
+        // `HTTPClient.shared` is built from AsyncHTTPClient's singleton
+        // configuration, which hard-codes a 90-second idle READ timeout that runs
+        // through body streaming and cannot be reconfigured. It fires ahead of
+        // this package's own idle guard for any silence budget at or above 90s —
+        // including the 120s default — and surfaces as the bare enum name
+        // `readTimeout`, which tells a user nothing. Say what happened, and say
+        // which knob does and does not reach it.
+        if String(describing: error).contains("readTimeout") {
+            return DoMoError(
+                .transport,
+                """
+                The model stream went quiet for 90 seconds and the connection was dropped. \
+                That 90-second limit belongs to the HTTP client and cannot be changed; \
+                DOMOCODE_STREAM_TIMEOUT_MS only takes effect below it.
+                """,
+                cause: error
+            )
         }
         return DoMoError(.transport, DoMoError.truncating(String(describing: error)), cause: error)
     }

@@ -195,6 +195,47 @@ struct StreamIdleGuardTests {
         // is not a false positive.
         #expect(AsyncHTTPClientTransport.defaultIdleTimeout == .seconds(120))
     }
+
+    // MARK: Disabling the silence bound
+
+    @Test("A nil idle window lets a silent stream run to the overall deadline")
+    func nilIdleDisablesTheSilenceCheck() async throws {
+        // What `DOMOCODE_STREAM_TIMEOUT_MS=0` resolves to. The stream must NOT be
+        // cut at a silence boundary — only the overall deadline may end it.
+        let upstream = AsyncThrowingStream<[UInt8], any Error> { continuation in
+            continuation.yield(Array("data: a\n\n".utf8))
+            // Then silence, forever, with the socket still open.
+        }
+
+        let start = ContinuousClock.now
+        let result = await drain(idleGuarded(upstream, idle: nil, overall: .milliseconds(400)))
+        let elapsed = ContinuousClock.now - start
+
+        #expect(result.chunks.count == 1)
+        let error = try #require(result.error as? DoMoError)
+        #expect(error.kind == .transport)
+        // The message must name the deadline that actually fired. With the silence
+        // bound expressed as `idle == overall` instead of nil, the idle branch wins
+        // the tick and tells an operator who DISABLED it that it fired.
+        #expect(
+            error.message.contains("deadline"),
+            "disabled silence bound reported as a stall: \(error.message)")
+        #expect(!error.message.contains("no data for"))
+        #expect(elapsed >= .milliseconds(400))
+    }
+
+    @Test("A zero idle timeout on the transport means disabled, never fail-instantly")
+    func zeroIdleTimeoutIsTheDisableSentinel() async throws {
+        // The sentinel's meaning lives in `AsyncHTTPClientTransport.execute`, so a
+        // resolver-level assertion cannot see it: deleting the reinterpretation
+        // leaves every configuration test green while every request fails
+        // milliseconds after the response head. This pins the mapping itself.
+        let disabled = AsyncHTTPClientTransport(idleTimeout: .zero)
+        #expect(disabled.idleWindow(for: .seconds(600)) == nil)
+
+        let normal = AsyncHTTPClientTransport(idleTimeout: .seconds(45))
+        #expect(normal.idleWindow(for: .seconds(600)) == .seconds(45))
+    }
 }
 
 /// A `Sendable` one-shot flag for observing an `onTermination` callback.

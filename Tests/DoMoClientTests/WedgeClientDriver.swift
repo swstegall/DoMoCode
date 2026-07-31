@@ -220,6 +220,24 @@ final class WedgeClient {
         return seen.contains(needle)
     }
 
+    /// Poll until `needle` is no longer on the CURRENT screen.
+    ///
+    /// The counterpart to ``wait(for:timeout:)``: that one proves a message was
+    /// shown at some point, this one proves it stopped being shown. Pair them to
+    /// pin a transient message that must both appear and then go away for a
+    /// reason other than its own expiry timer.
+    @discardableResult
+    func waitUntilGone(_ needle: String, timeout: Duration = .seconds(15)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            poll()
+            if !joined().contains(needle) { return true }
+            try? await Task.sleep(for: .milliseconds(40))
+        }
+        poll()
+        return !joined().contains(needle)
+    }
+
     /// Poll until every watched needle has appeared at least once.
     @discardableResult
     func waitForAll(timeout: Duration = .seconds(25)) async -> Bool {

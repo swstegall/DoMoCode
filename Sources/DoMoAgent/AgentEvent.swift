@@ -127,6 +127,33 @@ public struct AgentNotice: Sendable, Hashable {
     }
 }
 
+extension AgentNotice {
+
+    /// The notice form of a retry the LLM client is about to perform.
+    ///
+    /// `warning`, not `error`: the turn has not failed — it is being waited out,
+    /// and a consumer that treats `error` as "this run is over" would be wrong.
+    /// The distinction is load-bearing downstream, where `error` is the door to
+    /// a *permanent* transcript row and `warning` is the transient-status door.
+    ///
+    /// `text` is deliberately ``DoMoLLM/RetryNotice/summary`` and nothing else:
+    /// it is composed entirely of program-controlled parts, so it is safe to put
+    /// straight onto a status line. The provider's own words go in `detail`,
+    /// where a consumer that renders them knows to sanitize first.
+    ///
+    /// `ttl` is the backoff itself, which makes the notice stop being true at
+    /// exactly the moment the next attempt begins.
+    public init(_ retry: RetryNotice) {
+        self.init(
+            level: .warning,
+            code: "retry",
+            text: retry.summary,
+            detail: retry.message.isEmpty ? nil : retry.message,
+            ttl: retry.delay
+        )
+    }
+}
+
 /// A `JSONValue` wrapper so ``AgentEvent`` stays `Hashable`.
 ///
 /// `JSONValue` is already `Hashable`; this box exists only to keep the argument

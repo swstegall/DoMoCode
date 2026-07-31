@@ -11,19 +11,32 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 
 ---
 
-## Status: Phases 0–4, 5.5, and 6 shipped; rest of the expansion planned
+## Status: the port is finished; the harness is being built out
 
-**The runtime, the inline terminal UI, image input, and the headless HTTP/SSE server are implemented
-and tested** — Phases 0–4 plus 5.5 and 6, with 1,116 tests green in both debug and `-c release`.
-Everything else tagged **Phase 5 and beyond** — the rest of the polish pass, the full-screen TUI, MCP,
-and image *display* — is a statement of intent and a plan of record, tagged with the phase that will
-deliver it and described in the future tense until it lands. Read the [roadmap](#roadmap) for the
-boundary between what runs today and what is planned.
+**The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine
+and the MCP client are implemented and tested** — Phases 0–4, 5.5, 6, 7, 7.5, 8 and the 8.5 hardening
+pass — with **2,017 tests in 237 suites green in both debug and `-c release`**.
+`domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
+`--inline` is the classic scrollback REPL; `-p` is headless.
 
-DoMoCode began as a deliberately **narrowed** port; the
-[scope expansion](#what-expanded-and-what-did-not) has since widened it in four directions while keeping
-the core constraints intact. See [Non-goals](#non-goals-and-known-gaps) for what is still left out on
-purpose.
+**Every phase of the pi port has shipped except one, and what is left after it is not port work at
+all — it is the difference between a correct harness and one you would reach for daily.** The
+exception is Phase 5, the polish pass, whose contents are squarely pi features and which never
+started: the default client has no slash commands at all, and skills, `AGENTS.md` loading, themes,
+external-editor handoff, session-tree navigation and in-session model switching do not exist. Beyond
+it,
+[a second survey of the sibling harnesses](#sibling-harnesses-and-prior-art) found **706 distinct
+capabilities DoMoCode does not have** — subagents, checkpoints and undo, a diff review pane, plan mode,
+LSP diagnostics, sandboxing. The [roadmap](#roadmap) now sequences them.
+
+The goal has changed accordingly. DoMoCode began as a deliberately **narrowed** port; the
+[first scope expansion](#what-expanded-and-what-did-not) widened it in four directions, all of which
+shipped. The aim now is a **fully-featured terminal harness** — no compromises on capability, with the
+remaining constraints (Swift 6.2, SwiftPM-only, macOS/Linux, one LiteLLM gateway) treated as facts
+about *how* a feature gets built wherever that is possible. A handful genuinely cannot survive them,
+and those are named rather than quietly dropped. Six reversals of a stated
+non-goal are called out in the roadmap rather than assumed; see
+[Non-goals](#non-goals-and-known-gaps).
 
 ## Why this exists
 
@@ -63,38 +76,37 @@ agent loop means auditing every `await`.
 ### What expanded, and what did not
 
 DoMoCode began as a deliberately *narrowed* pi port, and for the runtime that framing still holds. But
-the scope has been widened on purpose, in four directions its founding thesis ruled out, and this README
-no longer pretends otherwise. DoMoCode is growing:
+the scope was widened on purpose, in four directions its founding thesis ruled out, and this README no
+longer pretends otherwise. DoMoCode grew:
 
 1. **A full-screen, alternate-screen TUI** — a widget-toolkit UI in the manner of Claude Code, opencode,
-   or kilocode — added *alongside* the inline renderer, not replacing it.
-2. **A client/server split** — the agent runtime moves behind a local HTTP + Server-Sent-Events server,
-   and the terminal becomes a client that attaches to it.
-3. **MCP** — a Model Context Protocol client, stdio-local first, so external tool servers can extend the
-   agent.
+   or kilocode — added *alongside* the inline renderer, not replacing it. It is now the default mode.
+2. **A client/server split** — the agent runtime moved behind a local HTTP + Server-Sent-Events server,
+   and the terminal became a client that attaches to it.
+3. **MCP** — a Model Context Protocol client, stdio-local, so external tool servers can extend the
+   agent. It is hand-rolled rather than SDK-based; see the [dependency table](#dependencies).
 4. **Inline images** — terminal graphics (Kitty/iTerm2) for display, plus image *input* to
    vision-capable models through the gateway.
 
 What did **not** expand is the load-bearing part. The constants are the three constraints above — one
 LiteLLM gateway (still no client-side multi-provider layer), Swift Package Manager only, and strict
 Swift 6.2 concurrency — plus macOS-and-Linux and a single-user, local posture. The honest reading is
-that "a port that implies parity will disappoint" now cuts both ways: DoMoCode is taking on a real slice
+that "a port that implies parity will disappoint" now cuts both ways: DoMoCode took on a real slice
 of the sibling-scale surface it once bounded out, and each reversal carries a named cost
-([Non-goals](#non-goals-and-known-gaps)) rather than arriving free. All four are future work, sequenced
-in the [roadmap](#roadmap); the runtime they build on (Phases 0–4) already exists.
+([Non-goals](#non-goals-and-known-gaps)) rather than arriving free. All four have shipped, in the order
+the [roadmap](#roadmap) records.
 
 ## Architecture
 
 Package name `DoMoCode`; executable target and installed command `domo`.
 
-The Phases 0–4 design is a single process: a headless runtime with every I/O concern injected, bound to
-an inline terminal client on the main actor. The expansion splits that seam onto a local socket. Three
+The Phases 0–4 design was a single process: a headless runtime with every I/O concern injected, bound to
+an inline terminal client on the main actor. The expansion split that seam onto a local socket. Three
 layers result — a **runtime** (unchanged, because it was already event-sink-driven and owned by a
 persistence actor), a **server** that hosts it behind HTTP+SSE, and a **client** that attaches over the
 wire. The split is CQRS-shaped: the write path (`POST /session/:id/prompt`) drives the `AgentHarness`
-actor that already owns the session tree; the read path (`GET /event`) is an SSE broadcast hub fed by the
-same `AgentEventSink` the runtime already emits to. Modules tagged *(planned)* below are the expansion;
-the rest ship today.
+actor that already owns the session tree; the read path (`GET /session/:id/events`) is an SSE broadcast
+hub fed by the same `AgentEventSink` the runtime already emits to. Every module below ships today.
 
 ```
 Sources/
@@ -107,31 +119,38 @@ Sources/
   DoMoAgent/        The pure agent loop: turn structure, tool dispatch, steering and follow-up
                     queues, the awaited event sink. No I/O, no persistence — so it is cheap to test.
   DoMoHarness/      Session tree, JSONL storage, context building, compaction, branch summaries,
-                    skills and prompt templates, hooks.
+                    hooks. (Skills and prompt templates land here in Phase 5; they do not exist yet.)
   DoMoExec/         FileSystem + Shell over swift-subprocess; gitignore walker; path sandboxing;
-                    per-path file mutation coordinator.
+                    per-path file mutation coordinator; image-attachment loading.
   DoMoTools/        The built-in tools (read/write/edit/bash/grep/find/ls), headless by design.
-  DoMoMCP/          (planned) MCP client: an McpManager actor owning stdio server connections plus
-                    an McpTool adapter — the seam that makes the fixed tool set dynamic. Peer of DoMoLLM.
+  DoMoPermissions/  The granular allow/ask/deny engine: glob matching, last-match-wins evaluation,
+                    the bash arity table, the .env guard, the config self-edit guard, an actor that
+                    remembers and persists grants, and the beforeToolCall hook that gates the loop.
+  DoMoMCP/          MCP client: an MCPManager actor owning stdio server subprocesses, a JSON-RPC 2.0
+                    protocol actor, and an McpTool: AgentTool adapter. Hand-rolled, no SDK.
 
   # The server — hosts the runtime behind a local socket
-  DoMoServer/       (planned) Hummingbird HTTP+SSE. Write path drives the AgentHarness actor; read
-                    path is an SSE broadcast hub. Loopback-only bind, per-session token.
+  DoMoServer/       Hummingbird HTTP+SSE. Write path drives the AgentHarness actor; read path is an
+                    SSE broadcast hub. Loopback-only bind, per-session token. Also owns the wire
+                    DTOs (ServerEvent, ServerNotice) that the client decodes.
 
   # The terminal client
   DoMoTermIO/       The POSIX seam. The only module that imports Darwin/Glibc: termios raw mode,
-                    TIOCGWINSZ, SIGWINCH, the stdin byte pump, panic-safe restore.
-                    (planned) alternate-screen enter/exit; image-capability probe.
-  DoMoTUI/          Inline (non-alternate-screen) differential renderer, Component protocol,
+                    TIOCGWINSZ, SIGWINCH, the stdin byte pump, panic-safe restore, alternate-screen
+                    enter/exit, mouse reporting, and the cell-pixel-size probe.
+  DoMoTUI/          Both renderers. Inline: the differential scrollback renderer, Component protocol,
                     overlays, multi-line Editor, keybindings, ANSI/display-width text engine.
-  DoMoTUIKit/       (planned) the full-screen (alternate-screen) layer: a box/flexbox-lite layout
-                    engine and a fixed-height cell-buffer compositor reusing DoMoTUI's frame
-                    differ; panes, splits, footer/sidebar, focus traversal.
-  DoMoTermGraphics/ (planned) UI-agnostic Kitty/iTerm2 image encoders and header-only dimension
-                    parsers, shared by both render modes.
+                    Full-screen: AltScreenCore + CellBuffer (absolute-CUP cell compositor), the
+                    flexbox-lite LayoutNode tree, FocusRing, and ScreenSurface. Both conform to one
+                    TerminalApp protocol, so one TerminalDriver drives either.
+  DoMoTermGraphics/ UI-agnostic Kitty/iTerm2 image encoders, capability detection, and header-only
+                    dimension parsers, shared by both render modes.
   DoMoToolsUI/      Renderers for the built-in tools, reattached at composition time.
-  DoMoCLI/          Modes (interactive/print/json), the SSE client that attaches to DoMoServer, and
-                    `domo serve`; settings, project trust, resource loading, slash commands, wiring.
+  DoMoClient/       The full-screen client: the AsyncHTTPClient REST + SSE transport, an EventStore
+                    that folds the delta-only stream into a normalized transcript, the two-pane UI,
+                    scrolling, selection and clipboard, prompt history, and the approval modal.
+  DoMoCLI/          Modes (full-screen/inline/print/json) and `--serve`; settings, project trust,
+                    permission setup, MCP wiring, and composition.
   domo/             The executable. ArgumentParser root plus DoMoCLI.run().
 ```
 
@@ -139,16 +158,18 @@ Sources/
 
 | pi package | DoMoCode module(s) | Notes |
 |---|---|---|
-| `@earendil-works/pi-tui` | `DoMoTermIO` + `DoMoTUI` (+ `DoMoTUIKit`, `DoMoTermGraphics`) | Split in two. TermIO owns terminal state (`terminal.ts`, `stdin-buffer.ts`); TUI owns the diff renderer, components, and the width/ANSI engine (`tui.ts`, `keys.ts`, `keybindings.ts`, `utils.ts`, `fuzzy.ts`, `autocomplete.ts`, `kill-ring.ts`, `undo-stack.ts`, `word-navigation.ts`, `components/`). The Windows shims are dropped. Unlike pi, which never takes the alternate screen, DoMoCode *adds* a full-screen alt-screen mode (`DoMoTUIKit`) beside the inline renderer; inline images (`terminal-image.ts`) are now a goal (`DoMoTermGraphics`), not dropped. |
+| `@earendil-works/pi-tui` | `DoMoTermIO` + `DoMoTUI` (+ `DoMoTermGraphics`) | Split in two. TermIO owns terminal state (`terminal.ts`, `stdin-buffer.ts`); TUI owns the diff renderer, components, and the width/ANSI engine (`tui.ts`, `keys.ts`, `keybindings.ts`, `utils.ts`, `fuzzy.ts`, `autocomplete.ts`, `kill-ring.ts`, `undo-stack.ts`, `word-navigation.ts`, `components/`). The Windows shims are dropped. Unlike pi, which never takes the alternate screen, DoMoCode *added* a full-screen alt-screen mode beside the inline renderer — it lives inside `DoMoTUI`, not in a separate module. Inline images (`terminal-image.ts`) are ported into `DoMoTermGraphics` rather than dropped. |
 | `@earendil-works/pi-ai` | `DoMoLLM` | Radically narrowed. Keeps the *shapes* — `Context`, `AssistantMessage`, `Usage`, `StopReason` — plus the streaming tool-call assembler, retry/overflow classifiers, and cost math. Drops 37 providers, 9 wire APIs, OAuth, and the generated model catalog. |
 | `@earendil-works/pi-agent-core` (`agent-loop.ts`, `types.ts`) | `DoMoAgent` | Ported structurally: turn loop, stop conditions, three-phase tool dispatch, parallel-vs-sequential execution, truncated-tool-call refusal, steering queues. |
 | `@earendil-works/pi-agent-core` (`harness/`) | `DoMoHarness` | Session tree, storage, `buildContext`, compaction, branch summarization, hooks. |
 | `@earendil-works/pi-agent-core` (`env/nodejs.ts`) | `DoMoExec` | Protocol-based FileSystem and Shell with a single POSIX implementation. |
 | `@earendil-works/pi-coding-agent` (`core/tools/`) | `DoMoTools` + `DoMoToolsUI` | The built-in tools, split headless/rendered. |
-| `@earendil-works/pi-coding-agent` (rest) | `DoMoCLI` | Session orchestration, settings, trust, slash commands, output modes. |
-| `@earendil-works/pi-storage-sqlite-node` | `DoMoHarness` protocol; SQLite backend deferred | JSONL is the shipping default; the `SessionStorage` seam exists from Phase 3. |
-| `@earendil-works/pi-server` | `DoMoServer` (planned) | No longer a non-goal. Narrowed hard: a *local, loopback-only, single-client-first* HTTP/SSE server (Hummingbird), modeled on opencode's `server.ts`/`event.ts`. Multi-instance supervision, mDNS discovery, and cloud presence stay out. |
-| *(no upstream — pi has no MCP)* | `DoMoMCP` (planned) | Original to DoMoCode, not derived from pi. An MCP client (stdio-local first), modeled on opencode's/kilocode's `mcp/`. |
+| `@earendil-works/pi-coding-agent` (rest) | `DoMoCLI` | Session orchestration, settings, trust, output modes. Slash commands are a Phase-5 item and are still a three-name stub. |
+| `@earendil-works/pi-storage-sqlite-node` | `DoMoHarness` protocol; SQLite backend deferred | JSONL is the shipping default and the only implementation; the `SessionStorage` seam exists from Phase 3. |
+| `@earendil-works/pi-server` | `DoMoServer` | No longer a non-goal. Narrowed hard: a *local, loopback-only* HTTP/SSE server (Hummingbird), modeled on opencode's `server.ts`/`event.ts`. Multi-instance supervision, mDNS discovery, and cloud presence stay out. |
+| *(no upstream — pi has no MCP)* | `DoMoMCP` | Original to DoMoCode, not derived from pi. A hand-rolled stdio MCP client, modeled on opencode's/kilocode's `mcp/`. |
+| *(no upstream — pi has no permission engine)* | `DoMoPermissions` | **Not from pi.** Eight of its thirteen files are ports carrying opencode's copyright, two of those also kilocode's; see [NOTICES.md](NOTICES.md#other-prior-art) for the per-file record. |
+| *(no upstream — pi has no client/server split)* | `DoMoClient` | Original to DoMoCode. The full-screen terminal client; only the retained-cell-buffer + flexbox *design* is borrowed from OpenTUI, never code. |
 
 ### Concurrency and isolation
 
@@ -195,17 +216,20 @@ the render loop — because a stuck agent loop is far easier to read in a backtr
 names; and `DoMoTermIO`'s platform imports are a three-way `Darwin` / `Glibc` / `Musl` shim from the
 start, so the Static Linux SDK can produce a fully static binary without retrofitting.
 
-**The client/server split moves two mechanisms across a socket.** The runtime itself does not change in
-isolation terms — it is already `nonisolated` / `@concurrent`-at-the-seams with a single `AgentHarness`
-actor — and `DoMoServer` is `nonisolated`, running on NIO's event loops, while `DoMoTUI`'s `MainActor`
-default stays entirely on the *client* side of the wire. But two invariants are genuinely weakened, and
-the rewrite names them rather than hiding them. First, `AgentEventSink.emit` is *awaited* today: the run
-does not advance until every listener has accepted each event. Over a socket that guarantee is unsafe —
-one hung client would stall the agent loop — so the network fan-out sink becomes fire-and-forget with a
-per-subscriber buffer and an explicit slow-client policy (drop-oldest, then disconnect), while the
-durable persistence sink stays awaited. Second, the `Mutex`-guarded steering box stops being an
-in-process lock and becomes a client→server request drained at the next steering poll. Both are real
-losses of a documented property, accepted for the split; see [Non-goals](#non-goals-and-known-gaps).
+**The client/server split cost two mechanisms.** The runtime itself did not change in isolation terms —
+it was already `nonisolated` / `@concurrent`-at-the-seams with a single `AgentHarness` actor — and
+`DoMoServer` is `nonisolated`, running on NIO's event loops, while `DoMoTUI`'s `MainActor` default stays
+entirely on the *client* side of the wire. But two invariants are genuinely weakened, and this names them
+rather than hiding them. First, `AgentEventSink.emit` is *awaited* in-process: the run does not advance
+until every listener has accepted each event. Over a socket that guarantee is unsafe — one hung client
+would stall the agent loop — so the network fan-out sink is fire-and-forget with a per-subscriber
+bounded buffer and a drop-oldest policy, while the durable persistence sink stays awaited. A client that
+misses frames re-seeds its transcript from `GET /session/:id/messages` on reconnect rather than replaying
+the gap. Second, **mid-run steering did not survive the split.** In-process, the `Mutex`-guarded steering
+box lets a second prompt join a running turn; the server-hosted harness disables steering outright and
+answers a prompt sent during a run with HTTP 409, which the client surfaces as a notice and restores into
+the input box. Steering therefore works under `--inline` and not under the default client. Both are real
+losses of a documented property; see [Non-goals](#non-goals-and-known-gaps).
 
 Deliberately *not* adopted: `Span`, `RawSpan`, `UTF8Span`, and `InlineArray`. They are the right shape
 for the escape decoder and for grapheme-cluster width measurement, but every standard-library API that
@@ -252,18 +276,68 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       driver, `DoMoToolsUI` tool renderers, and the interactive REPL. *Exit met:* `domo` with no
       `-p` is an interactive session with streaming output, `@` file completion, Escape-to-abort, and
       Enter to queue a follow-up; three end-to-end tests drive the real REPL headlessly against a mock
-      gateway. 1059 tests, green in both configurations.
-- [ ] **Phase 5 — Polish.** Slash commands, `!` shell commands, skills, prompt templates,
-      `AGENTS.md` loading, themes, external editor, session tree navigation, model cycling.
-      Refinements taken from the [sibling harnesses](#sibling-harnesses-and-prior-art):
-      `$ARGUMENTS`/`$N` and inline `` !`shell` `` substitution in command and prompt templates,
-      with per-command model and agent overrides; keyword-triggered skill auto-injection and
-      task-input `{VAR}` templates; opencode's ANSI-index / `none`-means-inherit theme model with
-      dark/light variants (exactly right for an inline renderer painting over an arbitrary
-      background); a local `/review` of a diff, branch, or commit; and an inline fuzzy command
-      menu with an on-demand cheat-sheet printed into scrollback — the flat, remappable subset of
-      a command palette that needs no overlay panel. Ships the in-process interactive path to a
-      genuinely useful state *before* the architecture pivot begins.
+      gateway. 1059 tests, green in both configurations. (That REPL is `domo --inline` today — Phase 7
+      moved the no-flag default to the full-screen client, which has no `@` completion of its own.)
+- [ ] **Phase 5 — Polish.** The oldest unstarted phase — planned before the architecture pivot, and a
+      prerequisite for roughly half of everything after it. It was sequenced *before* the architecture pivot and was overtaken by it,
+      so what exists today is substrate rather than feature: `SlashCommand` + `SlashCommandProvider`
+      and a fuzzy completion popup are built and tested, but dispatch is a hard-coded three-name
+      `switch` in the `--inline` REPL and the default client has none at all; `ToolRenderTheme` /
+      `SelectListTheme` / `EditorTheme` are styling seams with presets nothing can select; the session
+      **tree** exists in the harness and over REST, and the sidebar draws a flat list that never calls
+      it; `model_change` session entries round-trip through the context builder and compactor and
+      nothing ever writes one; `Yams` is declared for skill frontmatter that was never written. Split
+      into four, the way Phase 8 was.
+
+      **5a — Truth and plumbing.** Several shipped subsystems report numbers that are structurally
+      wrong: cost is always zero because `rates:` is never passed to a single production call site,
+      and the context window is a hardcoded 200k guess that is wrong for every non-frontier alias
+      behind the proxy. This makes the existing system honest and gives the dead substrate a caller —
+      `modelOverrides` per alias (context window, cost rates, reasoning efforts) threaded to all three
+      `streamCompletion` sites; LiteLLM's `x-litellm-response-cost` header read into `Usage`;
+      compaction settings made configurable at all; `smallModel` wired to a real summarizer, making
+      the documented "dedicated compaction model" true; `{env:}`/`{file:}` config resolution; a shared
+      secret-redaction module; structured config errors with line, column and caret; a cross-process
+      lock on the settings read-modify-write, which can lose a concurrent grant today. Two items here
+      **cannot be backfilled** — per-turn `elapsedMs` and a monotonic `seq` on session entries — so
+      every file written before them is permanently unable to report throughput or support
+      incremental catch-up. *Exit:* a footer can be fed a real token count, cost and context
+      percentage, and a malformed `settings.json` names the offending line and key instead of
+      aborting the run.
+
+      **5b — The command layer.** The two seams the rest of the roadmap leans on hardest: a composable
+      `SystemPromptBuilder` (base → `SYSTEM.md` → `AGENTS.md`/`CLAUDE.md` ancestor walk → available
+      skills → cwd) and one `CommandDescriptor` registry served to both surfaces over `GET /commands`,
+      so they cannot drift. On top of them: markdown-plus-frontmatter commands and skills with a
+      permissive parser so Claude Code files load unmodified, `.claude/skills` and `.agents/skills`
+      read in place rather than migrated, the full template grammar (`$ARGUMENTS`, `$N` with
+      last-slurps-remainder, `${1:-default}`, `@file` inclusion, trust-gated inline `` !`shell` ``),
+      per-command model and reasoning overrides, keyword-triggered skills, and `/init` and `/review`
+      shipped as built-in templates rather than special-cased code. *Exit:* dropping
+      `.domocode/commands/review.md` into a repo produces a working `/review` in both surfaces, and an
+      `AGENTS.md` at the root visibly changes the system prompt.
+
+      **5c — Dialogs, themes, and the client's missing hands.** The largest single chunk of Phase 5.
+      One reusable dialog vocabulary (`select`/`confirm`/`input`/`form`/`editor` as async overlays,
+      with a dialog stack and focus save/restore), proven by refactoring the existing permission modal
+      onto it; a `Theme` value type with hex / ANSI-index / `none`-means-inherit and dark-light
+      variants; and then both spent on the pickers users expect — command palette, `@` completion in
+      the client, model picker writing the first real `model_change`, `/tree` with filter modes,
+      folding, labels and branch summaries (giving the already-written `summarizeBranch` a caller),
+      session picker with search, rename and LLM auto-titling, `$EDITOR` handoff around the alt
+      screen, and a footer showing cwd, branch, tokens, cost and context percentage. *Exit:* in the
+      default client a user can theme it, switch models, search and rename sessions, navigate and
+      branch the tree, and read a footer whose numbers are derived rather than guessed.
+
+      **5d — Terminal-native polish.** Kitty keyboard protocol negotiation with a `modifyOtherKeys`
+      fallback, restoring Shift+Enter (the decoder already carries a `kittyProtocolActive`
+      parameter, threaded through every internal call site and exercised by tests, that no production
+      code path ever sets to `true` — the handshake that would set it is what is missing); exit-time stdin drain so key-release escapes do not leak into the
+      parent shell; focus tracking; OS notifications via OSC 777 / Kitty OSC 99 written straight down
+      the tty, which works unchanged over SSH; terminal title and OSC 9;4 progress, both registered in
+      the crash-safe teardown; OSC 8 hyperlinks; clipboard image paste. *Exit:* Shift+Enter works, a
+      finished run notifies only when you have tabbed away, and quitting — including crashing — always
+      leaves the terminal clean.
 - [x] **Phase 5.5 — Inline images, the input half.** `ContentBlock.image(ImageBlock)` and an
       `image_url` data-URL wire encoding for image-bearing *user* turns (assistant turns stay
       plain-string, since some models mirror a content-part array back as garbage). Images a *tool*
@@ -287,60 +361,331 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       fan-out-buffered, drop-oldest, so one stuck client cannot stall the loop); REST over
       `AgentHarness`/`JSONLSessionStore` (`POST /session/{id}/prompt` → 202, list / messages /
       children / abort / fork, resume by id); loopback-only bind + a constant-time bearer token;
-      `domo serve`. *Exit met:* an in-process end-to-end test stands the server up and drives it with
+      `domo --serve`. *Exit met:* an in-process end-to-end test stands the server up and drives it with
       a real HTTP client — create → SSE subscribe → prompt → assert the event frames → transcript
       persisted and read back → fork → 401/404 — and a three-lens adversarial review's findings
       (unbounded SSE buffer, error-swallowing that dropped the terminal frame, live-session
-      overwrite, arbitrary-path resume) were fixed. **Single loopback client only**; local
-      interactive/`-p` stays in-process; multi-client mirroring waits on Phase 7. 1,116 tests green
-      in debug and release.
-- [ ] **Phase 7 — Full-screen widget TUI** (built in-house — there is no OpenTUI-equivalent in
-      Swift). `DoMoTermIO` gains alternate-screen enter/exit (`CSI ?1049h/l`) with crash-safe
-      restore; a new `DoMoTUIKit` module adds a box/flexbox-lite layout solver above the existing
-      1-D `Component` protocol, a fixed-height cell-buffer compositor reusing `RenderCore`'s frame
-      differ, and pane/split/footer/sidebar containers with focus traversal; a new full-screen
-      screen-state test oracle (no upstream oracle exists). `DoMoCLI` grows the SSE client + a small
-      normalized event store so the full-screen TUI renders from the server stream with
-      random-access repaint. *Exit:* a full-screen TUI attaches over SSE, renders a session, survives
-      resize, and restores the terminal cleanly on crash — **inline mode stays first-class for piped
-      and `-p` output.** This is the single largest net-new subsystem in the project.
-- [ ] **Phase 7.5 — Inline images, the display half.** Port pi's `terminal-image.ts` into
-      `DoMoTermGraphics` (Kitty/iTerm2 encoders, header-only dimension parsers, cell-pixel-size
-      query) with two placement adapters — scrollback spacers for inline, absolute-cell Kitty
-      virtual placements for full-screen — plus the Kitty-ID free-and-repaint bookkeeping. *Exit:*
-      images render in both modes on Kitty/iTerm2 and degrade to a text placeholder under
-      tmux/screen. Sequenced after Phase 7 because placement forks on the render mode.
-- [ ] **Phase 8 — Permission engine, then MCP.** Land the granular allow/ask/deny permission engine
-      *first* (the binary project-trust gate is too coarse to gate arbitrary tool execution and the
-      prompt-injection surface MCP introduces). Then `DoMoMCP` via the official
-      `modelcontextprotocol/swift-sdk`: an `McpManager` actor, **stdio transport, tools only, no
-      OAuth**, namespaced tool discovery, an `McpTool: AgentTool` adapter, and the fixed tool set
-      made dynamic with a per-turn snapshot. *Exit:* a stdio MCP server's tools appear namespaced in
-      the agent's tool set, gated by allow/ask/deny and snapshot-stable within a turn. Remote
-      transports and OAuth are explicitly a later, separately-scoped reversal.
-- [ ] **Later (unscheduled).** Multi-client attach / session mirroring; remote MCP + OAuth (PKCE +
-      dynamic client registration + loopback callback); SQLite/GRDB storage behind the existing
-      `SessionStorage` protocol; the remaining
-      [sibling-harness candidates](#sibling-harnesses-and-prior-art) (git-shadow checkpoints,
-      headless `domo run`, agent personas, per-task budget cap, first-party tool additions, …); and
-      sixel.
+      overwrite, arbitrary-path resume) were fixed. **Single-client-first** — the broadcast hub takes
+      N subscribers and nothing rejects a second one, but the mirroring semantics that would make that
+      safe are unscheduled; `-p` stays in-process. 1,116 tests green in debug and release. The REST surface has since grown
+      `/permission`, `/permissions` (Phase 8b) and `/status`, `/force-clear` (Phase 8.5).
+- [x] **Phase 7 — Full-screen widget TUI**, built in-house across four sub-phases (there is no
+      OpenTUI-equivalent in Swift). **7a:** alternate-screen enter/exit (`CSI ?1049h/l`) with
+      crash-safe restore, plus `AltScreenCore` — a `RenderCore` sibling that paints by absolute `CUP`
+      and never scrolls — over a `CellBuffer`. **7b:** the flexbox-lite `LayoutNode` tree
+      (`Row`/`Column`/`Fixed`/`Flexible`/`FlexSpacer`, deterministic remainder split, and a
+      `ComponentBox` adapter that lifts the existing 1-D `Component` protocol into 2-D). **7c:** the
+      interactive layer — `FocusRing` (Tab-order traversal, an invariant the inline model never
+      needed), `ScreenSurface` (the full-screen analogue of `TUI`), a `TerminalApp` protocol both
+      conform to so *one* `TerminalDriver` drives either, and the overlay geometry solver extracted
+      for sharing (inline behavior proven byte-identical). **7d:** a new `DoMoClient` target — not
+      `DoMoTUIKit`, which was planned and never built, and not inside `DoMoCLI` as first sketched:
+      an AsyncHTTPClient REST + SSE transport, an `EventStore` that folds the delta-only stream into
+      a normalized transcript, and the two-pane sidebar/transcript/status/prompt UI. *Exit met:* the
+      client attaches over SSE, renders a live session, and survives resize, all asserted against the
+      SwiftTerm cell-grid oracle driving the real client against a real in-process server; terminal
+      restore is an `atexit` + `SIGINT`/`SIGTERM`/`SIGHUP` handler replaying a preallocated exit
+      sequence, covered by byte-composition and real-pty tests but not by a kill-mid-session test.
+      **Inline mode stayed first-class** and `-p` still pipes. 1,193 tests green in debug and release.
+- [x] **Phase 7.5 — Inline images, the display half.** `DoMoTermGraphics` is a faithful port of pi's
+      `terminal-image.ts` (Kitty `APC f=100` and iTerm2 `OSC 1337` encoders, env-based capability
+      detection, header-only PNG/JPEG/GIF/WebP dimension parsers plus a BMP reader pi does not have,
+      cell sizing), fed by a `TIOCGWINSZ` cell-pixel-size probe. Both renderers learned to place images: the inline
+      `RenderCore` treats an escape as an opaque image line and reserves `r` rows, while the
+      full-screen `AltScreenCore` keeps a separate per-column image layer with its own diff — novel
+      work, since pi is inline-only. Two protocol facts were byte-verified against upstream and are
+      load-bearing: inline layout is **protocol-specific** (Kitty draws escape-first holding the
+      cursor; iTerm2 reserves with blank lines and draws on the last row after `ESC[{rows-1}A`), and
+      Kitty `f=100` is **PNG-only**, so a non-PNG returns nil and the caller shows the text fallback.
+      *Exit met:* images render in the full-screen client and the inline REPL on Kitty and iTerm2 and
+      degrade to a text placeholder under tmux/screen; print mode emits images only on a graphics tty
+      in `.text` mode, so piped and `--json` output stay byte-clean rather than gaining a placeholder.
+      1,253 tests green in debug and release.
+- [x] **Phase 8 — Permission engine, then MCP**, across four sub-phases. **8a:** `DoMoPermissions` —
+      allow/ask/deny with glob matching and last-match-wins evaluation (ported from opencode and
+      checked against its test corpus), kilocode's base-vs-saved layering so a config `deny` beats a
+      broad in-session grant, a 136-entry bash arity table so an "always" grant is scoped to a command
+      prefix rather than to `bash`, a `.env` read guard, and a config self-edit guard that forces a
+      prompt for any write, edit, or bash command touching the settings or trust file. Grants persist
+      into the user's `settings.json` through an order-preserving rewrite. The gate is the agent
+      loop's pre-existing `beforeToolCall` hook, so one seam covers every surface: the inline REPL
+      raises a capturing modal, and headless `-p` refuses with a model-visible reason unless `--yolo`.
+      **8b:** the server/client round-trip — `permission_request` on the SSE stream,
+      `POST /session/:id/permission` to answer, `permission_resolved` broadcast, and
+      `GET /session/:id/permissions` to reconcile a prompt missed while disconnected. **8c:**
+      `DoMoMCP` — **hand-rolled, not the official Swift SDK** (whose stdio transport does not spawn
+      the subprocess and which pins `swift-docc-plugin` to a git branch): one persistent subprocess
+      per server over newline-delimited JSON-RPC 2.0, **stdio only, tools only, no OAuth**, paginated
+      discovery, namespaced `server_tool` names de-collided against each other and against the
+      built-ins, and an `McpTool: AgentTool` adapter. **8d:** integration and hardening — a `deny`
+      rule *hides* an MCP tool from the model rather than merely blocking it (in both the tool array
+      and the system-prompt tool list), a malformed schema drops the tool, LLM credentials are
+      scrubbed from each child's environment, the system prompt carries a standing prompt-injection
+      caveat, and teardown signals the child's process group directly, which fixed a real
+      descendant leak. *Exit met, with one deviation:* MCP tools appear namespaced and gated, proven
+      end-to-end through the compiled binary, and an untrusted project never spawns its servers — but
+      the **per-turn tool-set snapshot did not ship**. The tool set is built once at startup and is
+      immutable for the run, so a `tools/list_changed` notification cannot take effect until restart.
+      1,340 tests green in debug and release.
+- [x] **Phase 8.5 — Hardening and quality of life** (unplanned; driven by using the thing). Two
+      efforts. First, a **defect sweep of the shipped full-screen client**: its root cause was that
+      `runClient` built a default `TerminalLifecycle`, so the client *never entered the alternate
+      screen* and painted absolute-CUP frames onto the normal buffer — every real scroll desynchronised
+      later repaints. The alt-screen requirement now lives with the UI. Alongside it: pre-existing
+      sessions were inert (the client never resumed them server-side), a dead SSE stream was permanent
+      and silent (now bounded-backoff reconnect with a transcript re-seed), model and tool text
+      reached the frame with control characters intact (`ESC[2J` wiped the page), tool calls gained
+      spinner/⏳/✓/✗ state with an argument summary, and "allow always" stopped granting `*` on every
+      path. Second, a **quality-of-life pass**: in-app selection and right-click copy (OSC 52 with
+      tmux passthrough, plus `pbcopy`/`wl-copy`/`xclip`), mouse-wheel and PgUp/PgDn scrolling, `F8`
+      and `--no-mouse` to hand the pointer back to the terminal, drag-and-drop image paths as prompt
+      attachments, a multi-line prompt that grows and scrolls, per-workspace persistent prompt
+      history, a real error surface (a classified notice channel, a persistent transcript row, `^O`
+      to expand), retries widened to ten attempts with a sleep budget, and `--max-turns` made
+      **unlimited by default in every mode**, guarded instead by a no-progress runaway detector.
+      The load-bearing fix underneath: `AsyncHTTPClient`'s request timeout covers only
+      time-to-response-head, so a gateway that sent headers and then stalled hung a turn forever and
+      held the session's run slot — streamed bodies are now idle-guarded, with `GET /session/:id/status`,
+      `POST /session/:id/force-clear` and a `^G` diagnostics panel as the escape hatch. Both efforts
+      were reviewed adversarially, and each review was followed by a second one aimed at the *fixes* —
+      which found about as many real problems as the review of the original code. That is the durable
+      lesson of this phase: review the fix, not just the defect. 1,995 tests green in debug and release.
+- [ ] **Phase 9 — Steering, queues, and run control.** Restores what the client/server split took
+      away: mid-run steering does not survive Phase 6, so a prompt sent during a run gets a 409 in the
+      default surface while `--inline` still has it. `SteeringBox` lifts into `DoMoHarness`, held
+      per-session on `ServerRuntime`, with `POST /session/:id/steer`, a `queue_update` frame, and the
+      client's 409 branch becoming an enqueue. Plus delivery modes (`all` vs one-at-a-time), a
+      `maxCostPerRun` budget cap with its own exit code, and the doom-loop guard escalated into a
+      permission request instead of a silent settle — the `doom_loop` key is already reserved in the
+      ruleset vocabulary and means nothing today. Small phase, outsized effect, and it must precede
+      background subagents, which need somewhere to inject a finished child's result. *Exit:* typing
+      while the agent works queues instead of erroring.
+- [ ] **Phase 10 — Context engineering.** Compaction ships and works; the machinery around it is thin.
+      There is no overflow recovery, so an alias resolving to a 32k upstream kills a turn on a session
+      DoMoCode believes is half full. 5a supplies the real window; this spends it — compact-and-retry
+      once with a per-turn latch, cross-provider overflow detection including silent and truncation
+      overflow, a cumulative file manifest carried across compactions, deterministic conversation serialization
+      for the summarizer (halves the bill and stops the model continuing the task), tool-output
+      pruning at context-build time, spill-to-disk for oversized output, and `/compact` and
+      `/context`. *Exit:* a long session against a small-context alias recovers instead of dying, and
+      the meter says `?` when it genuinely does not know.
+- [ ] **Phase 11 — Mutable tool set, and the tool suite.** The seam phase. Making tool resolution a
+      per-request function — `tools(agent:model:ruleset:config:)`, with the system prompt's tool list
+      computed from the result — is the prerequisite for plan mode, agents, subagents, and the MCP
+      `tools/list_changed` work already deferred out of Phase 8d for exactly this reason. Registration
+      order must stay stable, because a reshuffling tool list breaks prompt caching. Spent on:
+      `todowrite`; `question` (structured multiple-choice, on 5c's dialog seam, denied outright under
+      `-p` or a headless run deadlocks); `webfetch` with its own permission kind; `glob`; `read`
+      gaining directory listing, "did you mean", and nested-`AGENTS.md` injection; `finish`;
+      session-scoped `background_process`; the edit engine's multi-strategy replacer cascade — with
+      the disproportionate-match guard ported **first and unconditionally**, because a fuzzy matcher
+      without it eats whole functions; and `external_directory` as a real permission derived from
+      parsed bash arguments. That last one closes a real asymmetry: the file tools *refuse* an
+      out-of-workspace path outright, while the same read through bash is merely *asked* about —
+      the baseline ruleset is `{"*": ask}`, so it prompts rather than running unbidden, but nothing
+      confines it and an "allow always" on a bash prefix widens further than a user expects.
+      Also re-enables parallel tool dispatch, which is fully implemented in `ToolDispatch.runParallel`
+      and opted out of by all three production surfaces — `-p`, `--inline`, and the server behind the
+      default client each pass `toolExecution: .sequential`. *Exit:* the model keeps a todo list, asks a
+      structured question, and fetches a URL under permission; an MCP server that changes its tools
+      mid-session is picked up without a restart.
+- [ ] **Phase 12 — Git: facade, diff, review.** The first phase needing a new subsystem rather than a
+      seam. DoMoCode has no git integration at all, and a `DoMoGit` facade gates the diff viewer,
+      `/review`, checkpoints and eventually worktrees — so it is built once, deliberately, with the
+      flag discipline (`--no-optional-locks`, `core.quotepath=false`, `GIT_TERMINAL_PROMPT=0`, …) that
+      removes a class of cross-platform bugs. Note that `Shell` takes a command *string*, not an argv
+      vector, so every interpolated ref must be quoted and every path list preceded by `--`; an
+      argv-level `Shell.exec` is worth adding here. The cheap 80% ships first: recording the session's
+      start HEAD as an entry makes `git diff <sha>` answer "everything this session changed" with no
+      snapshot infrastructure at all. Then the full-screen diff review route — file-tree pane with
+      collapsed path chains, split-versus-unified chosen by width, `]`/`[` hunk navigation,
+      mark-reviewed, a source switcher behind one `DiffSource` protocol — plus per-file revert, a live
+      modified-files sidebar, and LLM commit-message generation. *Exit:* `domo diff` and a `/diff`
+      pane; `/review` on a branch produces an advisory review.
+- [ ] **Phase 13 — Checkpoints and undo.** The single highest-value absent capability in the survey.
+      Today a bad edit is permanent unless the user's own VCS happened to have it staged. Shadow git —
+      a second `GIT_DIR` in the data directory whose work-tree is the user's project, capturing
+      `write-tree` objects with no commits, branches or reflog — gives real undo without touching the
+      user's repository, with ignore filtering piped through the *real* repo's `check-ignore`.
+      Per-step snapshots are appended as their own entries rather than mutating the assistant message,
+      preserving the append-only invariant. The revert planner is a pure, separately-tested function
+      with earliest-writer-wins semantics: files nobody touched are never read or written, which is
+      what stops undo clobbering the user's concurrent edits. The workspace-status indicator
+      (`restored` / `snapshots-disabled` / `unavailable`) ships **in the same change as revert, never
+      after** — a silent partial undo where the user believes files came back and they did not is the
+      worst outcome in this domain. Plus `/timeline`, and a `/fork` command over plumbing that exists but has
+      no interactive entry point: `AgentHarness.fork` is reachable today only through the `--fork`
+      launch flag, while `POST /session/:id/fork` and `ServerClient.fork` have no caller outside
+      tests. `/clone` has no plumbing at all — no harness method, no route — and is new work. *Exit:* `/undo`
+      rolls back conversation and files together; `/redo` puts them back; the banner never claims a
+      file was restored when it was not.
+- [ ] **Phase 14 — Agents, personas, and plan mode.** An agent is a value — a name, a system prompt, a
+      model, a permission ruleset, a mode. Under one gateway this is unusually cheap: a per-agent
+      model is another alias on the same endpoint, with no provider resolution and no second
+      credential. Markdown-plus-frontmatter agent files are **inert data with no host and no hot
+      reload**, so this does not breach the extension-system non-goal — a distinction worth stating
+      plainly, because it looks adjacent to a refused feature and is not. Layered builtin → user →
+      project resolution with project files behind the trust gate, and **hardened modes**: a project
+      config may tighten a mode and may never widen it. Plan mode is built entirely from permissions
+      plus a plan file under `.domocode/plans/`, needing no external-directory concept because the
+      sandbox root already contains it, with `plan_exit` as a terminating tool (the loop already
+      honours `terminate` and settles as `.terminatedByTool`). *Exit:* Tab switches between `build`
+      and `plan`; plan mode provably cannot edit anything but its plan file.
+- [ ] **Phase 15 — Subagents.** Transformative, and the most expensive item here. Requires 14, 11, 9
+      and 5c. It disturbs a real invariant: `AgentHarness.run` throws if already running and the
+      server allows one run per session, so a background child must be a separate harness instance and
+      a result arriving while the parent is idle must be able to *start* a run. Child sessions are
+      real, resumable sessions with `parentSession` set — navigable, not summarized black boxes — with
+      a `task` tool carrying `task_id` resumption, derived child permissions (parent *denies* inherit,
+      capabilities do not), a `subagent_depth` cap, and background children whose results arrive
+      through the Phase 9 queue. Child permission prompts bubble to the parent's UI by constructing
+      the child's engine with the *root* session id — one argument, and the whole feature. Delegation
+      must be modelled as a typed event across `AgentEvent`, `ServerEvent` and the session payload
+      **before** three closed enums calcify: retrofitting it re-cuts the JSONL format, the SSE wire
+      and the `-p` JSON contract simultaneously. *Exit:* plan mode launches parallel `explore`
+      subagents; you can walk into a child session and back out.
+- [ ] **Phase 16 — LSP and code intelligence.** Independent of 14 and 15; can run in parallel. The
+      cheap version ships first behind the same protocol as the expensive one, so nothing is thrown
+      away: a `DiagnosticsProvider` implemented by a **CLI provider** (`swift build`, `tsc --noEmit`,
+      `cargo check --message-format=json`) has no server lifecycle, no resident memory, and real value
+      in a week. Then a real LSP client, reusing `PersistentProcess` and the JSON-RPC correlator
+      extracted out of `DoMoMCP` (plus Content-Length framing), with per-root pooling and push+pull
+      diagnostics merged. Post-edit diagnostics are appended to `edit`/`write` results as
+      `<diagnostics>` blocks the model reads — errors only, capped. Auto-format after write lands here
+      too, and needs **an explicit decision about its permission story**: running a project-configured
+      binary after every write is an execution path the permission engine currently never sees.
+      *Exit:* an edit that breaks the build comes back with the compiler's own error attached.
+- [ ] **Phase 17 — Memory and recall.** The best value-to-cost ratio left after Phase 5, and it needs
+      no new storage and no network. `session_recall` searches and reads this project's own past
+      sessions, ranked over user text, assistant text, file references and tool *errors* while
+      excluding reasoning and successful tool output — with recalled content labelled untrusted and
+      elided in the middle rather than the tail. Then durable typed project memory outside the repo
+      (project / environment / corrections / per-session digests) with a byte-budgeted index,
+      `/memory`, and the secret-redaction gate from 5a on every write so there is exactly one
+      definition of what counts as a secret. *Exit:* "what did we decide about X last week" is
+      answerable inside the session, and nothing secret-shaped ever reaches a memory file.
+- [ ] **Phase 18 — Sandboxing and permission hardening.** The honest framing: `PathSandbox` confines
+      the file tools and **bash is not confined at all**, so a reader could reasonably conclude the
+      whole harness is sandboxed. This closes that and documents it. A pluggable OS backend with
+      **fail-closed** selection — Seatbelt on macOS, bubblewrap on Linux, and a hard error rather than
+      a silent downgrade when confinement cannot be established — with a parameterized SBPL policy
+      that never string-interpolates a path, so it is unit-testable without spawning a process.
+      Environment scrubbing and pinning is the cheapest high-value item in the phase. Project config
+      may only *tighten* policy, expressed as a per-key lattice applied inside `resolvedRuleset` so
+      nothing downstream can get it wrong — generalised to `mcpServers`, where a project may disable a
+      user's server and never add one. Also argument-level narrowing for MCP tools, whose permission pattern is
+      `*` today, so one "allow always" grants the whole tool forever. (Two-tier base-vs-saved
+      resolution already shipped in 8a: `resolvePermission` returns a config `deny` before it will
+      honour any saved allow.) *Exit:* `--sandbox` confines
+      every model-originated process or refuses to run and says which backend was unavailable.
+- [ ] **Phase 19 — PTY and interactive terminal.** Harder here than in any surveyed harness, because
+      of the client/server split. Control messages already flow client→server over REST
+      (`/prompt`, `/abort`, `/permission`), but there is no *streaming* channel to carry keystrokes
+      into a live process, and SSE cannot become one. A
+      server-owned PTY service with a bounded retained ring and a two-step attach (replay-then-
+      activate) closes the race where bytes arrive between replay and subscription. Needs a small VT
+      screen emulator written as a separate type: the existing scanner handles OSC and APC strings
+      but recognizes only the five CSI final bytes the renderer itself emits (`m G K H J`), which is
+      correct for measuring DoMoCode's own output and nowhere near enough to interpret a foreign
+      program's. `interactive_terminal` ships
+      **inline-first**, degrading to a model-visible refusal elsewhere until a client input channel
+      exists. *Exit:* `gh auth login` and an ssh passphrase prompt work from inside the agent.
+- [ ] **Phase 20 — Export, replay, and scriptability.** Small and self-contained. Markdown transcript
+      export with a content-options dialog and a shared `/copy` using the same formatter — the export
+      people actually want, and it should ship before any HTML viewer. Single-file HTML export is
+      implemented as a **second `ToolRenderTheme` emitting spans instead of SGR**, so `DoMoToolsUI`'s
+      renderers are reused verbatim rather than duplicated. Plus **trajectory replay** — a replay
+      `ToolExecutor` keyed by tool-call id over a recorded stream, driven by
+      `domo --replay <session> --until <entry>` — which is the debugging tool DoMoCode lacks entirely
+      and the cheapest possible "branch from here", needing no snapshot infrastructure. *Exit:*
+      `domo export --html` and `domo replay --until <id>` leaving a live, divergeable session.
+- [ ] **Phase 21 — Split-footer render mode.** Very large, depends on nothing, retires debt, and can
+      be pulled forward at any time. The alternate screen is the default today, which is why DoMoCode
+      has paid to rebuild what the terminal does for free: ~739 lines of in-app drag selection, a
+      mouse-capture debt the code documents, an F8 escape hatch and an OSC 52 copy path. A DECSTBM
+      split-footer mode — transcript appended into real scrollback, footer pinned to the bottom N rows
+      — makes most of that optional and restores the property
+      [Non-goals](#non-goals-and-known-gaps) lists as the largest cost the expansion accepted. With
+      OSC 133 semantic prompt marks, which only pay off once there is real scrollback. *Exit:*
+      `domo --mini` gives a live prompt with a genuinely selectable, searchable, shell-composable
+      transcript above it.
+
+### Decisions that reverse a stated non-goal
+
+None of these are folded into a phase above. Each needs an explicit yes before it can be scheduled.
+
+| Reversal | Needed for | Recommendation |
+|---|---|---|
+| **TypeScript extension system** | plugin hosts, `registerTool`/`registerCommand`, hot reload | **Stay dropped.** Swift has no in-process plugin ABI and a JS runtime breaks SPM-only. The in-scope substitute is **shell hooks** — `.domocode/hooks.json` mapping lifecycle events to subprocess commands with matchers and timeouts, trust-gated. Out-of-process extensibility with zero runtime dependency; it would slot after Phase 11. (Auto-format itself does not wait on this: it is Phase 16, run from a formatter registry rather than a user hook.) |
+| **Multi-provider** | talking to a model without a proxy in front; subscription auth (Claude Pro/Max, ChatGPT Plus) | **Stay dropped** — it is the founding premise. Per-alias `modelOverrides` (5a) plus named profiles keyed on model/effort/permissions rather than base URL gets most of the practical value inside it. |
+| **OAuth** | remote MCP, provider login, marketplaces | **The reversal most worth considering** — but note the README has been stricter than necessary. The transport half of remote MCP (`{type: remote, url, headers}` with a static bearer) needs **no OAuth at all** and is buildable today. Ship that as a small phase; decide OAuth separately. |
+| **A supervising daemon** | warm singleton, multi-instance supervision, live share, persistent background processes | **Stay dropped**, but two in-scope substitutes capture most of the win: a parent-PID watchdog so an embedded server cannot be orphaned, and `domo -p --attach <url>` reusing a warm server's already-connected MCP servers — every `-p` run currently spawns and tears down every stdio server, which for an `npx`-launched one is seconds per invocation. |
+| **A package manager** for skills, themes, extensions | distribution | **Decline for now**; revisit only if people are actually authoring skills after 5b. Reading `.claude/skills` and `.agents/skills` in place gives day-one compatibility with no distribution mechanism at all. |
+| **Windows** | the platform | Nothing in the plan assumes it. |
+
+Boundary-adjacent, not literally on the non-goal list, but worth deciding deliberately: **ACP over
+stdio** (`domo acp`) is a stdio subprocess speaking a documented protocol with *zero* editor-side code
+to maintain, and becomes cheap once Phase 14's registry exists; a **second read-only sandbox root** for
+cloned reference repos preserves the single-root invariant that the whole tool layer is built on, where
+a multi-root sandbox would weaken it; and **any phone-home at all** — there is none today, and a
+notification centre, an update check or analytics would each be the first.
 
 Phases 0–3 produced a genuinely useful headless tool; Phase 4 (the inline TUI) was the largest single
-body of the *port*. The expansion is ordered by dependency, not by appeal: the server comes **before**
-the full-screen TUI, because the TUI-as-client model presumes a server to attach to and the inline
-renderer cannot faithfully replay a session's scrollback to a late client; image *input* is pulled
-early because it is cheap and orthogonal; the permission engine precedes MCP because it is a safety
-prerequisite, not a nicety. Upstream's TUI test suite is larger than its TUI source, and the new
-full-screen renderer has **no upstream oracle at all** — budget for building its test harness, not just
-its implementation.
+body of the *port*, and Phase 7 (the full-screen client) the largest net-new subsystem. The expansion
+was ordered by dependency, not by appeal: the server came **before** the full-screen TUI, because the
+TUI-as-client model presumes a server to attach to and the inline renderer cannot faithfully replay a
+session's scrollback to a late client; image *input* was pulled early because it is cheap and
+orthogonal; the permission engine preceded MCP because it is a safety prerequisite, not a nicety.
+
+Two things are worth recording for anyone planning similar work. The full-screen renderer had **no
+upstream oracle at all**, and building its test harness cost about as much as its implementation.
+And Phase 8.5 exists because a subsystem can be fully tested and still be broken in the one
+configuration the tests never construct — the alt-screen machinery was green throughout, because
+every test fed it `?1049h` itself while the shipping client never did. Smoke-test the real binary.
+
+### The dependency spine
+
+Six seams gate most of the remaining surface. Every phase above is placed relative to these, and the
+ordering falls out of them rather than out of appeal:
+
+| Seam | Today | Unblocks |
+|---|---|---|
+| **System-prompt builder** | one literal string in `PrintMode.systemPrompt` | `AGENTS.md`, skills, agents, plan mode, tool-visibility rewriting |
+| **Command registry** | a three-name `switch` in `--inline`; nothing in the client | slash commands, palette, keybindings, `/review`, plan-exit UI |
+| **Dialog vocabulary** | one bespoke permission modal per surface | `question`, every picker, settings, export options, diff review |
+| **Per-turn mutable tool set** | `AgentContext.tools` fixed at construction | plan mode, agents, subagents, MCP `tools/list_changed` |
+| **Git facade** | none | diff viewer, `/review`, checkpoints, undo, worktrees, branch in footer |
+| **Model metadata** | 200k context hardcoded; cost rates never passed, so cost is always zero | context meter, cost display, budget cap, compaction honesty |
+
+### Scale
+
+Honest sizing, so the roadmap is not read as a quarter's work. Phase 5 alone is multi-month.
+
+| Phase | Scale | | Phase | Scale |
+|---|---|---|---|---|
+| 5a Truth and plumbing | weeks | | 14 Agents and plan mode | 1–2 months |
+| 5b Command layer | ~1 month | | 15 Subagents | **multi-month** |
+| 5c Dialogs and pickers | **multi-month** | | 16 LSP | weeks → **multi-month** |
+| 5d Terminal polish | weeks | | 17 Memory and recall | 1–2 months |
+| 9 Steering and run control | weeks | | 18 Sandboxing | **multi-month** |
+| 10 Context engineering | ~1 month | | 19 PTY | **multi-month** |
+| 11 Mutable tools + tool suite | 1–2 months | | 20 Export and replay | weeks |
+| 12 Git, diff, review | **multi-month** | | 21 Split-footer | **multi-month** |
+| 13 Checkpoints and undo | **multi-month** | | | |
 
 ## Sibling harnesses and prior art
 
 pi is DoMoCode's upstream, but it is not the only coding-agent harness worth reading. Three others
-sit alongside it in this workspace and were studied in depth — not for code to copy (**none is
-copied, vendored, or derived**) but to decide, feature by feature, what a LiteLLM-only,
-inline-terminal harness should adopt, adapt, or refuse. Each is MIT or MIT-cored and independently
-developed; full attribution and the license nuances are in [NOTICES.md](NOTICES.md).
+sit alongside it in this workspace and were studied in depth, mostly to decide — feature by feature —
+what a LiteLLM-only terminal harness should adopt, adapt, or refuse. Each is MIT or MIT-cored and
+independently developed; full attribution and the license nuances are in [NOTICES.md](NOTICES.md).
+
+This section used to claim none of their code was copied or derived. That stopped being true at
+Phase 8: **`DoMoPermissions` contains code ported from opencode and kilocode** — the wildcard matcher,
+the bash arity table, the policy evaluator, the config codec, the engine, the request vocabulary, the
+request factory and the settings writer. Those files carry dual copyright headers, and
+[NOTICES.md](NOTICES.md#other-prior-art) records them file by file. Everything else below really is
+idea-only.
 
 - **[pi](https://github.com/earendil-works/pi)** — MIT, © 2025 Mario Zechner. The direct upstream.
   DoMoCode derives code from it; everything below is measured against it.
@@ -363,44 +708,53 @@ All three converged on the same shape: a headless HTTP/SSE (or Effect-`HttpApi`)
 agent runtime, driven by many clients, with a full-screen widget-toolkit TUI (OpenTUI/SolidJS) or a
 React SPA as just *one* front-end. DoMoCode's founding thesis defined itself *against* that shape — a
 single process, an inline-scrollback renderer, no widget toolkit. The
-[scope expansion](#what-expanded-and-what-did-not) reverses that, in the narrowed form the roadmap
-records: DoMoCode now **adopts the server shape** (bounded to a local, loopback-only,
-single-client-first HTTP/SSE server, modeled on opencode's `server.ts`/`event.ts`) and grows a
+[scope expansion](#what-expanded-and-what-did-not) reversed that, in the narrowed form the roadmap
+records: DoMoCode **adopted the server shape** (bounded to a local, loopback-only,
+single-client-first HTTP/SSE server, modeled on opencode's `server.ts`/`event.ts`) and grew a
 **full-screen event-store client** beside the inline renderer — built in-house, because OpenTUI is
 TypeScript and has no Swift port, so only its retained-cell-buffer-plus-flexbox *design* is borrowed,
 never code. What DoMoCode still refuses is the *rest* of the cluster: a client-side multi-provider
 abstraction (model breadth stays the LiteLLM gateway's job), OAuth login, a JS/TS plugin system, an
-extension/skill/theme marketplace, mDNS/multi-device presence, and any web/IDE/desktop GUI. MCP crosses
-from the refused column to a goal (stdio-local first); the multi-client, remote-MCP-with-OAuth, and
-daemon breadth stays out. So the survey no longer merely *reaffirms* DoMoCode's boundaries — it moved
-four of them, each at a named cost.
+extension/skill/theme marketplace, mDNS/multi-device presence, and any web/IDE/desktop GUI. MCP crossed
+from the refused column to a shipped feature (stdio-local only); the multi-client,
+remote-MCP-with-OAuth, and daemon breadth stays out. So the survey no longer merely *reaffirms*
+DoMoCode's boundaries — it moved four of them, each at a named cost.
 
 ### Features worth adopting
 
-What the survey did surface is a compact set of terminal-native, single-provider, dependency-light
-features that fit inside every constraint. They are folded into the roadmap above — a few into Phase 5,
-the granular permission engine into Phase 8 (MCP's safety prerequisite), and the rest into the
-unscheduled *Later* bucket. "Fit" is judged against the [non-goals](#non-goals-and-known-gaps): a new
-*first-party* tool is `adaptable`, not free, because the extensibility non-goal forbids plugin-defined
-tools, not new Swift ones — each addition still forces a tool-vs-prompt-injection and
-in-process-vs-out-of-process decision.
+**This workspace has now been surveyed twice.** The first pass, below, covered the three siblings and
+was filtered through the narrowed thesis, asking which handful of features fit inside it. The second
+pass asked the opposite question — *what would it take to be fully featured* — and swept all four
+repositories, upstream pi included, across sixteen feature domains, fit-checking every candidate against DoMoCode's actual code. It found **706 distinct
+capabilities DoMoCode does not have**: 37 rated transformative, 282 high value. The
+[roadmap](#roadmap) sequences everything rated transformative or high, plus most of the medium band;
+what is left out is named under [Non-goals](#non-goals-and-known-gaps) rather than left to be
+rediscovered. The table below is kept as the record of the first, narrower judgment.
+
+The second survey's blunt finding: the most valuable single absent capability is **checkpoints and
+undo** (Phase 13), and the cheapest large win is **`AGENTS.md` loading** (Phase 5b) — a few hundred
+lines that changes every response the agent gives.
+
+"Fit" below is judged against the [non-goals](#non-goals-and-known-gaps): a new *first-party* tool is
+`adaptable`, not free, because the extensibility non-goal forbids plugin-defined tools, not new Swift
+ones — each addition still forces a tool-vs-prompt-injection and in-process-vs-out-of-process decision.
 
 | Feature | Seen in | Fit | Lands in |
 |---|---|---|---|
-| Granular permission engine (allow/ask/deny globs, last-match-wins, inline once/always/reject) | all three | yes | Phase 8 |
-| Git-shadow snapshot checkpoints + undo/redo + fork-from-any-message | kilocode, opencode | yes | Later |
-| Headless `domo run` (prompt in, streamed/JSON out, exit codes, `--auto`) | kilocode, opencode | yes | Later |
-| Config-driven agent/persona profiles + a read-only plan mode | all three | yes | Later |
-| Auto-format-after-edit hook; repo `.setup.sh` session-init hook | all three | yes | Later |
-| Hard per-task budget cap (abort the loop on a cost ceiling) | OpenHands | yes | Later |
-| Trusted-config `{env:}`/`{file:}` interpolation gated by the trust boundary | kilocode | yes | Later |
+| Granular permission engine (allow/ask/deny globs, last-match-wins, inline once/always/reject) | all three | yes | **Shipped** (Phase 8) |
+| Headless run (prompt in, streamed/JSON out, exit codes, auto-approve) | kilocode, opencode | yes | **Shipped**, as flags rather than a subcommand: `-p` / `--json` / `--yolo`, exit codes 0–3 |
+| Git-shadow snapshot checkpoints + undo/redo + fork-from-any-message | kilocode, opencode | yes | Phase 13 |
+| Config-driven agent/persona profiles + a read-only plan mode | all three | yes | Phase 14 |
+| Auto-format-after-edit hook; repo `.setup.sh` session-init hook | all three | yes | Phase 16 (format); hooks await the [extensibility decision](#decisions-that-reverse-a-stated-non-goal) |
+| Hard per-task budget cap (abort the loop on a cost ceiling) | OpenHands | yes | Phase 9 (needs Phase 5a's real cost rates) |
+| Trusted-config `{env:}`/`{file:}` interpolation gated by the trust boundary | kilocode | yes | Phase 5a |
 | Local `/review` of a diff, branch, or commit | kilocode, OpenHands | yes | Phase 5 |
 | Skill refinements: keyword auto-injection, task-input `{VAR}` templates | all three | yes | Phase 5 |
 | Slash-command polish: `$ARGUMENTS`/`$N`, inline `` !`shell` ``, per-command overrides, ANSI-index / `none`=inherit theming | opencode, kilocode | yes | Phase 5 |
-| First-party tool additions: `question`/`suggest`, todo checklist, `webfetch` (+ gated `apply_patch`, `websearch`, notebook-edit, `recall`) | all three | adaptable | Later |
-| Selectable/tunable history condensers (observation-masking, recent-window, LLM-summarizing) | OpenHands | adaptable | Later |
-| Local conveniences: prompt stash, `/btw` side-branch, background jobs, file watcher, deterministic JSONL replay, local secrets + env injection, out-of-process notify/sound | opencode, kilocode, OpenHands | yes/adaptable | Later |
-| Out-of-process research items: ACP single-session stdio subcommand (atop the Phase-6 server), LSP post-edit diagnostics, Seatbelt/bubblewrap bash sandbox, local semantic index via the gateway's `/embeddings` | all three | adaptable | Later / research |
+| First-party tool additions: `question`/`suggest`, todo checklist, `webfetch` (+ gated `apply_patch`, notebook-edit, `recall`) | all three | adaptable | Phase 11; `recall` in Phase 17. `websearch` needs a second vendor and stays out |
+| Selectable/tunable history condensers (observation-masking, recent-window, LLM-summarizing) | OpenHands | adaptable | Phase 10 |
+| Local conveniences: prompt stash, `/btw` side-branch, background jobs, file watcher, JSONL replay, local secrets + env injection, out-of-process notify/sound | opencode, kilocode, OpenHands | yes/adaptable | Scattered: stash in Phase 9, background jobs in 11, replay in 20, notify/sound in 5d, secrets in 5a. Prompt *history* shipped in 8.5; a file watcher remains unscheduled |
+| Out-of-process research items: ACP single-session stdio subcommand, LSP post-edit diagnostics, Seatbelt/bubblewrap bash sandbox, local semantic index | all three | adaptable | LSP is Phase 16, the sandbox Phase 18; ACP awaits a [decision](#decisions-that-reverse-a-stated-non-goal); the semantic index is [not planned](#non-goals-and-known-gaps) |
 
 The semantic-index row is the sharpest example of "adapt, don't adopt": the idea ports only if
 embeddings come from the single LiteLLM gateway's OpenAI-compatible `/embeddings` into an
@@ -409,9 +763,14 @@ single-provider and the SPM-only / no-vendored-binaries constraints.
 
 ### Features declined
 
-The [scope expansion](#what-expanded-and-what-did-not) moved four items — the server, the full-screen
-TUI, MCP, and inline images — out of this list. Most of the rest still recurs across all three and stays
-out, each against a named constraint:
+This list has shrunk twice. The [first scope expansion](#what-expanded-and-what-did-not) moved four
+items out of it — the server, the full-screen TUI, MCP and inline images — and all four shipped. The
+turn toward a fully-featured harness moves more: **sandboxing (Phase 18), an interactive full-screen
+diff pane (Phase 12) and a PTY with an interactive terminal (Phase 19) are all now roadmap phases**,
+not exclusions. What remains below is what stays out, each against a named constraint — and the six that
+are genuinely the owner's call are tabulated in
+[Decisions that reverse a stated non-goal](#decisions-that-reverse-a-stated-non-goal) rather than
+settled here:
 
 - **Multi-provider model layers and wire-protocol adapters** — DoMoCode has one surface (LiteLLM);
   model breadth is the gateway's job, so the client-side abstraction is both disallowed and
@@ -419,19 +778,21 @@ out, each against a named constraint:
 - **OAuth / device login, JS/TS plugin systems, in-process JS interpreters (kilocode's "CodeMode"),
   and extension/skill/theme marketplaces** — the declared extensibility, bearer-key-only, and
   package-manager non-goals; several also need vendored binaries (SPM-only). MCP is no longer in this
-  bullet — it is a Phase-8 goal — but only *stdio-local* MCP, because *remote* MCP servers require
-  full OAuth, so that half stays deferred here.
+  bullet — it shipped in Phase 8 — and only the *OAuth* half of remote MCP is still deferred: a remote
+  server reached with a static bearer header needs none, and is buildable today.
 - **Detached daemons, multi-instance supervision, mDNS, multi-device sync, and multi-backend
   (Docker/K8s/remote) sandboxes** — still out. DoMoCode's own server (Phase 6) is deliberately the
   opposite, narrow slice: one local loopback endpoint, single-client-first, no supervision and no
-  discovery. Only the *local* Seatbelt/bwrap wrap of the bash tool is a later candidate.
+  discovery. The *local* Seatbelt/bubblewrap wrap of the bash tool is no longer a "later candidate" —
+  it is Phase 18, and it is the phase that makes the sandboxing story honest.
 - **Web / GUI / IDE / desktop UI** — embedded VSCode/browser panes, a hosted web console, an Electron
-  app, editor extensions, and an *interactive full-screen diff pane*. DoMoCode does build a full-screen
-  *terminal* TUI (Phase 7, in-house), but it stays a terminal app on the inline renderer's own
-  primitives; the OpenTUI/SolidJS/React foundations and every non-terminal surface stay out.
+  app and editor extensions stay out. The *interactive full-screen diff pane* has left this bullet:
+  it is a terminal feature, it is Phase 12, and declining it was a category error — DoMoCode builds a
+  full-screen terminal UI on the inline renderer's own primitives, and a diff pane is exactly that.
+  The OpenTUI/SolidJS/React foundations and every non-terminal surface still stay out.
 - **Cloud agents, webhooks, cron automations, git-provider issue-resolvers, and inline
   FIM/speech-to-text** — daemon + OAuth + non-terminal-input constraints. Only the local headless
-  `run` primitive is in scope, invoked from an external job the user owns.
+  path is in scope — `domo -p`, invoked from an external job the user owns.
 
 ## Dependencies
 
@@ -444,18 +805,24 @@ The deployment floor is **macOS 15**, raised from 13. `Synchronization.Mutex` an
 mutable state is handled here, per [Concurrency](#concurrency-and-isolation). macOS 15 shipped in
 September 2024; requiring it for a developer CLI is not aggressive.
 
-These thirteen resolve as a set on a 6.2 manifest, and to a graph of **33 packages** once transitive
-dependencies are counted — the AsyncHTTPClient tail (NIO, NIO-SSL, NIO-HTTP2, swift-certificates,
-swift-crypto, swift-asn1, service-lifecycle) and swift-syntax 603, pulled by swift-json-schema for its
-macros, account for most of that. swift-syntax is the single largest build-time cost in the graph; if
-clean-build time becomes intolerable, dropping to swift-json-schema's non-macro modules and
-hand-writing the tool schemas removes it.
+These thirteen resolve as a set on a 6.2 manifest, and to a graph of **34 pinned packages** once
+transitive dependencies are counted — the AsyncHTTPClient tail (NIO, NIO-SSL, NIO-HTTP2,
+swift-certificates, swift-crypto, swift-asn1, service-lifecycle) and swift-syntax 603, pulled by
+swift-json-schema for its macros, account for most of that. swift-syntax is the single largest
+build-time cost in the graph; if clean-build time becomes intolerable, dropping to swift-json-schema's
+non-macro modules and hand-writing the tool schemas removes it.
 
-The [scope expansion](#what-expanded-and-what-did-not) adds direct dependencies, tagged in the table
-with the phase that introduces them: **Hummingbird** for the server (Phase 6), the **MCP Swift SDK**
-(Phase 8), and, only if image resizing is in scope, **swift-png**/**swift-jpeg** (Phase 7.5). Because
-Hummingbird is built on the swift-nio tail already resolved above, the net-new graph is modest. The
-full-screen TUI (Phase 7) adds *no* dependency — it is built in-house on the existing renderer.
+**The whole expansion cost exactly one dependency: Hummingbird.** Three others were planned and none
+was needed. The MCP Swift SDK was replaced by a hand-rolled client (Phase 8c) — its stdio transport
+does not spawn the subprocess, and it pins `swift-docc-plugin` to a git *branch*, which is a
+reproducible-resolution liability; the fallback the table below had already pre-justified is what
+shipped. swift-png/swift-jpeg were needed only for resizing attachments, and images are passed through
+unresized (an oversized attachment is rejected, not downscaled), so nothing decodes pixels — image
+bytes are only ever inspected by hand-written header readers: `DoMoExec`'s magic-number media-type
+sniffer and `DoMoTermGraphics`'s dimension parsers. GRDB is still unused because JSONL remains the only `SessionStorage`
+implementation. The full-screen TUI (Phase 7) and the whole Phase 8.5 pass added *no third-party*
+dependency: Phase 7's only manifest change was declaring the new `DoMoClient` target and its test
+target, and Phase 8.5's was a single intra-package edge from `DoMoClient` to `DoMoExec`.
 
 | Package | License | Why |
 |---|---|---|
@@ -467,30 +834,34 @@ full-screen TUI (Phase 7) adds *no* dependency — it is built in-house on the e
 | [apple/swift-system](https://github.com/apple/swift-system) | Apache-2.0 | `FilePath`, `FileDescriptor`, `Errno`. Note it does *not* expose termios or ioctl. `from: "1.7.5"`. |
 | [swiftlang/swift-subprocess](https://github.com/swiftlang/swift-subprocess) | Apache-2.0 | Async subprocess with cancellation that reaches the child. `from: "0.5.0"` — the previous sub-0.5 pin was a toolchain cap, not a stability choice. `1.0.0-beta.1` is usable but needs `.exact()`, since SwiftPM never selects a pre-release via `from:`. |
 | [apple/swift-log](https://github.com/apple/swift-log) | Apache-2.0 | Logging facade; handler tees JSON to the session log and human text to stderr. `from: "1.14.0"` — the 6.1 floor capped this at 1.10.0. |
-| [jpsim/Yams](https://github.com/jpsim/Yams) | MIT | YAML frontmatter in skills and prompt templates. `from: "6.2.2"` — that is Yams' own semver and has nothing to do with the Swift version. |
+| [jpsim/Yams](https://github.com/jpsim/Yams) | MIT | YAML frontmatter in skills and prompt templates. `from: "6.2.2"` — that is Yams' own semver and has nothing to do with the Swift version. **Currently unused**: it is declared for Phase 5, which has not started, and no source file imports it. |
 | [ajevans99/swift-json-schema](https://github.com/ajevans99/swift-json-schema) | MIT | Tool-schema generation *and* draft-2020-12 validation of returned arguments — validation is the half that protects you. `.upToNextMinor(from: "0.13.1")`, pre-1.0. |
 | [swiftlang/swift-markdown](https://github.com/swiftlang/swift-markdown) | Apache-2.0 WITH Swift-exception | cmark-gfm AST for the Markdown component. `.upToNextMinor(from: "0.8.0")` — the 6.1 floor capped this at 0.7.1. The repository moved from `apple/`, which now redirects; pin the semver tag, never a `swift-6.x.y-RELEASE` tag. |
-| [groue/GRDB.swift](https://github.com/groue/GRDB.swift) | MIT | Later (SQLite session storage), optional target only. `from: "7.11.1"`. |
+| [groue/GRDB.swift](https://github.com/groue/GRDB.swift) | MIT | **Not declared.** Held for a possible SQLite session store at `from: "7.11.1"`, validated against this graph and recorded as a comment in `Package.swift`. JSONL is still the only `SessionStorage` implementation. |
 | [migueldeicaza/SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) | MIT | **Test target only** — a headless VT100 emulator used as a test oracle. Renderer bytes go in, assertions run against the resulting cell grid. Without it the riskiest code in the port has no end-to-end coverage on a TTY-less CI runner. `from: "1.15.0"`. Builds in Swift 5 language mode, so expect `Sendable` friction at the boundary from a `[.v6]` test target. Note: it does *not* emulate the Kitty/iTerm2 graphics protocols, so image *display* (Phase 7.5) has weaker automated coverage than the rest of the renderer. |
-| [hummingbird-project/hummingbird](https://github.com/hummingbird-project/hummingbird) | Apache-2.0 | **Phase 6.** HTTP router + streaming SSE for `DoMoServer` (an SSE body is just a response streamed from an `AsyncSequence`). Built directly on swift-nio, already resolved via async-http-client, so it adds little to the graph. `swift-tools-version: 6.0`. Vapor was assessed and declined — heavier graph, older `EventLoopFuture`-era surface. |
-| [modelcontextprotocol/swift-sdk](https://github.com/modelcontextprotocol/swift-sdk) | MIT / Apache-2.0 | **Phase 8.** The MCP client for `DoMoMCP` (stdio transport first). Pre-1.0, `.upToNextMinor(from: "0.12.1")`; `swift-tools-version: 6.1`. One risk to watch: it pins `swift-docc-plugin` to a git *branch*, which can complicate reproducible resolution — a hand-rolled JSON-RPC-over-stdio client (on `JSONValue` + swift-subprocess + EventSource, all already present) is the pre-justified fallback. |
-| [tayloraswift/swift-png](https://github.com/tayloraswift/swift-png) | Apache-2.0 | **Phase 7.5, optional.** Pure-Swift PNG decode/encode, needed only if attachments must be resized to fit provider byte caps. `swift-tools-version: 5.10`. Skipped entirely for pass-through images. |
-| [tayloraswift/swift-jpeg](https://github.com/tayloraswift/swift-jpeg) | Apache-2.0 | **Phase 7.5, optional.** Pure-Swift JPEG companion to swift-png for normalizing attachments. `swift-tools-version: 6.0`. |
+| [hummingbird-project/hummingbird](https://github.com/hummingbird-project/hummingbird) | Apache-2.0 | **Phase 6, shipped.** HTTP router + streaming SSE for `DoMoServer` (an SSE body is just a response streamed from an `AsyncSequence`). Built directly on swift-nio, already resolved via async-http-client, so it added little to the graph. `from: "2.25.1"`. Vapor was assessed and declined — heavier graph, older `EventLoopFuture`-era surface. |
+| [modelcontextprotocol/swift-sdk](https://github.com/modelcontextprotocol/swift-sdk) | MIT / Apache-2.0 | **Not declared — the pre-justified fallback is what shipped.** It was to be the MCP client for `DoMoMCP` at `.upToNextMinor(from: "0.12.1")`. Two blockers decided it: its `StdioTransport` does not spawn the server subprocess (so the hard part was ours either way), and it pins `swift-docc-plugin` to a git *branch*. `DoMoMCP` is instead a hand-rolled JSON-RPC-2.0-over-stdio client on `JSONValue` + swift-subprocess, both already present. |
+| [tayloraswift/swift-png](https://github.com/tayloraswift/swift-png) | Apache-2.0 | **Not declared.** Pure-Swift PNG decode/encode, needed only if attachments must be resized to fit provider byte caps. Images are passed through unresized and an oversized one is rejected, so nothing decodes pixels — only the hand-written header-only dimension parsers in `DoMoTermGraphics` read image bytes. |
+| [tayloraswift/swift-jpeg](https://github.com/tayloraswift/swift-jpeg) | Apache-2.0 | **Not declared**, for the same reason as swift-png. |
 
 ### Deliberately not used
 
 - **TUI frameworks** (SwiftTUI, TermKit, TUIkit, ncurses bindings) — assessed for the full-screen mode
-  (Phase 7) and declined in favor of building the layout layer in-house. This is now a *build-vs-adopt*
-  decision, not a no-widget-toolkit stance. `rensbreur/SwiftTUI` (MIT, `swift-tools-version: 5.6`) is
-  the closest fit and is held as an escape hatch, but every candidate *owns* the screen, the stdin read
-  loop, and the event model: adopting one means running a second terminal-owning stack beside
-  `DoMoTermIO`'s key-decoding / framing / keybindings seam, rewriting `Editor` / `Markdown` /
-  `Autocomplete` / `SelectList` as framework views, and surrendering the byte-level diff, the
-  width-invariant check, and `CSI ?2026` synchronized output to a reactive whole-tree recompute — all
-  on a pre-1.0 dependency. The in-house path instead adds an alternate-screen mode plus a flexbox-lite
-  layout layer *above* the existing 1-D `Component` protocol, reusing `RenderCore`'s frame differ, the
-  width engine, and every built widget unchanged. (`swifttui.sh`'s swift-tui is separately disqualified:
-  its manifest declares `swift-tools-version: 6.3`, above the floor, so it will not resolve.)
+  (Phase 7) and declined in favor of building the layout layer in-house. That was a *build-vs-adopt*
+  decision, not a no-widget-toolkit stance, and the build side of it has since shipped.
+  `rensbreur/SwiftTUI` (MIT, `swift-tools-version: 5.6`) was the closest fit, but every candidate
+  *owns* the screen, the stdin read loop, and the event model: adopting one would have meant running a
+  second terminal-owning stack beside `DoMoTermIO`'s key-decoding / framing / keybindings seam,
+  rewriting `Editor` / `Markdown` / `Autocomplete` / `SelectList` as framework views, and surrendering
+  the byte-level diff, the width-invariant check, and `CSI ?2026` synchronized output to a reactive
+  whole-tree recompute — all on a pre-1.0 dependency. The in-house path added an alternate-screen mode
+  plus a flexbox-lite layout layer *above* the existing 1-D `Component` protocol, reusing the width
+  engine, `RenderCore`'s mode-independent helpers (per-line resets, output normalization, the
+  synchronized-output wrapper), and every built widget unchanged. The frame differ itself is not
+  reused: `AltScreenCore` is a sibling with its own absolute-`CUP` diff, because a fixed-height buffer
+  and a growing scrollback do not diff the same way.
+  (`swifttui.sh`'s swift-tui is separately disqualified: its manifest declares
+  `swift-tools-version: 6.3`, above the floor, so it will not resolve.)
 - **TauTUI** ([steipete/TauTUI](https://github.com/steipete/TauTUI)) — the one Swift package that
   gets the architecture right: an honest, well-attributed port of pi-tui that renders inline into
   scrollback with relative cursor motion and `CSI ?2026` synchronized output, no alternate screen
@@ -512,8 +883,9 @@ full-screen TUI (Phase 7) adds *no* dependency — it is built in-house on the e
   terminal size, and OSC queries including background-color detection. Not adopted at Phase 0 because
   it overlaps the one subsystem this project has decided to own end to end, and because it means a
   pre-1.0 single-maintainer package with a vendored C shim sitting under the key decoder — the same
-  bet declined above. Its OSC-query surface is the genuinely non-duplicative part; worth revisiting
-  at Phase 4 as a narrow dependency for background detection only, if theming needs it.
+  bet declined above. Its OSC-query surface is the genuinely non-duplicative part, and the revisit
+  never happened because nothing has needed it: there is no background-color detection in the tree,
+  and no theming to want it until Phase 5.
 - **swift-collections** and **swift-async-algorithms** — not *direct* dependencies, but both are
   already in the resolved graph and already built: `swift-collections` 1.6.0 arrives via swift-nio,
   swift-json-schema, and swift-configuration, and `swift-async-algorithms` 1.1.5 via swift-nio-extras
@@ -559,7 +931,7 @@ an agent mid-render.
 
 ## Configuration
 
-Planned precedence, highest first: **CLI flag → environment variable → project
+Precedence, highest first: **CLI flag → environment variable → project
 `.domocode/settings.json` (trusted projects only) → user `~/.domocode/settings.json` → built-in
 default.**
 
@@ -572,22 +944,21 @@ default.**
 | `DOMOCODE_AUTH_HEADER` | `Authorization` | Header *name* — operators can configure a custom one, so this is not hardcoded. |
 | `DOMOCODE_AUTH_SCHEME` | `Bearer` | Scheme prefix. |
 | `DOMOCODE_MODEL` | — | The public model alias as configured on the proxy. |
-| `DOMOCODE_SMALL_MODEL` | falls back to `DOMOCODE_MODEL` | Used for compaction and branch summaries. |
+| `DOMOCODE_SMALL_MODEL` | falls back to `DOMOCODE_MODEL` | Intended for compaction and branch summaries. **Resolved but not yet consumed** — the summarizer reuses the run's own model today; Phase 5a wires it. |
 | `DOMOCODE_REASONING_EFFORT` | unset | `minimal` / `low` / `medium` / `high`. |
-| `DOMOCODE_TIMEOUT_MS` | `600000` | Overall request timeout. |
-| `DOMOCODE_STREAM_TIMEOUT_MS` | `30000` | Time to first chunk — the knob that makes the UI feel responsive. |
+| `DOMOCODE_TIMEOUT_MS` | `600000` | Overall request timeout. `0` means the default — a literal zero would fail every request before the gateway could answer, and there is no "no deadline" to express here. |
+| `DOMOCODE_STREAM_TIMEOUT_MS` | `120000` | How long a committed response may deliver **nothing** before the turn is failed. A 2xx has already committed the stream, so exceeding this fails the turn rather than retrying it — tighten it and you trade a hung turn for a lost one, since a model can legitimately go quiet through a long reasoning block. `0` removes DoMoCode's silence bound. Time-to-response-head is separately bounded by a fixed 10 s connect timeout. **This knob previously did nothing**; setting it now has an effect — but see the note below on its 90 s ceiling. |
 | `DOMOCODE_MAX_RETRIES` | `10` | Client-side retry count for a *retryable* failure. `0` disables retrying. |
 | `DOMOCODE_RETRY_BASE_MS` | `1000` | First backoff; each further attempt doubles it before jitter. |
 | `DOMOCODE_RETRY_MAX_MS` | `60000` | Backoff ceiling, which also caps a server-supplied `Retry-After`. |
 | `DOMOCODE_RETRY_BUDGET_MS` | `300000` | Total time one request may spend asleep between attempts. `0` means no budget. |
-| `DOMOCODE_CONFIG_DIR` | `~/.domocode` | Settings, sessions, trust store, skills, themes. |
-| `DOMOCODE_SESSION_DIR` | `$CONFIG_DIR/sessions` | Session JSONL root. |
+| `DOMOCODE_CONFIG_DIR` | `~/.domocode` | Settings and the trust store. (Skills and themes land here in Phase 5.) |
+| `DOMOCODE_SESSION_DIR` | `$CONFIG_DIR/sessions` | Session JSONL root, and the per-workspace prompt history beside it. Point this elsewhere and both move. |
 | `DOMOCODE_LOG_LEVEL` | `warning` | Logs go to stderr; stdout is reserved for the JSON protocol channel. |
-| `DOMOCODE_OFFLINE` | `0` | Skip catalog and version lookups. |
-| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | — | Honored by the transport. |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | — | **Not honored.** Nothing reads them, and the default transport is `HTTPClient.shared`, which cannot be given a proxy configuration. Behind a proxy, point `DOMOCODE_BASE_URL` at it directly. |
 
-Secrets are never written to `settings.json` — only the *name* of the environment variable holding
-them, or a `~/.domocode/credentials.json` created `0600` whose permissions are checked on read.
+Secrets are never written to `settings.json` — `Settings` has no API-key field at all. `apiKeyEnv`
+holds only the *name* of the environment variable to read, so the key value never touches disk.
 
 ### Retries
 
@@ -601,8 +972,24 @@ maximum. A failure that arrives *before* the gateway ever answered keeps its own
 because an unreachable host is not a busy one.
 
 Nothing that cannot clear on its own is retried: a rejected credential, an exhausted quota, a context
-overflow and a malformed response all fail immediately. Retries are announced while they happen
-rather than hidden — a waiting run says so instead of looking frozen.
+overflow and a malformed response all fail immediately.
+
+A retry of an **assistant turn** is announced while it happens rather than hidden — a waiting run says
+so instead of looking frozen, which is what makes a ten-attempt budget acceptable. Each attempt reports
+the wait, the attempt number and the reason (`Retrying in 8s (attempt 4/10) — provider busy`): the
+full-screen client puts it on the status line until the wait is over or something else needs that line,
+the inline REPL adds a dim transcript line, and `-p` writes it to **stderr** in both text and `--json`
+mode, so stdout and the JSON event vocabulary are untouched.
+
+One retry path is still silent, and it is a known gap: compaction's summarization request is driven
+directly by the harness rather than through the agent loop, so it reaches no sink. A session that
+compacts against a busy gateway can still pause without saying why.
+
+**A ceiling worth knowing about.** The transport runs on `HTTPClient.shared`, whose singleton
+configuration carries a 90-second read timeout that DoMoCode cannot set. That bound fires first, so
+`DOMOCODE_STREAM_TIMEOUT_MS` is only really in force below 90 s — a larger value, including the
+120 s default, is preempted, and `0` disables DoMoCode's own silence bound without lifting that one.
+Raising it means constructing an owned `HTTPClient`, which is the same change proxy support needs.
 
 ### Command line
 
@@ -663,18 +1050,25 @@ swift test             # run tests
 swift run domo         # run from source
 ```
 
-Two run modes are planned once the [expansion](#roadmap) lands. `domo` continues to run in-process for
-local interactive and `-p` use, with **inline** output by default — the only mode that pipes.
-`domo serve` (Phase 6) starts the headless runtime behind a loopback-only HTTP/SSE server with a
-per-session token, and `domo` then attaches to it as a **full-screen** alternate-screen client
-(Phase 7).
+There are four ways to run it, and the default changed with Phase 7.
+
+| Invocation | What it does |
+|---|---|
+| `domo` | The **full-screen** alternate-screen client. It spawns a loopback `DoMoServer` on an ephemeral port with a generated token, attaches over SSE, and tears it down on exit. This is the default. |
+| `domo --inline` | The classic **inline** REPL, painting into normal scrollback, in-process. Mid-run steering works here and not in the client. |
+| `domo -p "…"` | Headless: prompt in, answer on stdout, exit code as the verdict. Add `--json` for a newline-delimited event stream. The only mode that pipes. |
+| `domo --serve` | The headless runtime behind a loopback-only HTTP/SSE server (default port 4100). Attach with `domo --url http://127.0.0.1:4100 --token …`. |
+
+Note that the server is a flag, not a subcommand — `domo --serve`, not `domo serve`.
 
 ## Non-goals and known gaps
 
-Stated plainly, because a port that implies parity will disappoint. The
-[scope expansion](#what-expanded-and-what-did-not) moved four former non-goals — a local server, a
-full-screen TUI, MCP, and inline images — into the roadmap; the boundaries below are what remains out,
-each against the constraint that keeps it there.
+Stated plainly, because a port that implies parity will disappoint. Two rounds of expansion have
+emptied most of this section: the first moved a local server, a full-screen TUI, MCP and inline images
+into the roadmap and all four shipped; the turn toward a fully-featured harness moved sandboxing, a
+diff review pane, a PTY and much else. What is below is what genuinely remains out — and every one of
+them is the owner's call rather than a settled fact, which is why each appears with its in-scope
+substitute in [Decisions that reverse a stated non-goal](#decisions-that-reverse-a-stated-non-goal).
 
 **Out of scope, deliberately:**
 
@@ -685,21 +1079,39 @@ each against the constraint that keeps it there.
   one sanctioned extension seam, and only stdio-local — see the roadmap.)
 - **Multi-provider support.** One wire API, one gateway. Routing across Bedrock, Vertex, Anthropic,
   and the rest is LiteLLM's job — that is the entire premise. This one did not move.
-- **OAuth login flows.** Bearer key only, for the LLM gateway. The one crack: *remote* MCP servers (a
-  later, separately-scoped goal) require OAuth, so remote MCP inherits this non-goal until that is
-  resolved; the stdio-local MCP shipping first (Phase 8) needs none.
+- **OAuth login flows.** Bearer key only, for the LLM gateway. This has been read too broadly: remote
+  MCP was treated as inheriting the whole non-goal, but a remote server reached with a *static bearer
+  header* needs no OAuth at all and is buildable today. The OAuth half — PKCE, dynamic client
+  registration, a loopback callback — is what actually stays out, and it is the reversal most worth
+  considering.
 - **A supervising daemon.** The Phase-6 server is one local, loopback-only, single-client-first
   endpoint — *not* the `pi-server` daemon's multi-instance supervision, Unix-socket fan-out, mDNS
   discovery, or cloud presence, all of which stay out.
-- **The pi package manager** for distributing extensions, skills, and themes.
+- **A package manager** for distributing extensions, skills and themes. Reading `.claude/skills` and
+  `.agents/skills` in place (Phase 5b) gives compatibility with what people already write, without
+  becoming a distribution mechanism.
 - **Windows.** macOS and Linux only. Not blocked architecturally, just unbuilt and untested.
 
-**Deferred:** SQLite session storage (Later); session sharing and HTML export — though the local
-JSON/JSONL/zip transcript-export half is cheap, dependency-free, and separable from the deferred
-hosted-share infrastructure — and vim-mode editing. The batch of features surfaced by the
-[sibling harnesses](#sibling-harnesses-and-prior-art) — a permission engine ([Phase 8](#roadmap)),
-snapshot checkpoints, a headless `run`, agent personas, and more (Later) — is tracked there. Inline
-images and a local server are no longer deferred; they are roadmap phases.
+**Still deferred, but no longer vague:** SQLite session storage stays behind the `SessionStorage`
+protocol until JSONL actually hurts; hosted session *sharing* stays out while local Markdown and HTML
+export become Phase 20; vim-mode editing, a file watcher, sixel, one-click whole-server MCP grants,
+and multi-client session mirroring are all unscheduled — the last of these is not blocked, since the
+SSE hub already takes N subscribers and REST is stateless, but the mirroring semantics that would make
+a second attached client safe do not exist. Everything else the
+[sibling-harness survey](#sibling-harnesses-and-prior-art) turned up — checkpoints, personas,
+subagents, memory, LSP — now has a phase number rather than a bucket.
+
+**Explicitly not planned,** so they are not rediscovered as gaps: codebase indexing and semantic search
+(LanceDB, Qdrant and tree-sitter each fail SPM-only or the strict-memory-safety posture; the
+transferable asset is the disciplined tool description that routes the model between the search tools
+it already has, which is free); a JS interpreter or "code mode" (JavaScriptCore is Apple-only, and the
+in-scope answer to tool-catalog bloat is the per-turn tool subset Phase 11 enables anyway);
+first-party browser control (route it through a stdio MCP server — `playwright-mcp` works today with
+zero new code, and `McpTool.mapResult` already lifts image blocks onto the attachment channel, so
+DoMoCode can *display* the screenshots); notebook kernel execution; a multi-forge provider
+abstraction; a Slack bridge; org-managed agents and marketplaces; live share links; and a crash screen
+for Swift *traps* — traps do not unwind, and the allocation-free signal-time restore that already
+ships is the correct and complete answer for that path.
 
 **Fidelity gaps that will not be closed:**
 
@@ -715,33 +1127,46 @@ images and a local server are no longer deferred; they are roadmap phases.
 - **Cost accounting** depends on prompt-cache plumbing whose support varies per upstream provider
   behind the gateway. Reported cost is an estimate.
 
-**Costs the expansion accepts.** The four reversals are not free, and the honest list is short and real:
+**Costs the expansion accepted.** The four reversals were not free, and the honest list is short and
+real — each of these is now a property of the shipped system, not a forecast:
 
 - **Full-screen mode abandons shell-scrollback composition.** The inline renderer's whole point is that
   it paints into normal scrollback and composes with your shell history; the alternate-screen mode owns
   the screen, leaves no transcript behind, and cannot be piped. Inline mode is kept as a first-class
-  second mode precisely so that property is not lost outright.
-- **Two render modes, and a new oracle to build.** The inline diff was verified against pi's oracle;
-  the fixed-height cell-buffer diff is new code with *no* upstream oracle, so its correctness rests on
-  a test harness DoMoCode must write itself, and the two modes double the renderer's test surface.
+  second mode precisely so that property is not lost outright — but the full-screen mode is now the
+  default, so that is what most runs get.
+- **Two render modes, and an oracle that had to be built.** The inline diff was verified against pi's
+  oracle; the fixed-height cell-buffer diff is new code with *no* upstream oracle, so its correctness
+  rests on a test harness written here, and the two modes doubled the renderer's test surface.
 - **A local server is a new attack surface.** A socket on loopback is reachable by any local process;
   the mitigation is a loopback-only bind plus a per-session token by default, but the single-process
   design never had this exposure.
-- **A weakened backpressure invariant.** The awaited event-emit guarantee is deliberately relaxed for
-  the network fan-out sink (buffer + slow-client policy), as [Concurrency](#concurrency-and-isolation)
-  records; a late client can only backfill a summary, not replay exact history.
-- **MCP widens the prompt-injection surface.** MCP tool descriptions and resource contents are
-  attacker-controlled text entering the context, which is why the permission engine is a hard
-  prerequisite (Phase 8) and remote servers wait.
+- **A weakened backpressure invariant, and no steering over the wire.** The awaited event-emit
+  guarantee is relaxed for the network fan-out sink (bounded buffer, drop-oldest), as
+  [Concurrency](#concurrency-and-isolation) records; a client that falls behind re-seeds from the
+  transcript rather than replaying the gap. Mid-run steering did not survive the split at all — it
+  works under `--inline`, while the client's second prompt during a run is refused with a 409 and
+  returned to the input box.
+- **MCP widens the prompt-injection surface.** MCP tool descriptions and tool output are
+  attacker-controlled text entering the context. That is why the permission engine landed first, why a
+  standing caveat in the system prompt marks tool text as data rather than instructions, and why
+  remote servers wait.
 - **Image display has weaker coverage.** Kitty images do not reflow and cannot be asserted on the
   TTY-less CI oracle, so display correctness leans on manual verification more than the rest of the
   renderer does.
+- **An error rebuilt from history loses its label.** The JSONL records a failure's prose and stop
+  reason but not its `DoMoError.Kind`, so a session reopened later shows the detail under a generic
+  headline. The live stream carries the real classification; persisting it is the fix.
 
 ## Contributing
 
-Phases 0–4 are implemented; Phase 5 and the [expansion](#roadmap) are the current work. Issues
-proposing scope changes — particularly anything in [Non-goals](#non-goals-and-known-gaps) — are
-welcome before code lands rather than after.
+Every phase of the pi port is implemented; **Phase 5 — Polish** is the current work, and Phases 9–21
+are planned but unstarted. The [dependency spine](#the-dependency-spine) is the useful map: six seams
+gate most of what is left, and a change that lands one of them is worth more than a change that ships
+a feature around it. Issues proposing scope changes — particularly anything in
+[Non-goals](#non-goals-and-known-gaps) or the
+[reversal table](#decisions-that-reverse-a-stated-non-goal) — are welcome before code lands rather
+than after.
 
 ## License
 

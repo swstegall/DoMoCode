@@ -93,15 +93,23 @@ private final class StreamActivity: Sendable {
 /// Re-emits `upstream`, failing the stream if no chunk arrives within `idle` or
 /// the whole body takes longer than `overall`.
 ///
-/// This exists because **nothing else bounds a streamed response body**.
-/// `HTTPClient.execute(_:timeout:)`'s deadline covers only time-to-response-head
-/// — AsyncHTTPClient cancels the deadline task in a `defer` the instant the head
-/// lands — and `HTTPClient.Configuration.Timeout.read` defaults to `nil`. So a
-/// gateway that writes headers and then stalls without closing the socket
-/// produces a stream that never yields, never throws and never finishes. That
-/// hangs the turn, which holds the server's run slot, which makes every later
-/// prompt on that session 409 — the "the session stopped answering, I had to
-/// make a new one" bug, exactly.
+/// This exists because `HTTPClient.execute(_:timeout:)`'s deadline covers only
+/// time-to-response-head — AsyncHTTPClient cancels the deadline task in a `defer`
+/// the instant the head lands — so on its own it bounds nothing about the body. A
+/// gateway that writes headers and then stalls without closing the socket hangs
+/// the turn, which holds the server's run slot, which makes every later prompt on
+/// that session 409 — the "the session stopped answering, I had to make a new
+/// one" bug, exactly.
+///
+/// CORRECTION (this comment used to say "**nothing else bounds a streamed
+/// response body**" because `Timeout.read` defaults to `nil`): that is true of
+/// `HTTPClient.Configuration()` and FALSE of `HTTPClient.shared`, which the
+/// production transport uses. Its `singletonConfiguration` sets
+/// `read: .seconds(90)`, an idle-read timeout that runs through body streaming.
+/// So there is a hard 90-second ceiling underneath this guard: an `idle` at or
+/// above it can never fire, and the failure arrives as `HTTPClientError.readTimeout`
+/// instead of the prose below. Lifting it means owning an `HTTPClient` rather than
+/// sharing the singleton — the same change proxy support needs.
 ///
 /// The failure message deliberately contains "timed out" so
 /// `LiteLLMClient.classifyTransport` marks it retryable and the user sees a
@@ -119,7 +127,7 @@ private final class StreamActivity: Sendable {
 /// Public so its tests build in release mode without `@testable`.
 public func idleGuarded(
     _ upstream: AsyncThrowingStream<[UInt8], any Error>,
-    idle: Duration,
+    idle: Duration?,
     overall: Duration,
     clock: ContinuousClock = ContinuousClock()
 ) -> AsyncThrowingStream<[UInt8], any Error> {
@@ -128,7 +136,7 @@ public func idleGuarded(
         let activity = StreamActivity(start)
         // Poll no slower than the idle window and no faster than 10ms, so a
         // pathological `idle` of zero cannot turn this into a spin loop.
-        let tick = max(.milliseconds(10), min(idle, .seconds(1)))
+        let tick = max(.milliseconds(10), min(idle ?? overall, .seconds(1)))
         let pump = Task {
             await withTaskGroup(of: Void.self) { group in
                 group.addTask {
@@ -147,7 +155,13 @@ public func idleGuarded(
                         try? await Task.sleep(for: tick)
                         if Task.isCancelled { return }
                         let now = clock.now
-                        if now - activity.last >= idle {
+                        // `idle == nil` disables the silence check entirely.
+                        // Expressing it that way rather than as `idle = overall`
+                        // matters for the MESSAGE: with both equal, the two
+                        // predicates go true on the same tick when no chunk ever
+                        // arrived, this branch wins, and an operator who turned
+                        // the silence bound OFF is told the silence bound fired.
+                        if let idle, now - activity.last >= idle {
                             continuation.finish(throwing: DoMoError(
                                 .transport,
                                 """
@@ -180,10 +194,21 @@ public func idleGuarded(
 
 /// The production transport.
 ///
-/// Uses `HTTPClient.shared` by default: it is process-wide, needs no shutdown,
-/// and honors `HTTP(S)_PROXY`/`NO_PROXY` from the environment, which is the
-/// behavior the README promises. An injected client is accepted for callers that
-/// need custom TLS or proxy configuration.
+/// Uses `HTTPClient.shared` by default: it is process-wide and needs no shutdown.
+///
+/// CORRECTION (this comment used to claim it "honors `HTTP(S)_PROXY`/`NO_PROXY`
+/// from the environment, which is the behavior the README promises"): it does
+/// not, and the README no longer promises it. `HTTPClient.shared` is built with
+/// a fixed configuration that cannot carry a proxy, and nothing in this package
+/// reads those variables. Proxy support means constructing an owned `HTTPClient`
+/// with `HTTPClient.Configuration(proxy:)` and taking on its shutdown — which is
+/// why the initializer accepts an injected client.
+///
+/// Note that injecting a *client* here is unrelated to
+/// ``LiteLLMClient/Configuration/streamIdleTimeout``: this initializer takes
+/// `idleTimeout` as its own parameter. It is injecting a whole *transport* into
+/// `LiteLLMClient` that opts out of that setting, because at that point the
+/// caller has already chosen these bounds.
 public struct AsyncHTTPClientTransport: StreamingTransport {
     private let client: HTTPClient
     private let connectTimeout: Duration
@@ -197,7 +222,11 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
     /// as soon as the head arrives — so on its own this bounds nothing about the
     /// streamed body. What actually bounds the body is ``idleGuarded(_:idle:overall:clock:)``,
     /// which this transport wraps every response body in, using this same value as
-    /// its `overall` budget and ``defaultIdleTimeout`` as its silence budget.
+    /// its `overall` budget and the instance's `idleTimeout` as its silence budget
+    /// — ``defaultIdleTimeout`` only when the caller supplied none, which since
+    /// `DOMOCODE_STREAM_TIMEOUT_MS` was wired is no longer the usual case. An
+    /// `idleTimeout` of zero disables the silence budget by setting it to this
+    /// same overall deadline, leaving this value the only bound.
     ///
     /// Ten minutes matches `DOMOCODE_TIMEOUT_MS`'s default; a streamed coding turn
     /// with large tool output legitimately runs for minutes.
@@ -244,6 +273,22 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         self.idleTimeout = idleTimeout
     }
 
+    /// The silence budget this transport will enforce for a request whose overall
+    /// deadline is `deadline`, or `nil` when the silence check is disabled.
+    ///
+    /// `.zero` is the disable sentinel, carried verbatim from
+    /// `DOMOCODE_STREAM_TIMEOUT_MS=0` through ``LiteLLMClient/Configuration/streamIdleTimeout``.
+    /// Zero must never be enforced literally: it would fail every request a few
+    /// milliseconds after the response head, against every gateway.
+    ///
+    /// Exposed rather than inlined into ``execute(request:body:timeout:)`` because
+    /// the sentinel is the whole behaviour and it needs a test that a
+    /// configuration-level assertion cannot provide — deleting the mapping left
+    /// the entire suite green while the knob bricked the CLI.
+    public func idleWindow(for deadline: Duration) -> Duration? {
+        idleTimeout == .zero ? nil : idleTimeout
+    }
+
     public func execute(
         request: HTTPRequest,
         body: [UInt8]?,
@@ -278,7 +323,18 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         // `deadline` bounded the head only (see `defaultTimeout`). The body is
         // unbounded until this wrap: without it a gateway that stalls after the
         // head hangs the turn, and the session, forever.
-        let stream = idleGuarded(Self.bridge(response.body), idle: idleTimeout, overall: deadline)
+        //
+        // An idle timeout of ZERO disables this package's silence check; the
+        // wrap still happens so the OVERALL deadline keeps applying. Zero must
+        // never mean "fail instantly" — that would trip a few milliseconds after
+        // the head on every request ever made. Note that disabling it does not
+        // make the stream unbounded by silence: `HTTPClient.shared`'s own 90s
+        // read timeout still applies and cannot be turned off from here.
+        let stream = idleGuarded(
+            Self.bridge(response.body),
+            idle: idleWindow(for: deadline),
+            overall: deadline
+        )
         return StreamingResponse(head: head, body: stream)
     }
 

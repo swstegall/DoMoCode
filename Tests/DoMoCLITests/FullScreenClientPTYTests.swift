@@ -114,7 +114,11 @@ struct FullScreenClientPTYTests {
         // to these, which is what gives the renderer a grid to paint.
         environment["COLUMNS"] = "100"
         environment["LINES"] = "30"
-        for key in ["OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL", "DOMOCODE_OFFLINE"] {
+        for key in [
+            "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
+            // Live since the stream idle bound was wired.
+            "DOMOCODE_STREAM_TIMEOUT_MS",
+        ] {
             environment.removeValue(forKey: key)
         }
         process.environment = environment
@@ -324,7 +328,11 @@ struct FullScreenClientPTYTests {
         environment["DOMOCODE_LOG_LEVEL"] = "error"
         environment["COLUMNS"] = "100"
         environment["LINES"] = "30"
-        for key in ["OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL", "DOMOCODE_OFFLINE"] {
+        for key in [
+            "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
+            // Live since the stream idle bound was wired.
+            "DOMOCODE_STREAM_TIMEOUT_MS",
+        ] {
             environment.removeValue(forKey: key)
         }
         process.environment = environment

@@ -98,6 +98,98 @@ struct WedgeSurfaceTests {
         await client.quit()
     }
 
+    @Test("A retry is shown on the status line while the run waits it out")
+    func retryNoticeReachesTheStatusLine() async throws {
+        // The wedge this closes is the quietest one: nothing is broken, the run is
+        // simply asleep in a backoff that can last five minutes. The runtime
+        // emitted a notice for it, the server projected it, and the store folded
+        // it — into `onNotice`, which nothing in the app was assigned to. The whole
+        // channel dead-ended one call short of the screen.
+        let stream = Self.sse([
+            .connected(protocolVersion: serverProtocolVersion, sessionID: "abc123", running: true),
+            .notice(
+                ServerNotice(
+                    level: .warning,
+                    code: "retry",
+                    text: "Retrying in 8s (attempt 4/10) — provider busy",
+                    detail: "upstream is at capacity",
+                    ttlMilliseconds: 8000
+                )),
+        ])
+        let stub = try Self.runtime([StubRoute("GET", "/events", 200, "OK", stream)])
+        stub.start()
+        defer { stub.stop() }
+
+        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, watching: [
+            "Retrying in 8s (attempt 4/10) — provider busy"
+        ])
+        _ = await client.waitForAll()
+        #expect(client.missing.isEmpty, "never shown: \(client.missing)\n\(client.joined())")
+        await client.quit()
+    }
+
+    @Test("A retry stops being advertised once the run it belonged to has ended")
+    func retryNoticeClearsWhenTheRunSettles() async throws {
+        // The dwell is the backoff, which reaches a minute. Abort at second five
+        // and, without this, the status line spends the next fifty-five seconds
+        // saying "Retrying in 60s" beside a segment that already reads `idle` —
+        // promising an attempt that will never be made.
+        // Two separate streams, so the notice is genuinely PAINTED before the run
+        // settles. Delivered in one burst the client would apply both frames and
+        // clear the notice before any frame reached the screen, and the test
+        // could not tell "shown then cleared" from "never shown at all".
+        let running = Self.sse([
+            .connected(protocolVersion: serverProtocolVersion, sessionID: "abc123", running: true),
+            .notice(
+                ServerNotice(
+                    level: .warning, code: "retry",
+                    text: "Retrying in 60s (attempt 7/10) — rate limited",
+                    ttlMilliseconds: 60000
+                )),
+        ])
+        let settled = Self.sse([
+            .connected(protocolVersion: serverProtocolVersion, sessionID: "abc123", running: false)
+        ])
+        let stub = try Self.runtime([
+            StubRoute("GET", "/events", 200, "OK", running, times: 1),
+            StubRoute("GET", "/events", 200, "OK", settled),
+        ])
+        stub.start()
+        defer { stub.stop() }
+
+        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, watching: [
+            "Retrying in 60s (attempt 7/10) — rate limited"
+        ])
+        // It must be shown at all — otherwise the clearing assertion below is
+        // vacuous and would pass against a client that never rendered it.
+        _ = await client.waitForAll()
+        #expect(client.missing.isEmpty, "never shown: \(client.missing)\n\(client.joined())")
+
+        // The first stream ends, the client reconnects, and the server now says
+        // the run is over. The retry must go with it — well inside its own 60s
+        // dwell, which is what proves the expiry timer is not what cleared it.
+        let cleared = await client.waitUntilGone("Retrying in 60s")
+        #expect(cleared, "the retry outlived its run:\n\(client.joined())")
+        await client.quit()
+    }
+
+    @Test("A retry never becomes a permanent transcript row")
+    func retryNoticeStaysOutOfTheTranscript() async throws {
+        // `error` is the door to a persistent row. A retry taking it would leave
+        // ten rows of resolved history in the transcript of a run that succeeded,
+        // and — worse — would read as a failure that did not happen.
+        let store = EventStore()
+        store.select("abc123")
+        store.apply(
+            .notice(
+                ServerNotice(
+                    level: .warning, code: "retry",
+                    text: "Retrying in 8s (attempt 4/10) — provider busy")))
+
+        #expect(store.transcript.isEmpty)
+        #expect(store.lastNotice?.code == "retry")
+    }
+
     @Test("A session list that will not refresh is reported, without pretending the session failed")
     func sessionListRefreshFailureIsReported() async throws {
         // The lightest of the swallow sites, and the one most likely to be dropped

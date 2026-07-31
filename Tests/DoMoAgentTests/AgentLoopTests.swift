@@ -150,10 +150,12 @@ extension AgentEvent {
         case .messageEnd(let message): "messageEnd(\(message.role.rawValue))"
         case .toolExecutionStart(_, let name, _): "toolStart(\(name))"
         case .toolExecutionEnd(_, let name, _, _): "toolEnd(\(name))"
-        // The loop emits exactly one of these, and only for a failed run: the
-        // classified failure, immediately before `agentEnd`. The label names the
-        // code so an order assertion reads the same way as every other kind
-        // here. See `AgentFailureTests`.
+        // Two producers: the classified failure of an errored run, immediately
+        // before `agentEnd` (`AgentFailureTests`), and one per retry the client
+        // is about to sleep through, ahead of the turn's `messageStart`
+        // (`RetryNoticeTests`). The label names the code so an order assertion
+        // reads the same way as every other kind here, and so the two are
+        // distinguishable in one.
         case .notice(let notice): "notice(\(notice.code))"
         }
     }

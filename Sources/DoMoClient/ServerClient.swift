@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 //
-// The write+read transport to a `domo serve` runtime. Thin on purpose: it speaks
+// The write+read transport to a `domo --serve` runtime. Thin on purpose: it speaks
 // the DoMoServer wire — the REST endpoints for control and history, and the SSE
 // stream for live events — and hands decoded values back. Everything above it
 // (the event store, the two-pane UI) is transport-agnostic.
@@ -69,7 +69,7 @@ private final class ActivityStamp: Sendable {
 
 // MARK: - Client
 
-/// A client for one `domo serve` runtime, identified by its base URL and bearer
+/// A client for one `domo --serve` runtime, identified by its base URL and bearer
 /// token. `Sendable` — it holds only value config and a shared ``HTTPClient`` the
 /// caller owns and shuts down.
 public struct ServerClient: Sendable {

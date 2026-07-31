@@ -80,6 +80,15 @@ public final class ClientApp {
     private var notice: String?
     private var noticeExpiry: Date?
 
+    /// Whether the current notice is only true while a run is in flight.
+    ///
+    /// A retry says what the run is *about to do*, and its dwell is the backoff —
+    /// up to a minute. Abort the run, or let it finish inside that window, and the
+    /// line goes on promising an attempt that will never happen, beside a status
+    /// segment that already says `idle`. Every other notice is an acknowledgement
+    /// of something that already happened, and stays true regardless.
+    private var noticeIsRunScoped = false
+
     // MARK: The one shared stored-property block
     //
     // Every area that adds state to this class adds it HERE, together, declared once.
@@ -162,6 +171,10 @@ public final class ClientApp {
     /// How many times a create/resume is retried before it becomes a failure row.
     /// A single attempt is how "no session selected, forever" happened.
     private static let sessionAttempts = 3
+    /// Longest a notice may hold the status line, however long its TTL claims.
+    /// Matches `DOMOCODE_RETRY_BUDGET_MS`'s default: no single backoff can exceed
+    /// the whole sleep budget, so nothing legitimate is ever truncated by this.
+    private static let maxNoticeDwell: Double = 300
 
     private static let ctrlC: [UInt8] = [0x03]
     private static let escape: [UInt8] = [0x1b]
@@ -234,9 +247,19 @@ public final class ClientApp {
         }
 
         store.onChange = { [weak self] in
+            self?.clearNoticeIfRunSettled()
             self?.reconcilePermissionOverlay()
             self?.surface?.requestRender()
         }
+        // An info/warning notice is transient status, not transcript. The store
+        // folds error-level notices into permanent rows itself and never calls
+        // this for them, so there is no double-reporting to guard against.
+        //
+        // Without this line the whole notice channel dead-ends: the runtime
+        // emits, the server projects, the store folds — and nothing renders. A
+        // retry is the only producer today, and it stayed invisible for exactly
+        // that reason.
+        store.onNotice = { [weak self] notice in self?.show(notice) }
         promptInput.onSubmit = { [weak self] text, attachments in self?.submit(text, attachments) }
         // Persist off the render loop. The store is an actor, so the write cannot
         // race the startup load and cannot stall the frame that just accepted the
@@ -462,7 +485,50 @@ public final class ClientApp {
     private func post(notice text: String, seconds: Double = 4) {
         notice = text
         noticeExpiry = Date().addingTimeInterval(seconds)
+        noticeIsRunScoped = false
         surface?.requestRender()
+    }
+
+    /// Drop a run-scoped notice once the run it described has settled.
+    ///
+    /// Called on every applied frame, so it fires on the `agent_end` that ends
+    /// the run whether it completed, errored, or was aborted from this client.
+    private func clearNoticeIfRunSettled() {
+        guard noticeIsRunScoped, store.runState != .running else { return }
+        noticeIsRunScoped = false
+        notice = nil
+        noticeExpiry = nil
+    }
+
+    /// Show a non-error runtime notice on the status line.
+    ///
+    /// The dwell comes from the notice's own TTL when it has one, because the
+    /// only producer today — a retry — knows exactly how long its message stays
+    /// true: the backoff it is about to sleep. Clamped at both ends so a hostile
+    /// or absurd `Retry-After` can neither flash the line for 20ms nor pin it
+    /// there for an hour.
+    ///
+    /// The upper bound is deliberately generous — the retry sleep budget's
+    /// default, not the per-attempt cap. An operator may raise
+    /// `DOMOCODE_RETRY_MAX_MS` above the 60s default, and this client cannot see
+    /// what they chose; clamping to a guess would blank the status line while the
+    /// run is still waiting, which is the silence this path exists to remove.
+    /// Staleness is handled by ``clearNoticeIfRunSettled()`` rather than by a
+    /// tight timer: the notice goes the moment the run does, so the only thing
+    /// this ceiling still guards against is an absurd TTL during a run that
+    /// really is still going.
+    ///
+    /// The text is sanitized even though the retry summary is built from
+    /// program-controlled parts. This is the general door for warning/info
+    /// notices, the next producer may not be so careful, and a status line that
+    /// accepts raw provider text is how an escape sequence reaches the frame.
+    private func show(_ notice: ServerNotice) {
+        let body = sanitizeUntrustedText(collapseToOneLine(notice.text))
+        guard !body.isEmpty else { return }
+        let seconds = notice.ttlMilliseconds.map { Double($0) / 1000 }
+        post(notice: body, seconds: min(max(seconds ?? 4, 2), Self.maxNoticeDwell))
+        // After `post`, which resets the flag for the ordinary case.
+        noticeIsRunScoped = notice.code == "retry"
     }
 
     /// One line describing anything the transport threw.

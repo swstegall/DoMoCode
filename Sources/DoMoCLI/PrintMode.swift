@@ -234,14 +234,24 @@ struct PrintEventSink: AgentEventSink {
             )
             emitImages(result.images)
 
-        case .notice:
-            // INERT SEAM. Nothing emits `.notice` yet, so print mode drops it and
-            // its output is byte-identical to before the case existed. The wave
-            // that adds the notice producers fills in the body here: a JSON
-            // `notice` event carrying level/code/text/detail/kind in JSON mode,
-            // and a single dim line on stderr in text mode (stderr, not stdout —
-            // `-p` output is scripted against and must stay clean).
-            break
+        case .notice(let notice):
+            // Only retries are reported here, and only on stderr.
+            //
+            // Scoped to `"retry"` on purpose. Error-level notices have been
+            // flowing since the loop learned to emit one on a failed settle, and
+            // `fail()` already reports that failure on stderr with an exit code
+            // — reporting it twice from two places is how a CI log grows a
+            // duplicate. The gap this closes is narrower: a run that goes quiet
+            // for minutes of backoff with nothing said.
+            //
+            // stderr in BOTH modes, unlike the turn heartbeat, which is text-only.
+            // A retry is a diagnostic, and `--help` promises diagnostics go to
+            // stderr; putting it there keeps stdout byte-clean for a script and
+            // leaves the `--json` event vocabulary — a published contract with no
+            // `notice` member — untouched, while a human watching a CI log still
+            // learns why nothing is happening.
+            guard notice.code == "retry" else { break }
+            channel.writeErr("… \(notice.text)\n")
 
         case .turnStart, .turnEnd, .agentEnd:
             break
