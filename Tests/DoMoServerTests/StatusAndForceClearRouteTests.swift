@@ -198,6 +198,68 @@ struct StatusAndForceClearRouteTests {
         #expect(serverProtocolVersion == 1)
     }
 
+    /// Phase 5a added a hop into the session's harness to this route, to carry the
+    /// cumulative accounting. That hop is only safe if it survives the situation the
+    /// route exists for: a run parked on a tool that cannot be cancelled. The
+    /// harness actor is reentrant across the parked tool's suspension, so the read
+    /// interleaves — but "should" is not evidence, and a route that answered every
+    /// case except the wedged one would be worse than no accounting at all.
+    ///
+    /// It also pins that the accounting survives the force-clear: the lever replaces
+    /// the whole `SessionState`, and a replacement harness that this route could not
+    /// read would turn a recovered session into a permanently number-less one.
+    @Test("Status answers with accounting while a run is wedged, and after force-clear")
+    func statusCarriesAccountingWhileWedgedAndAfterForceClear() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let server = makeServer(dirs, tools: [tool], streamFn: Self.parkThenText())
+
+        try await withServer(server) { http, port in
+            let create = try await send(http, port, .post, "/session")
+            let id = try JSONDecoder().decode(SessionRef.self, from: create.body).id
+
+            let prompt = try await send(http, port, .post, "/session/\(id)/prompt", json: ["prompt": "go"])
+            #expect(prompt.status == 202)
+            var parked = false
+            for _ in 0..<250 where !parked {
+                if tool.parkedCount == 1 { parked = true; break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(parked, "the run never reached the parking tool")
+
+            let wedged = try await send(http, port, .get, "/session/\(id)/status")
+            #expect(wedged.status == 200, "a wedged session made the status route return \(wedged.status)")
+            let wedgedStatus = try JSONDecoder().decode(SessionStatus.self, from: wedged.body)
+            #expect(wedgedStatus.running, "the wedged run was not reported as running")
+            let wedgedAccounting = try #require(
+                wedgedStatus.accounting,
+                "the status route reported no accounting for a wedged session"
+            )
+            // The assistant turn that made the tool call is persisted before the
+            // tool is dispatched, so exactly one turn is on the books.
+            #expect(wedgedAccounting.turns == 1, "turns was \(wedgedAccounting.turns)")
+            // This suite's scripted stream reports no usage at all, and this suite's
+            // server configures no window. Both must read back as what they are —
+            // zero spent, and an unknown ceiling — rather than as invented numbers.
+            #expect(wedgedAccounting.usage.totalTokens == 0)
+            #expect(wedgedAccounting.contextWindow == nil, "an unconfigured window was reported as a number")
+
+            let cleared = try await send(http, port, .post, "/session/\(id)/force-clear")
+            #expect(cleared.status == 200, "force-clear returned \(cleared.status)")
+
+            let after = try await send(http, port, .get, "/session/\(id)/status")
+            #expect(after.status == 200, "status after force-clear returned \(after.status)")
+            let afterStatus = try JSONDecoder().decode(SessionStatus.self, from: after.body)
+            #expect(afterStatus.running == false)
+            #expect(
+                afterStatus.accounting != nil,
+                "the replacement harness reported no accounting; the recovered session lost its numbers"
+            )
+        }
+    }
+
     // MARK: - Body caps
 
     @Test("The prompt route accepts a body over the 4 MiB default; other routes still do not")

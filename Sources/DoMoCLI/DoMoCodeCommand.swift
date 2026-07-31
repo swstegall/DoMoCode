@@ -237,16 +237,62 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let environment = ProcessInfo.processInfo.environment
         let workingDirectory = FilePath(FileManager.default.currentDirectoryPath)
 
+        // Refuse to run an untrusted project's local settings BEFORE they are
+        // parsed, not after. The gate used to run some thirty lines below
+        // ``ResolvedConfiguration/load(cli:environment:workingDirectory:)``, which
+        // meant an untrusted repository's `.domocode/settings.json` was already
+        // decoded — and, now that settings values interpolate `{env:…}`/`{file:…}`,
+        // already *acted on* — by the time the user was asked whether to trust it.
+        // `InterpolationPolicy.untrusted(root:)`'s root confinement remains the
+        // primary defence; this ordering is the belt to its braces, and it costs
+        // nothing because ``ResolvedConfiguration/resolveConfigDirectory(environment:)``
+        // is pure and reads only the environment — never a settings file — so the
+        // config directory the trust store lives in is knowable without loading
+        // anything. A directory with no `.domocode/settings.json` needs no trust.
+        // An interactive run (no `-p`) can ASK; print mode and `--serve` cannot.
+        try Self.ensureProjectTrust(
+            workingDirectory: workingDirectory,
+            configDirectory: ResolvedConfiguration.resolveConfigDirectory(environment: environment),
+            trustFlag: trust,
+            canPrompt: prompt == nil && !serve && isatty(STDIN_FILENO) == 1
+        )
+
         let configuration = try ResolvedConfiguration.load(
             cli: CLIOverrides(baseURL: baseURL, model: model),
             environment: environment,
             workingDirectory: workingDirectory
         )
 
+        // Teach the redaction vault this process's ACTUAL secrets, at the one
+        // moment they are all known and before anything can print a diagnostic.
+        // The pattern rules alone cannot catch a gateway key that carries no
+        // recognizable prefix, and the code that resolves a key and the code that
+        // renders a failure live in different modules and never meet — which is
+        // exactly why the vault is process-wide.
+        //
+        // Every `mcpServers[*].environment` value is registered wholesale rather
+        // than only the credential-looking ones: that block exists to hand
+        // secrets to a child, and a name-based filter would miss the one a user
+        // spelled `GH_PAT`. The cost is that an innocuous value of eight
+        // characters or more (`production`) is also scrubbed out of diagnostics.
+        Redaction.register(configuration.apiKey)
+        Redaction.registerAll(
+            configuration.mcpServers.values.flatMap { server in (server.environment ?? [:]).values }
+        )
+
         // Bootstrap logging to stderr *before* anything can log. The stock
         // swift-log handler writes to stdout, which would corrupt the output
         // channel; routing it to stderr is what keeps stdout clean.
         Self.bootstrapLogging(level: configuration.logLevel)
+
+        // Resolution warnings — a setting that parsed as JSON but means nothing,
+        // such as `"logLevel": "verbose"`. They go to stderr, never stdout, so
+        // `-p` and `--json` stay byte-clean for a pipe. Without this the
+        // resolver's diagnosis is computed and thrown away, which is the exact
+        // kind of dead substrate this phase exists to remove.
+        for warning in configuration.warnings {
+            Self.writeStderr("warning: \(warning)\n")
+        }
 
         guard let model = configuration.model, !model.isEmpty else {
             throw DoMoError(
@@ -259,17 +305,6 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         if let maxTurns, maxTurns < 0 {
             throw DoMoError(.configuration, "--max-turns must be 0 (unlimited) or greater (got \(maxTurns)).")
         }
-
-        // Refuse to run an untrusted project's local settings before any tool is
-        // built — the point of the gate is that untrusted input never reaches a
-        // run. A directory with no `.domocode/settings.json` needs no trust.
-        // An interactive run (no `-p`) can ASK; print mode and `--serve` cannot.
-        try Self.ensureProjectTrust(
-            workingDirectory: workingDirectory,
-            configDirectory: configuration.configDirectory,
-            trustFlag: trust,
-            canPrompt: prompt == nil && !serve && isatty(STDIN_FILENO) == 1
-        )
 
         // `--serve` runs the headless HTTP/SSE server and does not return until the
         // process is signalled. It manages sessions itself, so it is branched before
@@ -319,7 +354,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     maxTurns: turnLimit,
                     sessionSource: sessionSource,
                     mcpServers: configuration.mcpServers,
-                    mcpLog: { Self.writeStderr($0 + "\n") }
+                    mcpLog: { Self.writeStderr($0 + "\n") },
+                    modelRuntime: configuration.modelRuntime(for: model),
+                    compaction: configuration.compaction,
+                    summarizer: Self.compactionSummarizer(configuration, model: model),
+                    credentialEnvNames: Self.gatewayCredentialEnvNames(configuration)
                 )
                 try await Self.runInteractive(mode)
             } else {
@@ -338,7 +377,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         }
 
         let shell = try SubprocessShell()
-        let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
+        let toolContext = try await ToolContext.rooted(
+            at: workingDirectory,
+            shell: shell,
+            environment: Self.toolEnvironment(configuration)
+        )
         let registry = ToolRegistry.builtin
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
 
@@ -377,8 +420,6 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
         let printMode = PrintMode(
             client: client,
-            model: model,
-            reasoningEffort: configuration.reasoningEffort,
             registry: registry,
             toolContext: toolContext,
             workingDirectory: workingDirectory,
@@ -388,7 +429,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionSource: sessionSource,
             sessionDirectory: configuration.sessionDirectory,
             beforeToolCall: permissionHook,
-            mcpTools: visibleMcp
+            mcpTools: visibleMcp,
+            modelRuntime: configuration.modelRuntime(for: model),
+            compaction: configuration.compaction,
+            summarizer: Self.compactionSummarizer(configuration, model: model, client: client)
         )
 
         let code: Int32
@@ -418,12 +462,89 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             workspaceDirectory: workingDirectory.string,
             // Scrub the LLM-gateway credential variables from each MCP child's
             // environment — an untrusted server has no business reading them.
-            sensitiveEnvKeys: Set(EnvName.apiKeyFallbacks),
+            // This used to be the hardcoded ``EnvName/apiKeyFallbacks`` triple,
+            // which silently exempted the one name a user chose for themselves:
+            // with `"apiKeyEnv": "MY_GATEWAY_KEY"` the key was handed intact to
+            // every configured MCP server. See ``gatewayCredentialEnvNames(_:)``.
+            sensitiveEnvKeys: Self.gatewayCredentialEnvNames(configuration),
             // Reserve the built-in tool names so an MCP tool can never shadow one.
             reservedNames: Set(ToolRegistry.builtin.names),
             log: { Self.writeStderr($0 + "\n") }
         )
         return (tools, manager)
+    }
+
+    // MARK: Credential hygiene
+
+    /// Every environment variable name that holds THIS run's LLM-gateway
+    /// credential.
+    ///
+    /// ``Redaction/secretEnvironmentNames`` is the fixed fallback chain
+    /// (`DOMOCODE_API_KEY`, `LITELLM_API_KEY`, `OPENAI_API_KEY`). A settings file
+    /// may name one more through `apiKeyEnv`, and that variable holds exactly the
+    /// same secret — so a scrub list that omitted it handed the key straight to
+    /// every MCP server and every `bash` command the model chose to run. The union
+    /// is computed in one place because the two scrub sites that need it (MCP
+    /// children, tool subprocesses) must not be able to drift apart.
+    static func gatewayCredentialEnvNames(_ configuration: ResolvedConfiguration) -> Set<String> {
+        var names = Redaction.secretEnvironmentNames
+        if let configured = configuration.apiKeyEnvName, !configured.isEmpty {
+            names.insert(configured)
+        }
+        return names
+    }
+
+    /// The environment a tool subprocess runs under: this process's, minus the
+    /// gateway credential.
+    ///
+    /// ``DoMoTools/ToolContext/environment`` inherits, so before this the model
+    /// could read the key with a one-word `bash` command (`env`). A `nil` override
+    /// unsets the variable in the child — and it must be written with
+    /// `updateValue(_:forKey:)`, because subscript-assigning `nil` to a dictionary
+    /// whose values are already `Optional` REMOVES the entry instead of storing a
+    /// nil under it, which would silently leave the variable inherited.
+    static func toolEnvironment(_ configuration: ResolvedConfiguration) -> ShellEnvironment {
+        var overrides: [String: String?] = [:]
+        for name in gatewayCredentialEnvNames(configuration) {
+            overrides.updateValue(nil, forKey: name)
+        }
+        return .inherit(overrides)
+    }
+
+    // MARK: Compaction
+
+    /// The alias compaction should summarize with, or `nil` to leave the harness's
+    /// own same-model fallback in place.
+    ///
+    /// `smallModel` DEFAULTS to `model` (see ``ResolvedConfiguration/resolve(cli:environment:project:user:)``),
+    /// so keying this on "is it non-nil" would install a CLI-built summarizer for
+    /// every existing user and change a compaction path nobody asked to change.
+    /// Only a genuinely different alias earns one.
+    static func compactionModel(_ configuration: ResolvedConfiguration, model: String) -> String? {
+        guard let small = configuration.smallModel, !small.isEmpty, small != model else { return nil }
+        return small
+    }
+
+    /// The compaction summarizer for this run, or `nil` when nothing configured a
+    /// distinct small model.
+    ///
+    /// - Parameter client: the run's own client, when there is one to share. The
+    ///   inline REPL builds its client inside `InteractiveMode.make`, so that
+    ///   surface passes nothing and a second client is constructed here. That is
+    ///   cheap: ``DoMoLLM/AsyncHTTPClientTransport`` runs on
+    ///   AsyncHTTPClient's process-wide shared `HTTPClient`, so the two clients
+    ///   share one connection pool and neither owns a shutdown.
+    static func compactionSummarizer(
+        _ configuration: ResolvedConfiguration,
+        model: String,
+        client: LiteLLMClient? = nil
+    ) -> Summarizer? {
+        guard let small = compactionModel(configuration, model: model) else { return nil }
+        return makeSummarizer(
+            client: client ?? LiteLLMClient(configuration: configuration.clientConfiguration),
+            model: small,
+            runtime: configuration.modelRuntime(for: small)
+        )
     }
 
     /// Reads each `--image` path into an ``ImageBlock``, sniffing its media type
@@ -501,7 +622,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             options: DoMoServer.Options(host: "127.0.0.1", port: port, token: token)
         )
 
+        // The handshake line first, the redaction registration second, and in that
+        // order on purpose: this line is how a `--url` client (and the end-to-end
+        // test that drives one) learns the token, so registering the token before
+        // writing it would only matter if this call were scrubbed — but the order
+        // is pinned anyway, because the day this stderr path grows a scrub is the
+        // day the handshake would silently start printing `[redacted]`.
         Self.writeStderr("Authorization: Bearer \(token)\n")
+        // From here on the token is a secret like any other: a diagnostic that
+        // echoes a request header must not reproduce it.
+        Redaction.register(token)
         // Print the ACTUAL bound port from onReady, so `--serve --port 0` (ephemeral)
         // advertises the real port the OS assigned rather than the literal 0.
         do {
@@ -525,7 +655,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         maxTurns: Int?
     ) async throws -> (runtime: ServerRuntime, mcpManager: MCPManager) {
         let shell = try SubprocessShell()
-        let toolContext = try await ToolContext.rooted(at: workingDirectory, shell: shell)
+        let toolContext = try await ToolContext.rooted(
+            at: workingDirectory,
+            shell: shell,
+            environment: Self.toolEnvironment(configuration)
+        )
         let registry = ToolRegistry.builtin
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
@@ -549,10 +683,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             workingDirectory: workingDirectory,
             toolNames: registry.names + visibleMcp.map(\.definition.name)
         )
-        let reasoningEffort = configuration.reasoningEffort
-        let streamFn: AgentStreamFn = { context in
-            client.streamCompletion(model: model, context: context, reasoningEffort: reasoningEffort)
-        }
+        // One resolved runtime for the alias — reasoning effort, per-alias rates and
+        // the declared context window — built once and shared by the stream function
+        // and the accounting the client's footer reads.
+        let modelRuntime = configuration.modelRuntime(for: model)
+        let streamFn = makeStreamFn(client: client, runtime: modelRuntime)
         let runtime = ServerRuntime(config: ServerRuntime.Config(
             systemPrompt: systemPrompt,
             tools: tools,
@@ -566,7 +701,13 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 ruleset: permission.ruleset,
                 factory: permission.factory,
                 persist: permission.persist
-            )
+            ),
+            // `nil` when nothing declared a window for this alias. It travels as
+            // `nil` all the way to the footer, which renders "?" — never a
+            // percentage of a guess.
+            contextWindow: modelRuntime.contextWindow,
+            compaction: configuration.compaction,
+            summarizer: Self.compactionSummarizer(configuration, model: model, client: client)
         ))
         return (runtime, mcpManager)
     }
@@ -602,6 +743,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         if let url = serverURL {
             baseURL = url
             token = serverToken ?? ""
+            // `--token` is a bearer credential the operator typed on the command
+            // line; a transport diagnostic that echoes the request header must not
+            // reproduce it. (`register` ignores the empty string.)
+            Redaction.register(token)
         } else {
             let (runtime, manager) = try await Self.buildServerRuntime(
                 configuration: configuration,
@@ -611,6 +756,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             )
             mcpManager = manager
             let generated = Self.generateToken()
+            // Never announced anywhere (the client is in this process), but it is
+            // still a bearer credential that a request-header dump would carry.
+            Redaction.register(generated)
             let server = DoMoServer(
                 runtime: runtime,
                 options: DoMoServer.Options(host: "127.0.0.1", port: 0, token: generated)

@@ -76,9 +76,14 @@ public func runAgentLoop(
                     AgentNotice(
                         level: .error,
                         code: noticeCode(for: carried.kind),
-                        // The whole cause chain, one line, capped: a gateway can
-                        // answer with an entire HTML error page.
-                        text: DoMoError.truncating(carried.description),
+                        // The whole cause chain, one line, redacted, then
+                        // capped: a gateway can answer with an entire HTML error
+                        // page, and the innermost link of the chain is the one
+                        // the HTTP client wrote — request URL and all. Redacting
+                        // before the cap matters because truncating first can
+                        // split a registered literal, and half a key matches
+                        // neither the registry nor a prefix rule.
+                        text: DoMoError.truncating(Redaction.diagnostic(carried.description)),
                         kind: carried.kind.label
                     )
                 )
@@ -480,10 +485,15 @@ private func streamAssistantResponse(
                     "The model request failed",
                     cancelled: cancelled
                 ),
-            // Byte-compat: `errorMessage` is spelled exactly as it was before
-            // the failure started being carried, so the persisted transcript
-            // does not change shape. `DoMoError.description` is the whole cause
-            // chain, so the prose was never the part that was lost.
+            // `errorMessage` is the whole cause chain
+            // (`DoMoError.description`), so no prose is lost relative to what
+            // was carried before the failure value existed — with ONE
+            // deliberate exception, which ``synthesizeTerminal`` applies: a
+            // credential found in that prose is replaced. That breaks the
+            // byte-compat this comment used to claim, and breaking it is the
+            // point. This string is appended to the session JSONL and never
+            // rewritten, so a gateway that echoed the API key back at us would
+            // otherwise leave it on disk for the life of the session.
             errorMessage: classified?.description ?? String(describing: error),
             sink: sink
         )
@@ -498,6 +508,11 @@ private func streamAssistantResponse(
 /// failure all come out of the SAME `cancelled` branch, so they cannot disagree:
 /// there is no arrangement of arguments that yields an `.aborted` message
 /// carrying a failure, or an `.error` message that silently drops one.
+///
+/// The single assignment of `errorMessage` is also the single place a credential
+/// can be stopped from reaching the transcript, which is why it is redacted
+/// here rather than at the two call sites: this message is persisted to the
+/// session JSONL and is never rewritten afterwards.
 private func synthesizeTerminal(
     current: AssistantMessage?,
     model: String,
@@ -516,7 +531,7 @@ private func synthesizeTerminal(
         model: model,
         usage: current?.usage ?? .zero,
         stopReason: stopReason,
-        errorMessage: text
+        errorMessage: Redaction.diagnostic(text)
     )
     if !startEmitted {
         await sink.emit(.messageStart(.assistant(message)))

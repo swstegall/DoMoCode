@@ -83,9 +83,20 @@ actor PersistentProcess {
         /// Working directory for the child, or nil to inherit.
         var workingDirectory: String?
         /// Environment variable names to REMOVE from the inherited environment before
-        /// spawning (overlaid `environment` still wins if it re-provides one). The MCP
-        /// subprocess is untrusted code; scrubbing the harness's LLM-gateway credential
-        /// names keeps a compromised server from reading them out of its own environment.
+        /// spawning. The MCP subprocess is untrusted code; scrubbing the harness's
+        /// LLM-gateway credential names keeps a compromised server from reading them out
+        /// of its own environment.
+        ///
+        /// The overlaid `environment` is applied AFTER these removals, so a server that
+        /// legitimately re-provides one of these names still gets it — see `start`. That
+        /// ordering is deliberate and it is only safe in company: it means a settings.json
+        /// can hand an MCP server any value it can *write*, so the thing that must hold
+        /// the line is config interpolation refusing to *resolve* a credential name.
+        /// `DoMoCore.InterpolationPolicy.deniedEnvironmentNames` — seeded from
+        /// `Redaction.secretEnvironmentNames` on both the trusted and the untrusted
+        /// policy — is what makes `{"env": {"X": "{env:DOMOCODE_API_KEY}"}}` a hard
+        /// config diagnostic rather than a laundering route straight back through this
+        /// overlay. Change either mechanism and the other stops being sufficient.
         var sensitiveEnvKeys: Set<String> = []
         /// Grace between SIGTERM and SIGKILL on teardown.
         var terminationGrace: Duration = .seconds(2)
@@ -126,7 +137,10 @@ actor PersistentProcess {
 
         // Build the environment overlay: first mark each sensitive key for REMOVAL (a
         // `nil` value in `updating` unsets an inherited variable), then apply the config
-        // overlay so a server that legitimately re-provides one still gets it.
+        // overlay so a server that legitimately re-provides one still gets it. The order
+        // is the documented contract on `Spawn.sensitiveEnvKeys`, and it is what config
+        // interpolation's env denylist is protecting — do not reverse it without reading
+        // that note.
         var overrides: [Subprocess.Environment.Key: String?] = [:]
         for key in spawn.sensitiveEnvKeys {
             overrides.updateValue(nil, forKey: Subprocess.Environment.Key(stringLiteral: key))

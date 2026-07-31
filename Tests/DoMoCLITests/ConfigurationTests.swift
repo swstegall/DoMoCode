@@ -246,4 +246,105 @@ struct ConfigurationTests {
             try Settings.load(fromPath: malformed.path)
         }
     }
+
+    // MARK: Pre-existing defects (Phase 5a)
+
+    /// `DOMOCODE_SESSION_DIR=""` used to become `FilePath("")`.
+    ///
+    /// An exported-but-empty variable is how a shell spells "I set this and then
+    /// unset it", and it is the one case `resolveConfigDirectory` had always
+    /// guarded against and this path had not. `FilePath("")` is relative, so
+    /// every session file went to the process's working directory — a different
+    /// directory per invocation, with the previous session apparently lost.
+    @Test
+    func anEmptySessionDirectoryIsIgnoredAtEveryLayer() throws {
+        let home = ["HOME": "/home/tester"]
+
+        let emptyEnv = try resolve(env: home.merging([EnvName.sessionDir: ""]) { _, new in new })
+        #expect(emptyEnv.sessionDirectory.string == "/home/tester/.domocode/sessions")
+
+        // The file layers get the same guard, and fall through to the next one.
+        let emptyProject = try resolve(
+            env: home, project: Settings(sessionDir: ""), user: Settings(sessionDir: "/user/sessions")
+        )
+        #expect(emptyProject.sessionDirectory.string == "/user/sessions")
+
+        // A real value still wins, or the guard would have eaten the setting.
+        let set = try resolve(env: home.merging([EnvName.sessionDir: "/env/sessions"]) { _, new in new })
+        #expect(set.sessionDirectory.string == "/env/sessions")
+    }
+
+    /// A project `"model": ""` used to beat a user's real model.
+    ///
+    /// The environment layer had always required a non-empty value; the two file
+    /// layers had not, so an empty string in a settings.json won the precedence
+    /// contest and produced a request with no model at all.
+    @Test
+    func anEmptyStringInASettingsFileIsNotASetting() throws {
+        let config = try resolve(project: Settings(model: ""), user: Settings(model: "user-model"))
+        #expect(config.model == "user-model")
+        #expect(config.smallModel == "user-model")
+
+        // The same for every other string knob, checked on one more so this is
+        // not a claim about `model` alone.
+        let urls = try resolve(project: Settings(baseURL: ""), user: Settings(baseURL: "http://user:4000/v1"))
+        #expect(urls.baseURL == "http://user:4000/v1")
+    }
+
+    /// A bad number must name the file it is in, not an environment variable the
+    /// user never set.
+    ///
+    /// `"timeoutMs": -1` in a settings.json used to report `DOMOCODE_TIMEOUT_MS
+    /// must be non-negative`, which sends the reader to inspect an environment
+    /// that is innocent while the offending line goes unmentioned.
+    @Test
+    func aNumericErrorNamesTheLayerThatSuppliedTheValue() throws {
+        let fromProject = #expect(throws: DoMoError.self) {
+            try resolve(project: Settings(timeoutMS: -1))
+        }
+        let projectText = try #require(fromProject?.description)
+        #expect(projectText.contains("timeoutMs"))
+        #expect(projectText.contains("project settings.json"))
+        #expect(!projectText.contains(EnvName.timeoutMS))
+
+        let fromUser = #expect(throws: DoMoError.self) {
+            try resolve(user: Settings(maxRetries: -2))
+        }
+        let userText = try #require(fromUser?.description)
+        #expect(userText.contains("maxRetries"))
+        #expect(userText.contains("user settings.json"))
+        #expect(!userText.contains(EnvName.maxRetries))
+
+        // The environment layer keeps naming the variable, because there the
+        // variable *is* the thing to edit.
+        let fromEnv = #expect(throws: DoMoError.self) {
+            try resolve(env: [EnvName.timeoutMS: "-1"])
+        }
+        let envText = try #require(fromEnv?.description)
+        #expect(envText.contains(EnvName.timeoutMS))
+    }
+
+    /// An unparseable `logLevel` used to fall through to the next precedence
+    /// layer in complete silence.
+    ///
+    /// It is still not fatal — nobody should lose a session over a typo in a log
+    /// knob — but it is now reported, because the alternative is a user staring
+    /// at a level they set and a harness plainly not using it.
+    @Test
+    func anUnparseableLogLevelIsReportedRatherThanIgnoredInSilence() throws {
+        let config = try resolve(user: Settings(logLevel: "verbose"))
+        #expect(config.logLevel == .warning)
+        let warning = try #require(config.warnings.first)
+        #expect(warning.contains("verbose"))
+        #expect(warning.contains("user settings.json"))
+
+        // A parseable level warns about nothing.
+        #expect(try resolve(user: Settings(logLevel: "debug")).warnings.isEmpty)
+
+        // A bad higher layer is reported *and* the next layer still wins, which
+        // is the fall-through that used to happen silently.
+        let mixed = try resolve(env: [EnvName.logLevel: "loud"], project: Settings(logLevel: "trace"))
+        #expect(mixed.logLevel == .trace)
+        #expect(mixed.warnings.contains(where: { $0.contains("loud") && $0.contains(EnvName.logLevel) }))
+    }
 }

@@ -9,28 +9,65 @@
 // intact. Merging happens at the CONFIG level (not through `fromConfig`) so a `~`/
 // `$HOME` in an existing pattern is NOT expanded to an absolute path on disk.
 
+import DoMoCore
+import Foundation
+
 /// Return the settings.json text with `grants` merged into its `permission` block, or
-/// `nil` to ABORT — the caller must then leave the file untouched. Aborting protects
-/// the user's other settings: an existing file that is non-empty but does not parse as
-/// a JSON object is never overwritten (a clobber would silently destroy hand-authored
-/// settings). Otherwise all other keys and the block's authored order are preserved; a
-/// grant for an existing `(permission, pattern)` overrides its action, a new pattern is
-/// appended (so it wins under last-match-wins), and a new permission key is appended.
-public func settingsText(_ existingText: String, mergingGrants grants: Ruleset) -> String? {
+/// throw a ``ConfigDiagnostic`` to ABORT — the caller must then leave the file
+/// untouched.
+///
+/// Aborting protects the user's other settings: an existing file that is non-empty but
+/// does not parse as a JSON object is never overwritten (a clobber would silently
+/// destroy hand-authored settings). Otherwise all other keys and the block's authored
+/// order are preserved; a grant for an existing `(permission, pattern)` overrides its
+/// action, a new pattern is appended (so it wins under last-match-wins), and a new
+/// permission key is appended.
+///
+/// The diagnostic is the reason this spelling exists. Refusing to write is the right
+/// call, but doing it silently meant every "Allow always" the user clicked was dropped
+/// for the rest of that session and every session after it, with the only symptom
+/// being that they kept getting asked.
+///
+/// - Parameters:
+///   - existingText: The current file contents. Empty or whitespace-only is treated as
+///     `{}` — there is nothing there to lose.
+///   - grants: The rules to merge in.
+///   - file: The path to name in the diagnostic.
+public func settingsText(
+    parsing existingText: String,
+    mergingGrants grants: Ruleset,
+    file: String? = nil
+) throws(ConfigDiagnostic) -> String {
     let trimmed = existingText.trimmingCharacters(in: .whitespacesAndNewlines)
     let root: OrderedJSONValue
     if trimmed.isEmpty {
         root = .object([])
-    } else if let parsed = parseOrderedJSON(existingText), case .object = parsed {
-        root = parsed
     } else {
-        return nil  // present but unparseable / not an object — do NOT clobber it
+        let parsed = try parseOrderedJSON(text: existingText, file: file)
+        guard case .object = parsed else {
+            throw ConfigDiagnostic(
+                file: file,
+                source: Array(existingText.utf8),
+                byteOffset: documentStartByteOffset(existingText),
+                keyPath: [],
+                problem: "settings must be a JSON object; refusing to overwrite it"
+            )
+        }
+        root = parsed
     }
 
     let existingConfig = root["permission"].map { permissionConfig(from: $0) } ?? []
     let merged = mergeGrants(into: existingConfig, grants: grants)
     let updated = setObjectKey(root, "permission", orderedJSON(from: merged))
     return serializeOrderedJSON(updated) + "\n"
+}
+
+/// The reportless spelling: `nil` where ``settingsText(parsing:mergingGrants:file:)``
+/// would have thrown. Kept for callers that have nowhere to put a diagnostic; a caller
+/// that writes to a terminal should use the throwing one so the user learns why their
+/// grant was not saved.
+public func settingsText(_ existingText: String, mergingGrants grants: Ruleset) -> String? {
+    try? settingsText(parsing: existingText, mergingGrants: grants)
 }
 
 /// Merge grant rules into a config. `grants` are always rule-capable (bash/write/…),

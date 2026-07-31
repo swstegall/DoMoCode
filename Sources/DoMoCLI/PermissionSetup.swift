@@ -11,6 +11,7 @@ import DoMoAgent
 import DoMoCore
 import DoMoPermissions
 import Foundation
+import Synchronization
 
 enum PermissionSetup {
     static func projectSettingsPath(_ workingDirectory: String) -> String {
@@ -27,11 +28,74 @@ enum PermissionSetup {
         URL(fileURLWithPath: path).standardizedFileURL.path
     }
 
-    /// The `permission` config in a settings.json, order preserved. Empty when the
-    /// file is absent, unreadable, or has no `permission` key.
+    /// The lock file guarding a read-modify-write of `settingsPath`.
+    ///
+    /// Derived from the **symlink-resolved** settings path, not the path as written,
+    /// so two processes that reach the same file by different names — a dotfiles
+    /// symlink, `/tmp` versus `/private/tmp`, `$HOME` versus its real location —
+    /// still contend for one lock instead of each taking their own and both winning.
+    ///
+    /// The lock is a sidecar (`.settings.json.lock`), never settings.json itself:
+    /// locking the document means opening it `O_CREAT`, and a 0-byte settings.json
+    /// left behind by an aborted merge is a hard failure on every later launch.
+    static func settingsLockPath(_ settingsPath: String) -> String {
+        FileLock.sidecarPath(for: URL(fileURLWithPath: settingsPath).resolvingSymlinksInPath().path)
+    }
+
+    /// The `permission` config in a settings.json, order preserved, together with the
+    /// diagnostic that explains an empty result when the file itself is the reason.
+    ///
+    /// A `nil` diagnostic covers both "loaded cleanly" and "there is no such file":
+    /// an absent settings.json is the overwhelmingly common case and is not news. A
+    /// file that exists but will not parse is news, because Foundation reads `model`
+    /// and `baseUrl` out of those same bytes quite happily — so without this the user
+    /// sees a completely normal session in which none of their permission rules are
+    /// in effect and no grant they make is ever saved.
+    static func configAndDiagnostic(_ path: String) -> (config: PermissionConfig, diagnostic: ConfigDiagnostic?) {
+        guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else {
+            return ([], nil)
+        }
+        do {
+            return (try permissionConfig(parsingSettingsText: text, file: path), nil)
+        } catch {
+            return ([], error)
+        }
+    }
+
+    /// The `permission` config in a settings.json, reporting a parse failure on
+    /// stderr rather than swallowing it.
+    ///
+    /// Reported, not thrown: a broken permission block must not stop the CLI from
+    /// starting. The run continues under the built-in baseline, which is the
+    /// restrictive direction.
     private static func loadConfig(_ path: String) -> PermissionConfig {
-        guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else { return [] }
-        return permissionConfig(fromSettingsText: text)
+        let (config, diagnostic) = configAndDiagnostic(path)
+        if let diagnostic { reportOnce(diagnostic, path: path) }
+        return config
+    }
+
+    /// Settings files already complained about.
+    ///
+    /// A single `-p` run resolves the ruleset twice (once inside ``headlessHook``,
+    /// once to decide MCP tool visibility), which is four `loadConfig` calls over two
+    /// files. Without this, one stray comma prints the same multi-line diagnostic
+    /// four times before the model has said anything.
+    private static let reportedPaths = Mutex<Set<String>>([])
+
+    private static func reportOnce(_ diagnostic: ConfigDiagnostic, path: String) {
+        guard reportedPaths.withLock({ $0.insert(path).inserted }) else { return }
+        warn(
+            "ignoring the permission block in \(path) — the file will not parse, so none of "
+                + "its rules are in effect:\n\(diagnostic)"
+        )
+    }
+
+    /// A warning on stderr.
+    ///
+    /// stderr and never stdout: `-p --output-format json` writes one JSON document to
+    /// stdout, and a warning mixed into it breaks every consumer that pipes it.
+    private static func warn(_ text: String) {
+        try? FileHandle.standardError.write(contentsOf: Data("domocode: \(text)\n".utf8))
     }
 
     /// The resolved ruleset: baseline first, then the user's global permission,
@@ -75,26 +139,114 @@ enum PermissionSetup {
         )
     }
 
+    /// Why a persist attempt did not save. Returned rather than thrown so the body of
+    /// the ``FileLock/withLock(at:timeout:_:)`` call stays non-throwing and the lock's
+    /// own `nil` (contention) is not confused with a failure inside it.
+    private enum PersistOutcome: Sendable {
+        case saved
+        case failed(String)
+    }
+
     /// A persister that writes "allow always" grants into the GLOBAL user
     /// settings.json (so a grant survives restarts and applies across projects,
-    /// matching kilocode). Best-effort: a failed write must never crash the session,
-    /// and the in-memory grant still holds for the rest of it.
+    /// matching kilocode).
+    ///
+    /// The session is never failed by a failed save — the in-memory grant still holds
+    /// for the rest of it — but the user is *told*. Silence here was the whole bug: a
+    /// settings.json with one trailing comma refused every grant forever, and the only
+    /// symptom was being asked again for a permission that had just been granted
+    /// "always".
     static func persister(configDirectory: String) -> @Sendable (Ruleset) async -> Void {
         let path = userSettingsPath(configDirectory)
         return { grants in
             guard !grants.isEmpty else { return }
+            await persistGrants(grants, settingsPath: path, configDirectory: configDirectory)
+        }
+    }
+
+    /// Merges `grants` into the settings.json at `path` under a cross-process lock,
+    /// reporting on stderr when it could not be done.
+    ///
+    /// The whole read → merge → write is inside the lock. Unguarded, the window is a
+    /// textbook lost update: A reads S0, B reads S0, A writes S0+gA, B writes S0+gB,
+    /// and gA is gone. `rename(2)` makes each write atomic, so the file is never torn
+    /// — the result is a perfectly valid settings.json that is simply missing a grant.
+    /// The race is not only across processes: `ServerRuntime` builds one
+    /// `PermissionEngine` per session over a single shared persist closure, so one
+    /// `domo --serve` can lose a grant to itself. That is why the lock is `flock(2)`
+    /// on a descriptor rather than a POSIX record lock, which a single process is
+    /// granted twice.
+    ///
+    /// The directory is created **before** the lock rather than between the read and
+    /// the write, where it used to sit: the lock file lives in that directory, and on
+    /// a first run there is no config directory at all — a lock that cannot be created
+    /// reports "busy", which would be a lie. It is belt and braces rather than a fix
+    /// on its own, because ``FileLock/withLock(at:timeout:_:)`` also creates its own
+    /// parent; stated here so the ordering is a decision and not an accident.
+    static func persistGrants(_ grants: Ruleset, settingsPath path: String, configDirectory: String) async {
+        try? FileManager.default.createDirectory(atPath: configDirectory, withIntermediateDirectories: true)
+
+        let outcome = await FileLock.withLock(at: settingsLockPath(path)) { () -> PersistOutcome in
             let existing: String
             if FileManager.default.fileExists(atPath: path) {
-                // Present but unreadable — skip, rather than clobber it with "{}".
-                guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else { return }
+                // Present but unreadable: report it rather than clobbering the user's
+                // settings with "{}" plus one grant.
+                guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else {
+                    return .failed("it could not be read")
+                }
                 existing = text
             } else {
                 existing = "{}"
             }
-            // Unparseable existing content aborts the write (settingsText -> nil).
-            guard let updated = settingsText(existing, mergingGrants: grants) else { return }
-            try? FileManager.default.createDirectory(atPath: configDirectory, withIntermediateDirectories: true)
-            try? updated.write(toFile: path, atomically: true, encoding: .utf8)
+
+            let updated: String
+            do {
+                updated = try settingsText(parsing: existing, mergingGrants: grants, file: path)
+            } catch {
+                return .failed("\(error)")
+            }
+
+            do {
+                // `AtomicFileWrite`, not `String.write(toFile:atomically:)`. Two
+                // behaviours were measured on Darwin 27 / Swift 6.3.3 under umask
+                // 022, not assumed:
+                //
+                //  - Foundation CREATES the file at 0644, so the first grant a user
+                //    ever makes leaves their settings.json world-readable — and this
+                //    is the file holding `apiKeyEnv` and every permission decision.
+                //  - Foundation REPLACES a symlink with a regular file, so a
+                //    settings.json symlinked out of a dotfiles repository is silently
+                //    detached from it by one saved grant.
+                //
+                // Foundation does happen to carry an *existing* file's mode across on
+                // Darwin (`replaceItemAt` copies metadata), so the mode-preservation
+                // tests would pass either way here. That is an implementation detail
+                // of one platform's replace, not a promise — which is exactly why the
+                // guarantee lives in `AtomicFileWrite` instead of being inherited.
+                try AtomicFileWrite.replace(at: path, with: updated)
+            } catch {
+                // Interpolated rather than `.message`: this `do` block sits inside a
+                // closure whose context type is `throws`, so the catch binds
+                // `any Error` and `DoMoError`'s one-line `description` is the right
+                // rendering anyway.
+                return .failed("\(error)")
+            }
+            return .saved
+        }
+
+        switch outcome {
+        case .some(.saved):
+            return
+        case .some(.failed(let reason)):
+            warn(
+                "could not save the permission grant to \(path): \(reason)\n"
+                    + "The grant applies for the rest of this session only."
+            )
+        case .none:
+            warn(
+                "could not save the permission grant: another process is writing \(path).\n"
+                    + "The grant applies for the rest of this session only."
+            )
         }
     }
 

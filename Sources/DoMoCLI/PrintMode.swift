@@ -399,8 +399,16 @@ public enum SessionSource: Sendable {
 public struct PrintMode: Sendable {
 
     let client: LiteLLMClient
-    let model: String
-    let reasoningEffort: ReasoningEffort?
+    /// The resolved model this run talks to: the alias, its reasoning effort, its
+    /// cost rates, and its context window. One value rather than four loose
+    /// parameters, so a surface cannot forward three of them and quietly drop the
+    /// fourth — which is how every `-p` run came to bill at zero and compact
+    /// against a hardcoded 200K guess regardless of the model it was using.
+    let modelRuntime: ModelRuntime
+    /// The alias this session is labelled with, for the `session_start` event, the
+    /// `assistant` events' `model` field, and the fallback warning. Computed off
+    /// ``modelRuntime`` so there is exactly one place the answer lives.
+    var model: String { modelRuntime.model }
     let registry: ToolRegistry
     let toolContext: ToolContext
     let workingDirectory: FilePath
@@ -419,6 +427,19 @@ public struct PrintMode: Sendable {
     /// Tools discovered from configured MCP servers (Phase 8c), appended after the
     /// built-ins. Already connected by the caller, which owns their teardown.
     let mcpTools: [any AgentTool]
+    /// When and how aggressively automatic pre-turn compaction fires. Forwarded to
+    /// the harness, which clamps it against the window; before it was plumbed, a
+    /// `-p` run ignored the user's `compaction` settings entirely.
+    let compaction: CompactionSettings
+    /// The compaction summarizer, when a distinct small model was configured.
+    ///
+    /// `nil` leaves the harness on its built-in one, which is the unchanged
+    /// behaviour for anyone who configured nothing — and, deliberately, keeps the
+    /// spurious-turn defect for them: the built-in summarizer re-enters
+    /// ``streamFunction(counter:runGuard:)``, so a compaction emits a `turn_start`
+    /// and advances the counter the terminal `result` event reports as `turns`.
+    /// Installing a real summarizer is what removes that turn from the count.
+    let summarizer: Summarizer?
 
     /// How often text mode says it is still alive, in turns. Rare enough that a
     /// short run prints nothing extra (the two-turn end-to-end runs are untouched),
@@ -427,8 +448,6 @@ public struct PrintMode: Sendable {
 
     public init(
         client: LiteLLMClient,
-        model: String,
-        reasoningEffort: ReasoningEffort?,
         registry: ToolRegistry,
         toolContext: ToolContext,
         workingDirectory: FilePath,
@@ -438,11 +457,13 @@ public struct PrintMode: Sendable {
         sessionSource: SessionSource,
         sessionDirectory: FilePath,
         beforeToolCall: BeforeToolCallHook? = nil,
-        mcpTools: [any AgentTool] = []
+        mcpTools: [any AgentTool] = [],
+        modelRuntime: ModelRuntime,
+        compaction: CompactionSettings = .default,
+        summarizer: Summarizer? = nil
     ) {
         self.client = client
-        self.model = model
-        self.reasoningEffort = reasoningEffort
+        self.modelRuntime = modelRuntime
         self.registry = registry
         self.toolContext = toolContext
         self.workingDirectory = workingDirectory
@@ -453,6 +474,8 @@ public struct PrintMode: Sendable {
         self.sessionDirectory = sessionDirectory
         self.beforeToolCall = beforeToolCall
         self.mcpTools = mcpTools
+        self.compaction = compaction
+        self.summarizer = summarizer
     }
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
@@ -494,12 +517,25 @@ public struct PrintMode: Sendable {
             tools: tools,
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
+            // Installing one is not only about spending less on compaction. The
+            // harness's built-in fallback summarizer runs its request through
+            // `configuration.streamFn` — which here is the seam below — so a
+            // compaction fires `turn_start` on the JSON stream and advances
+            // ``TurnCounter``, inflating the `turns` field of the terminal `result`
+            // event by one per compaction. A real summarizer bypasses that seam
+            // entirely.
+            summarizer: summarizer,
             // Sequential to preserve Phase 1's strictly source-ordered tool
             // dispatch: `tool_use`/`tool_result` events, and the tool-result
             // messages fed back to the model, appear in the model's own call
             // order. Parallel would reorder the completion-order `tool_result`s.
             toolExecution: .sequential,
             maxTurns: maxTurns,
+            // Both were previously omitted, which meant every `-p` run compacted on
+            // the default settings against the 200K fallback window no matter what
+            // model it was talking to or what the user configured.
+            compaction: compaction,
+            contextWindow: modelRuntime.contextWindow,
             beforeToolCall: beforeToolCall
         )
 
@@ -576,7 +612,16 @@ public struct PrintMode: Sendable {
     /// failing turn (exit 1) without a further provider call — the effect Phase 1
     /// got from `shouldStopAfterTurn`.
     private func streamFunction(counter: TurnCounter, runGuard: RunGuard) -> AgentStreamFn {
-        { context in
+        // The request itself is ``makeStreamFn``'s, shared with the inline REPL and
+        // the embedded server, so an argument added there (per-alias `rates`, say)
+        // cannot reach two surfaces and miss the third. Only the guard, the counter
+        // and the heartbeat are print mode's own.
+        let request = makeStreamFn(
+            client: client,
+            runtime: modelRuntime,
+            onResponse: { metadata in onMetadata(metadata) }
+        )
+        return { context in
             if let blocking = runGuard.blockingError {
                 return AsyncThrowingStream { $0.finish(throwing: blocking) }
             }
@@ -591,12 +636,7 @@ public struct PrintMode: Sendable {
             if mode == .text, turn % Self.progressHeartbeatTurns == 0 {
                 channel.writeErr("… still working — turn \(turn)\n")
             }
-            return client.streamCompletion(
-                model: model,
-                context: context,
-                reasoningEffort: reasoningEffort,
-                onResponse: { metadata in onMetadata(metadata) }
-            )
+            return request(context)
         }
     }
 

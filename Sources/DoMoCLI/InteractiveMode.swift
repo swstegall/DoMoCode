@@ -108,6 +108,40 @@ final class SteeringBox: Sendable {
     }
 }
 
+// MARK: - Response metadata relay
+
+/// A late-bound sink for the response headers of every LLM request this session
+/// makes.
+///
+/// It exists for the same reason ``DoMoPermissions/PrompterBox`` does: the harness
+/// — and therefore the stream function whose `onResponse` fires — is built by
+/// `InteractiveMode.make`, long before `InteractiveMode.run` builds the coordinator
+/// that can draw anything. Until a handler is installed the metadata is dropped,
+/// which is correct: there is no transcript to write it to.
+///
+/// The inline REPL previously passed `onResponse: { _ in }`, so the "a fallback
+/// fired and a different model answered" warning — which the README states the UI
+/// must give "rather than lie" — existed on `-p` and nowhere else.
+///
+/// `Sendable` around a ``Mutex``: the handler is installed from the main actor and
+/// invoked from the streaming client's task. The stored closure is read out of the
+/// lock before it is called, so a handler that hops to the main actor never runs
+/// with the lock held.
+final class ResponseMetadataRelay: Sendable {
+    private let handler = Mutex<(@Sendable (ResponseMetadata) -> Void)?>(nil)
+
+    /// Install the sink (called once, when the surface's UI is ready).
+    func set(_ sink: @escaping @Sendable (ResponseMetadata) -> Void) {
+        handler.withLock { $0 = sink }
+    }
+
+    /// Forward one response head, or drop it when nothing is listening yet.
+    func deliver(_ metadata: ResponseMetadata) {
+        let sink = handler.withLock { $0 }
+        sink?(metadata)
+    }
+}
+
 // MARK: - Mutable transcript block
 
 /// A transcript entry whose rendered content can be swapped in place.
@@ -1140,6 +1174,30 @@ final class InteractiveCoordinator {
         transcript.addChild(Text("  \u{1b}[33m⚠ " + text + Self.sgrReset))
     }
 
+    /// Say out loud that a LiteLLM fallback fired and a different model answered.
+    ///
+    /// The README is explicit that a surface must report this "rather than lie",
+    /// and until the stream function's `onResponse` was routed here the inline REPL
+    /// had no way to know it had happened: it passed `onResponse: { _ in }`, so
+    /// ``ResponseMetadata/attemptedFallbacks`` — the only signal there is — was
+    /// discarded at the seam.
+    ///
+    /// Both names are gateway-controlled strings arriving in a response header, so
+    /// both are collapsed to one line and stripped of anything a terminal would act
+    /// on before they reach the screen.
+    ///
+    /// Said once per request that fell back, not once per session: which turn was
+    /// answered by a substitute is exactly the thing a reader needs to know.
+    func noteFallback(served: String, requested: String) {
+        appendStopNotice(
+            "request fell back — answered by "
+                + sanitizeUntrustedText(collapseToOneLine(served))
+                + ", not the requested model "
+                + sanitizeUntrustedText(collapseToOneLine(requested))
+        )
+        render()
+    }
+
     /// A drop's outcome — what attached, what did not.
     private func appendAttachmentNotice(_ text: String) {
         transcript.addChild(Text("  " + Self.dim(text)))
@@ -1270,6 +1328,13 @@ public struct InteractiveMode: Sendable {
     /// can tear them down on exit — they spawn in their own process group and would
     /// otherwise be orphaned. `nil` when no MCP servers are configured.
     private let mcpManager: MCPManager?
+    /// The response-header relay the session's stream function reports to. Built in
+    /// ``make`` alongside that stream function, pointed at the coordinator's
+    /// transcript by ``run`` once there is a transcript to write to.
+    private let metadataRelay: ResponseMetadataRelay
+    /// The alias this session asked for, kept so the fallback warning can name what
+    /// was requested next to what actually answered.
+    private let requestedModel: String
 
     private init(
         harness: AgentHarness,
@@ -1280,6 +1345,8 @@ public struct InteractiveMode: Sendable {
         toolTheme: ToolRenderTheme,
         steering: SteeringBox,
         prompterBox: PrompterBox,
+        metadataRelay: ResponseMetadataRelay,
+        requestedModel: String,
         fileSystem: SandboxedFileSystem? = nil,
         mcpManager: MCPManager? = nil
     ) {
@@ -1291,6 +1358,8 @@ public struct InteractiveMode: Sendable {
         self.toolTheme = toolTheme
         self.steering = steering
         self.prompterBox = prompterBox
+        self.metadataRelay = metadataRelay
+        self.requestedModel = requestedModel
         self.fileSystem = fileSystem
         self.mcpManager = mcpManager
     }
@@ -1329,14 +1398,42 @@ public struct InteractiveMode: Sendable {
         sessionSource: SessionSource = .new,
         toolTheme: ToolRenderTheme = .ansi,
         mcpServers: [String: MCPServerConfig] = [:],
-        mcpLog: (@Sendable (String) -> Void)? = nil
+        mcpLog: (@Sendable (String) -> Void)? = nil,
+        // The resolved model, when the caller has one. Added ALONGSIDE
+        // `model`/`reasoningEffort` rather than replacing them, because those two
+        // are what every existing caller passes; a runtime supersedes both when
+        // given, and also carries the cost rates and the context window a bare alias
+        // cannot express. `nil` builds one from `model`/`reasoningEffort`, which is
+        // exactly the request this surface made before.
+        modelRuntime: ModelRuntime? = nil,
+        compaction: CompactionSettings = .default,
+        // The compaction summarizer, when a distinct small model was configured.
+        // Decided by the caller (`DoMoCodeCommand.compactionSummarizer`), because
+        // that is the layer that knows both aliases; `nil` keeps the harness's own.
+        summarizer: Summarizer? = nil,
+        // The environment variable names holding this run's gateway credential —
+        // the three built-in spellings plus whatever `apiKeyEnv` named. They are
+        // unset for every MCP child and every tool subprocess, so a model cannot
+        // read the key back with a one-word `bash` command. Empty leaves only
+        // `ToolContext`'s own built-in scrub, which is what a test that never
+        // configured a credential wants.
+        credentialEnvNames: Set<String> = []
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
+        // One resolved model for the whole session. A caller that supplied a runtime
+        // has already applied its own precedence (an alias-level `reasoningEffort`
+        // outranks the global one), so it wins outright rather than being merged
+        // with the loose parameters here.
+        let runtime = modelRuntime ?? ModelRuntime(model: model, reasoningEffort: reasoningEffort)
 
         let client = LiteLLMClient(configuration: clientConfiguration)
         let shell = try SubprocessShell()
-        let toolContext = try await ToolContext.rooted(at: workDirectory, shell: shell)
+        let toolContext = try await ToolContext.rooted(
+            at: workDirectory,
+            shell: shell,
+            environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+        )
         let registry = ToolRegistry.builtin
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools to the built-ins. The manager is held on the session and torn down in
@@ -1349,8 +1446,10 @@ public struct InteractiveMode: Sendable {
             mcpTools = await manager.connect(
                 servers: mcpServers,
                 workspaceDirectory: workingDirectory,
-                // Scrub the LLM-gateway credential variables from each MCP child's env.
-                sensitiveEnvKeys: Set(EnvName.apiKeyFallbacks),
+                // Scrub the LLM-gateway credential variables from each MCP child's
+                // env — including the one a user named through `apiKeyEnv`, which
+                // the old hardcoded three-name list handed to every server.
+                sensitiveEnvKeys: Redaction.secretEnvironmentNames.union(credentialEnvNames),
                 // Reserve the built-in tool names so an MCP tool can't shadow one.
                 reservedNames: Set(ToolRegistry.builtin.names),
                 log: mcpLog ?? { _ in }
@@ -1373,14 +1472,15 @@ public struct InteractiveMode: Sendable {
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
         let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
 
-        let streamFn: AgentStreamFn = { context in
-            client.streamCompletion(
-                model: model,
-                context: context,
-                reasoningEffort: reasoningEffort,
-                onResponse: { _ in }
-            )
-        }
+        // The shared factory, so this surface gets the per-alias cost rates and the
+        // response-head callback that `-p` already had. The relay is the seam: the
+        // coordinator that can draw a warning does not exist yet.
+        let metadataRelay = ResponseMetadataRelay()
+        let streamFn = makeStreamFn(
+            client: client,
+            runtime: runtime,
+            onResponse: { metadataRelay.deliver($0) }
+        )
 
         // The steering seam: the loop drains this box for mid-run submissions at
         // each turn boundary, and the coordinator appends to it. Built here so the
@@ -1401,12 +1501,21 @@ public struct InteractiveMode: Sendable {
                 toolNames: registry.names + visibleMcp.map(\.definition.name)
             ),
             tools: tools,
-            model: model,
+            model: runtime.model,
             streamFn: streamFn,
+            // A distinct small model compacts on its own request rather than through
+            // `streamFn`; with none configured this is `nil` and the harness keeps
+            // its built-in summarizer, unchanged.
+            summarizer: summarizer,
             // Sequential keeps tool-start/tool-result transcript order equal to the
             // model's own call order, which is what a reader expects to watch.
             toolExecution: .sequential,
             maxTurns: maxTurns,
+            // Neither was forwarded before, so the REPL compacted on the built-in
+            // defaults against the 200K fallback window whatever the user configured
+            // and whatever model was answering.
+            compaction: compaction,
+            contextWindow: runtime.contextWindow,
             getSteeringMessages: { steering.drain() },
             beforeToolCall: gate
         )
@@ -1439,6 +1548,8 @@ public struct InteractiveMode: Sendable {
             toolTheme: toolTheme,
             steering: steering,
             prompterBox: prompterBox,
+            metadataRelay: metadataRelay,
+            requestedModel: runtime.model,
             fileSystem: toolContext.fileSystem,
             mcpManager: mcpManager
         )
@@ -1531,6 +1642,17 @@ public struct InteractiveMode: Sendable {
         // Now that the approval UI exists, point the engine's prompter at it. Until
         // this runs (it cannot fire before the first frame), the box refuses.
         prompterBox.set { await coordinator.showPermissionPrompt($0) }
+        // And point the response-header relay at the transcript, so a fallback the
+        // gateway performed is reported instead of swallowed. The head arrives on
+        // the streaming client's task, off the main actor, so the hop is explicit.
+        // Only a fallback is surfaced: the rest of the head is diagnostic noise the
+        // inline surface has no room for and the JSON stream already carries.
+        let requested = requestedModel
+        metadataRelay.set { metadata in
+            guard metadata.fellBack else { return }
+            let served = metadata.modelID ?? "an unknown model"
+            Task { @MainActor in coordinator.noteFallback(served: served, requested: requested) }
+        }
 
         await driver.run(tui, quit: quit, background: {
             await coordinator.agentLoop()

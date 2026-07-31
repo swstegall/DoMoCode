@@ -73,7 +73,10 @@ public actor MCPManager {
                 }
                 log?("MCP server '\(name)' connected with \(count) tool(s).")
             } catch {
-                log?("MCP server '\(name)' failed to connect: \(error)")
+                // Redacted: a spawn failure quotes the command, and a configured
+                // `environment` block is exactly where a user keeps that server's
+                // token. This line goes to stderr, where it would outlive the run.
+                log?(Redaction.diagnostic("MCP server '\(name)' failed to connect: \(error)"))
                 await client.shutdown()
             }
         }
