@@ -172,13 +172,124 @@ final class MutableBlock: @MainActor Component {
 /// It answers "what can I do right now": the idle affordances, or — while the
 /// agent runs — that Escape interrupts. Always exactly one line, always clipped to
 /// width, so it can never be the over-wide line the renderer treats as fatal.
+///
+/// ``trailing`` is the session's accounting, right-aligned against the same row.
+/// It is dropped WHOLE when it does not fit rather than truncated with the left
+/// side, because half of `$0.0312` is `$0.03` — a smaller number that still looks
+/// like a number, which is exactly the class of quiet lie Phase 5a exists to
+/// remove. Nothing on this strip is load-bearing enough to be worth showing
+/// wrongly.
 @MainActor
 final class StatusLine: @MainActor Component {
     var text: String = ""
+    /// The right-aligned accounting strip. Empty renders the row exactly as it
+    /// rendered before there was one.
+    var trailing: String = ""
+
+    /// Columns of clear space kept between the hints and the accounting, so the
+    /// two never read as one sentence.
+    private static let gap = 2
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [""] }
-        return [truncateToWidth(text, width, ellipsis: "")]
+        let left = truncateToWidth(text, width, ellipsis: "")
+        guard !trailing.isEmpty else { return [left] }
+        let leftWidth = visibleWidth(left)
+        let trailingWidth = visibleWidth(trailing)
+        let padding = width - leftWidth - trailingWidth
+        guard padding >= Self.gap else { return [left] }
+        return [left + String(repeating: " ", count: padding) + trailing]
+    }
+}
+
+// MARK: - Inline accounting strip
+
+/// The three numbers the inline REPL reports about the session it is driving:
+/// tokens used, money spent, and how full the context is.
+///
+/// Pure, and public, rather than a method on the coordinator: it can then be
+/// exercised without a terminal, a harness or a gateway, which the `@MainActor`
+/// coordinator needs all three of. That is how a formatter like this otherwise
+/// ends up with no test at all.
+///
+/// Every number here comes from ``DoMoHarness/SessionAccounting``, which the
+/// harness produces from the ONE running total it keeps. There is deliberately no
+/// accumulator on this side: a second one is how `--inline` and `--serve` came to
+/// be able to report different figures for the same session file.
+///
+/// The segment vocabulary — `tok`, `$`, `ctx N (P%)`, and `?` for "unknown" —
+/// deliberately matches the full-screen client's footer, so a user who moves
+/// between the two surfaces reads the same row. It is a SECOND implementation of
+/// that vocabulary only because DoMoCLI does not depend on DoMoClient; if a third
+/// surface ever needs it, the formatting belongs in a module both can import
+/// rather than a third copy.
+public enum InlineAccountingSummary {
+
+    /// `"tok 12.3k · $0.0031 · ctx 4.2k (2%)"`, or `""` when nothing is known yet.
+    public static func text(_ accounting: SessionAccounting?) -> String {
+        guard let accounting else { return "" }
+        return [
+            "tok " + compact(accounting.usage.totalTokens),
+            cost(accounting),
+            context(accounting),
+        ].joined(separator: " · ")
+    }
+
+    /// What the session has spent.
+    ///
+    /// The exact decimal digits, not a fixed number of places: a turn that cost a
+    /// third of a cent rounds to `$0.00` at two places, and "the meter reads zero"
+    /// is the falsehood this phase exists to remove. Rendering the `Decimal`'s own
+    /// description also keeps the number off `Double` entirely.
+    ///
+    /// A zero total on a session that demonstrably ran gets a trailing `?`. Two
+    /// different situations produce that zero — a model nobody configured a price
+    /// for, and a session file written before this phase recorded any cost at all
+    /// — and neither is "it was free", so the strip marks it unknown with the same
+    /// glyph the context meter uses rather than asserting either.
+    static func cost(_ accounting: SessionAccounting) -> String {
+        guard accounting.costTotal > 0 else {
+            return accounting.turns > 0 && accounting.usage.totalTokens > 0 ? "$0.00?" : "$0.00"
+        }
+        return "$" + accounting.costTotal.description
+    }
+
+    /// How big the context is, and how much of the window it fills.
+    ///
+    /// An unknown ``DoMoHarness/SessionAccounting/contextWindow`` renders `(?)`
+    /// and **never** a percentage. Compaction falls back to a 200K guess so that a
+    /// session against an unrecognised model still compacts rather than growing
+    /// into a provider overflow, but a percentage computed against that guess is
+    /// indistinguishable on screen from one computed against the model's real
+    /// window — which would replace the old lie with a new one.
+    ///
+    /// A context past its window reports the real figure rather than clamping at
+    /// 100: it is a true state (the next turn is what compacts), and a meter
+    /// pinned at 100% hides how far past it has gone. The 9999 ceiling is only so
+    /// a nonsense window cannot widen the row without bound.
+    static func context(_ accounting: SessionAccounting) -> String {
+        let tokens = compact(accounting.contextTokens)
+        guard let window = accounting.contextWindow, window > 0 else { return "ctx \(tokens) (?)" }
+        return "ctx \(tokens) (\(min(9_999, accounting.contextTokens * 100 / window))%)"
+    }
+
+    /// A token count as `842`, `12.3k` or `1.4M`.
+    ///
+    /// The strip has to stay a roughly fixed handful of columns as a session
+    /// grows — ``StatusLine`` drops it entirely once it stops fitting, so a count
+    /// that widens by a digit every ten turns would eventually take the cost and
+    /// the context meter off the screen with it.
+    public static func compact(_ value: Int) -> String {
+        if value < 1000 { return "\(value)" }
+        // 999_950 and not 1_000_000: one decimal place already rounds to
+        // "1000.0k" at that point, which is a unit nobody uses.
+        if value < 999_950 { return tenths((value + 50) / 100, suffix: "k") }
+        return tenths((value + 50_000) / 100_000, suffix: "M")
+    }
+
+    /// `count` is the value in TENTHS of the unit, so 123 renders `12.3k`.
+    private static func tenths(_ count: Int, suffix: String) -> String {
+        "\(count / 10).\(count % 10)\(suffix)"
     }
 }
 
@@ -916,11 +1027,56 @@ final class InteractiveCoordinator {
     /// run's last steering poll is still sitting in the box, so it is re-queued as
     /// the next run's prompt rather than being left to wait for an unrelated submit.
     func agentLoop() async {
+        // Before parking on the first submission: a RESUMED session already has
+        // tokens and a bill behind it, and a strip that only appears after the
+        // first new turn would make a resumed session look free until it was
+        // spent again.
+        await refreshAccounting()
+        render()
         var iterator = submissions.makeAsyncIterator()
         while !Task.isCancelled {
             guard let submission = await iterator.next() else { break }
             await runOne(submission)
             drainLeftoverSteering()
+        }
+    }
+
+    // MARK: Accounting strip
+
+    /// Re-read the session's totals and put them on the status line.
+    ///
+    /// The harness owns the only accumulator, so this is a READ — nothing here
+    /// adds anything up. It is cached onto ``StatusLine/trailing`` rather than
+    /// recomputed per repaint because ``AgentHarness/accounting()`` rebuilds the
+    /// context to measure it and the status row repaints about ten times a second
+    /// while a turn is in flight.
+    ///
+    /// A failure leaves the previous figures in place rather than blanking them:
+    /// the numbers are a display, and a session whose path momentarily cannot be
+    /// resolved still has a REPL to run. It does not silently show zeros — the
+    /// last figures it actually read are the last true ones it had.
+    private func refreshAccounting() async {
+        guard let latest = try? await harness.accounting() else { return }
+        statusLine.trailing = InlineAccountingSummary.text(latest)
+    }
+
+    /// The in-flight refresh, so a run that finishes several turns quickly queues
+    /// one catch-up rather than one task per turn.
+    private var accountingRefreshTask: Task<Void, Never>?
+
+    /// Ask for a refresh from a synchronous context.
+    ///
+    /// ``handle(_:)`` is deliberately synchronous — it mutates the transcript and
+    /// repaints in one uninterrupted main-actor step, and adding an `await` inside
+    /// it would let another main-actor task interleave between the mutation and
+    /// the frame. So the refresh is hopped onto its own main-actor task: the strip
+    /// catches up a frame later, which is invisible beside a 10 Hz spinner.
+    private func scheduleAccountingRefresh() {
+        guard accountingRefreshTask == nil else { return }
+        accountingRefreshTask = Task { @MainActor [weak self] in
+            await self?.refreshAccounting()
+            self?.accountingRefreshTask = nil
+            self?.render()
         }
     }
 
@@ -1005,6 +1161,10 @@ final class InteractiveCoordinator {
         running = false
         stopProgressClock()
         statusLine.text = idleStatus
+        // The settled run is the moment the totals are final for this turn set —
+        // and the one refresh that is guaranteed to happen even if every mid-run
+        // one was coalesced away.
+        await refreshAccounting()
         if reason == .aborted {
             appendInterrupted()
         } else if let notice = Self.stopNotice(for: reason) {
@@ -1083,7 +1243,13 @@ final class InteractiveCoordinator {
         case .messageUpdate(_, let assembly):
             if case .textDelta(_, let delta) = assembly { appendAssistantText(delta) }
         case .messageEnd(let message):
-            if case .assistant(let assistant) = message { finalizeAssistant(assistant) }
+            if case .assistant(let assistant) = message {
+                finalizeAssistant(assistant)
+                // A turn just billed. Without this the strip would only move when
+                // a whole run settled, so a long agentic run — the one where the
+                // spend actually matters — would sit on stale numbers for minutes.
+                scheduleAccountingRefresh()
+            }
         case .toolExecutionStart(let id, let name, let arguments):
             startTool(id: id, name: name, arguments: arguments.value)
         case .toolExecutionEnd(let id, let name, let result, let isError):

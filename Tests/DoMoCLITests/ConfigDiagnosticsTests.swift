@@ -93,8 +93,11 @@ struct ConfigDiagnosticsTests {
             let caught = try #require(failure)
             #expect(caught.kind == .configuration)
             #expect(caught.cause as? ConfigDiagnostic != nil)
-            // The outer message names the file; the chain adds the position.
-            #expect(caught.message.contains("settings.json"))
+            // The file is named ONCE, by the diagnostic, and the outer message
+            // does not repeat it. It used to, and the rendered error then opened
+            // with the same long path twice before saying anything.
+            #expect(!caught.message.contains("settings.json"))
+            #expect(caught.description.contains("settings.json"))
             #expect(caught.description.count > caught.message.count)
         }
     }

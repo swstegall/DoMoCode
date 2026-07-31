@@ -10,6 +10,7 @@
 
 import DoMoCore
 import DoMoExec
+import DoMoHarness
 import DoMoLLM
 import DoMoPermissions
 import Foundation
@@ -44,6 +45,7 @@ public final class ClientApp {
     private let transcriptView = TranscriptView()
     private let promptInput = PromptInput()
     private let statusBar = StatusBar()
+    private let footerBar = FooterBar()
     private let focus = FocusRing()
     private let quit = QuitSignal()
 
@@ -171,6 +173,20 @@ public final class ClientApp {
     /// How many times a create/resume is retried before it becomes a failure row.
     /// A single attempt is how "no session selected, forever" happened.
     private static let sessionAttempts = 3
+    /// The branch last read off `.git/HEAD`, and the directory it was read for.
+    ///
+    /// ``DoMoCore/GitInfo/branch(forWorkingDirectory:)`` does blocking file IO —
+    /// up to 128 `stat(2)`s while it walks up to the repository root, then two
+    /// small reads — and the footer is rebuilt on every repaint, which means on
+    /// every keystroke. Calling it uncached would put a filesystem walk on the
+    /// render loop; this is the cache the function's own documentation requires
+    /// of its callers.
+    private var branchCache: (cwd: String, branch: String?)?
+    /// The run state the branch cache was last refreshed against, so a TURN
+    /// BOUNDARY — a run settling — is what invalidates it. A branch changes when
+    /// the agent (or the user in another window) checks one out, and the end of a
+    /// turn is the moment that has just become likely; a repaint is not.
+    private var branchCacheRunState: EventStore.RunState = .idle
     /// Longest a notice may hold the status line, however long its TTL claims.
     /// Matches `DOMOCODE_RETRY_BUDGET_MS`'s default: no single backoff can exceed
     /// the whole sleep budget, so nothing legitimate is ever truncated by this.
@@ -323,6 +339,7 @@ public final class ClientApp {
         transcriptView.items = store.transcript
         transcriptView.running = store.runState == .running
         statusBar.text = statusText()
+        footerBar.model = footerModel()
 
         let sidebarWidth = ClientLayout.sidebarWidth(for: width)
         // The width the input will ACTUALLY be placed at: `Row` gives the flexible
@@ -332,19 +349,56 @@ public final class ClientApp {
         // decide whether an arrow recalls history or moves the caret — are computed
         // against the last width it rendered at.
         let inputWidth = max(0, width - sidebarWidth)
+        let footerRows = ClientLayout.footerRows(for: height)
         promptRows = inputWidth > 0
-            ? promptInput.height(forWidth: inputWidth, maxRows: ClientLayout.promptRowCap(for: height))
+            ? promptInput.height(
+                forWidth: inputWidth,
+                maxRows: ClientLayout.promptRowCap(for: height, footerRows: footerRows)
+            )
             : 1
-        let layout = ClientLayout(width: width, height: height, promptRows: promptRows)
-        let main = Column([
+        let layout = ClientLayout(
+            width: width, height: height, promptRows: promptRows, footerRows: footerRows
+        )
+        // Built as an array rather than a literal because the footer row is
+        // CONDITIONAL. `Fixed.measure` returns its basis unconditionally and the
+        // flexible transcript is handed only what is left, so an unconditional
+        // second footer row would take the transcript to nothing on a short
+        // terminal — the same failure `promptRowCap` exists to prevent, arriving
+        // by a different door.
+        var mainChildren: [any LayoutNode] = [
             Flexible(1, TranscriptNode(view: transcriptView, capabilities: graphicsCapabilities, cell: cellSize)),
             Fixed(.absolute(ClientLayout.statusRows), statusBar.layout),
-            Fixed(.absolute(layout.promptRows), promptInput.layout),
-        ])
+        ]
+        if layout.footerRows > 0 {
+            mainChildren.append(Fixed(.absolute(layout.footerRows), footerBar.layout))
+        }
+        mainChildren.append(Fixed(.absolute(layout.promptRows), promptInput.layout))
         return Row([
             Fixed(.absolute(layout.sidebarWidth), sidebar.layout),
-            Flexible(1, main),
+            Flexible(1, Column(mainChildren)),
         ])
+    }
+
+    /// What the accounting footer should say right now.
+    ///
+    /// The cwd comes from the SESSION — the sidebar row for the open session —
+    /// and not from the client's own process, which may be running somewhere else
+    /// entirely (that is the whole point of `--serve`). The branch comes from
+    /// disk, through the cache above. The numbers come from the store, which
+    /// folds the live stream on top of the server's last authoritative answer.
+    private func footerModel() -> FooterModel {
+        let cwd = store.sessions.first { $0.id == store.selectedSessionID }?.cwd ?? ""
+        refreshBranchIfNeeded(cwd: cwd)
+        return FooterModel(cwd: cwd, branch: branchCache?.branch, accounting: store.accounting)
+    }
+
+    /// Re-read the branch when the directory changed or a turn just settled, and
+    /// at no other time. See ``branchCache``.
+    private func refreshBranchIfNeeded(cwd: String) {
+        let turnJustSettled = branchCacheRunState == .running && store.runState == .idle
+        branchCacheRunState = store.runState
+        guard branchCache?.cwd != cwd || turnJustSettled else { return }
+        branchCache = (cwd, GitInfo.branch(forWorkingDirectory: cwd))
     }
 
     /// The status line: what the run is doing right now, then the key hints.
@@ -626,7 +680,15 @@ public final class ClientApp {
     /// that clock is already adaptive, already cancelled with the app, and one task
     /// that can be reasoned about beats two that can drift apart.
     private func pollStatusIfDue() {
-        guard store.runState == .running,
+        // `wantsAccountingPoll` is the second trigger, and it is what keeps the
+        // footer honest between runs: the last turn of a run is folded locally,
+        // and a compaction's own usage is billed to the session without ever
+        // being streamed as an assistant turn, so an idle session's total is only
+        // right once the server has been asked one more time. The store clears
+        // the flag on any answer — and ``EventStore/noteAccountingPollFailed()``
+        // clears it on a failure — so this is one extra poll per run, not a
+        // second timer.
+        guard store.runState == .running || store.wantsAccountingPoll,
               !statusPollInFlight,
               Date().timeIntervalSince(lastStatusPollAt) >= Self.statusPollInterval,
               let id = store.selectedSessionID
@@ -646,9 +708,16 @@ public final class ClientApp {
     /// diagnosis rather than something the user asked for — it must never put a row
     /// on the transcript for failing.
     private func reconcileWithServer(_ id: String) async {
-        guard let status = try? await client.status(sessionID: id),
-              store.selectedSessionID == id
-        else { return }
+        guard let status = try? await client.status(sessionID: id) else {
+            // Told, rather than swallowed. The accounting trigger above re-asks
+            // until it gets an answer, and against a runtime that is gone (or one
+            // that predates this route) "until it gets an answer" is forever.
+            // Session-checked like every other write here: a poll that failed for
+            // the session we just left must not silence the one we just opened.
+            if store.selectedSessionID == id { store.noteAccountingPollFailed() }
+            return
+        }
+        guard store.selectedSessionID == id else { return }
         let wasRunning = store.runState == .running
         store.adopt(status)
         if wasRunning, !status.running {
@@ -740,7 +809,12 @@ public final class ClientApp {
     private func scrollFromKeyboard(rows: Int, up: Bool, page: Bool) {
         let columns = surface?.target.columns ?? 0
         let height = surface?.target.rows ?? 0
-        let layout = ClientLayout(width: columns, height: height, promptRows: promptRows)
+        let layout = ClientLayout(
+            width: columns,
+            height: height,
+            promptRows: promptRows,
+            footerRows: ClientLayout.footerRows(for: height)
+        )
         // A page keeps one row of overlap, so the eye has an anchor across the
         // jump — the same step the Ctrl-wheel already uses.
         let step = page ? max(1, layout.transcriptHeight - 1) : max(1, rows)
@@ -767,7 +841,12 @@ public final class ClientApp {
         // would paint a highlight the user cannot clear with a gesture we no longer
         // receive.
         guard mouseOwned, let target = surface?.target else { return }
-        let layout = ClientLayout(width: target.columns, height: target.rows, promptRows: promptRows)
+        let layout = ClientLayout(
+            width: target.columns,
+            height: target.rows,
+            promptRows: promptRows,
+            footerRows: ClientLayout.footerRows(for: target.rows)
+        )
 
         if event.isScroll {
             guard event.kind == .scrollUp || event.kind == .scrollDown else { return }
@@ -1250,6 +1329,41 @@ public final class ClientApp {
         store.seed(history)
         for failure in failures { postError(failure.headline, failure.error, hint: failure.hint) }
         attachEvents(sessionID)
+        // Ask for this session's totals once, on open.
+        //
+        // The stream is delta-only: it can tell the footer what THIS attachment
+        // spends and nothing about what the session already spent, so without
+        // this a resumed conversation comes up reading zero — a number that is
+        // wrong rather than merely absent. After `attachEvents`, so the round trip
+        // does not delay the subscription.
+        //
+        // Accounting ONLY. A full `reconcileWithServer` here would also adopt run
+        // state, which is not this call's business and is not free: the SSE
+        // `connected(running:)` frame is authoritative for that both ways, and
+        // taking it over on open defeats the wedge repair path, where the client
+        // believes it is idle until a 409 tells it otherwise.
+        //
+        // `lastStatusPollAt` is stamped BEFORE the await, not after: the spinner
+        // clock's own poll is due whenever `lastStatusPollAt` is `.distantPast`,
+        // so without this a session that opens mid-run is polled twice within a
+        // few milliseconds, and the second answer lands before the first has been
+        // adopted.
+        lastStatusPollAt = Date()
+        await seedAccounting(sessionID)
+    }
+
+    /// Fill the footer's totals for a session that was already under way.
+    ///
+    /// `try?` throughout, and silent: nobody asked for this, an older runtime has
+    /// no such route, and a footer that comes up blank is a far better outcome
+    /// than a transcript row apologising for a number.
+    private func seedAccounting(_ id: String) async {
+        guard let status = try? await client.status(sessionID: id) else {
+            if store.selectedSessionID == id { store.noteAccountingPollFailed() }
+            return
+        }
+        guard store.selectedSessionID == id else { return }
+        store.adoptAccounting(status)
     }
 
     /// Subscribe to a session's event stream, and KEEP it subscribed.

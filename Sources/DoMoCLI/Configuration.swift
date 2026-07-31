@@ -211,7 +211,7 @@ public struct Settings: Sendable, Hashable, Codable {
         } catch {
             throw DoMoError(
                 .configuration,
-                "Could not parse settings file \(path)",
+                "Could not parse settings file",
                 cause: ConfigDiagnostic(decoding: error, source: source, file: path.string)
             )
         }
@@ -232,7 +232,7 @@ public struct Settings: Sendable, Hashable, Codable {
             return resolved.settings
         } catch {
             throw DoMoError(
-                .configuration, "Could not resolve values in settings file \(path)", cause: error)
+                .configuration, "Could not resolve values in settings file", cause: error)
         }
     }
 

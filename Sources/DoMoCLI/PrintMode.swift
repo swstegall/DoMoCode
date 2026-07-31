@@ -99,6 +99,57 @@ struct EventLog: Sendable {
     }
 }
 
+// MARK: - Usage encoding
+
+/// The `usage` object carried by the JSON stream's `assistant` and `result`
+/// events.
+///
+/// One encoder for both, so the per-turn numbers and the session totals cannot
+/// come to describe the same quantities under different key names — the JSON
+/// stream is a published contract, and two spellings of "cache reads" is a
+/// contract nobody can write one parser for.
+enum PrintUsageEncoding {
+
+    /// - Parameters:
+    ///   - usage: the token counts to report.
+    ///   - cost: the total to report alongside them. Callers pass
+    ///     ``DoMoLLM/Usage/effectiveCostTotal`` or
+    ///     ``DoMoHarness/SessionAccounting/costTotal`` — never `cost.total`,
+    ///     which silently discards a price the gateway itself reported.
+    static func object(_ usage: Usage, cost: Decimal) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "input": .int(usage.input),
+            "output": .int(usage.output),
+            "cacheRead": .int(usage.cacheRead),
+            "cacheWrite": .int(usage.cacheWrite),
+            "cost": .string(decimalString(cost)),
+        ]
+        // ABSENT, not `0`, when the provider said nothing about reasoning.
+        // ``DoMoLLM/Usage/reasoning`` is Optional for exactly this reason: a
+        // provider that reports no reasoning tokens and one that never mentions
+        // them are different facts, and `0` asserts the first about the second.
+        if let reasoning = usage.reasoning {
+            fields["reasoning"] = .int(reasoning)
+        }
+        return .object(fields)
+    }
+
+    /// A `Decimal` as its exact decimal digits, in a JSON **string**.
+    ///
+    /// A string because ``DoMoCore/JSONValue`` has no decimal case: its only
+    /// fractional number is `.double`, and a per-turn cost like `0.000003`
+    /// summed over a few hundred turns is precisely the binary-floating-point
+    /// drift ``DoMoLLM/Cost`` chose `Decimal` to avoid. Emitting the number
+    /// through `.double` would round-trip every cost this phase exists to make
+    /// honest through the type it was chosen to escape.
+    ///
+    /// `Decimal.description` writes the base-10 significand and exponent it
+    /// actually holds, so nothing is rounded, and it is locale-independent
+    /// (`NSDecimalString` with no locale always writes `.`), so the same run
+    /// produces the same bytes on a machine set to `de_DE`.
+    static func decimalString(_ value: Decimal) -> String { value.description }
+}
+
 // MARK: - Tool adapter
 
 /// Wraps a ``DoMoTools/Tool`` and its bound ``ToolContext`` as an ``AgentTool``.
@@ -289,6 +340,12 @@ struct PrintEventSink: AgentEventSink {
         }
     }
 
+    /// The `assistant` event for one finished turn.
+    ///
+    /// Its `usage` object reports what THAT turn used and cost. Two of the six
+    /// numbers were missing until Phase 5a: `reasoning`, which is emitted only
+    /// when the provider reported it, and `cost`, without which a `-p` run could
+    /// not tell a caller what it had just spent even though the harness knew.
     private func emitAssistant(_ assistant: AssistantMessage) {
         log.emit(
             "assistant",
@@ -302,12 +359,10 @@ struct PrintEventSink: AgentEventSink {
                         .object(["id": .string(call.id), "name": .string(call.name), "arguments": call.arguments])
                     }
                 ),
-                "usage": .object([
-                    "input": .int(assistant.usage.input),
-                    "output": .int(assistant.usage.output),
-                    "cacheRead": .int(assistant.usage.cacheRead),
-                    "cacheWrite": .int(assistant.usage.cacheWrite),
-                ]),
+                "usage": PrintUsageEncoding.object(
+                    assistant.usage,
+                    cost: assistant.usage.effectiveCostTotal
+                ),
             ]
         )
     }
@@ -555,7 +610,18 @@ public struct PrintMode: Sendable {
         )
 
         let result = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
-        return finish(result: result, turns: turnCounter.value)
+        // The totals come off the harness's own accumulator rather than a second
+        // sum kept here: one accumulator per session is the whole reason
+        // ``AgentHarness/accounting()`` exists, and a private one in this file
+        // would make `-p` and `--serve` report different numbers for the same
+        // session file.
+        //
+        // `try?` on purpose. `accounting()` resolves the session path to measure
+        // the context, and a run that produced a perfectly good answer must still
+        // print it and exit 0 if that resolution fails. The totals are then
+        // OMITTED from the `result` event rather than reported as zeros.
+        let accounting = try? await harness.accounting()
+        return finish(result: result, turns: turnCounter.value, accounting: accounting)
     }
 
     /// Builds the harness for this run's ``SessionSource``: a new file, an opened
@@ -678,7 +744,12 @@ public struct PrintMode: Sendable {
     /// occur — every other code keeps its exact meaning, and `--max-turns N` brings
     /// `2` back unchanged. The one code that gained reachability is `3`: the
     /// runaway guard is the bound an unbounded run still has.
-    private func finish(result: AgentRunResult, turns: Int) -> Int32 {
+    ///
+    /// - Parameter accounting: the session's running totals, or `nil` when they
+    ///   could not be read. `nil` omits them from the `result` event; it never
+    ///   substitutes zeros, which would be a confident claim that the run was
+    ///   free.
+    private func finish(result: AgentRunResult, turns: Int, accounting: SessionAccounting?) -> Int32 {
         let lastAssistant = Self.lastAssistant(in: result.messages)
 
         switch result.stopReason {
@@ -692,7 +763,23 @@ public struct PrintMode: Sendable {
                 return fail(lastAssistant)
             }
             if let lastAssistant { finishText(lastAssistant) }
-            log.emit("result", ["text": .string(lastAssistant?.text ?? ""), "turns": .int(turns)])
+            // `text` and `turns` keep their existing names and meanings; the
+            // `usage` object is ADDED beside them, and the event keeps its place
+            // as the last line of the stream. Adding a key cannot break a reader
+            // that ignores unknown ones, which is the only compatibility promise
+            // a newline-delimited JSON stream can offer.
+            var fields: [String: JSONValue] = [
+                "text": .string(lastAssistant?.text ?? ""),
+                "turns": .int(turns),
+            ]
+            if let accounting {
+                fields["usage"] = PrintUsageEncoding.object(
+                    accounting.usage,
+                    cost: accounting.costTotal
+                )
+            }
+            log.emit("result", fields)
+            reportSessionTotal(accounting)
             return 0
 
         case .errored, .aborted:
@@ -740,6 +827,31 @@ public struct PrintMode: Sendable {
         log.emit("error", ["message": .string(message), "stopReason": .string(stopReason)])
         channel.writeErr(message + "\n")
         return 1
+    }
+
+    /// Tells a human what the session has spent, on **stderr**, in text mode.
+    ///
+    /// stdout stays exactly what it was — the final answer and nothing else — for
+    /// the reason `-p` exists at all: it is piped into other programs, and a
+    /// summary line appended to the text they are parsing is a breaking change to
+    /// every one of them. stderr is where this file already puts the retry notice
+    /// and the turn heartbeat, and `--help` promises diagnostics land there.
+    ///
+    /// JSON mode says nothing here: the `result` event's `usage` object carries
+    /// the same numbers, and a second copy on stderr would only be a second thing
+    /// to keep in step.
+    ///
+    /// "Session", not "run": the harness seeds its totals by walking the file it
+    /// opened, so a `--resume`d run reports what the whole session has spent, not
+    /// only what this invocation added. For a fresh `-p` run the two are the same
+    /// number. Nothing is printed when there is nothing to report — a run that
+    /// used no tokens has no total worth a line.
+    private func reportSessionTotal(_ accounting: SessionAccounting?) {
+        guard mode == .text, let accounting, accounting.usage.totalTokens > 0 else { return }
+        channel.writeErr(
+            "… session total: \(accounting.usage.totalTokens) tokens · "
+                + "$\(PrintUsageEncoding.decimalString(accounting.costTotal))\n"
+        )
     }
 
     /// Prints the final assistant text in text mode, one text block per line to
