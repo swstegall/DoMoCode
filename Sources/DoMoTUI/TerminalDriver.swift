@@ -303,13 +303,13 @@ public final class TerminalDriver {
         let inputTask = Task { [input] in
             defer { outcomeContinuation.yield(.inputEnded) }
             for await chunk in input {
-                await self.ingest(chunk, app: app)
+                self.ingest(chunk, app: app)
             }
         }
         let resizeTask = Task { [resize] in
             defer { outcomeContinuation.yield(.resizeEnded) }
             for await size in resize {
-                await self.handleResize(size, app: app)
+                self.handleResize(size, app: app)
             }
         }
         let quitTask = Task {
