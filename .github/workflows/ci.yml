@@ -50,15 +50,10 @@ jobs:
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 
-      # Keep package-level parallelism enabled. Suites that own processes, sockets,
-      # PTYs, or wall-clock fixtures opt into Swift Testing's `.serialized` trait
-      # in their source file. Ubuntu needs a modestly larger pool to finish the
-      # broad integration suite within the job budget; macOS stays at two workers
-      # because that is the stable setting for its timing-sensitive Shell tests.
+      # Keep concurrency inside individual tests, but use one package worker.
+      # Several suites drive a real full-screen client on the main actor; Swift
+      # Testing's `.serialized` trait only protects a suite from itself, so
+      # multiple package workers can still starve that render loop and turn a
+      # short wait into a job-wide hang.
       - name: Test
-        run: |
-          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 4
-          else
-            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 2
-          fi
+        run: swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 1
