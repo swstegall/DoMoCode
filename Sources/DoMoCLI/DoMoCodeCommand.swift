@@ -353,6 +353,13 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     sessionSource: sessionSource,
                     mcpServers: configuration.mcpServers,
                     mcpLog: { Self.writeStderr($0 + "\n") },
+                    // The per-alias trio, and the reason `SurfaceWiringTests` drives
+                    // this surface on a real pty. `InteractiveMode.make` defaults all
+                    // three of them, so deleting them here still COMPILES while
+                    // changing what every `--inline` session bills, meters and
+                    // compacts on — and the REPL's own tests build their own
+                    // `InteractiveMode` with arguments of their own, so nothing but a
+                    // run of the real binary observes what this line hands it.
                     modelRuntime: configuration.modelRuntime(for: model),
                     compaction: configuration.compaction,
                     summarizer: Self.compactionSummarizer(configuration, model: model),

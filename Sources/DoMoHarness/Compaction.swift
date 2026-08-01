@@ -168,7 +168,9 @@ private func assistantContextUsage(_ message: Message) -> Usage? {
 /// A context-size estimate for a message list, split into its trusted and
 /// estimated halves.
 public struct ContextUsageEstimate: Sendable, Hashable {
-    /// Total estimated context tokens: `usageTokens + trailingTokens`.
+    /// Total estimated context tokens: `usageTokens + trailingTokens`, summed
+    /// **saturating** — see ``estimateContextTokens(_:)``, where the anchor half
+    /// of that sum is a number the provider chose and nothing bounds.
     public var tokens: Int
     /// Tokens reported by the most recent assistant ``Usage``, or `0` when none
     /// exists.
@@ -192,6 +194,17 @@ public struct ContextUsageEstimate: Sendable, Hashable {
 /// count for everything up to and including that turn — and only *estimates* the
 /// tail after it. With no assistant usage anywhere (a session that has not yet
 /// completed a turn), it falls back to the character heuristic over every message.
+///
+/// **Every sum here saturates**, and the anchored one is the reason. `usageTokens`
+/// is ``calculateContextTokens(_:)`` of a provider-reported ``DoMoLLM/Usage`` — a
+/// number this process never bounded, arriving on an SSE frame or off a session
+/// line an older build wrote — so it can already be `Int.max` by the time the
+/// clamp inside ``DoMoLLM/Usage/totalTokens`` is done with it. Adding a single
+/// trailing message to that is a trap, and it is a trap *inside the server*: this
+/// is the function ``AgentHarness/accounting()`` calls on every `/status` read and
+/// ``AgentHarness`` calls before every turn, so it takes the whole process down
+/// rather than one client's frame. Clamping the estimate keeps it wrong in the
+/// direction its input was already wrong; trapping loses the session.
 public func estimateContextTokens(_ messages: [Message]) -> ContextUsageEstimate {
     var anchor: (usage: Usage, index: Int)?
     for index in stride(from: messages.count - 1, through: 0, by: -1) {
@@ -203,7 +216,7 @@ public func estimateContextTokens(_ messages: [Message]) -> ContextUsageEstimate
 
     guard let anchor else {
         var estimated = 0
-        for message in messages { estimated += estimateTokens(message) }
+        for message in messages { estimated = estimated.saturatingAdding(estimateTokens(message)) }
         return ContextUsageEstimate(tokens: estimated, usageTokens: 0, trailingTokens: estimated, lastUsageIndex: nil)
     }
 
@@ -211,11 +224,11 @@ public func estimateContextTokens(_ messages: [Message]) -> ContextUsageEstimate
     var trailing = 0
     var index = anchor.index + 1
     while index < messages.count {
-        trailing += estimateTokens(messages[index])
+        trailing = trailing.saturatingAdding(estimateTokens(messages[index]))
         index += 1
     }
     return ContextUsageEstimate(
-        tokens: usageTokens + trailing,
+        tokens: usageTokens.saturatingAdding(trailing),
         usageTokens: usageTokens,
         trailingTokens: trailing,
         lastUsageIndex: anchor.index
@@ -680,7 +693,15 @@ public func prepareCompaction(
     if let previousSummary {
         // The standing summary is part of what a fresh turn would send, so it
         // counts toward the size compaction is trying to bound.
-        tokensBefore += estimateTokens(.user(UserMessage(content: [.text(previousSummary)])))
+        //
+        // Saturating for the reason ``estimateContextTokens(_:)`` gives: the value
+        // it just returned is anchored on a provider-reported usage and can be
+        // `Int.max`. This runs inside ``AgentHarness``'s pre-turn compaction check,
+        // so a plain `+=` here trapped the server on the second compaction of any
+        // session whose provider reported an absurd count.
+        tokensBefore = tokensBefore.saturatingAdding(
+            estimateTokens(.user(UserMessage(content: [.text(previousSummary)])))
+        )
     }
 
     let cut = findCutIndex(messages, keepRecentTokens: settings.keepRecentTokens)

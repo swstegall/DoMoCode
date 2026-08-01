@@ -344,6 +344,99 @@ struct SessionAccountingTests {
         #expect(accounting.turns == 1, "a branch summary was counted as a conversational turn")
     }
 
+    // MARK: - Numbers the provider chose
+
+    /// A `Usage` as it actually arrives: decoded off a frame, with no bounds
+    /// applied anywhere on the way in.
+    private func wireUsage(input: Int, output: Int = 0) throws -> Usage {
+        let json = """
+            {"input":\(input),"output":\(output),"cacheRead":0,"cacheWrite":0,\
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}
+            """
+        return try JSONDecoder().decode(Usage.self, from: Data(json.utf8))
+    }
+
+    /// Clamping ``DoMoLLM/Usage/totalTokens`` did not close this door — it moved the
+    /// trap one frame down, from a client reading `/status` into the process that
+    /// serves it. ``AgentHarness/accounting()`` runs the context estimate over the
+    /// same unbounded number, and the estimate ADDS to it.
+    ///
+    /// The trailing user message is the whole point of the shape here. With the
+    /// assistant turn last, it is the estimate's anchor and nothing is added to it,
+    /// which is why every accounting test written before this one walked straight
+    /// past the trap: the boundary is "is there a message after the anchor", and
+    /// they were all on the safe side of it.
+    @Test("an absurd provider-reported usage is accounted for rather than trapping the process")
+    func absurdProviderUsageDoesNotTrapAccounting() async throws {
+        let usage = try wireUsage(input: Int.max, output: Int.max)
+        #expect(usage.input == Int.max, "the premise is a usage the decoder carried through unclamped")
+        #expect(usage.totalTokens == Int.max, "the premise is a usage whose own total already saturated")
+
+        let responder = Responder([assistant("answer", usage: usage)])
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(streamFn: responder.fn(), contextWindow: 200_000, ids: IDs(prefix: "sat"))
+        )
+        _ = try await harness.run(prompt: "hello")
+        // Anything after the anchor turns the estimate into `Int.max + n`.
+        try await harness.persistMessage(.user("and one more thing"), elapsedMs: nil)
+
+        let accounting = try await harness.accounting()
+        #expect(accounting.contextTokens == Int.max, "the estimate did not clamp: \(accounting.contextTokens)")
+        #expect(accounting.usage.input == Int.max)
+        #expect(accounting.usage.totalTokens == Int.max)
+        #expect(accounting.turns == 1)
+
+        // The estimate's own parts must agree with the total it reports, or the
+        // clamp merely hid the sum instead of saturating it.
+        let estimate = estimateContextTokens(try await harness.contextMessages())
+        #expect(estimate.usageTokens == Int.max)
+        #expect(estimate.trailingTokens > 0, "the premise is a message after the anchor")
+        #expect(estimate.tokens == Int.max)
+    }
+
+    /// The same number reaches compaction, which adds the standing summary's size to
+    /// the estimate before deciding what to cut. This is the second frame down: the
+    /// harness runs it *before every turn*, so a session whose provider reported an
+    /// absurd count could not take another turn at all.
+    @Test("a compaction over an absurd usage measures rather than trapping")
+    func absurdProviderUsageDoesNotTrapCompactionMath() throws {
+        let stamp = "2026-07-31T00:00:00.000Z"
+        let absurd = try wireUsage(input: Int.max)
+        let prior = SessionTreeEntry(
+            id: "c0",
+            parentId: nil,
+            timestamp: stamp,
+            payload: .compaction(Compaction(
+                summary: "SUMMARY",
+                tokensBefore: 10,
+                retainedTail: [
+                    .user("older"),
+                    .assistant(assistant("answer", usage: absurd)),
+                ]
+            ))
+        )
+        let tail = SessionTreeEntry(
+            id: "m1",
+            parentId: "c0",
+            timestamp: stamp,
+            payload: .message(.user("and one more thing"))
+        )
+
+        let preparation = try #require(
+            prepareCompaction(
+                pathEntries: [prior, tail],
+                settings: CompactionSettings(enabled: true, reserveTokens: 1, keepRecentTokens: 1)
+            ),
+            "the premise is a path with a prior checkpoint and something older than the recent budget"
+        )
+        #expect(preparation.previousSummary == "SUMMARY",
+                "the premise is a standing summary whose size is added to the estimate")
+        #expect(preparation.tokensBefore == Int.max,
+                "the standing summary's size was added to a saturated estimate without clamping")
+    }
+
     // MARK: - The wire form
 
     private func snapshot(costTotal: Decimal, contextWindow: Int? = nil) -> SessionAccounting {
@@ -415,6 +508,57 @@ struct SessionAccountingTests {
         let data = try payload(costTotalLiteral: #""free""#)
         #expect(throws: DecodingError.self) {
             _ = try JSONDecoder().decode(SessionAccounting.self, from: data)
+        }
+    }
+
+    /// `"free"` is the easy half of that rule and it hid the hard half: bare
+    /// `Decimal(string:)` does not refuse a string that merely *begins* with a
+    /// number, it **prefix-parses** it. Every spelling below came back as a
+    /// plausible, wrong total that nobody sent —
+    ///
+    ///     "0.25 dollars" -> 0.25      "0.25xyz" -> 0.25
+    ///     "1_000"        -> 1         "0x10"    -> 0
+    ///
+    /// — which is a session's entire reported spend, off by up to three orders of
+    /// magnitude, with nothing anywhere saying so. It is locale-influenced as well:
+    /// the same body read where the decimal separator is a comma means something
+    /// else again. `LiteLLM.parseResponseCost` already defends the identical hazard
+    /// on `x-litellm-response-cost` with a strict whole-string grammar, and this is
+    /// the same quantity crossing the same kind of boundary, so it uses the same
+    /// grammar — the one in ``DoMoLLM/DecimalText``, not a second copy of it.
+    @Test("a costTotal string is parsed whole, never prefix-parsed into a wrong price")
+    func aPrefixParseableCostTotalIsRefused() throws {
+        let refused = [
+            "0.25 dollars", "0.25xyz", "1_000", "0x10",
+            // Neighbours of the same grammar, so the fix cannot be a substring check
+            // against the four above: a trailing comma-joined duplicate header, the
+            // spellings `Decimal` accepts and this does not, and empty text.
+            "0.001, 0.001", ".5", "5.", "1,5", "", " ", "NaN", "Infinity", "+", "1e", "1e+",
+        ]
+        for spelling in refused {
+            let data = try payload(costTotalLiteral: "\"\(spelling)\"")
+            #expect(throws: DecodingError.self, "\"\(spelling)\" was accepted as a cost total") {
+                _ = try JSONDecoder().decode(SessionAccounting.self, from: data)
+            }
+        }
+    }
+
+    /// What the strictness must NOT cost: every spelling a real payload carries has
+    /// to keep decoding, exponent form included — LiteLLM stringifies a Python
+    /// float, so `1e-05` is what a small per-request cost actually looks like — and
+    /// surrounding whitespace is trimmed rather than treated as corruption.
+    @Test("the spellings a real payload uses still decode, exactly")
+    func strictParsingStillAcceptsRealPayloads() throws {
+        let accepted: [(String, String)] = [
+            ("0", "0"), ("8", "8"), ("0.25", "0.25"), ("1e-05", "0.00001"), ("1E-05", "0.00001"),
+            ("-0.5", "-0.5"), ("+0.5", "0.5"), (" 0.25 ", "0.25"),
+            ("0.000000123456789", "0.000000123456789"),
+        ]
+        for (spelling, expected) in accepted {
+            let data = try payload(costTotalLiteral: "\"\(spelling)\"")
+            let decoded = try JSONDecoder().decode(SessionAccounting.self, from: data)
+            #expect(decoded.costTotal == Decimal(string: expected, locale: nil),
+                    "\"\(spelling)\" decoded as \(decoded.costTotal)")
         }
     }
 

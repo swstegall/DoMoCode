@@ -178,12 +178,29 @@ enum FooterRow {
     // of them is not a wrong number on a row — it is SIGTRAP with the alternate
     // screen still on, which takes the session with it.
     //
-    // These three deliberately produce the SAME strings as
-    // `DoMoCLI/InlineAccountingSummary`, which draws the identical numbers on the
-    // inline REPL's status line. Two surfaces of one program that render the same
+    // These three are this side's copy of `DoMoCLI/InlineAccountingSummary`'s
+    // `compact`, `cost` and `context`, which draw the same numbers on the inline
+    // REPL's status line. Two surfaces of one program rendering the same
     // `SessionAccounting` differently is the exact class of drift this phase
     // exists to end, and the dependency graph runs DoMoCLI -> DoMoClient, so the
     // shared spelling cannot live in the CLI. Change one and change the other.
+    //
+    // They are not yet the same strings, and this note used to claim they were.
+    // Two differences are live, and both belong to the inline copy:
+    //
+    // * **A negative total.** ``formatCost`` tests `!= 0` and renders a credit as
+    //   `-$0.25`; the inline copy tests `> 0`, so the identical accounting reads
+    //   `$0.00?` there. The two surfaces disagree about that session outright.
+    // * **Hostile magnitudes.** The hardening this section is about — dividing
+    //   before the round in ``formatTokens(_:)``, clamping before the multiply in
+    //   ``formatContext(_:)`` — exists only here. The inline copy still rounds with
+    //   `value + 50_000` and still computes `contextTokens * 100` unclamped.
+    //
+    // The second is a GAP rather than a difference in exposure. The inline REPL
+    // reads its totals from the local harness, but the harness seeds them from the
+    // provider's `usage` frames — ``DoMoHarness/calculateContextTokens(_:)`` returns
+    // the reported total verbatim — so an absurd `total_tokens` reaches that
+    // arithmetic too; it just makes one hop fewer on the way.
 
     /// A token count as `842`, `12.3k` or `1.4M`.
     static func formatTokens(_ count: Int) -> String {
@@ -219,7 +236,19 @@ enum FooterRow {
     /// rather than asserting either one. A session that has genuinely spent
     /// nothing (no turns at all) still reads `$0.00`, never a blank.
     ///
-    /// `$0.00?` therefore means EXACTLY ONE THING: nobody priced this session.
+    /// `$0.00?` therefore means "zero, on a session that demonstrably ran, and
+    /// this row cannot say which zero it is". It does NOT mean "nobody priced this
+    /// session" — which is what this comment used to assert: a model an operator
+    /// deliberately priced AT ZERO produces the same total and renders the same
+    /// `$0.00?` here. Print mode CAN tell the two apart, and says so differently
+    /// — `$0` for a stated zero, `cost unknown` for a run nothing priced — because
+    /// it carries the run's `ratesConfigured` alongside the number
+    /// (`DoMoCLI/PrintUsageEncoding.reportableCost(_:ratesConfigured:reportedCost:)`).
+    /// All that reaches this row is a `Decimal`. So it marks the number unknown
+    /// instead of asserting a price it cannot see: widening ``SessionAccounting``
+    /// to carry that fact is the fix, under-claiming is the interim, and the `?`
+    /// is what keeps the interim honest.
+    ///
     /// The test is `!= 0` and not `> 0` because a NEGATIVE total is a different
     /// fact, and one this side does not get to rule out: `costTotal` is whatever
     /// number the server put in the `/status` body, decoded with no bounds (the
@@ -255,7 +284,9 @@ enum FooterRow {
         // hostile value traps rather than wrapping, and every number on this row
         // arrives over a socket (see the section comment above — the token and
         // cost segments answer the same door by saturating instead). The inline
-        // surface takes its input from the local harness and has no such door.
+        // surface's copy of this does NOT clamp; that is an open gap, not a
+        // surface with no such door, because the harness it reads from takes its
+        // context total straight from the provider's `usage` frames.
         let tokens = min(max(0, accounting.contextTokens), Int.max / 100)
         return "ctx \(label) (\(min(9_999, tokens * 100 / window))%)"
     }

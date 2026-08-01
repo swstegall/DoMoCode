@@ -306,6 +306,137 @@ struct ConfigDiagnosticsTests {
         }
     }
 
+    /// The half the first confinement fix left wide open.
+    ///
+    /// That fix resolved with `URL.resolvingSymlinksInPath()`, which follows a
+    /// link only when its target **exists**. A link inside the project pointing
+    /// at a file that is not there yet came back as the link's *own* in-project
+    /// path, confinement agreed it was inside, and the read then followed the
+    /// link out of the root the instant the target appeared. Same for any leaf
+    /// under a directory link, whether or not the directory itself exists.
+    ///
+    /// Both cases are driven through an *injected* reader on purpose. With the
+    /// real reader a dangling link fails either way — refused, or opened and
+    /// `ENOENT` — and it was exactly that shared failure that hid the hole: the
+    /// question is not "did the load fail" but "was a path outside the root ever
+    /// handed to the thing that opens files".
+    @Test
+    func aDanglingLinkAndAMissingLeafUnderADirectoryLinkAreBothRefused() throws {
+        try withTemporaryDirectory { directory in
+            let root = directory + "/project"
+            try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                atPath: directory + "/outside", withIntermediateDirectories: true)
+
+            // A link inside the project at a file outside it that does not exist
+            // yet — the attacker's half of the trick is creating it afterwards.
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/dangling.key",
+                withDestinationPath: directory + "/outside/appears-later.key"
+            )
+            // A link inside the project at a directory outside it, read through
+            // for a leaf that does not exist yet.
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/dirlink", withDestinationPath: directory + "/outside"
+            )
+            // The same, with the directory itself missing: resolution must not
+            // depend on any part of the target existing.
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/gonelink", withDestinationPath: directory + "/not-there-yet"
+            )
+
+            let settingsPath = root + "/settings.json"
+            let planted = "PWNED-SECRET-9f3a2c17"
+            let tokens = [
+                "{file:dangling.key}",
+                "{file:dirlink/later.key}",
+                "{file:gonelink/later.key}",
+            ]
+
+            for token in tokens {
+                let handed = Mutex<[String]>([])
+                #expect(throws: ConfigDiagnostic.self, "\(token) must be refused") {
+                    _ = try Settings(model: token).resolvingInterpolations(
+                        policy: .untrusted(root: root),
+                        environment: [:],
+                        baseDirectory: root,
+                        file: settingsPath,
+                        readFile: { requested in
+                            handed.withLock { $0.append(requested) }
+                            return planted
+                        }
+                    )
+                }
+                // Before the fix this held `<root>/dangling.key` — a path that
+                // reads as inside the project and names a file outside it.
+                #expect(handed.withLock { $0 }.isEmpty, "\(token) reached the reader")
+            }
+        }
+    }
+
+    /// The rest of the matrix, in one place, so a fix that welds the check shut
+    /// fails here rather than in somebody's repository.
+    ///
+    /// A chain out, a chain out whose end does not exist, and a relative link
+    /// out are all refused; a link that stays inside the project is still read.
+    @Test
+    func chainedAndRelativeLinksOutAreRefusedWhileAnInProjectLinkIsStillRead() throws {
+        try withTemporaryDirectory { directory in
+            let root = directory + "/project"
+            try FileManager.default.createDirectory(
+                atPath: root + "/secrets", withIntermediateDirectories: true)
+            try write("outside-body\n", to: directory + "/outside.key")
+
+            // hop1 -> hop2 -> <outside>/outside.key, which exists.
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/hop2.key", withDestinationPath: directory + "/outside.key")
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/hop1.key", withDestinationPath: root + "/hop2.key")
+            // The same chain ending on a file that does not exist.
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/hopgone.key",
+                withDestinationPath: directory + "/outside/never.key"
+            )
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/chain-gone.key", withDestinationPath: root + "/hopgone.key")
+            // A relative target, which names nothing outside the project as text.
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/relative.key", withDestinationPath: "../outside.key")
+
+            let settingsPath = root + "/settings.json"
+            let tokens = [
+                "{file:hop1.key}", "{file:chain-gone.key}", "{file:relative.key}",
+            ]
+            for token in tokens {
+                let handed = Mutex<[String]>([])
+                #expect(throws: ConfigDiagnostic.self, "\(token) must be refused") {
+                    _ = try Settings(model: token).resolvingInterpolations(
+                        policy: .untrusted(root: root),
+                        environment: [:],
+                        baseDirectory: root,
+                        file: settingsPath,
+                        readFile: { requested in
+                            handed.withLock { $0.append(requested) }
+                            return "should-never-be-read"
+                        }
+                    )
+                }
+                #expect(handed.withLock { $0 }.isEmpty, "\(token) reached the reader")
+            }
+
+            // And the other direction, which is the half a blunt fix breaks: a
+            // link that stays inside the project is still followed and read.
+            try write("in-project-token\n", to: root + "/secrets/real.key")
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/inside.key", withDestinationPath: root + "/secrets/real.key")
+            try write(#"{"model": "{file:inside.key}"}"#, to: settingsPath)
+            let confined = try #require(
+                try Settings.load(fromPath: settingsPath, interpolation: .untrusted(root: root))
+            )
+            #expect(confined.model == "in-project-token")
+        }
+    }
+
     /// An unset variable is a hard error naming it, not the empty string.
     ///
     /// Substituting `""` — which is what opencode does — turns one typo in a
@@ -677,6 +808,47 @@ struct ConfigDiagnosticsTests {
             let typo = try #require(plain.warnings.first)
             #expect(typo.contains("\"verbose\""))
         }
+    }
+
+    /// The boundary itself, which is where the previous fix went wrong.
+    ///
+    /// The cut was twelve characters while the longest level name — `critical` —
+    /// is eight, so a nine-to-twelve-character value was quoted back to stderr
+    /// whole. The tests meant to pin this used a 21- and a 33-character value:
+    /// both far past twelve, so both passed against a limit that was wrong by
+    /// four characters. A boundary is only tested from both sides of it.
+    ///
+    /// `logLevel` is an interpolated field, so "the value" can be whatever
+    /// `{env:}` produced, and the scrub only replaces what the vault was told
+    /// about — which for a key that is not credential-shaped is nothing.
+    @Test
+    func aRejectedLogLevelIsQuotedOnlyUpToTheLongestLevelName() throws {
+        // Eight characters: exactly the limit, and exactly the kind of typo the
+        // warning exists to show a user. Hiding this one would make the warning
+        // a more elaborate way of saying nothing.
+        let atLimit = try ResolvedConfiguration.resolve(
+            cli: CLIOverrides(),
+            environment: [:],
+            project: nil,
+            user: Settings(logLevel: "criticel")
+        )
+        let quoted = try #require(atLimit.warnings.first)
+        #expect(quoted.contains("\"criticel\""))
+
+        // Nine: one character past anything that could ever name a level, so it
+        // is measured and never shown — not even the eight-character prefix the
+        // old limit would have let through.
+        let overLimit = try ResolvedConfiguration.resolve(
+            cli: CLIOverrides(),
+            environment: [:],
+            project: nil,
+            user: Settings(logLevel: "criticall")
+        )
+        let measured = try #require(overLimit.warnings.first)
+        #expect(measured.contains("a 9-character value"))
+        #expect(!measured.contains("criticall"))
+        #expect(!measured.contains("critical"))
+        #expect(measured.contains("logLevel in the user settings.json"))
     }
 
     /// The other half of the rule, and the one that actually bit: a value

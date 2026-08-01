@@ -544,8 +544,13 @@ public struct Usage: Sendable, Hashable, Codable {
     /// hostile snapshot is therefore a trap that kills the whole TUI session
     /// mid-frame, with the alternate screen still on. A clamped total is wrong in
     /// the same direction its input was already wrong; a trap loses the session.
+    ///
+    /// This property is one stop on that path and never the whole of it: the same
+    /// unbounded number reaches the harness's context estimate and its running
+    /// fold, where the server process — not merely a client — would take the trap.
+    /// See ``Int/saturatingAdding(_:)``, which every one of those folds now uses.
     public var totalTokens: Int {
-        saturatingAdd(saturatingAdd(saturatingAdd(input, output), cacheRead), cacheWrite)
+        input.saturatingAdding(output).saturatingAdding(cacheRead).saturatingAdding(cacheWrite)
     }
 
     /// What this turn actually cost: the gateway's number when it gave one,
@@ -560,9 +565,18 @@ public struct Usage: Sendable, Hashable, Codable {
     /// A copy rather than a mutation: upstream mutates the usage object in place
     /// from inside the stream loop, which means every snapshot taken before the
     /// final chunk silently changes underneath its holder.
+    ///
+    /// The tier lookup sums three token counts the provider chose, so it sums them
+    /// **saturating**: this runs on the client's stream path, on the same
+    /// unbounded `usage` frame ``totalTokens`` guards against, and a plain `+`
+    /// here trapped on any turn whose reported prompt tokens were near `Int.max`.
+    /// A clamped tier input picks the top tier, which is the same answer an
+    /// absurd-but-representable count would have picked.
     public func costed(at rates: ModelCostRates?) -> Usage {
         guard let rates else { return self }
-        let applicable = rates.rates(forInputTokens: input + cacheRead + cacheWrite)
+        let applicable = rates.rates(
+            forInputTokens: input.saturatingAdding(cacheRead).saturatingAdding(cacheWrite)
+        )
         let million: Decimal = 1_000_000
         var copy = self
         copy.cost = Cost(
@@ -592,12 +606,12 @@ public struct Usage: Sendable, Hashable, Codable {
     /// snapshot comes through.
     public static func + (lhs: Usage, rhs: Usage) -> Usage {
         Usage(
-            input: saturatingAdd(lhs.input, rhs.input),
-            output: saturatingAdd(lhs.output, rhs.output),
-            cacheRead: saturatingAdd(lhs.cacheRead, rhs.cacheRead),
-            cacheWrite: saturatingAdd(lhs.cacheWrite, rhs.cacheWrite),
+            input: lhs.input.saturatingAdding(rhs.input),
+            output: lhs.output.saturatingAdding(rhs.output),
+            cacheRead: lhs.cacheRead.saturatingAdding(rhs.cacheRead),
+            cacheWrite: lhs.cacheWrite.saturatingAdding(rhs.cacheWrite),
             reasoning: lhs.reasoning == nil && rhs.reasoning == nil
-                ? nil : saturatingAdd(lhs.reasoning ?? 0, rhs.reasoning ?? 0),
+                ? nil : (lhs.reasoning ?? 0).saturatingAdding(rhs.reasoning ?? 0),
             cost: lhs.cost + rhs.cost,
             reportedCost: lhs.reportedCost == nil && rhs.reportedCost == nil
                 ? nil : lhs.effectiveCostTotal + rhs.effectiveCostTotal
@@ -605,16 +619,34 @@ public struct Usage: Sendable, Hashable, Codable {
     }
 }
 
-/// `lhs + rhs`, clamped to the ends of `Int` instead of trapping on overflow.
-///
-/// Two operands can only overflow when they share a sign, so the sign of `rhs`
-/// names which end it ran off. Deliberately file-private: the saturation is a
-/// property of ``Usage``'s own arithmetic — every value in it arrives from
-/// outside this process — and not a general licence to stop checking sums.
-private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
-    let (sum, overflow) = lhs.addingReportingOverflow(rhs)
-    guard overflow else { return sum }
-    return rhs > 0 ? Int.max : Int.min
+// MARK: - Saturating token arithmetic
+
+extension Int {
+    /// `self + other`, clamped to the ends of `Int` instead of trapping on
+    /// overflow.
+    ///
+    /// Two operands can only overflow when they share a sign, so the sign of
+    /// `other` names which end it ran off.
+    ///
+    /// Public, and **not** a general licence to stop checking sums. It exists for
+    /// one path and is spelled loudly so a reader can tell when they are on it: a
+    /// token count that arrived from outside this process — a provider's `usage`
+    /// frame, a `/status` snapshot decoded by the client, a session line written
+    /// by an older build — being folded on its way to a footer or to the harness's
+    /// session accounting. Nothing bounds those numbers on the way in, so a plain
+    /// `+` anywhere along that path is a SIGTRAP on a value somebody else chose,
+    /// in release as much as in debug.
+    ///
+    /// Saturating ``Usage/totalTokens`` alone did not close that path — it moved
+    /// the trap one frame down, into the context estimate the harness runs over
+    /// the same numbers — which is why the clamp is a shared operation now rather
+    /// than a private detail of ``Usage``. Arithmetic on numbers this process
+    /// computed itself still uses `+` and still traps, which is what it should do.
+    public func saturatingAdding(_ other: Int) -> Int {
+        let (sum, overflow) = addingReportingOverflow(other)
+        guard overflow else { return sum }
+        return other > 0 ? Int.max : Int.min
+    }
 }
 
 // MARK: - Tools

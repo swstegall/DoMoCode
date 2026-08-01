@@ -14,8 +14,8 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 ## Status: the port is finished; the harness is being built out
 
 **The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine
-and the MCP client are implemented and tested** — Phases 0–4, 5.5, 6, 7, 7.5, 8 and the 8.5 hardening
-pass — with **2,017 tests in 237 suites green in both debug and `-c release`**.
+and the MCP client are implemented and tested** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8 and the 8.5
+hardening pass — with **2,524 tests in 298 suites green in both debug and `-c release`**.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
@@ -278,32 +278,65 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       Enter to queue a follow-up; three end-to-end tests drive the real REPL headlessly against a mock
       gateway. 1059 tests, green in both configurations. (That REPL is `domo --inline` today — Phase 7
       moved the no-flag default to the full-screen client, which has no `@` completion of its own.)
-- [ ] **Phase 5 — Polish.** The oldest unstarted phase — planned before the architecture pivot, and a
-      prerequisite for roughly half of everything after it. It was sequenced *before* the architecture pivot and was overtaken by it,
-      so what exists today is substrate rather than feature: `SlashCommand` + `SlashCommandProvider`
-      and a fuzzy completion popup are built and tested, but dispatch is a hard-coded three-name
-      `switch` in the `--inline` REPL and the default client has none at all; `ToolRenderTheme` /
-      `SelectListTheme` / `EditorTheme` are styling seams with presets nothing can select; the session
-      **tree** exists in the harness and over REST, and the sidebar draws a flat list that never calls
-      it; `model_change` session entries round-trip through the context builder and compactor and
-      nothing ever writes one; `Yams` is declared for skill frontmatter that was never written. Split
-      into four, the way Phase 8 was.
+- [ ] **Phase 5 — Polish**, split into four the way Phase 8 was. **5a is shipped; 5b–5d are not.**
+      It was sequenced *before* the architecture pivot and was overtaken by it, so what remains is
+      substrate rather than feature: `SlashCommand` + `SlashCommandProvider` and a fuzzy completion
+      popup are built and tested, but dispatch is a hard-coded three-name `switch` in the `--inline`
+      REPL and the default client has none at all; `ToolRenderTheme` / `SelectListTheme` /
+      `EditorTheme` are styling seams with presets nothing can select; the session **tree** exists in
+      the harness and over REST, and the sidebar draws a flat list that never calls it; `model_change`
+      session entries round-trip through the context builder and compactor and nothing ever writes
+      one; `Yams` is declared for skill frontmatter that was never written.
 
-      **5a — Truth and plumbing.** Several shipped subsystems report numbers that are structurally
-      wrong: cost is always zero because `rates:` is never passed to a single production call site,
-      and the context window is a hardcoded 200k guess that is wrong for every non-frontier alias
-      behind the proxy. This makes the existing system honest and gives the dead substrate a caller —
-      `modelOverrides` per alias (context window, cost rates, reasoning efforts) threaded to all three
-      `streamCompletion` sites; LiteLLM's `x-litellm-response-cost` header read into `Usage`;
-      compaction settings made configurable at all; `smallModel` wired to a real summarizer, making
-      the documented "dedicated compaction model" true; `{env:}`/`{file:}` config resolution; a shared
-      secret-redaction module; structured config errors with line, column and caret; a cross-process
-      lock on the settings read-modify-write, which can lose a concurrent grant today. Two items here
-      **cannot be backfilled** — per-turn `elapsedMs` and a monotonic `seq` on session entries — so
-      every file written before them is permanently unable to report throughput or support
-      incremental catch-up. *Exit:* a footer can be fed a real token count, cost and context
-      percentage, and a malformed `settings.json` names the offending line and key instead of
-      aborting the run.
+      **[x] 5a — Truth and plumbing.** Several shipped subsystems reported numbers that were
+      structurally wrong: cost was always zero because `rates:` was never passed to a single
+      production call site, and the context window was a hardcoded 200k guess wrong for every
+      non-frontier alias behind the proxy. Per-alias `modelOverrides` (context window, cost rates,
+      reasoning effort) now reach all three `streamCompletion` sites through one `ModelRuntime` and a
+      shared stream factory; LiteLLM's `x-litellm-response-cost` is read into `Usage` when present,
+      though per-alias rates remain the primary source because a streaming response's headers flush
+      before its cost is knowable; compaction is configurable; `smallModel` (or `compaction.model`)
+      builds a real summarizer, but only when it differs from the run's model, so nothing changes for
+      a user who configures nothing. `contextWindow` became **optional** — `nil` means genuinely
+      unknown and a meter renders `?` rather than a percentage of a guess, with a 200k fallback used
+      only to decide when to compact. Plus `{env:}`/`{file:}` resolution following kilocode's hardened
+      semantics rather than opencode's (project config untrusted, an unset variable a hard error
+      rather than a silent empty string, an env denylist so an interpolated value cannot re-inject the
+      credential the MCP scrub removes); a shared secret-redaction module; config errors that name a
+      line, a column and draw a caret; and a `flock(2)` lock plus a mode-preserving atomic write
+      around the settings read-modify-write, whose race was never only cross-process — one
+      `domo --serve` with two sessions could lose a grant to itself. Two items **could not be
+      backfilled** and so shipped now: per-entry `elapsedMs` and a monotonic per-file `seq`.
+      *Exit met, and exceeded at the user's request:* the numbers are not merely available but
+      **displayed** — a footer in the default client showing cwd, git branch, tokens, cost and
+      context percentage (Phase 5c's item, pulled forward), the same three numbers on the inline
+      REPL's status row, and `cost`/`reasoning` on the `--json` stream. A malformed `settings.json`
+      names the offending line, column and key under a caret. Three approved secret-leak fixes went
+      with it: the gateway's 401 body — which echoes the key it received and was persisted into
+      session JSONL forever — is redacted; a custom `apiKeyEnv` is scrubbed from MCP children; and
+      `bash` no longer inherits the gateway credential. **Two adversarial reviews ran, one on the code
+      and one on the fixes**, producing 45 confirmed findings and 66 disproved suspicions; among the
+      real ones were a symlink escape in untrusted project config, a redaction registration that
+      *defeated* the header rule it was meant to help, an overflow that trapped and killed the client,
+      and — the most valuable — proof that the entire per-alias plumbing on the **default** surface
+      could be deleted with the whole suite green, because the surface everybody uses was the one
+      nobody had tested. A **third** pass then reviewed those fixes, and found several incomplete and
+      one strictly worse than what it replaced — the `{file:}` fix did not close a *dangling* symlink,
+      running the redaction patterns before the literal registry let a rule bite a piece out of a
+      registered secret so the rest printed, and a length cut meant to hide a value was four
+      characters wider than the longest thing it could legitimately show. Those are closed too.
+      2,524 tests in 298 suites, green in debug and release.
+
+      *Left open, deliberately, and written down rather than discovered later:* the `{file:}` check
+      still has a residual TOCTOU window — closing it needs `O_NOFOLLOW` and a read from the
+      descriptor, which would break the trusted policy's documented ability to follow a link to
+      `~/.gateway-key`; `SessionAccounting` cannot say whether a session was *priced*, so the footer
+      still cannot distinguish an operator's deliberate `$0` from an unpriced alias the way print mode
+      can, and the inline strip has not been brought onto the footer's negative-cost and clamping
+      rules; `Usage`'s own `Decimal`s still cross `/status` as JSON numbers, so only
+      `SessionAccounting.costTotal` is string-encoded; and `AgentLoop` still fabricates a
+      `messageStart` for a turn that never streamed, so the sink infers "was this timed" from the stop
+      reason instead of being told.
 
       **5b — The command layer.** The two seams the rest of the roadmap leans on hardest: a composable
       `SystemPromptBuilder` (base → `SYSTEM.md` → `AGENTS.md`/`CLAUDE.md` ancestor walk → available
@@ -655,7 +688,7 @@ ordering falls out of them rather than out of appeal:
 | **Dialog vocabulary** | one bespoke permission modal per surface | `question`, every picker, settings, export options, diff review |
 | **Per-turn mutable tool set** | `AgentContext.tools` fixed at construction | plan mode, agents, subagents, MCP `tools/list_changed` |
 | **Git facade** | none | diff viewer, `/review`, checkpoints, undo, worktrees, branch in footer |
-| **Model metadata** | 200k context hardcoded; cost rates never passed, so cost is always zero | context meter, cost display, budget cap, compaction honesty |
+| **Model metadata** | ~~200k hardcoded; cost always zero~~ — **closed in 5a**: per-alias `modelOverrides`, an optional context window (`nil` renders `?`), and cost from rates or the gateway's own header | ~~context meter, cost display~~ (both shipped); budget cap |
 
 ### Scale
 
@@ -944,7 +977,7 @@ default.**
 | `DOMOCODE_AUTH_HEADER` | `Authorization` | Header *name* — operators can configure a custom one, so this is not hardcoded. |
 | `DOMOCODE_AUTH_SCHEME` | `Bearer` | Scheme prefix. |
 | `DOMOCODE_MODEL` | — | The public model alias as configured on the proxy. |
-| `DOMOCODE_SMALL_MODEL` | falls back to `DOMOCODE_MODEL` | Intended for compaction and branch summaries. **Resolved but not yet consumed** — the summarizer reuses the run's own model today; Phase 5a wires it. |
+| `DOMOCODE_SMALL_MODEL` | falls back to `DOMOCODE_MODEL` | The model compaction summarizes with. Consumed since 5a, but only when it **differs** from the run's model — otherwise the harness's own summarizer is kept, so configuring nothing changes nothing. `compaction.model` in settings.json outranks it. |
 | `DOMOCODE_REASONING_EFFORT` | unset | `minimal` / `low` / `medium` / `high`. |
 | `DOMOCODE_TIMEOUT_MS` | `600000` | Overall request timeout. `0` means the default — a literal zero would fail every request before the gateway could answer, and there is no "no deadline" to express here. |
 | `DOMOCODE_STREAM_TIMEOUT_MS` | `120000` | How long a committed response may deliver **nothing** before the turn is failed. A 2xx has already committed the stream, so exceeding this fails the turn rather than retrying it — tighten it and you trade a hung turn for a lost one, since a model can legitimately go quiet through a long reasoning block. `0` removes DoMoCode's silence bound. Time-to-response-head is separately bounded by a fixed 10 s connect timeout. **This knob previously did nothing**; setting it now has an effect — but see the note below on its 90 s ceiling. |
@@ -959,6 +992,47 @@ default.**
 
 Secrets are never written to `settings.json` — `Settings` has no API-key field at all. `apiKeyEnv`
 holds only the *name* of the environment variable to read, so the key value never touches disk.
+
+### settings.json (Phase 5a keys)
+
+```jsonc
+{
+  "modelOverrides": {
+    "gpt-4o": { "contextWindow": 128000, "input": 2.5, "output": 10.0, "reasoningEffort": "high" }
+  },
+  "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000, "model": "cheap-alias" },
+  "contextWindow": 200000,
+  "mcpServers": { "gh": { "command": ["npx", "-y", "server"], "environment": { "TOKEN": "{env:GH_PAT}" } } }
+}
+```
+
+`modelOverrides` is what the operator knows that the gateway will not say: LiteLLM's `/models`
+answers with names and nothing else, so every number here is operator-supplied. Prices are per
+million tokens and may be written flat (as above) or nested under `rates`; they decode from a JSON
+number **or a string**, because a `Decimal` written as a bare number can lose its last digits on some
+platforms. An alias-level `reasoningEffort` outranks the global one. An alias with no entry has an
+**unknown** context window, which a meter renders as `?` — not as a percentage of a guess.
+
+The two dictionaries merge differently, deliberately: `modelOverrides` replaces a **whole entry** per
+key (project over user, the `mcpServers` rule), while `compaction` merges **field by field** (the
+rule every other numeric knob follows).
+
+**Value interpolation.** Any string field above, plus `mcpServers.*.command`, `.environment` values
+and `.cwd`, may contain `{env:NAME}` or `{file:PATH}`. Write `{{env:NAME}}` for a literal. The rules
+differ by trust, following kilocode rather than opencode:
+
+| | user `~/.domocode/settings.json` | project `.domocode/settings.json` |
+|---|---|---|
+| `{env:NAME}` | allowed, except the gateway-credential names | **refused** |
+| `{file:PATH}` | any file | confined to the project directory, symlinks resolved |
+
+An unset variable or an unreadable file is a **hard error** naming the token — never the value, and
+never the file's contents. That is a deliberate divergence from opencode, whose silent empty string
+turns a config typo into an unexplained 401. Interpolation happens at decode time, so it cannot
+reach the integer-valued knobs (`timeoutMs` and the retry numbers), and the `permission` block is
+never interpolated at all — which is what stops `{env:}` becoming a permission-widening vector.
+Values substituted into a credential-carrying field are registered for redaction; a hostname is not,
+because blanking it would destroy the one fact a connection failure needs to report.
 
 ### Retries
 

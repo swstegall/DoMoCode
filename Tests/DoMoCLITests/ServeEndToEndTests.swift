@@ -5,11 +5,19 @@
 //
 // "There is no turn limit by default, in EVERY mode — interactive, -p and --serve
 // alike" is a claim `--help` and the README both make, and it fans out to four
-// separate call sites. Three of them were pinned: `-p` by the print-mode tests,
-// the full-screen client by the pty test, `--inline` by the REPL tests. The
-// fourth — `runServer`'s `buildServerRuntime(…, maxTurns: turnLimit)` — had
-// nothing behind it at all, so hardcoding a `20` there changed no test's verdict
-// while quietly reinstating exactly the cap the user asked to have removed.
+// separate call sites. Two of them run the real binary against the claim: `-p`
+// through the print-mode tests and the full-screen client through the pty test.
+// The `--serve` leg — `runServer`'s `buildServerRuntime(…, maxTurns: turnLimit)`
+// — had nothing behind it at all, so hardcoding a `20` there changed no test's
+// verdict while quietly reinstating exactly the cap the user asked to have
+// removed. That is what this file covers.
+//
+// The fourth, `--inline`, is still only HALF covered, and this comment used to
+// call it pinned: the REPL tests hand `InteractiveMode.make` a `maxTurns` of
+// their own, which pins what the REPL does with a bound but not what the COMMAND
+// passes it. (``SurfaceWiringTests`` now drives that surface on a pty for the
+// per-alias arguments; adding `--max-turns` to that run is how this leg would be
+// closed.)
 //
 // This drives the real binary over the same HTTP surface the client uses: create
 // a session, POST a prompt, and watch a twenty-five-turn run finish. An
@@ -90,6 +98,98 @@ struct ServeEndToEndTests {
     }
 }
 
+// MARK: - What the developer's shell may not decide
+
+/// The isolation every spawned `domo` in this target runs under.
+///
+/// This is a test OF a test helper because the helper's failure mode is
+/// invisible from the tests that use it: a leaked variable does not make
+/// anything red, it makes an assertion pass for a reason that is not the code
+/// under test. Both cases below were observed, not imagined — an exported
+/// `DOMOCODE_REASONING_EFFORT=high` kept
+/// ``SurfaceWiringTests/theDefaultSurfaceBillsAtTheConfiguredRatesAndReportsTheDeclaredWindow()``
+/// green with the per-alias plumbing deleted, and an exported
+/// `DOMOCODE_SMALL_MODEL` failed a compaction test whose premise is that nothing
+/// named a small model.
+@Suite
+struct ChildEnvironmentIsolationTests {
+
+    /// Nothing that CONFIGURES a run survives from the parent's environment, and
+    /// everything the child needs to RUN does. (`HOME` is read by the resolver and
+    /// does survive — as the workspace's own, which is the isolation, not a leak.)
+    ///
+    /// The inherited dictionary is supplied rather than read from `ProcessInfo`
+    /// on purpose: `setenv` in a test process is visible to every other test in
+    /// it, so the one thing this must not do to prove a variable is stripped is
+    /// export it.
+    @Test
+    func noDomocodeVariableSurvivesFromTheParentShell() throws {
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+
+        let developersShell = [
+            // The two the reviewer actually proved.
+            "DOMOCODE_REASONING_EFFORT": "high",
+            "DOMOCODE_SMALL_MODEL": "leaked-small-model",
+            // And the rest of the resolver's surface, none of which was stripped
+            // by the five-name list this replaced.
+            "DOMOCODE_SESSION_DIR": "/somewhere/of/their/own",
+            "DOMOCODE_AUTH_HEADER": "X-Leaked",
+            "DOMOCODE_MAX_RETRIES": "9",
+            "DOMOCODE_TIMEOUT_MS": "1",
+            "OPENAI_API_KEY": "sk-the-developers-real-key",
+            "LITELLM_API_KEY": "sk-also-real",
+            // What the child needs to load a Swift runtime and find a binary.
+            "PATH": "/usr/bin:/bin",
+            "DYLD_LIBRARY_PATH": "/toolchain/lib",
+        ]
+        let environment = isolatedChildEnvironment(inherited: developersShell, workspace: workspace)
+
+        for name in [
+            "DOMOCODE_REASONING_EFFORT", "DOMOCODE_SMALL_MODEL", "DOMOCODE_SESSION_DIR",
+            "DOMOCODE_AUTH_HEADER", "DOMOCODE_MAX_RETRIES", "DOMOCODE_TIMEOUT_MS",
+            "OPENAI_API_KEY", "LITELLM_API_KEY",
+        ] {
+            #expect(environment[name] == nil, "\(name) reached the child from the developer's shell")
+        }
+
+        // CONTROL: the sweep is a sweep of the RESOLVER's variables, not of the
+        // environment. A helper that returned an empty dictionary would "pass"
+        // every assertion above and leave every end-to-end test unable to start
+        // the binary at all.
+        #expect(environment["PATH"] == "/usr/bin:/bin")
+        #expect(environment["DYLD_LIBRARY_PATH"] == "/toolchain/lib")
+        #expect(environment["DOMOCODE_CONFIG_DIR"] == workspace.configDirectory.path)
+        #expect(environment["HOME"] == workspace.homeDirectory.path)
+        #expect(environment["DOMOCODE_API_KEY"] == "sk-mock-test-key")
+        #expect(environment["DOMOCODE_LOG_LEVEL"] == "error")
+    }
+
+    /// A variable the TEST set outlives the sweep.
+    ///
+    /// The sweep runs over the inherited environment and the overrides are
+    /// applied after it, which is the order that lets a test say
+    /// `DOMOCODE_LOG_LEVEL: ""` (the redaction test's way of stopping the
+    /// environment layer from short-circuiting a settings warning) or shrink the
+    /// retry backoff. Applied in the other order, every such test would be
+    /// silently disarmed.
+    @Test
+    func aCallersOwnVariablesAreAppliedAfterTheSweep() throws {
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+
+        let environment = isolatedChildEnvironment(
+            inherited: ["DOMOCODE_RETRY_BASE_MS": "60000"],
+            workspace: workspace,
+            extra: ["DOMOCODE_RETRY_BASE_MS": "5", "DOMOCODE_LOG_LEVEL": "", "MY_HELPER_TOKEN": "value"]
+        )
+
+        #expect(environment["DOMOCODE_RETRY_BASE_MS"] == "5", "the caller's value did not outrank the sweep")
+        #expect(environment["DOMOCODE_LOG_LEVEL"] == "")
+        #expect(environment["MY_HELPER_TOKEN"] == "value")
+    }
+}
+
 // MARK: - The served process
 
 /// A running `domo --serve`, plus the loopback client calls a test needs to drive
@@ -116,19 +216,12 @@ final class ServeProcess: @unchecked Sendable {
         process.arguments = arguments
         process.currentDirectoryURL = workspace.workDirectory
 
-        var environment = ProcessInfo.processInfo.environment
-        environment["DOMOCODE_CONFIG_DIR"] = workspace.configDirectory.path
-        environment["HOME"] = workspace.homeDirectory.path
-        environment["DOMOCODE_API_KEY"] = "sk-mock-test-key"
-        environment["DOMOCODE_LOG_LEVEL"] = "error"
-        for key in [
-            "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
-            // Live since the stream idle bound was wired.
-            "DOMOCODE_STREAM_TIMEOUT_MS",
-        ] {
-            environment.removeValue(forKey: key)
-        }
-        process.environment = environment
+        // Isolated the same way `runDomo`'s child is, through the same function:
+        // a served run resolves the same settings from the same environment, and
+        // the surface-wiring tests that drive this class assert on numbers a
+        // stray `DOMOCODE_*` variable in the developer's shell could otherwise
+        // supply. See ``isolatedChildEnvironment(inherited:workspace:extra:)``.
+        process.environment = isolatedChildEnvironment(workspace: workspace)
 
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice

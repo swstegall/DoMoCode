@@ -503,9 +503,24 @@ extension Settings {
     /// filesystem — so `.domocode/id_rsa -> ~/.ssh/id_rsa`, a symlink a cloned
     /// repository is free to commit, passes it: the path names nothing outside
     /// the project. The kernel disagrees. So confinement is decided again here,
-    /// against a path resolved through every symlink, and the read is issued
-    /// against **that** resolved path rather than the one the config asked for,
-    /// so the answer cannot change between the check and the open.
+    /// against a path walked component by component through every symlink, and
+    /// the read is issued against **that** path rather than the one the config
+    /// asked for.
+    ///
+    /// That is not a closed race, and an earlier version of this comment claimed
+    /// it was. Between the resolution and the `open`, another process can swap a
+    /// component of the resolved path for a link out of the root; nothing here
+    /// holds a descriptor, because the read is an injected
+    /// `(String) throws -> String` and there is no descriptor to hand it.
+    /// ``DoMoExec/PathSandbox`` states the same residual risk for the same
+    /// reason. What *is* true is narrower: the object checked is the object the
+    /// resolved path names at the moment of the check — including when the leaf
+    /// is a **dangling** link, or sits under a directory link whose leaf does not
+    /// exist yet. Those two cases are why the walk is hand-rolled:
+    /// `URL.resolvingSymlinksInPath()` leaves a link unresolved whenever its
+    /// target is missing, so it handed back the link's *own* path, confinement
+    /// passed on it, and the read then followed the link straight out of the root
+    /// the instant the target appeared.
     ///
     /// A `nil` or empty root returns `readFile` untouched. That is the trusted
     /// policy, and it must stay unconfined: a user's own settings.json pointing
@@ -524,29 +539,109 @@ extension Settings {
     ///
     /// - Throws: ``FileConfinementError`` when it does not, *before* any read.
     static func resolvedPath(_ path: String, confinedTo root: String) throws -> String {
-        let resolvedRoot = canonicalized(root)
-        let target = canonicalized(path)
         // An empty root would make `starts(with:)` vacuously true and confine
         // nothing, which is the one answer that must not happen — the same guard
-        // `resolveConfigValue` keeps for the lexical check.
-        guard !resolvedRoot.isEmpty,
+        // `resolveConfigValue` keeps for the lexical check. It is asked of the
+        // *given* root, before resolution, because resolving "" would silently
+        // answer with the process's working directory and confine to that.
+        guard !root.isEmpty else {
+            throw FileConfinementError(requested: path, resolved: path, root: root)
+        }
+        let resolvedRoot = canonicalized(root)
+        let target = canonicalized(path)
+        // `nil` is a symlink loop on one side or the other: unresolvable, and so
+        // refused, since a path nobody can name cannot be shown to be inside.
+        // Nothing tests `resolvedRoot` for emptiness — the walk starts at `/` and
+        // never shortens past it, so such a test would be vacuously true, which
+        // is precisely the kind of guard that looks like confinement and is not.
+        guard let resolvedRoot, let target,
             target == resolvedRoot || target.starts(with: resolvedRoot)
         else {
             throw FileConfinementError(
-                requested: path, resolved: target.string, root: resolvedRoot.string)
+                requested: path,
+                resolved: target?.string ?? path,
+                root: resolvedRoot?.string ?? root
+            )
         }
         return target.string
     }
 
-    /// A path with its symlinks resolved and `.`/`..` collapsed.
+    /// The number of symlinks followed before declaring a loop. Matches the
+    /// conventional `MAXSYMLINKS`; the kernel is not counting for us, because
+    /// this walk runs in user space one component at a time.
+    private static let maximumSymlinkHops = 40
+
+    /// A path with every symlink followed and `.`/`..` collapsed against the
+    /// resolved prefix rather than against the text.
     ///
     /// Applied to the root as well as to the target, so the platforms where the
     /// root itself sits under a link — macOS resolves `/tmp` to `/private/tmp` —
-    /// compare like with like. A component that does not exist resolves to
-    /// itself, which is harmless: the read that follows fails with `ENOENT`
-    /// instead of returning something.
-    private static func canonicalized(_ path: String) -> FilePath {
-        FilePath(URL(fileURLWithPath: path).resolvingSymlinksInPath().path).lexicallyNormalized()
+    /// compare like with like.
+    ///
+    /// This is deliberately **not** `URL.resolvingSymlinksInPath()`. That
+    /// function resolves a link only when its target exists; a dangling link, or
+    /// any path under a directory link whose leaf is not there yet, comes back
+    /// verbatim. Handing that back is not a harmless "the read will fail with
+    /// `ENOENT`" — it is the confinement check passing on the link's own
+    /// in-project path while the read follows the link out. `readlink(2)`, which
+    /// is what ``Foundation/FileManager/destinationOfSymbolicLink(atPath:)``
+    /// calls, answers about the link and never about its target, so the walk
+    /// below gives the same answer whether the target exists or not.
+    ///
+    /// - Returns: `nil` on a symlink loop — no path to compare, so the caller
+    ///   refuses.
+    private static func canonicalized(_ path: String) -> FilePath? {
+        let requested = FilePath(path)
+        let absolute =
+            requested.isRelative
+            ? FilePath(FileManager.default.currentDirectoryPath).pushing(requested)
+            : requested
+        // Split raw, never `lexicallyNormalized()` first: collapsing `link/..` as
+        // text names the link's parent, and the kernel would have gone to the
+        // parent of whatever `link` points at, which can be anywhere.
+        var pending = Array(absolute.components.map(\.string).reversed())
+        var resolved = FilePath("/")
+        var hops = 0
+
+        while let component = pending.popLast() {
+            switch component {
+            case ".":
+                continue
+            case "..":
+                // Correct only because `resolved` is already link-free: popping a
+                // component off a resolved path names the directory the kernel
+                // would reach, which is the whole reason `..` is handled here and
+                // not by a lexical pass beforehand.
+                resolved.removeLastComponent()
+                continue
+            default:
+                break
+            }
+
+            let candidate = resolved.appending(component)
+            guard
+                let target = try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: candidate.string
+                )
+            else {
+                // Not a link — or not there at all, which amounts to the same
+                // thing: a component that does not exist cannot be a symlink, and
+                // neither can anything under it. Either way the component stands
+                // for itself.
+                resolved = candidate
+                continue
+            }
+
+            hops += 1
+            guard hops <= maximumSymlinkHops else { return nil }
+            let link = FilePath(target)
+            // An absolute target restarts resolution at the root; a relative one
+            // is spliced in ahead of whatever is left, exactly as the kernel does.
+            // `pending` is reversed, so appending puts these next in line.
+            if link.isAbsolute { resolved = FilePath("/") }
+            pending.append(contentsOf: link.components.map(\.string).reversed())
+        }
+        return resolved
     }
 }
 
@@ -1025,18 +1120,24 @@ extension ResolvedConfiguration {
     /// the redaction registry and then cut.
     ///
     /// The cut still has to leave the warning useful: the point of it is a user
-    /// staring at a level they set and a harness plainly not using it. Every
-    /// level name is at most eight characters, so a typo worth showing —
-    /// `verbose`, `loud`, `WARN ` — is quoted whole.
+    /// staring at a level they set and a harness plainly not using it. The
+    /// longest level name is `critical`, so a typo worth showing — `verbose`,
+    /// `loud`, `WARN ` — is quoted whole.
     ///
     /// Anything LONGER than a level name could ever be is not quoted at all,
     /// only measured. Truncating it instead was the first attempt and it was
     /// worse than either doing nothing or doing this: the scrub only replaces a
     /// value the vault was told about, and `logLevel` is not a credential-shaped
-    /// key, so an unregistered secret reached the prefix intact — and a
-    /// twelve-character prefix of a secret is twelve characters of a secret. The
-    /// length alone already tells the user the value is not a level, which is
-    /// the whole question the warning exists to answer.
+    /// key, so an unregistered secret reached the prefix intact — and a prefix
+    /// of a secret is that many characters of a secret. The length alone already
+    /// tells the user the value is not a level, which is the whole question the
+    /// warning exists to answer.
+    ///
+    /// The same argument condemns a limit that is merely *near* the longest
+    /// name: a cut of twelve quoted a nine-to-twelve-character secret in full,
+    /// which is the defect the measuring was introduced to prevent, four
+    /// characters at a time. See ``quotableLimit``.
+    ///
     /// Returns the value already quoted when it is short enough to show, and an
     /// unquoted description of it when it is not — so the caller interpolates
     /// this verbatim rather than deciding where the quotation marks go.
@@ -1046,8 +1147,15 @@ extension ResolvedConfiguration {
         return "a \(scrubbed.count)-character value"
     }
 
-    /// Half again the longest level name (`critical`), rounded up.
-    static let quotableLimit = 12
+    /// The longest name a level can have — `critical`, eight characters.
+    ///
+    /// Derived rather than written down, because the number is the argument: any
+    /// value longer than this cannot be a level whatever it is, so quoting it
+    /// tells the user nothing they did not already learn from the warning
+    /// existing, and risks echoing an unregistered secret. It was hard-coded at
+    /// twelve — "half again the longest name, rounded up" — and those four spare
+    /// characters printed a nine-to-twelve-character secret to stderr in full.
+    static let quotableLimit = Logger.Level.allCases.map(\.rawValue.count).max() ?? 8
 
     /// `nil` for an absent *or* empty string, so the two spellings of "not set"
     /// are one value everywhere below.

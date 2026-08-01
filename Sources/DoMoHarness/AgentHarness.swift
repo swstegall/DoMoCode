@@ -904,6 +904,17 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
     ///
     /// A string that is not a decimal is an error rather than a zero: a total that
     /// could not be read is not a total of nothing.
+    ///
+    /// The string is read through ``DoMoLLM/DecimalText/strict(_:)`` and never
+    /// through bare `Decimal(string:)`, which is the same defence
+    /// `LiteLLM.parseResponseCost` applies to `x-litellm-response-cost` and for
+    /// the same reasons: `Decimal(string:)` **prefix**-parses, so `"0.25 dollars"`
+    /// and `"0.25xyz"` both come back as `0.25` — a plausible number nobody sent,
+    /// silently accepted as a session's whole spend — and `"1_000"` comes back as
+    /// `1`, off by three orders of magnitude. It is locale-influenced too, so the
+    /// same payload read under a comma-decimal locale means something else. This
+    /// is a published REST surface; a body that does not match the grammar is a
+    /// body this cannot read, and saying so is the only honest answer.
     private static func decodeDecimal(
         from container: KeyedDecodingContainer<CodingKeys>,
         forKey key: CodingKeys
@@ -911,7 +922,7 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
         guard let text = try? container.decode(String.self, forKey: key) else {
             return try container.decode(Decimal.self, forKey: key)
         }
-        guard let value = Decimal(string: text) else {
+        guard let value = DecimalText.strict(text) else {
             throw DecodingError.dataCorruptedError(
                 forKey: key,
                 in: container,

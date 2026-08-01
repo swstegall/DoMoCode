@@ -305,6 +305,84 @@ struct SessionTimingTests {
         #expect(clock.readCount == 2, "the assistant turn was never timed, so the negative-interval guard never ran")
     }
 
+    /// The rule is "only a turn whose model call actually started is timed", and the
+    /// role check was not that rule. A turn that dies before its first chunk — a
+    /// refused connection, a transport failure, a cancellation — is announced by
+    /// `AgentLoop.synthesizeTerminal`, which emits both boundaries back to back
+    /// around a message that already existed, exactly the way a prompt's are
+    /// emitted. Timing that measured two `await`s and wrote `0`: a claim about a
+    /// stopwatch nobody started, indistinguishable in the file from a genuinely
+    /// instantaneous turn, and permanent, because the log is append-only.
+    ///
+    /// The clock-read count is asserted for the same reason the backwards-clock test
+    /// asserts it: without it, this passes the moment assistant turns stop being
+    /// timed at all.
+    @Test("a turn whose stream never opened records no measurement, not a zero one")
+    func aTurnThatNeverStreamedIsNotTimed() async throws {
+        let clock = SteppingClock(step: .milliseconds(7))
+        let refused: AgentStreamFn = { _ in
+            AsyncThrowingStream { continuation in
+                continuation.finish(throwing: DoMoError(.transport, "connection refused"))
+            }
+        }
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: refused,
+                monotonicNow: clock.fn(),
+                ids: TimingIDs(prefix: "never")
+            )
+        )
+        _ = try await harness.run(prompt: "hello")
+
+        let recorded = try entries(of: await harness.sessionFilePath)
+        #expect(recorded.count == 2, "the premise is a prompt and the settle that answered it")
+        let settle = try #require(recorded.last)
+        guard case .message(.assistant(let turn)) = settle.payload else {
+            Issue.record("the last entry is not the synthesized assistant turn: \(settle.payload)")
+            return
+        }
+        #expect(turn.stopReason == .error, "the premise is a failed turn — `role=assistant stop=error`")
+        #expect(settle.elapsedMs == nil, "a turn that never opened a stream was stamped with an interval")
+        #expect(clock.readCount == 0, "the clock was read for a turn that never started")
+    }
+
+    /// The half of that rule which must survive it: a stream that opened and *then*
+    /// failed has a real interval, measured from the chunk that opened it, and
+    /// throwing that away would be the mirror-image lie. This is why the question is
+    /// asked at `messageStart` — where "did a model call start" is knowable — and
+    /// never at `messageEnd`, where every failure looks alike.
+    @Test("a stream that opened and then failed keeps the interval it really took")
+    func aStreamThatOpenedThenFailedKeepsItsMeasurement() async throws {
+        let clock = SteppingClock(step: .milliseconds(7))
+        let brokenMidStream: AgentStreamFn = { _ in
+            AsyncThrowingStream { continuation in
+                continuation.yield(.start(AssistantSnapshot(model: "test-model")))
+                continuation.finish(throwing: DoMoError(.transport, "connection reset mid-stream"))
+            }
+        }
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: brokenMidStream,
+                monotonicNow: clock.fn(),
+                ids: TimingIDs(prefix: "midfail")
+            )
+        )
+        _ = try await harness.run(prompt: "hello")
+
+        let recorded = try entries(of: await harness.sessionFilePath)
+        let settle = try #require(recorded.last)
+        guard case .message(.assistant(let turn)) = settle.payload else {
+            Issue.record("the last entry is not the synthesized assistant turn: \(settle.payload)")
+            return
+        }
+        #expect(turn.stopReason == .error, "the premise is a failed turn, not a clean one")
+        #expect(settle.elapsedMs == 7, "the interval a real stream spent before failing was discarded")
+    }
+
     /// A compaction checkpoint is not a `Message` and never travels the event
     /// stream, so the sink can never see it. If it is not timed where it is built,
     /// the single most expensive thing a session does is the one thing with no

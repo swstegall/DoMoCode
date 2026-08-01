@@ -305,6 +305,47 @@ struct UsageCostTests {
         #expect(sum.totalTokens == Int.max)
     }
 
+    /// `totalTokens` was not the only `+` on that path, only the first one found.
+    /// `costed(at:)` sums three provider-chosen counts to pick a volume tier, and it
+    /// runs on the client's stream path — the same `message_end` frame, one frame
+    /// earlier. Clamping the total and leaving this alone moved the trap rather than
+    /// closing it.
+    @Test("Costing an extreme usage clamps the tier lookup instead of trapping")
+    func costingSaturatesTheTierLookup() throws {
+        let json = """
+            {"input":9223372036854775807,"output":0,"cacheRead":1,"cacheWrite":1,\
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}
+            """
+        let usage = try JSONDecoder().decode(Usage.self, from: Data(json.utf8))
+        #expect(usage.input == Int.max, "the premise is a count the decoder carried through unclamped")
+
+        let rates = ModelCostRates(
+            input: 1,
+            output: 2,
+            tiers: [ModelCostRates.Tier(inputTokensAbove: 200_000, rates: TokenRates(input: 10, output: 20))]
+        )
+        let costed = usage.costed(at: rates)
+        // Clamped to `Int.max`, which is above the threshold — the same tier an
+        // absurd-but-representable count would have chosen.
+        #expect(costed.cost.input == Decimal(10) * Decimal(Int.max) / Decimal(1_000_000))
+        #expect(costed.cost.output == 0)
+    }
+
+    @Test("The tier lookup still sums the three prompt buckets, it does not just read input")
+    func tierLookupStillSumsEveryPromptBucket() {
+        // What the clamp must NOT do: turn the sum into `input` alone. 10 + 3 + 3
+        // clears a threshold of 15 that `input` on its own does not.
+        let rates = ModelCostRates(
+            input: 1,
+            tiers: [ModelCostRates.Tier(inputTokensAbove: 15, rates: TokenRates(input: 1_000_000))]
+        )
+        let usage = Usage(input: 10, cacheRead: 3, cacheWrite: 3).costed(at: rates)
+        #expect(usage.cost.input == 10, "the tiered rate did not apply, so the buckets were not summed")
+        #expect(Usage(input: 10, cacheRead: 1, cacheWrite: 1).costed(at: rates).cost.input
+                == Decimal(10) / Decimal(1_000_000),
+                "a request below the threshold was billed at the tiered rate")
+    }
+
     @Test("The clamp leaves ordinary arithmetic exactly as it was")
     func saturationDoesNotDisturbOrdinarySums() {
         // What the fix must NOT do: change any number a real provider produces.
@@ -316,6 +357,25 @@ struct UsageCostTests {
         #expect(Usage(input: -5, output: 2).totalTokens == -3)
         #expect((Usage(input: Int.min, output: 0) + Usage(input: Int.min, output: 0)).input == Int.min)
         #expect(Usage(input: Int.min, output: Int.min).totalTokens == Int.min)
+    }
+
+    /// The clamp is a shared operation now, because ``Usage`` was never the only
+    /// place a provider's number gets added to something. Its boundary is pinned on
+    /// both sides — the largest sum that still fits must come back exact, or the
+    /// clamp is quietly rounding real numbers off.
+    @Test("The shared clamp is exact right up to the ends, and pinned at them")
+    func saturatingAddingIsExactUntilItCannotBe() {
+        #expect(2.saturatingAdding(3) == 5)
+        #expect((-2).saturatingAdding(-3) == -5)
+        #expect((Int.max - 1).saturatingAdding(1) == Int.max, "the last exact sum was clamped early")
+        #expect(Int.max.saturatingAdding(1) == Int.max)
+        #expect(Int.max.saturatingAdding(Int.max) == Int.max)
+        #expect((Int.min + 1).saturatingAdding(-1) == Int.min, "the last exact sum was clamped early")
+        #expect(Int.min.saturatingAdding(-1) == Int.min)
+        #expect(Int.min.saturatingAdding(Int.min) == Int.min)
+        // Opposite signs cannot overflow, so nothing may be clamped here.
+        #expect(Int.max.saturatingAdding(Int.min) == -1)
+        #expect(Int.min.saturatingAdding(Int.max) == -1)
     }
 
     @Test("A session line written before reported costs existed still decodes")

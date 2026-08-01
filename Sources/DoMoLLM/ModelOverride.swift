@@ -5,7 +5,7 @@ import Foundation
 
 // MARK: - Strict numeric text
 
-/// The one place in this module a `Decimal` is recovered from text.
+/// The one place a `Decimal` is recovered from text.
 ///
 /// Strict on purpose, because `Decimal(string:)` alone is a quiet liar in two
 /// ways this project has to care about. It *prefix*-parses, so `"1.5x"` comes
@@ -15,7 +15,13 @@ import Foundation
 /// on a Linux box running under a comma-decimal locale would turn `"3.5"` into
 /// something else entirely. Requiring the whole string to match a fixed grammar,
 /// and parsing under `en_US_POSIX`, removes both.
-enum DecimalText {
+///
+/// Public, and deliberately so: `SessionAccounting.costTotal` crosses the REST
+/// surface as a decimal *string* and has to be read back somewhere, and the same
+/// hazard applies there — a `/status` body reading `"0.25 dollars"` must not
+/// become `0.25`. A second copy of a number grammar is how two readers of the
+/// same quantity come to disagree, so there is one, and every reader calls it.
+public enum DecimalText {
     /// A locale that cannot be reconfigured out from under a price.
     private static let posix = Locale(identifier: "en_US_POSIX")
 
@@ -32,7 +38,7 @@ enum DecimalText {
     /// Returns `nil` on overflow too: `Decimal(string:)` answers `nil` rather
     /// than a saturated value for `1e1000`, and a saturated price is worse than
     /// no price.
-    static func strict(_ raw: String) -> Decimal? {
+    public static func strict(_ raw: String) -> Decimal? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isCanonicalNumber(text) else { return nil }
         return Decimal(string: text, locale: posix)

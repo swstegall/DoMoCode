@@ -76,15 +76,65 @@ func domoBinaryURL() -> URL {
     productsDirectory().appendingPathComponent("domo")
 }
 
+/// The environment a `domo` child runs under in an end-to-end test.
+///
+/// It INHERITS this process's environment — which is what carries the
+/// toolchain's `DYLD_*` runtime paths `swift test` sets up, without which the
+/// binary cannot load its Swift runtime — then removes everything that
+/// configures a run (the whole `DOMOCODE_*` namespace, plus the two unprefixed
+/// credential fallbacks), and only then applies the isolation defaults and the
+/// caller's overrides.
+///
+/// **The removal is by prefix, and that is the whole point of this function.**
+/// It used to be a list of five names spelled out at each spawn site, and that
+/// list made end-to-end tests depend on the developer's shell:
+///
+/// * an exported `DOMOCODE_REASONING_EFFORT=high` satisfied the reasoning-effort
+///   assertion in ``SurfaceWiringTests`` with the per-alias plumbing that
+///   assertion exists to pin DELETED, and
+/// * an exported `DOMOCODE_SMALL_MODEL` installed a compaction summarizer that a
+///   test's stated premise says nothing configured, failing it for a reason
+///   found nowhere in the repository.
+///
+/// A test a stray shell variable can satisfy is not a test. A name-by-name list
+/// is also a thing to forget: ``EnvName`` gains a variable and every spawn site
+/// has to be revisited, whereas `DOMOCODE_*` is the naming rule that file
+/// already states. The two credential fallbacks that carry no prefix
+/// (`LITELLM_API_KEY`, `OPENAI_API_KEY`) are named explicitly because nothing
+/// about their spelling says `domo`.
+///
+/// - Parameter inherited: the environment to start from. A parameter rather than
+///   a direct read of `ProcessInfo` so the sweep itself can be tested without
+///   mutating the test process's own environment.
+/// - Parameter extra: applied LAST, so a caller can override an isolation
+///   default (a test that must exercise the retry loop shrinks the backoff
+///   instead of paying seconds of real sleep) and so a deliberately-set
+///   `DOMOCODE_*` value survives the sweep.
+func isolatedChildEnvironment(
+    inherited: [String: String] = ProcessInfo.processInfo.environment,
+    workspace: Workspace,
+    extra: [String: String] = [:]
+) -> [String: String] {
+    var environment = inherited
+    for key in Array(environment.keys) where key.hasPrefix("DOMOCODE_") {
+        environment.removeValue(forKey: key)
+    }
+    for key in ["LITELLM_API_KEY", "OPENAI_API_KEY"] {
+        environment.removeValue(forKey: key)
+    }
+    environment["DOMOCODE_CONFIG_DIR"] = workspace.configDirectory.path
+    environment["HOME"] = workspace.homeDirectory.path
+    environment["DOMOCODE_API_KEY"] = "sk-mock-test-key"
+    environment["DOMOCODE_LOG_LEVEL"] = "error"
+    for (key, value) in extra { environment[key] = value }
+    return environment
+}
+
 /// Runs the real `domo` binary and captures its output.
 ///
-/// The child inherits this process's environment — which is what carries the
-/// toolchain's `DYLD_*` runtime paths `swift test` sets up, without which the
-/// binary cannot load its Swift runtime — and then overrides only the
-/// configuration-relevant variables to isolate the run.
-/// - Parameter environment: extra variables, applied last so a test can override
-///   the isolation defaults below. Exists so a test that must exercise the retry
-///   loop can shrink the backoff instead of paying seconds of real sleep.
+/// - Parameter environment: extra variables, applied last — see
+///   ``isolatedChildEnvironment(inherited:workspace:extra:)``, which is where
+///   this run's isolation is decided.
 func runDomo(
     arguments: [String],
     workspace: Workspace,
@@ -94,23 +144,7 @@ func runDomo(
     process.executableURL = domoBinaryURL()
     process.arguments = arguments
     process.currentDirectoryURL = workspace.workDirectory
-
-    var environment = ProcessInfo.processInfo.environment
-    environment["DOMOCODE_CONFIG_DIR"] = workspace.configDirectory.path
-    environment["HOME"] = workspace.homeDirectory.path
-    environment["DOMOCODE_API_KEY"] = "sk-mock-test-key"
-    environment["DOMOCODE_LOG_LEVEL"] = "error"
-    // Strip anything from the developer's shell that would leak into resolution.
-    for key in [
-        "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
-        // Live since the stream idle bound was wired: a developer's exported
-        // value would otherwise apply to every end-to-end run.
-        "DOMOCODE_STREAM_TIMEOUT_MS",
-    ] {
-        environment.removeValue(forKey: key)
-    }
-    for (key, value) in extra { environment[key] = value }
-    process.environment = environment
+    process.environment = isolatedChildEnvironment(workspace: workspace, extra: extra)
 
     let outputPipe = Pipe()
     let errorPipe = Pipe()
