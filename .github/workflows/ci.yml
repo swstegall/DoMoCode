@@ -50,9 +50,9 @@ jobs:
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 
-      # Keep macOS in one bounded Swift Testing worker: its full package run is
-      # healthy with that setting, while --no-parallel makes the large matrix
-      # needlessly long. On Linux, run each test target in its own process. A
+      # Keep macOS package tests fully serial: several suites launch `domo`
+      # subprocesses, and a bounded Swift Testing worker still allows those
+      # suites to overlap. On Linux, run each test target in its own process. A
       # package-wide Swift Testing process lets unrelated suites overlap even
       # when its worker count is one; that is enough for a full-screen
       # @MainActor client to starve on Linux. Keep those process/PTY targets
@@ -60,7 +60,7 @@ jobs:
       - name: Test
         run: |
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 1
+            swift test --configuration ${{ matrix.configuration }} --no-parallel
             exit 0
           fi
 
