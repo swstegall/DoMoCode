@@ -76,14 +76,11 @@ jobs:
             DoMoToolsUITests
           )
 
-          # Keep the CLI's process/PTY fixtures in one bounded worker on macOS.
-          # Running the whole package in that worker lets unrelated @MainActor
-          # client suites starve it; restarting the CLI target as a separate
-          # process, however, makes its loopback fixtures contend with leftover
-          # child teardown. The single target worker is the stable middle ground.
-          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 1 --filter '^DoMoCLITests\.'
-          fi
+          # The CLI target owns real child processes, PTYs, and loopback
+          # gateways. Swift Testing's worker limit still starts separate suites
+          # concurrently, so serialize this target as a whole on both platforms
+          # to keep one fixture's teardown from colliding with the next fixture.
+          swift test --configuration ${{ matrix.configuration }} --no-parallel --filter '^DoMoCLITests\.'
 
           for target in "${serial_targets[@]}"; do
             swift test --configuration ${{ matrix.configuration }} --no-parallel --filter "^${target}\."
