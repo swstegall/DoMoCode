@@ -302,13 +302,13 @@ public final class TerminalDriver {
         // Dispatch queue; only the UI handoff is main-actor isolated here.
         let inputTask = Task { @MainActor [input, quit] in
             for await chunk in input {
-                await self.ingest(chunk, app: app)
+                self.ingest(chunk, app: app)
             }
             quit.quit()
         }
         let resizeTask = Task { @MainActor [resize] in
             for await size in resize {
-                await self.handleResize(size, app: app)
+                self.handleResize(size, app: app)
             }
         }
 
