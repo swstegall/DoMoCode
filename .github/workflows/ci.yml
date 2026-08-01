@@ -50,15 +50,17 @@ jobs:
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 
-      # Run each test target in its own process. A package-wide Swift Testing
-      # process lets unrelated suites overlap even when its worker count is
-      # one; that is enough for a full-screen @MainActor client to starve on
-      # Linux. Keep those process/PTY targets serial, while ordinary targets
-      # retain limited case-level parallelism.
+      # Keep macOS in one bounded Swift Testing worker: its full package run is
+      # healthy with that setting, while --no-parallel makes the large matrix
+      # needlessly long. On Linux, run each test target in its own process. A
+      # package-wide Swift Testing process lets unrelated suites overlap even
+      # when its worker count is one; that is enough for a full-screen
+      # @MainActor client to starve on Linux. Keep those process/PTY targets
+      # serial, while ordinary targets retain limited case-level parallelism.
       - name: Test
         run: |
           if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            swift test --configuration ${{ matrix.configuration }} --no-parallel
+            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 1
             exit 0
           fi
 
