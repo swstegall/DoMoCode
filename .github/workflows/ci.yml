@@ -50,10 +50,11 @@ jobs:
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 
-      # Keep concurrency inside individual tests, but use one package worker.
-      # Several suites drive a real full-screen client on the main actor; Swift
-      # Testing's `.serialized` trait only protects a suite from itself, so
-      # multiple package workers can still starve that render loop and turn a
-      # short wait into a job-wide hang.
+      # Run the cases one at a time. Several suites drive a real full-screen
+      # client on the main actor; `--parallel --num-workers 1` still permits
+      # cases from different suites to overlap in the same process, so an
+      # optimized Linux run can starve a render loop and turn a short wait into
+      # a job-wide hang. The end-to-end cases already provide the concurrency
+      # coverage; CI needs deterministic teardown.
       - name: Test
-        run: swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 1
+        run: swift test --configuration ${{ matrix.configuration }} --no-parallel
