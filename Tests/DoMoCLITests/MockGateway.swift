@@ -48,9 +48,11 @@ final class MockGateway: @unchecked Sendable {
     private let listenFD: Int32
     private let chatBodies: [String]
     private let lock = NSLock()
+    private let lifecycleLock = NSLock()
     private var served = 0
     private var recorded: [RecordedRequest] = []
     private var stopped = false
+    private var acceptLoopFinished = false
     private var thread: Thread?
 
     /// A status and JSON body to answer every `chat/completions` request with,
@@ -118,6 +120,11 @@ final class MockGateway: @unchecked Sendable {
             close(fd)
             throw MockGatewayError("listen() failed: \(errno)")
         }
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            close(fd)
+            throw MockGatewayError("fcntl() failed: \(errno)")
+        }
 
         var bound = sockaddr_in()
         var boundSize = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -171,15 +178,35 @@ final class MockGateway: @unchecked Sendable {
         let alreadyStopped = stopped
         stopped = true
         lock.unlock()
-        guard !alreadyStopped else { return }
-        // Closing the listening fd makes the blocking `accept` return with an
-        // error, which ends the loop.
-        close(listenFD)
+        if !alreadyStopped {
+            // The listener is non-blocking, so the accept loop can observe the
+            // stop flag even on Darwin, where closing a socket from another
+            // thread does not reliably wake a blocking accept immediately.
+            _ = shutdown(listenFD, SHUT_RDWR)
+            close(listenFD)
+        }
+
+        // Do not let the OS reuse this descriptor while the old accept loop can
+        // still touch it. This is especially important when the next test starts
+        // another ephemeral loopback gateway immediately after this one stops.
+        while true {
+            lifecycleLock.lock()
+            let finished = acceptLoopFinished
+            lifecycleLock.unlock()
+            if finished { return }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
     }
 
     // MARK: Accept loop
 
     private func acceptLoop() {
+        defer {
+            lifecycleLock.lock()
+            acceptLoopFinished = true
+            lifecycleLock.unlock()
+        }
+
         while true {
             lock.lock()
             let done = stopped
@@ -189,6 +216,10 @@ final class MockGateway: @unchecked Sendable {
             let client = accept(listenFD, nil, nil)
             if client < 0 {
                 if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    usleep(1_000)
+                    continue
+                }
                 return  // listen fd closed by stop()
             }
             handleConnection(client)
