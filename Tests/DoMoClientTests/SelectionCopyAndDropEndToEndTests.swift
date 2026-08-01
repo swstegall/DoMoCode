@@ -1180,8 +1180,9 @@ struct SelectionCopyAndDropEndToEndTests {
         // The window: `handleSubmit` used to clear `pendingDrops`, which made the
         // loader's answer stale — so the drop's images were discarded, the message
         // went out with no image part in it, and the status line said "attached 1
-        // image" anyway. A multi-megabyte file makes the window wide enough to
-        // walk into on the first try, which is how it was found on a real pty.
+        // image" anyway. A two-megabyte file makes the window wide enough to walk
+        // into on the first try, which is how it was found on a real pty, without
+        // making the Linux test server buffer an unnecessarily large request.
         //
         // The assertion is the INVARIANT rather than the race: whichever side wins,
         // no user message may reach the gateway without the picture it claims.
@@ -1189,7 +1190,7 @@ struct SelectionCopyAndDropEndToEndTests {
         defer { dirs.cleanUp() }
         let file = dirs.files.appendingPathComponent("shot.png")
         var bytes = Self.onePixelPNG
-        bytes.append(Data(repeating: 0x42, count: (4 << 20)))
+        bytes.append(Data(repeating: 0x42, count: (2 << 20)))
         try bytes.write(to: file)
 
         let seen = SeenMessages()
