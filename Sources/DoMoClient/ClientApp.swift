@@ -56,6 +56,10 @@ public final class ClientApp {
 
     private var surface: ScreenSurface?
     private var eventTask: Task<Void, Never>?
+    /// User actions can outlive the input event that started them. Keep them under
+    /// the app's lifetime so shutdown cancels and drains in-flight HTTP requests
+    /// before `runFullScreenClient` shuts down its shared client.
+    private var actionTasks: [Task<Void, Never>] = []
     /// Drives the in-flight animation. The transcript's spinner is a pure function
     /// of a frame index, so something has to advance it; this is that clock, and it
     /// only runs while there is something in flight. Its second job is diagnostic: a
@@ -311,9 +315,11 @@ public final class ClientApp {
             await self?.bootstrap()
         })
 
-        eventTask?.cancel()
+        let tasks = actionTasks + [eventTask, spinnerTask].compactMap { $0 }
+        for task in tasks { task.cancel() }
+        for task in tasks { await task.value }
+        actionTasks.removeAll()
         eventTask = nil
-        spinnerTask?.cancel()
         spinnerTask = nil
 
         if let error = driver.startupError { throw error }
@@ -695,11 +701,12 @@ public final class ClientApp {
         else { return }
         statusPollInFlight = true
         lastStatusPollAt = Date()
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.statusPollInFlight = false }
             await self.reconcileWithServer(id)
         }
+        actionTasks.append(task)
     }
 
     /// Ask for the server's snapshot once and adopt it.
@@ -942,12 +949,13 @@ public final class ClientApp {
             // fail, it produces a wrong clipboard. The local helper has no such cap.
             post(notice: "selection too large for the terminal clipboard — trying the local helper")
         }
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             if case .failed(let why) = await self.clipboard.copy(text) {
                 self.post(notice: "clipboard: \(sanitizeUntrustedText(collapseToOneLine(why)))")
             }
         }
+        actionTasks.append(task)
     }
 
     /// F8: hand the mouse back to the terminal, or take it again.
@@ -1006,7 +1014,7 @@ public final class ClientApp {
         let staged = promptInput.attachments
         let limits = Self.attachmentLimits
         let fileSystem = self.fileSystem
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             // `resolveDrop` is `@concurrent`, so the stat/sniff/read and the whole
             // image payload stay off the render loop — which is the difference
@@ -1066,6 +1074,7 @@ public final class ClientApp {
                 self.post(notice: "not attached — \(sanitizeUntrustedText(collapseToOneLine(notice)))", seconds: 6)
             }
         }
+        actionTasks.append(task)
     }
 
     /// A drop whose answer arrived after the prompt had moved on.
@@ -1529,11 +1538,13 @@ public final class ClientApp {
     // MARK: Actions (called from the render actor via component callbacks)
 
     private func openSession(_ id: String) {
-        Task { @MainActor [weak self] in await self?.open(id) }
+        let task = Task { @MainActor [weak self] in await self?.open(id) }
+        actionTasks.append(task)
     }
 
     private func newSession() {
-        Task { @MainActor [weak self] in await self?.createAndOpen() }
+        let task = Task { @MainActor [weak self] in await self?.createAndOpen() }
+        actionTasks.append(task)
     }
 
     /// Send a prompt — and never destroy it silently.
@@ -1566,7 +1577,7 @@ public final class ClientApp {
         // actor — so this is a pure send with no IO of its own and nothing that can
         // fail for a reason the prompt is not about.
         let images = attachments.map(\.image)
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await self.client.sendPrompt(sessionID: id, prompt: text, images: images)
@@ -1605,6 +1616,7 @@ public final class ClientApp {
                 )
             }
         }
+        actionTasks.append(task)
     }
 
     /// Refuse a prompt because a turn is already in flight — and make the refusal
@@ -1627,7 +1639,7 @@ public final class ClientApp {
         // harmless 200 — `ServerRuntime.abort` cancels a nil task and drains an empty
         // map. Refusing to try was how "Esc does nothing" happened.
         guard let id = store.selectedSessionID else { return }
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 // The server answers whether anything was actually in flight. `false`
@@ -1645,6 +1657,7 @@ public final class ClientApp {
                 self.postError("Could not abort the run", error)
             }
         }
+        actionTasks.append(task)
     }
 
     // MARK: Diagnostics (^G)
@@ -1755,7 +1768,7 @@ public final class ClientApp {
             diagnosticsStatusError = "no session is open"
             return
         }
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 let status = try await self.client.status(sessionID: id)
@@ -1768,6 +1781,7 @@ public final class ClientApp {
             }
             self.surface?.requestRender()
         }
+        actionTasks.append(task)
     }
 
     /// Rebuild the panel when the terminal size changes, mirroring the modal's own
@@ -1801,7 +1815,7 @@ public final class ClientApp {
         let value = diagnosticsList?.getSelectedItem()?.value
         dismissDiagnosticsOverlay()
         guard value == "force-clear", let id = store.selectedSessionID else { return }
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await self.client.forceClearRun(sessionID: id)
@@ -1814,6 +1828,7 @@ public final class ClientApp {
                 self.postError("Could not clear the run", error)
             }
         }
+        actionTasks.append(task)
     }
 
     // MARK: Permission approval
@@ -1975,7 +1990,7 @@ public final class ClientApp {
         store.clearPendingPermission()
         let sessionID = request.sessionID
         let requestID = request.id
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await self.client.resolvePermission(sessionID: sessionID, requestID: requestID, reply: reply)
@@ -1991,6 +2006,7 @@ public final class ClientApp {
                 await self.reconcilePendingPermissions(sessionID)
             }
         }
+        actionTasks.append(task)
     }
 
     private static func reply(for value: String?) -> PermissionReply {

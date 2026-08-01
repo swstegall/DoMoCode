@@ -52,12 +52,8 @@ jobs:
 
       # Keep package-level parallelism enabled. Suites that own processes, sockets,
       # PTYs, or wall-clock fixtures opt into Swift Testing's `.serialized` trait
-      # in their source file. Ubuntu's runner has a smaller process/file-descriptor
-      # budget than macOS, so cap its concurrent tests while retaining parallelism.
+      # in their source file. Two workers keep the suite fast without letting a
+      # runner's process/file-descriptor budget turn timing-sensitive tests into
+      # unrelated failures.
       - name: Test
-        run: |
-          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 2
-          else
-            swift test --configuration ${{ matrix.configuration }} --parallel
-          fi
+        run: swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 2

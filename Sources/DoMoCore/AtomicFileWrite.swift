@@ -111,34 +111,35 @@ public enum AtomicFileWrite {
             throw failure(error, path: temporary, while: "write")
         }
 
-        let destinationURL = URL(fileURLWithPath: destination.string)
-        let temporaryURL = URL(fileURLWithPath: temporary.string)
         do {
-            if FileManager.default.fileExists(atPath: destination.string) {
-                // `.usingNewMetadataOnly` says the result keeps the temp's
-                // metadata rather than inheriting the original's. It is belt and
-                // braces, not load-bearing, and this comment says so because it
-                // used to claim otherwise: the temp is created at the old file's
-                // mode and `fchmod`ed to it, so both paths land on the same
-                // permission bits and no test in the suite can tell the flag
-                // apart from its absence. What it buys is that the mode is
-                // decided in one place instead of two — this function's masked
-                // 0o7777, rather than whatever `replaceItemAt` chooses to copy.
-                _ = try FileManager.default.replaceItemAt(
-                    destinationURL,
-                    withItemAt: temporaryURL,
-                    backupItemName: nil,
-                    options: [.usingNewMetadataOnly]
-                )
-            } else {
-                try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
-            }
+            // This is the atomic operation promised by this type. Foundation's
+            // `replaceItemAt` is not a portable spelling of it: on Linux it can
+            // fail to replace an existing file under concurrent activity, and its
+            // error may arrive after it has moved the temp. POSIX rename replaces
+            // an existing regular file and moves a new one atomically.
+            try rename(temporary, to: destination)
         } catch {
             // The temp is ours and nobody else can see it, so removing it is
             // unconditional. Leaving it would accumulate one file per failed save
             // in the user's config directory.
             try? FileManager.default.removeItem(atPath: temporary.string)
-            throw failure(error, path: destination, while: "replace")
+            throw error
+        }
+    }
+
+    /// Atomically replaces `destination` with `source`, retaining POSIX errno.
+    private static func rename(_ source: FilePath, to destination: FilePath) throws(DoMoError) {
+        #if canImport(Darwin)
+        let result = Darwin.rename(source.string, destination.string)
+        #elseif canImport(Glibc)
+        let result = Glibc.rename(source.string, destination.string)
+        #elseif canImport(Musl)
+        let result = Musl.rename(source.string, destination.string)
+        #else
+        let result: CInt = -1
+        #endif
+        guard result == 0 else {
+            throw DoMoError.file(Errno(rawValue: errno), path: destination, while: "replace")
         }
     }
 
