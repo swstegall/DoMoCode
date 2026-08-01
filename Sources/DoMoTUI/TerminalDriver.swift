@@ -320,8 +320,6 @@ public final class TerminalDriver {
 
         inputTask.cancel()
         resizeTask.cancel()
-        await inputTask.value
-        await resizeTask.value
     }
 
     // MARK: Input

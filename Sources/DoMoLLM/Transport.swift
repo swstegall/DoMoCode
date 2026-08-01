@@ -90,11 +90,6 @@ private final class StreamActivity: Sendable {
     }
 }
 
-private enum GuardOutcome: Sendable {
-    case upstreamEnded
-    case timerEnded
-}
-
 /// Re-emits `upstream`, failing the stream if no chunk arrives within `idle` or
 /// the whole body takes longer than `overall`.
 ///
@@ -142,9 +137,7 @@ public func idleGuarded(
         // Poll no slower than the idle window and no faster than 10ms, so a
         // pathological `idle` of zero cannot turn this into a spin loop.
         let tick = max(.milliseconds(10), min(idle ?? overall, .seconds(1)))
-        let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: GuardOutcome.self)
         let pump = Task {
-            defer { outcomeContinuation.yield(.upstreamEnded) }
             do {
                 for try await chunk in upstream {
                     activity.record(clock.now)
@@ -156,7 +149,6 @@ public func idleGuarded(
             }
         }
         let timer = Task {
-            defer { outcomeContinuation.yield(.timerEnded) }
             while !Task.isCancelled {
                 try? await Task.sleep(for: tick)
                 if Task.isCancelled { return }
@@ -186,19 +178,9 @@ public func idleGuarded(
                 }
             }
         }
-        let coordinator = Task {
-            var iterator = outcomes.makeAsyncIterator()
-            _ = await iterator.next()
-            pump.cancel()
-            timer.cancel()
-            await pump.value
-            await timer.value
-            outcomeContinuation.finish()
-        }
         continuation.onTermination = { _ in
             pump.cancel()
             timer.cancel()
-            coordinator.cancel()
         }
     }
 }
