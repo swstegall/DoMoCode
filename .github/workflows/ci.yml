@@ -57,6 +57,11 @@ jobs:
       # retain limited case-level parallelism.
       - name: Test
         run: |
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            swift test --configuration ${{ matrix.configuration }} --no-parallel
+            exit 0
+          fi
+
           serial_targets=(
             DoMoLLMTests
             DoMoMCPTests
@@ -64,6 +69,7 @@ jobs:
             DoMoCLITests
             DoMoServerTests
             DoMoClientTests
+            DoMoTUITests
           )
           parallel_targets=(
             DoMoCoreTests
@@ -73,7 +79,6 @@ jobs:
             DoMoAgentTests
             DoMoPermissionsTests
             DoMoHarnessTests
-            DoMoTUITests
             DoMoToolsUITests
           )
 
