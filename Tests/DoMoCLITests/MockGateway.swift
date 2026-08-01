@@ -183,9 +183,11 @@ final class MockGateway: @unchecked Sendable {
         if !alreadyStopped {
             // The listener is non-blocking, so the accept loop can observe the
             // stop flag even on Darwin, where closing a socket from another
-            // thread does not reliably wake a blocking accept immediately.
+            // thread does not reliably wake a blocking accept immediately. Keep
+            // the descriptor open until the loop has exited: closing it first
+            // lets another parallel test reuse the number while this thread can
+            // still call accept(2) on it.
             _ = shutdown(listenFD, Int32(SHUT_RDWR))
-            close(listenFD)
         }
 
         // Interrupt any connection the serial accept loop is currently reading
@@ -201,9 +203,13 @@ final class MockGateway: @unchecked Sendable {
             lifecycleLock.lock()
             let finished = acceptLoopFinished
             lifecycleLock.unlock()
-            if finished { return }
+            if finished { break }
             Thread.sleep(forTimeInterval: 0.001)
         }
+
+        // No thread can touch the listener now, so its descriptor number is safe
+        // to release for the next fixture.
+        if !alreadyStopped { close(listenFD) }
     }
 
     // MARK: Accept loop

@@ -1632,7 +1632,6 @@ final class SteerableGateway: @unchecked Sendable {
         lock.unlock()
         if !alreadyStopped {
             _ = shutdown(listenFD, Int32(SHUT_RDWR))
-            close(listenFD)
         }
         for client in activeClients {
             _ = shutdown(client, Int32(SHUT_RDWR))
@@ -1641,9 +1640,11 @@ final class SteerableGateway: @unchecked Sendable {
             lifecycleLock.lock()
             let finished = acceptLoopFinished
             lifecycleLock.unlock()
-            if finished { return }
+            if finished { break }
             Thread.sleep(forTimeInterval: 0.001)
         }
+
+        if !alreadyStopped { close(listenFD) }
     }
 
     private func acceptLoop() {
