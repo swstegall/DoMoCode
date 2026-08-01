@@ -302,20 +302,22 @@ public final class TerminalDriver {
         let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: RunOutcome.self)
         // These streams must be pumped from outside the main actor. The app
         // callback hops back to the actor, while the client/network work keeps
-        // getting scheduled when input is busy or a stream reconnects.
-        let inputTask = Task { @concurrent [input] in
+        // getting scheduled when input is busy or a stream reconnects. Detached
+        // tasks preserve the old task-group child isolation without inheriting
+        // the caller's actor through Swift 6.3's `Task { @concurrent in }` form.
+        let inputTask = Task.detached { [input] in
             defer { outcomeContinuation.yield(.inputEnded) }
             for await chunk in input {
                 await self.ingest(chunk, app: app)
             }
         }
-        let resizeTask = Task { @concurrent [resize] in
+        let resizeTask = Task.detached { [resize] in
             defer { outcomeContinuation.yield(.resizeEnded) }
             for await size in resize {
                 await self.handleResize(size, app: app)
             }
         }
-        let quitTask = Task {
+        let quitTask = Task.detached {
             defer { outcomeContinuation.yield(.quit) }
             await quit.wait()
         }
