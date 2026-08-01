@@ -32,7 +32,7 @@ LSP diagnostics, sandboxing. The [roadmap](#roadmap) now sequences them.
 The goal has changed accordingly. DoMoCode began as a deliberately **narrowed** port; the
 [first scope expansion](#what-expanded-and-what-did-not) widened it in four directions, all of which
 shipped. The aim now is a **fully-featured terminal harness** — no compromises on capability, with the
-remaining constraints (Swift 6.2, SwiftPM-only, macOS/Linux, one LiteLLM gateway) treated as facts
+remaining constraints (Swift 6.3, SwiftPM-only, macOS/Linux, one LiteLLM gateway) treated as facts
 about *how* a feature gets built wherever that is possible. A handful genuinely cannot survive them,
 and those are named rather than quietly dropped. Six reversals of a stated
 non-goal are called out in the roadmap rather than assumed; see
@@ -50,12 +50,31 @@ the renderer instead.
 
 Three constraints shape the whole project:
 
-1. **Swift 6.2**, `swift-tools-version: 6.2`, `swiftLanguageModes: [.v6]` — strict concurrency on
-   from day one. 6.2 is a floor, not a ceiling; development happens on the current release (6.3.3 at
-   time of writing) and nothing here depends on 6.3-only features.
+1. **Swift 6.3**, `swift-tools-version: 6.2`, `swiftLanguageModes: [.v6]` — strict concurrency on
+   from day one. The manifest *format* stays at 6.2 because nothing here needs a 6.3 manifest
+   feature; the **toolchain floor** is 6.3, and CI pins it. Nothing in this package uses a 6.3-only
+   language feature — the floor moved because 6.2 stopped being buildable, not because anything
+   wanted it. See below.
 2. **Swift Package Manager only.** No CocoaPods, no Carthage, no vendored binary frameworks. Every
    dependency resolves from a public GitHub repository.
 3. **One provider surface: LiteLLM.** Model breadth is the gateway's job, not the client's.
+
+**The floor moved twice, both times for the same reason, and the second time is worth recording
+because it was found the hard way.** On 2026-08-01 CI began failing on all four jobs inside
+`SystemPackage` itself, before a line of this package compiled — `cannot find 'AT_RESOLVE_BENEATH' in
+scope`. swift-system 1.7 put that constant behind a `canImport(Darwin, _version: 346)` gate that
+admits it on an SDK which does not declare it; constraining swift-system below 1.7 fixed that job and
+revealed the next one, `swift-configuration` reaching for `Data.bytes`, a Foundation API 6.2 does not
+ship. That package is a Hummingbird transitive — not something this project chose — present in every
+1.x release and in every Hummingbird since 2.18. Holding 6.2 would have meant pinning swift-system
+back two minors *and* Hummingbird back nine, indefinitely, to keep a promise nothing here depended
+on. So the floor moved instead.
+
+Two things are worth taking from that. A version floor is a claim about what other people can build
+with, and it decays silently: it broke in CI while every local build stayed green, because
+development happens on a newer toolchain. And **pinning the floor in CI is what made it decay
+loudly** rather than becoming a lie in this README — which is the entire argument for pinning it
+there rather than letting the runner's default drift.
 
 This project previously held a 6.1 floor, and that floor was expensive in a specific, mechanical way:
 SwiftPM rejects any dependency whose manifest declares a `swift-tools-version` above the active
@@ -245,7 +264,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
 
 - [x] **Phase 0 — Skeleton.** `Package.swift` with the pin table, all eleven targets declared, the
       per-target isolation and safety settings from
-      [Concurrency](#concurrency-and-isolation), CI on macOS and Ubuntu at Swift 6.2 building in both
+      [Concurrency](#concurrency-and-isolation), CI on macOS and Ubuntu at the floor toolchain building in both
       debug and `-c release`. `DoMoCore`: `JSONValue`, JSON Schema, the tolerant JSON parser,
       `uuidv7`, error taxonomy, JSONL codec. 234 tests, green in both configurations.
 - [x] **Phase 1 — Talk to LiteLLM headlessly.** `DoMoLLM` end to end: transport seam, lenient
@@ -829,7 +848,7 @@ settled here:
 
 ## Dependencies
 
-Every direct dependency must resolve on Swift 6.2. Several pins below were previously version caps
+Every direct dependency must resolve on the floor toolchain (Swift 6.3). Several pins below were previously version caps
 imposed by the 6.1 floor rather than stability judgments; those caps are gone and the table records
 the versions that replaced them.
 
@@ -838,7 +857,7 @@ The deployment floor is **macOS 15**, raised from 13. `Synchronization.Mutex` an
 mutable state is handled here, per [Concurrency](#concurrency-and-isolation). macOS 15 shipped in
 September 2024; requiring it for a developer CLI is not aggressive.
 
-These thirteen resolve as a set on a 6.2 manifest, and to a graph of **34 pinned packages** once
+These thirteen resolve as a set on a 6.2 manifest under a 6.3 toolchain, and to a graph of **34 pinned packages** once
 transitive dependencies are counted — the AsyncHTTPClient tail (NIO, NIO-SSL, NIO-HTTP2,
 swift-certificates, swift-crypto, swift-asn1, service-lifecycle) and swift-syntax 603, pulled by
 swift-json-schema for its macros, account for most of that. swift-syntax is the single largest

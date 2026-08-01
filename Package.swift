@@ -3,9 +3,25 @@
 // DoMoCode — a Swift port of the Pi Agent Harness (earendil-works/pi, MIT).
 // See NOTICES.md for attribution and README.md for the module map.
 //
-// The 6.2 floor is deliberate: it is what gates `.defaultIsolation`, and SE-0461
-// changes the runtime meaning of every `nonisolated async` function in the
-// package. Adopting that now, against an empty package, is free.
+// `swift-tools-version` stays at 6.2 — it is the manifest FORMAT this file uses,
+// and nothing here needs a 6.3 manifest feature. The *toolchain* floor is 6.3,
+// pinned by CI; see below.
+//
+// The floor was 6.2 originally because that is what gates `.defaultIsolation`,
+// and SE-0461 changes the runtime meaning of every `nonisolated async` function
+// in the package. Both still hold at 6.3.
+//
+// It moved to 6.3 on 2026-08-01 because 6.2 stopped being buildable, not because
+// anything here wanted a newer feature. Two dependencies now need a toolchain
+// newer than 6.2 ships: swift-system 1.7+ references `AT_RESOLVE_BENEATH` behind
+// a `canImport(Darwin, _version: 346)` gate that admits it on an SDK which does
+// not declare it, and swift-configuration — a Hummingbird transitive since 2.18,
+// in every 1.x release — reaches for `Data.bytes`, a Foundation API 6.2 does not
+// have. Holding 6.2 would have meant pinning swift-system back two minors AND
+// Hummingbird back nine, indefinitely, to keep a promise nothing in this package
+// actually depended on. The floor exists to be tested rather than assumed, which
+// is exactly how this was found — it failed only in CI, because development
+// happens on a newer toolchain.
 
 import PackageDescription
 
@@ -43,25 +59,7 @@ let package = Package(
         .library(name: "DoMoCore", targets: ["DoMoCore"]),
     ],
     dependencies: [
-        // PINNED BELOW 1.7.0 ON PURPOSE — do not "helpfully" bump this.
-        //
-        // swift-system 1.7.0 added a batch of file-mode and `openat` constants,
-        // one of them behind `#if canImport(Darwin, _version: 346) || os(FreeBSD)`:
-        //
-        //     internal var _AT_RESOLVE_BENEATH: CInt { AT_RESOLVE_BENEATH }
-        //
-        // That gate admits the code on the SDK CI builds against while
-        // `AT_RESOLVE_BENEATH` is not declared there, so `SystemPackage` itself
-        // fails to compile with `cannot find 'AT_RESOLVE_BENEATH' in scope`. It
-        // builds fine on a newer toolchain, which is exactly why it is invisible
-        // locally and only ever fails in CI.
-        //
-        // This package declares a **Swift 6.2 floor** and CI pins 6.2 precisely so
-        // that floor is tested rather than assumed. A dependency that needs
-        // something newer does not meet it, so the floor wins and the dependency
-        // is constrained. Revisit when swift-system tightens the gate — or, if the
-        // floor is ever raised to 6.3, this range can go back to `from:`.
-        .package(url: "https://github.com/apple/swift-system", "1.6.6"..<"1.7.0"),
+        .package(url: "https://github.com/apple/swift-system", from: "1.7.5"),
         .package(url: "https://github.com/apple/swift-log", from: "1.14.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2"),
         .package(url: "https://github.com/swift-server/async-http-client", from: "1.35.0"),

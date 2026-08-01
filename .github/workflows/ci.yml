@@ -27,13 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The project targets a 6.2 *floor*, so CI pins the floor rather than
+      # The project targets a 6.3 *floor*, so CI pins the floor rather than
       # whatever the runner ships. .swift-version is deliberately gitignored —
       # see the note there.
       - name: Install Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.2"
+          swift-version: "6.3"
 
       - name: Swift version
         run: swift --version
