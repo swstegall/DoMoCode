@@ -300,16 +300,19 @@ public final class TerminalDriver {
         // unwinding; avoiding a nested task-group teardown keeps optimized Swift
         // runtimes from tripping their stack-allocation assertion.
         let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: RunOutcome.self)
-        let inputTask = Task { [input] in
+        // These streams must be pumped from outside the main actor. The app
+        // callback hops back to the actor, while the client/network work keeps
+        // getting scheduled when input is busy or a stream reconnects.
+        let inputTask = Task { @concurrent [input] in
             defer { outcomeContinuation.yield(.inputEnded) }
             for await chunk in input {
-                self.ingest(chunk, app: app)
+                await self.ingest(chunk, app: app)
             }
         }
-        let resizeTask = Task { [resize] in
+        let resizeTask = Task { @concurrent [resize] in
             defer { outcomeContinuation.yield(.resizeEnded) }
             for await size in resize {
-                self.handleResize(size, app: app)
+                await self.handleResize(size, app: app)
             }
         }
         let quitTask = Task {
