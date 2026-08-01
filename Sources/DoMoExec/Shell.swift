@@ -450,50 +450,41 @@ extension SubprocessShell {
             output: .sequence,
             error: .sequence
         ) { execution in
-            await withTaskGroup(of: DrainOutcome.self) { group in
-                group.addTask {
-                    .standardOutput(await drain(execution.standardOutput, limits: limits))
+            let stdoutTask = Task {
+                await drain(execution.standardOutput, limits: limits)
+            }
+            let stderrTask = Task {
+                await drain(execution.standardError, limits: limits)
+            }
+            let timerTask: Task<Bool, Never>? = timeout.map { timeout in
+                Task {
+                    // `Task.sleep` throws only on cancellation, which is how
+                    // the timer is retired once both streams have closed.
+                    do { try await Task.sleep(for: timeout) } catch { return false }
+                    await execution.teardown(using: teardownSteps(grace: grace))
+                    return true
                 }
-                group.addTask {
-                    .standardError(await drain(execution.standardError, limits: limits))
-                }
-                if let timeout {
-                    group.addTask {
-                        // `Task.sleep` throws only on cancellation, which is how
-                        // the timer is retired once both streams have closed.
-                        do { try await Task.sleep(for: timeout) } catch { return .timerRetired }
-                        await execution.teardown(using: teardownSteps(grace: grace))
-                        return .timerFired
-                    }
-                }
+            }
 
-                var standardOutput: ShellStreamOutput?
-                var standardError: ShellStreamOutput?
-                var timedOut = false
-                var retiredTimer = false
-                // Every task is drained to completion rather than stopping at
-                // the second stream, because the timer's verdict is what makes
-                // a killed process distinguishable from one the command itself
-                // killed, and it can arrive either side of the last read.
-                while let outcome = await group.next() {
-                    switch outcome {
-                    case .standardOutput(let value): standardOutput = value
-                    case .standardError(let value): standardError = value
-                    case .timerFired: timedOut = true
-                    case .timerRetired: break
-                    }
-                    if !retiredTimer, standardOutput != nil, standardError != nil {
-                        retiredTimer = true
-                        group.cancelAll()
-                    }
-                }
-
+            return await withTaskCancellationHandler(operation: {
+                // The two drains run concurrently even though their values are
+                // awaited in sequence. The timer is also live while either pipe
+                // is being drained, so a child that keeps a pipe open cannot
+                // defeat the deadline.
+                let standardOutput = await stdoutTask.value
+                let standardError = await stderrTask.value
+                timerTask?.cancel()
+                let timedOut = await timerTask?.value ?? false
                 return DrainedStreams(
-                    stdout: standardOutput ?? .empty,
-                    stderr: standardError ?? .empty,
+                    stdout: standardOutput,
+                    stderr: standardError,
                     timedOut: timedOut
                 )
-            }
+            }, onCancel: {
+                stdoutTask.cancel()
+                stderrTask.cancel()
+                timerTask?.cancel()
+            })
         }
 
         return (result.closureOutput, result.terminationStatus, result.processIdentifier.value)
@@ -658,11 +649,4 @@ private struct DrainedStreams: Sendable {
     let stdout: ShellStreamOutput
     let stderr: ShellStreamOutput
     let timedOut: Bool
-}
-
-private enum DrainOutcome: Sendable {
-    case standardOutput(ShellStreamOutput)
-    case standardError(ShellStreamOutput)
-    case timerFired
-    case timerRetired
 }

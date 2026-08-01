@@ -176,27 +176,40 @@ struct ToolDispatch: Sendable {
         }
 
         // Phase B — execute deferred calls concurrently. Collect in COMPLETION
-        // order (that is when the group yields), emitting each end as it lands,
-        // so the UI sees tools finish in real time.
+        // order (that is when each task yields), emitting each end as it lands,
+        // so the UI sees tools finish in real time. Unstructured tasks keep the
+        // results concurrent without putting their optimized teardown through a
+        // task-group frame.
         var finishedByIndex: [Int: Finalized] = [:]
-        await withTaskGroup(of: (Int, Finalized).self) { group in
-            for (index, slot) in slots.enumerated() {
-                guard case .deferred(let tool, let toolCall, let arguments) = slot else { continue }
-                group.addTask {
-                    let outcome = await executeAndFinalize(
-                        tool: tool,
-                        toolCall: toolCall,
-                        arguments: arguments,
-                        from: assistantMessage
-                    )
-                    return (index, outcome)
-                }
-            }
-            for await (index, outcome) in group {
-                await emitEnd(outcome)
-                finishedByIndex[index] = outcome
+        let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: (Int, Finalized).self)
+        var tasks: [Task<Void, Never>] = []
+        for (index, slot) in slots.enumerated() {
+            guard case .deferred(let tool, let toolCall, let arguments) = slot else { continue }
+            tasks.append(Task {
+                let outcome = await executeAndFinalize(
+                    tool: tool,
+                    toolCall: toolCall,
+                    arguments: arguments,
+                    from: assistantMessage
+                )
+                outcomeContinuation.yield((index, outcome))
+            })
+        }
+        if tasks.isEmpty { outcomeContinuation.finish() }
+
+        var iterator = outcomes.makeAsyncIterator()
+        while let (index, outcome) = await iterator.next() {
+            await emitEnd(outcome)
+            finishedByIndex[index] = outcome
+            if finishedByIndex.count == tasks.count {
+                outcomeContinuation.finish()
             }
         }
+        for task in tasks {
+            task.cancel()
+            await task.value
+        }
+        outcomeContinuation.finish()
 
         // Phase C — walk slots in SOURCE order to build the transcript, so the
         // conversation is deterministic regardless of who finished first.

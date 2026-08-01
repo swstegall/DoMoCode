@@ -90,6 +90,11 @@ private final class StreamActivity: Sendable {
     }
 }
 
+private enum GuardOutcome: Sendable {
+    case upstreamEnded
+    case timerEnded
+}
+
 /// Re-emits `upstream`, failing the stream if no chunk arrives within `idle` or
 /// the whole body takes longer than `overall`.
 ///
@@ -137,56 +142,64 @@ public func idleGuarded(
         // Poll no slower than the idle window and no faster than 10ms, so a
         // pathological `idle` of zero cannot turn this into a spin loop.
         let tick = max(.milliseconds(10), min(idle ?? overall, .seconds(1)))
+        let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: GuardOutcome.self)
         let pump = Task {
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    do {
-                        for try await chunk in upstream {
-                            activity.record(clock.now)
-                            continuation.yield(chunk)
-                        }
-                        continuation.finish()
-                    } catch {
-                        continuation.finish(throwing: error)
-                    }
+            defer { outcomeContinuation.yield(.upstreamEnded) }
+            do {
+                for try await chunk in upstream {
+                    activity.record(clock.now)
+                    continuation.yield(chunk)
                 }
-                group.addTask {
-                    while !Task.isCancelled {
-                        try? await Task.sleep(for: tick)
-                        if Task.isCancelled { return }
-                        let now = clock.now
-                        // `idle == nil` disables the silence check entirely.
-                        // Expressing it that way rather than as `idle = overall`
-                        // matters for the MESSAGE: with both equal, the two
-                        // predicates go true on the same tick when no chunk ever
-                        // arrived, this branch wins, and an operator who turned
-                        // the silence bound OFF is told the silence bound fired.
-                        if let idle, now - activity.last >= idle {
-                            continuation.finish(throwing: DoMoError(
-                                .transport,
-                                """
-                                The model stream stalled — no data for \(idle). \
-                                The connection was still open; it timed out.
-                                """
-                            ))
-                            return
-                        }
-                        if now - start >= overall {
-                            continuation.finish(throwing: DoMoError(
-                                .transport,
-                                "The model stream exceeded its \(overall) deadline and timed out."
-                            ))
-                            return
-                        }
-                    }
-                }
-                // Whichever child settles first decides the stream; cancel the
-                // other and let the group drain, so no task outlives this scope.
-                _ = await group.next()
-                group.cancelAll()
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
             }
         }
-        continuation.onTermination = { _ in pump.cancel() }
+        let timer = Task {
+            defer { outcomeContinuation.yield(.timerEnded) }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: tick)
+                if Task.isCancelled { return }
+                let now = clock.now
+                // `idle == nil` disables the silence check entirely.
+                // Expressing it that way rather than as `idle = overall`
+                // matters for the MESSAGE: with both equal, the two
+                // predicates go true on the same tick when no chunk ever
+                // arrived, this branch wins, and an operator who turned
+                // the silence bound OFF is told the silence bound fired.
+                if let idle, now - activity.last >= idle {
+                    continuation.finish(throwing: DoMoError(
+                        .transport,
+                        """
+                        The model stream stalled — no data for \(idle). \
+                        The connection was still open; it timed out.
+                        """
+                    ))
+                    return
+                }
+                if now - start >= overall {
+                    continuation.finish(throwing: DoMoError(
+                        .transport,
+                        "The model stream exceeded its \(overall) deadline and timed out."
+                    ))
+                    return
+                }
+            }
+        }
+        let coordinator = Task {
+            var iterator = outcomes.makeAsyncIterator()
+            _ = await iterator.next()
+            pump.cancel()
+            timer.cancel()
+            await pump.value
+            await timer.value
+            outcomeContinuation.finish()
+        }
+        continuation.onTermination = { _ in
+            pump.cancel()
+            timer.cancel()
+            coordinator.cancel()
+        }
     }
 }
 
