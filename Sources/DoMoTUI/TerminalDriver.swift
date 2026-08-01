@@ -8,9 +8,10 @@
 // pump stdin through the framer into the focused component, repaint on resize,
 // and always restore the terminal on the way out. pi wires input and resize as
 // Node event-emitter callbacks; Swift structured concurrency lets the same three
-// sources (keystrokes, `SIGWINCH`, a quit signal) meet under one task group, so
-// the "always restore" guarantee is a `defer` around the group rather than pi's
-// scattered `stop()` calls in signal/exit/error handlers.
+// sources (keystrokes, `SIGWINCH`, a quit signal) meet under one cancellation-safe
+// coordinator, so the "always restore" guarantee is a `defer` around the
+// coordinator rather than pi's scattered `stop()` calls in signal/exit/error
+// handlers.
 
 import Dispatch
 import DoMoCore
@@ -286,43 +287,66 @@ public final class TerminalDriver {
         render()
 
         // Keep optional work alive alongside the input pumps, but outside the
-        // structured shutdown group. The group is responsible for deciding when
+        // shutdown coordinator. The coordinator is responsible for deciding when
         // the session ends; it must not wait for arbitrary agent/network work to
         // acknowledge cancellation before the terminal can be restored.
         if let background {
             backgroundTask = Task { await background() }
         }
 
-        await withTaskGroup(of: RunOutcome.self) { group in
-            group.addTask { [input] in
-                for await chunk in input {
-                    await self.ingest(chunk, app: app)
-                }
-                return .inputEnded
+        // Keep the three pumps concurrent, but coordinate their completion with
+        // an AsyncStream rather than a task group. The live full-screen path
+        // cancels these pumps while a child process and an HTTP stream are also
+        // unwinding; avoiding a nested task-group teardown keeps optimized Swift
+        // runtimes from tripping their stack-allocation assertion.
+        let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: RunOutcome.self)
+        let inputTask = Task { [input] in
+            defer { outcomeContinuation.yield(.inputEnded) }
+            for await chunk in input {
+                await self.ingest(chunk, app: app)
             }
-            group.addTask { [resize] in
-                for await size in resize {
-                    await self.handleResize(size, app: app)
-                }
-                return .resizeEnded
+        }
+        let resizeTask = Task { [resize] in
+            defer { outcomeContinuation.yield(.resizeEnded) }
+            for await size in resize {
+                await self.handleResize(size, app: app)
             }
-            group.addTask {
-                await quit.wait()
-                return .quit
-            }
-            for await outcome in group {
+        }
+        let quitTask = Task {
+            defer { outcomeContinuation.yield(.quit) }
+            await quit.wait()
+        }
+
+        await withTaskCancellationHandler(operation: {
+            var iterator = outcomes.makeAsyncIterator()
+            while let outcome = await iterator.next() {
                 switch outcome {
                 case .quit, .inputEnded:
-                    // Session over. Cancelling the group unblocks the remaining
-                    // stream iterators (they return nil on cancel), and the
-                    // background task is canceled by the outer defer.
-                    group.cancelAll()
+                    // Session over. Cancellation unblocks the remaining stream
+                    // iterators, and the background task is canceled by the outer
+                    // defer rather than delaying terminal restoration.
+                    inputTask.cancel()
+                    resizeTask.cancel()
+                    quitTask.cancel()
                     return
                 case .resizeEnded:
                     continue
                 }
             }
-        }
+        }, onCancel: {
+            inputTask.cancel()
+            resizeTask.cancel()
+            quitTask.cancel()
+            outcomeContinuation.finish()
+        })
+
+        inputTask.cancel()
+        resizeTask.cancel()
+        quitTask.cancel()
+        await inputTask.value
+        await resizeTask.value
+        await quitTask.value
+        outcomeContinuation.finish()
     }
 
     // MARK: Input

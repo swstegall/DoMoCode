@@ -56,6 +56,10 @@ jobs:
       # and for release subprocess fixtures to collide. Keep process/PTY targets
       # serial, while ordinary targets retain limited case-level parallelism.
       - name: Test
+        env:
+          # Keep optimized runtime assertions actionable: child-process stderr carries
+          # the Swift backtrace instead of only the allocator's final sentence.
+          SWIFT_BACKTRACE: enable
         run: |
           serial_targets=(
             DoMoLLMTests
