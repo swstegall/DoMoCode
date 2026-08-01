@@ -1538,12 +1538,18 @@ public final class ClientApp {
     // MARK: Actions (called from the render actor via component callbacks)
 
     private func openSession(_ id: String) {
-        let task = Task { @MainActor [weak self] in await self?.open(id) }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.open(id)
+        }
         actionTasks.append(task)
     }
 
     private func newSession() {
-        let task = Task { @MainActor [weak self] in await self?.createAndOpen() }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.createAndOpen()
+        }
         actionTasks.append(task)
     }
 
