@@ -207,7 +207,7 @@ struct SessionTimingTests {
 
     // MARK: - Elapsed measurement
 
-    @Test("every persisted message carries the interval measured across its own boundaries")
+    @Test("an assistant turn carries the interval measured across its own boundaries")
     func messagesCarryMeasuredElapsedTime() async throws {
         let clock = SteppingClock(step: .milliseconds(7))
         let responder = TimingResponder([assistant("hi there")])
@@ -224,11 +224,57 @@ struct SessionTimingTests {
 
         let recorded = try entries(of: await harness.sessionFilePath)
         #expect(recorded.count == 2)
-        // Two reads bracket each message, and the clock advances 7ms per read. A
-        // `compactMap` so an unmeasured entry shortens the list and fails, rather
-        // than needing an optional literal on the right.
-        #expect(recorded.compactMap(\.elapsedMs) == [7, 7])
-        #expect(clock.readCount == 4, "the stopwatch read the clock a different number of times than it timed")
+        // Two reads bracket the assistant turn, and the clock advances 7ms per
+        // read. The prompt is not a measurement — the loop emits its start and end
+        // back to back around a message that already exists — so it records none.
+        #expect(recorded.map(\.elapsedMs) == [nil, 7])
+        #expect(clock.readCount == 2, "the stopwatch read the clock a different number of times than it timed")
+    }
+
+    /// The `0` this asserts against is not a rounding artifact: ``AgentLoop`` emits
+    /// a prompt's `messageStart` and `messageEnd` on consecutive lines, and
+    /// `ToolDispatch.emitResultMessage` does the same for a tool result *after* the
+    /// tool has already returned. A stopwatch across those boundaries measures two
+    /// `await`s. And because a session file is append-only, every `0` written that
+    /// way is permanent: there is no pass that can come back and tell a fabricated
+    /// interval from a genuinely instantaneous one.
+    @Test("only assistant turns are timed; prompts and tool results record no measurement")
+    func onlyAssistantTurnsAreTimed() async throws {
+        let clock = SteppingClock(step: .milliseconds(7))
+        let responder = TimingResponder([
+            AssistantMessage(
+                content: [.toolCall(ToolCallBlock(id: "c1", name: "echo"))],
+                model: "test-model",
+                stopReason: .toolUse
+            ),
+            assistant("done"),
+        ])
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: responder.fn(),
+                tools: [TimingEchoTool()],
+                monotonicNow: clock.fn(),
+                ids: TimingIDs(prefix: "only")
+            )
+        )
+        _ = try await harness.run(prompt: "please echo")
+
+        let recorded = try entries(of: await harness.sessionFilePath)
+        let roles: [String] = recorded.map { entry in
+            guard case .message(let message) = entry.payload else { return "other" }
+            switch message {
+            case .system: return "system"
+            case .user: return "user"
+            case .assistant: return "assistant"
+            case .tool: return "tool"
+            }
+        }
+        #expect(roles == ["user", "assistant", "tool", "assistant"], "the premise is a run with all three kinds")
+        #expect(recorded.map(\.elapsedMs) == [nil, 7, nil, 7],
+                "a message nobody timed was stamped with a measurement anyway")
+        #expect(clock.readCount == 4, "the clock was read for a message that is not a measurement")
     }
 
     /// `nil` is "nothing was measured". `0` would be a claim about a stopwatch
@@ -253,6 +299,10 @@ struct SessionTimingTests {
         #expect(recorded.count == 2)
         let measured = recorded.compactMap(\.elapsedMs)
         #expect(measured.isEmpty, "a negative interval was laundered into a number: \(measured)")
+        // Without this the assertion above passes vacuously the moment the
+        // assistant turn stops being timed at all — which is precisely the change
+        // that made prompts and tool results record nothing.
+        #expect(clock.readCount == 2, "the assistant turn was never timed, so the negative-interval guard never ran")
     }
 
     /// A compaction checkpoint is not a `Message` and never travels the event
@@ -290,7 +340,7 @@ struct SessionTimingTests {
 
     // MARK: - The sink's stopwatch, directly
 
-    @Test("the sink times a message across its own boundaries and clears the slot after")
+    @Test("the sink times an assistant turn across its own boundaries and clears the slot after")
     func sinkStopwatchMeasuresAndClears() async {
         let persister = RecordingPersister()
         let clock = SteppingClock(step: .milliseconds(5))
@@ -299,11 +349,12 @@ struct SessionTimingTests {
             errorBox: PersistenceErrorBox(),
             monotonicNow: clock.fn()
         )
-        await sink.emit(.messageStart(.user("hi")))
-        await sink.emit(.messageEnd(.user("hi")))
+        let turn = Message.assistant(assistant("hi"))
+        await sink.emit(.messageStart(turn))
+        await sink.emit(.messageEnd(turn))
         // A second end with no start ahead of it: the slot was cleared, so nothing
         // is measured rather than a stale instant being reused.
-        await sink.emit(.messageEnd(.user("bye")))
+        await sink.emit(.messageEnd(.assistant(assistant("bye"))))
 
         let recorded = persister.recorded
         #expect(recorded.count == 2)
@@ -311,15 +362,30 @@ struct SessionTimingTests {
         #expect(recorded[1].elapsedMs == nil, "a cleared stopwatch was re-read and produced a fabricated interval")
     }
 
-    /// The widened requirement is on a public protocol, so the old spelling has to
-    /// keep working for an embedding that implements or calls it.
-    @Test("the pre-timing persistMessage spelling still works and reports no measurement")
-    func legacyPersistSpellingForwards() async throws {
+    /// The slot holds an assistant turn's start and nothing else. A prompt that
+    /// left one behind would be worse than the `0` this replaced: the next
+    /// assistant `messageEnd` would inherit it and report an interval that spans
+    /// somebody else's message while looking entirely plausible.
+    @Test("an untimed message neither starts the stopwatch nor leaves one to inherit")
+    func untimedMessagesNeverBorrowAnInterval() async {
         let persister = RecordingPersister()
-        try await persister.persistMessage(.user("no stopwatch here"))
-        #expect(persister.recorded.count == 1)
-        #expect(persister.recorded[0].elapsedMs == nil)
-        #expect(persister.recorded[0].message == .user("no stopwatch here"))
+        let clock = SteppingClock(step: .milliseconds(5))
+        let sink = SessionPersistenceSink(
+            persister: persister,
+            errorBox: PersistenceErrorBox(),
+            monotonicNow: clock.fn()
+        )
+        let result = Message.tool(ToolResultBlock(toolCallID: "c1", toolName: "echo", output: "echoed"))
+        await sink.emit(.messageStart(.user("prompt")))
+        await sink.emit(.messageEnd(.user("prompt")))
+        await sink.emit(.messageStart(result))
+        await sink.emit(.messageEnd(result))
+        // An assistant end with no start of its own: there must be nothing lying
+        // in the slot for it to pick up.
+        await sink.emit(.messageEnd(.assistant(assistant("orphan"))))
+
+        #expect(persister.recorded.map(\.elapsedMs) == [nil, nil, nil])
+        #expect(clock.readCount == 0, "the clock was read for messages that are not measurements")
     }
 
     // MARK: - Ordering keys
@@ -365,14 +431,52 @@ struct SessionTimingTests {
         let directory = path.removingLastComponent()
         try FileManager.default.removeItem(atPath: directory.string)
         await #expect(throws: DoMoError.self) {
-            try await harness.persistMessage(.user("this cannot be written"))
+            try await harness.persistMessage(.user("this cannot be written"), elapsedMs: nil)
         }
         try FileManager.default.createDirectory(atPath: directory.string, withIntermediateDirectories: true)
         try saved.write(toFile: path.string, atomically: true, encoding: .utf8)
 
-        try await harness.persistMessage(.user("this one lands"))
+        try await harness.persistMessage(.user("this one lands"), elapsedMs: nil)
         #expect(try entries(of: path).compactMap(\.seq) == [0, 1, 2],
                 "the failed append consumed an ordering key")
+    }
+
+    /// The ordering key is a session-wide counter, and *every* append path draws
+    /// from it — the compaction checkpoint included, because it is an entry in the
+    /// same file and is written between two messages that both have numbers.
+    ///
+    /// Asserted as full contiguity rather than as "the checkpoint has a seq":
+    /// dropping the `nextSeq += 1` that follows the checkpoint's append leaves the
+    /// checkpoint numbered and the very next message numbered *the same*, which a
+    /// per-entry check reads as fine. A duplicate key is worse than a missing one —
+    /// a reader sorting by `seq` gets an arbitrary order between the two, and the
+    /// key exists precisely so that order is not arbitrary.
+    @Test("a session that compacts numbers every entry exactly once, with no gap and no duplicate")
+    func compactingSessionNumbersEveryEntryOnce() async throws {
+        let text = String(repeating: "a", count: 40)
+        let responder = TimingResponder([assistant(text, usageInput: 5000)])
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: responder.fn(),
+                summarizer: { _ in SummarizerResult(text: "SUMMARY") },
+                compaction: CompactionSettings(enabled: true, reserveTokens: 100, keepRecentTokens: 25),
+                contextWindow: 1000,
+                ids: TimingIDs(prefix: "sc")
+            )
+        )
+        let user = String(repeating: "b", count: 40)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+
+        let recorded = try entries(of: await harness.sessionFilePath)
+        let compactions = recorded.filter { if case .compaction = $0.payload { true } else { false } }
+        #expect(compactions.count == 1, "the premise is a session that compacted exactly once")
+        #expect(recorded.count > compactions.count + 1, "the premise is a checkpoint with entries on both sides")
+        #expect(recorded.compactMap(\.seq) == Array(0..<recorded.count),
+                "the compaction entry duplicated or skipped an ordering key: \(recorded.map(\.seq))")
     }
 
     @Test("a fork continues numbering past everything its own file already carries")

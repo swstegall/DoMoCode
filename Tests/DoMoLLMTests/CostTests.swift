@@ -266,6 +266,58 @@ struct UsageCostTests {
         #expect(decoded.reportedCost == dec("3.00003"))
     }
 
+    @Test("totalTokens saturates rather than trapping on numbers that arrived over a socket")
+    func totalTokensSaturates() throws {
+        // DECODED, not constructed, because that is the actual door: a
+        // `SessionAccounting` comes off the `/status` body and an assistant
+        // `usage` off the SSE `message_end` frame, both through a plain
+        // `JSONDecoder` with no bounds applied anywhere on the way in. The
+        // full-screen footer then reads `totalTokens` every frame, so a plain `+`
+        // here is a SIGTRAP that takes the whole TUI session down — in debug and
+        // in release alike.
+        let json = """
+            {"input":9223372036854775807,"output":9223372036854775807,\
+            "cacheRead":9223372036854775807,"cacheWrite":9223372036854775807,\
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}
+            """
+        let usage = try JSONDecoder().decode(Usage.self, from: Data(json.utf8))
+        // Proof the decoder really carried the value through — without this the
+        // assertion below could pass on a usage that was quietly clamped on ingest.
+        #expect(usage.input == Int.max)
+        #expect(usage.cacheWrite == Int.max)
+        #expect(usage.totalTokens == Int.max)
+    }
+
+    @Test("Folding two extreme turns clamps instead of trapping")
+    func additionSaturates() {
+        // The other half of the same door: the client folds `message_end` usages
+        // onto a running delta with this operator.
+        let extreme = Usage(
+            input: Int.max, output: Int.max, cacheRead: Int.max, cacheWrite: Int.max,
+            reasoning: Int.max
+        )
+        let sum = extreme + extreme
+        #expect(sum.input == Int.max)
+        #expect(sum.output == Int.max)
+        #expect(sum.cacheRead == Int.max)
+        #expect(sum.cacheWrite == Int.max)
+        #expect(sum.reasoning == Int.max)
+        #expect(sum.totalTokens == Int.max)
+    }
+
+    @Test("The clamp leaves ordinary arithmetic exactly as it was")
+    func saturationDoesNotDisturbOrdinarySums() {
+        // What the fix must NOT do: change any number a real provider produces.
+        #expect(Usage(input: 10, output: 3, cacheRead: 5, cacheWrite: 2).totalTokens == 20)
+        #expect((Usage(input: 10, output: 3) + Usage(input: 1, output: 1)).totalTokens == 15)
+        // Negative values are not a shape the wire should ever produce, but they
+        // decode, and they must clamp at the OTHER end rather than wrapping round
+        // to a huge positive total.
+        #expect(Usage(input: -5, output: 2).totalTokens == -3)
+        #expect((Usage(input: Int.min, output: 0) + Usage(input: Int.min, output: 0)).input == Int.min)
+        #expect(Usage(input: Int.min, output: Int.min).totalTokens == Int.min)
+    }
+
     @Test("A session line written before reported costs existed still decodes")
     func decodesLegacyLine() throws {
         let legacy = """

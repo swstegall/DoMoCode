@@ -198,10 +198,9 @@ struct ModelOverridesTests {
 
     /// An unknown window stays `nil` all the way to the runtime.
     ///
-    /// Substituting ``ResolvedConfiguration/defaultContextWindow`` here would be
-    /// the whole bug this phase exists to prevent: a meter cannot tell a guessed
-    /// denominator from a measured one, so it would render a confident
-    /// percentage of a number nobody stated.
+    /// Substituting a fallback here would be the whole bug this phase exists to
+    /// prevent: a meter cannot tell a guessed denominator from a measured one,
+    /// so it would render a confident percentage of a number nobody stated.
     @Test
     func anUnknownContextWindowStaysUnknown() throws {
         let config = try resolve(env: [EnvName.model: "mystery"])
@@ -209,15 +208,31 @@ struct ModelOverridesTests {
         #expect(config.modelRuntime(for: "mystery").contextWindow == nil)
     }
 
-    /// The compaction fallback and the CLI's copy of it must be the same number,
-    /// or the CLI and the harness disagree about when a session is full.
+    /// There is exactly one fallback window in the package, and it belongs to
+    /// the harness.
+    ///
+    /// `ResolvedConfiguration.defaultContextWindow` used to sit here as a second
+    /// copy of it — declared, pinned to the harness's number by a test, and read
+    /// by nothing at all. A constant nobody calls cannot make the CLI and the
+    /// harness agree; it can only give a later contributor a plausible-looking
+    /// number to substitute into a meter. It is gone, and what remains is the
+    /// claim that actually matters: an unstated window reaches the harness as
+    /// `nil`, and the harness — the only code that must have a number to compact
+    /// against — supplies its own.
     @Test
-    func theDefaultContextWindowMatchesTheHarnessFallback() {
-        #expect(ResolvedConfiguration.defaultContextWindow == 200_000)
-        #expect(
-            ResolvedConfiguration.defaultContextWindow
-                == AgentHarness.Configuration.fallbackContextWindow
-        )
+    func theOnlyFallbackContextWindowBelongsToTheHarness() throws {
+        #expect(AgentHarness.Configuration.fallbackContextWindow == 200_000)
+
+        let unstated = try resolve(user: Settings(model: "mystery"))
+        #expect(unstated.contextWindow == nil)
+        #expect(unstated.modelRuntime(for: "mystery").contextWindow == nil)
+
+        // And a stated one is passed through untouched rather than clamped to
+        // the harness's floor in either direction.
+        let stated = try resolve(user: Settings(contextWindow: 8_000))
+        #expect(stated.modelRuntime(for: "mystery").contextWindow == 8_000)
+        let large = try resolve(user: Settings(contextWindow: 1_000_000))
+        #expect(large.modelRuntime(for: "mystery").contextWindow == 1_000_000)
     }
 
     // MARK: Validation

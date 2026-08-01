@@ -218,6 +218,36 @@ struct FooterCompositionTests {
         #expect(FooterRow.formatCost(Decimal(string: "12.5")!, turns: 9, tokens: 10) == "$12.5")
     }
 
+    @Test("A credit renders as a negative number, never as an unpriced session")
+    func aNegativeCostIsANumberAndNotAQuestionMark() {
+        // `$0.00?` is reserved for exactly one situation: nobody priced this
+        // session. A credit — `costTotal` is whatever number arrived in the
+        // `/status` body, and nothing on this side bounds it — is a session that
+        // WAS priced and came out below zero, and the old `> 0` test could not
+        // tell the two apart: it showed a credit as "unpriced", a different claim
+        // entirely.
+        #expect(FooterRow.formatCost(Decimal(string: "-0.25")!, turns: 4, tokens: 12_000) == "-$0.25")
+        #expect(FooterRow.formatCost(Decimal(string: "-12.5")!, turns: 1, tokens: 10) == "-$12.5")
+        // The sign goes in front of the amount, the way accounting spells a
+        // credit, and never inside it.
+        #expect(!FooterRow.formatCost(Decimal(string: "-0.25")!, turns: 1, tokens: 1).contains("$-"))
+        // Exactly zero is still the unknown marker, so the fix did not widen it.
+        #expect(FooterRow.formatCost(0, turns: 4, tokens: 12_000) == "$0.00?")
+    }
+
+    @Test("A negative total still composes a row that fits")
+    func aNegativeCostFitsTheRow() {
+        // The `?` and the `-` are different widths; this is the fitting loop
+        // seeing the new spelling.
+        var model = sampleModel
+        model.accounting = accounting(
+            tokens: 7_000, cost: Decimal(string: "-0.25")!,
+            contextTokens: 50_000, window: 200_000, turns: 3
+        )
+        #expect(FooterRow.compose(model, width: 80).contains("-$0.25"))
+        for width in 1...200 { #expect(visibleWidth(FooterRow.compose(model, width: width)) <= width) }
+    }
+
     @Test("A session that spent nothing shows $0.00, and one that cannot know marks it")
     func zeroCostIsPrintedAndQualified() {
         // No turns: the session genuinely has not spent anything.
@@ -250,6 +280,33 @@ struct FooterCompositionTests {
         // A hostile snapshot must not trap the multiply or widen the row.
         let absurd = FooterRow.formatContext(accounting(contextTokens: Int.max, window: 1))
         #expect(absurd.hasSuffix("(9999%)"))
+    }
+
+    @Test("A hostile /status body draws a row instead of killing the session")
+    func absurdTotalsCannotTrapTheFooter() throws {
+        // DECODED, not constructed. The trap this closes is on numbers that
+        // arrive over the socket: `ServerClient.status` uses a plain
+        // `JSONDecoder` and nothing bounds any field on the way in, so a buggy,
+        // older or hostile server puts these straight into the footer's
+        // arithmetic. A hand-built fixture would not prove the decoder lets them
+        // through.
+        let json = """
+            {"usage":{"input":9223372036854775807,"output":9223372036854775807,\
+            "cacheRead":9223372036854775807,"cacheWrite":9223372036854775807,\
+            "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}},\
+            "costTotal":0,"contextTokens":9223372036854775807,\
+            "contextWindow":1,"turns":9223372036854775807}
+            """
+        let totals = try JSONDecoder().decode(SessionAccounting.self, from: Data(json.utf8))
+        #expect(totals.usage.input == Int.max, "the decoder did not carry the value through")
+        // Every one of these three lines is a SIGTRAP without the saturation, in
+        // debug AND in release: `+` on `Int` traps on overflow in both.
+        #expect(totals.usage.totalTokens == Int.max)
+        #expect(FooterRow.formatTokens(totals.usage.totalTokens).hasSuffix("M"))
+        let row = FooterRow.compose(FooterModel(cwd: "/w", branch: "main", accounting: totals), width: 200)
+        #expect(visibleWidth(row) <= 200)
+        #expect(row.contains("tok "))
+        #expect(row.hasSuffix("(9999%)"))
     }
 
     @Test("The rendered row is one line and fits, escapes included")
@@ -416,6 +473,167 @@ struct FooterAccountingTests {
         store.apply(assistant(Usage(input: 1_000)))
         store.adopt(status("someone-else", accounting: accounting(tokens: 99, turns: 9)))
         #expect(store.accounting?.usage.totalTokens == 1_000)
+    }
+
+    @Test("The accounting-only entry point checks the session too, not just adopt()")
+    func adoptAccountingChecksItsOwnSession() {
+        // `adoptAccounting` is a SECOND door — the session-open seed calls it
+        // directly, never through `adopt` — so its own guard has to be exercised
+        // directly. The test above only ever reached the guard inside `adopt`,
+        // which left this one dead code that nothing would have noticed the loss
+        // of.
+        let store = makeStore()
+        store.apply(assistant(Usage(input: 1_000)))
+        #expect(store.wantsAccountingPoll)
+        store.adoptAccounting(status("someone-else", accounting: accounting(tokens: 99, turns: 9)))
+        #expect(store.accounting?.usage.totalTokens == 1_000, "another session's totals were adopted")
+        #expect(store.accounting?.turns == 1)
+        // The guard sits BEFORE the flag, and must: a poll answered for the
+        // session we just left has not answered this one's question.
+        #expect(store.wantsAccountingPoll, "the wrong session's answer disarmed this session's poll")
+    }
+
+    // MARK: The context estimate
+
+    @Test("A streamed turn's own usage is what the context meter reads between polls")
+    func aFoldedTurnSetsTheContextEstimate() {
+        // The live estimate was entirely untested: replacing the assignment with
+        // `0` left the whole suite green. It is the prompt (billed, cached and
+        // cache-written alike) plus the completion.
+        let store = makeStore()
+        store.apply(assistant(Usage(input: 1_000, output: 234, cacheRead: 500, cacheWrite: 100)))
+        #expect(store.accounting?.contextTokens == 1_834)
+        // And on top of a polled baseline it supersedes the server's older figure.
+        let store2 = makeStore()
+        store2.adopt(status(accounting: accounting(
+            tokens: 90_000, contextTokens: 60_000, window: 120_000, turns: 5
+        )))
+        store2.apply(assistant(Usage(input: 1_000, output: 234, cacheRead: 500, cacheWrite: 100)))
+        #expect(store2.accounting?.contextTokens == 1_834)
+    }
+
+    @Test("An aborted turn does not rebase the context meter onto zero")
+    func aTurnThatReportedNoUsageLeavesTheContextEstimateAlone() {
+        // `AgentLoop` emits `message_end` for an assistant message with
+        // `usage: .zero` when the user presses Esc. Taking that literally read
+        // `ctx 0 (0%)` on a 120k context and stuck there until the next poll. A
+        // turn that reported nothing has not told us the context shrank.
+        let store = makeStore()
+        store.adopt(status(accounting: accounting(
+            tokens: 90_000, contextTokens: 60_000, window: 120_000, turns: 5
+        )))
+        store.apply(assistant(.zero))
+        #expect(store.accounting?.contextTokens == 60_000, "an abort deleted the context meter")
+        // The abort is still a turn, and still folds into the totals — only the
+        // context ESTIMATE is left alone.
+        #expect(store.accounting?.turns == 6)
+        #expect(store.accounting?.usage.totalTokens == 90_000)
+        #expect(store.wantsAccountingPoll, "the abort still needs the server's correction")
+    }
+
+    @Test("With no earlier number to keep, a usage-less turn honestly reads zero")
+    func theLegitimateZeroContextStillReadsZero() {
+        // The other half of the guard: it must not invent a context out of
+        // nothing, and it must not freeze the meter once a real number exists.
+        let store = makeStore()
+        store.apply(assistant(.zero))
+        #expect(store.accounting?.turns == 1)
+        #expect(store.accounting?.contextTokens == 0, "there was no earlier figure to preserve")
+        store.apply(assistant(Usage(input: 700, output: 42)))
+        #expect(store.accounting?.contextTokens == 742, "a real turn must still move it")
+        store.apply(assistant(.zero))
+        #expect(store.accounting?.contextTokens == 742, "and an abort after it must not delete it")
+    }
+
+    // MARK: A snapshot older than the fold
+
+    @Test("A /status computed before a turn was persisted cannot delete that turn")
+    func aStalePollCannotUnfoldATurn() {
+        // The interleave: the poll's snapshot is taken, the turn is persisted and
+        // streamed, the client folds it, and only THEN does the snapshot arrive.
+        // Adopting it would re-base onto the older total, discard the delta and
+        // disarm the poll — so the turn's tokens and cost vanish until the next
+        // prompt re-arms everything.
+        let store = makeStore()
+        let before = accounting(
+            tokens: 90_000, cost: Decimal(string: "0.5")!,
+            contextTokens: 60_000, window: 120_000, turns: 5
+        )
+        store.adopt(status(accounting: before))
+        store.apply(assistant(Usage(input: 1_000, output: 234, reportedCost: Decimal(string: "0.25")!)))
+        #expect(store.accounting?.usage.totalTokens == 91_234)
+
+        store.adopt(status(accounting: before))     // the snapshot from before the turn
+        #expect(store.accounting?.usage.totalTokens == 91_234, "a stale poll deleted the folded turn")
+        #expect(store.accounting?.turns == 6)
+        #expect(store.accounting?.costTotal == Decimal(string: "0.75")!)
+        #expect(store.wantsAccountingPoll, "and it must leave the poll armed to ask again")
+
+        // The answer that does include the turn wins, exactly as it always did.
+        store.adopt(status(accounting: accounting(
+            tokens: 91_234, cost: Decimal(string: "0.75")!,
+            contextTokens: 61_000, window: 120_000, turns: 6
+        )))
+        #expect(store.accounting?.turns == 6)
+        #expect(store.accounting?.contextTokens == 61_000)
+        #expect(store.wantsAccountingPoll == false)
+    }
+
+    @Test("The staleness guard cannot weld the poll shut when the CLIENT is what is wrong")
+    func aPersistentlyLowSnapshotIsEventuallyBelieved() {
+        // If the fold is the thing that is wrong — one turn counted twice —
+        // refusing forever would leave the footer permanently inflated and the
+        // poll re-asking every five seconds with no answer it would ever accept.
+        // The server is the authority; the refusal is bounded.
+        let store = makeStore()
+        store.adopt(status(accounting: accounting(tokens: 90_000, turns: 5)))
+        store.apply(assistant(Usage(input: 1_000)))
+        store.apply(assistant(Usage(input: 1_000)))   // the same turn, folded twice
+        #expect(store.accounting?.turns == 7)
+
+        let truth = status(accounting: accounting(tokens: 91_000, contextTokens: 61_000, turns: 6))
+        store.adopt(truth)
+        #expect(store.accounting?.turns == 7, "the first refusal")
+        store.adopt(truth)
+        #expect(store.accounting?.turns == 7, "the second refusal")
+        store.adopt(truth)
+        #expect(store.accounting?.turns == 6, "the guard never let go of a wrong local count")
+        #expect(store.accounting?.usage.totalTokens == 91_000)
+        #expect(store.wantsAccountingPoll == false)
+    }
+
+    @Test("A snapshot with no totals is still an answer, stale guard or not")
+    func aSnapshotWithoutTotalsStillDisarmsThePoll() {
+        // The guard reads `status.accounting`; a server that reports none must
+        // still be able to stop the poll loop, or an older runtime is asked every
+        // five seconds forever.
+        let store = makeStore()
+        store.adopt(status(accounting: accounting(tokens: 90_000, turns: 5)))
+        store.apply(assistant(Usage(input: 1_000)))
+        store.adopt(status(accounting: nil))
+        #expect(store.accounting?.usage.totalTokens == 91_000)
+        #expect(store.wantsAccountingPoll == false)
+    }
+
+    // MARK: Numbers that arrived over a socket
+
+    @Test("Absurd totals fold and re-base without trapping the session")
+    func hostileNumbersSaturateInsteadOfTrapping() {
+        // Both doors, on the store: the SSE fold (`Usage.+`) and the
+        // baseline-plus-delta sum the footer reads every frame.
+        let store = makeStore()
+        store.apply(assistant(Usage(input: Int.max, output: Int.max)))
+        store.apply(assistant(Usage(input: Int.max, output: Int.max)))
+        #expect(store.accounting?.usage.totalTokens == Int.max)
+
+        let other = makeStore("s2")
+        other.adopt(status("s2", accounting: SessionAccounting(
+            usage: Usage(input: Int.max), costTotal: 0, contextTokens: Int.max,
+            contextWindow: 1, turns: Int.max
+        )))
+        other.apply(assistant(Usage(input: 10)))
+        #expect(other.accounting?.turns == Int.max, "baseline.turns + pendingTurns trapped")
+        #expect(other.accounting?.usage.totalTokens == Int.max)
     }
 }
 

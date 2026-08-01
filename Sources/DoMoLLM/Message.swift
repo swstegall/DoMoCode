@@ -534,7 +534,19 @@ public struct Usage: Sendable, Hashable, Codable {
 
     public static let zero = Usage()
 
-    public var totalTokens: Int { input + output + cacheRead + cacheWrite }
+    /// The four token buckets summed, **saturating** at the ends of `Int` rather
+    /// than trapping.
+    ///
+    /// Not arithmetic paranoia. `SessionAccounting` — which owns a `Usage` — is
+    /// decoded straight off the `/status` socket by the
+    /// full-screen client, with no bounds applied anywhere on the way in, and the
+    /// footer reads this property every frame. A plain `+` on a buggy, older or
+    /// hostile snapshot is therefore a trap that kills the whole TUI session
+    /// mid-frame, with the alternate screen still on. A clamped total is wrong in
+    /// the same direction its input was already wrong; a trap loses the session.
+    public var totalTokens: Int {
+        saturatingAdd(saturatingAdd(saturatingAdd(input, output), cacheRead), cacheWrite)
+    }
 
     /// What this turn actually cost: the gateway's number when it gave one,
     /// otherwise the rate-derived total.
@@ -573,19 +585,36 @@ public struct Usage: Sendable, Hashable, Codable {
     /// runs. In other words the sum is always the sum of both sides'
     /// ``effectiveCostTotal``, and it only becomes visible as a reported cost
     /// once at least one side had one.
+    ///
+    /// Every token sum here saturates, for the reason ``totalTokens`` gives: the
+    /// client folds this operator over `usage` values that arrived on the SSE
+    /// `message_end` frame, which is the same unbounded door the `/status`
+    /// snapshot comes through.
     public static func + (lhs: Usage, rhs: Usage) -> Usage {
         Usage(
-            input: lhs.input + rhs.input,
-            output: lhs.output + rhs.output,
-            cacheRead: lhs.cacheRead + rhs.cacheRead,
-            cacheWrite: lhs.cacheWrite + rhs.cacheWrite,
+            input: saturatingAdd(lhs.input, rhs.input),
+            output: saturatingAdd(lhs.output, rhs.output),
+            cacheRead: saturatingAdd(lhs.cacheRead, rhs.cacheRead),
+            cacheWrite: saturatingAdd(lhs.cacheWrite, rhs.cacheWrite),
             reasoning: lhs.reasoning == nil && rhs.reasoning == nil
-                ? nil : (lhs.reasoning ?? 0) + (rhs.reasoning ?? 0),
+                ? nil : saturatingAdd(lhs.reasoning ?? 0, rhs.reasoning ?? 0),
             cost: lhs.cost + rhs.cost,
             reportedCost: lhs.reportedCost == nil && rhs.reportedCost == nil
                 ? nil : lhs.effectiveCostTotal + rhs.effectiveCostTotal
         )
     }
+}
+
+/// `lhs + rhs`, clamped to the ends of `Int` instead of trapping on overflow.
+///
+/// Two operands can only overflow when they share a sign, so the sign of `rhs`
+/// names which end it ran off. Deliberately file-private: the saturation is a
+/// property of ``Usage``'s own arithmetic — every value in it arrives from
+/// outside this process — and not a general licence to stop checking sums.
+private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+    guard overflow else { return sum }
+    return rhs > 0 ? Int.max : Int.min
 }
 
 // MARK: - Tools

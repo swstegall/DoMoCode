@@ -463,12 +463,35 @@ public final class EventStore {
     /// and it now asks only that.
     public func adoptAccounting(_ status: SessionStatus) {
         guard status.sessionID == selectedSessionID else { return }
-        // The server answered, so stop asking — whether or not it had totals to
-        // give. An older runtime sends no `accounting` at all, and re-asking it
-        // every five seconds forever would be a poll loop with no possible
-        // answer.
+        guard let reported = status.accounting else {
+            // The server answered, so stop asking — even though it had no totals
+            // to give. An older runtime sends no `accounting` at all, and
+            // re-asking it every five seconds forever would be a poll loop with
+            // no possible answer.
+            accountingPolled = true
+            return
+        }
+        // A snapshot that knows about FEWER turns than this client has already
+        // folded on top of the current baseline was computed before those turns
+        // were persisted, and is arriving after them. Adopting it would re-base
+        // onto the older total, discard the local delta AND disarm the poll — so
+        // the turn's tokens and its cost would simply vanish from the footer
+        // until the next prompt. Keep the fold and leave the poll armed instead;
+        // the next answer, five seconds later, has the turn in it.
+        //
+        // Bounded, and deliberately: if the client's own count is what is wrong
+        // (a turn folded twice), refusing forever would weld the self-correcting
+        // path shut on exactly the session that needs it. The server is
+        // authoritative; after `staleSnapshotLimit` consecutive refusals this
+        // believes it over its own arithmetic.
+        if let baseline = accountingBaseline, pendingTurns > 0,
+           reported.turns < Self.saturatingAdd(baseline.turns, pendingTurns),
+           staleSnapshots < Self.staleSnapshotLimit {
+            staleSnapshots += 1
+            return
+        }
+        staleSnapshots = 0
         accountingPolled = true
-        guard let reported = status.accounting else { return }
         // The polled total WINS. It is the one that counted the turns this
         // client never saw: everything before it attached, every compaction
         // and branch summary, and any turn a dropped frame cost it. Re-basing
@@ -493,15 +516,34 @@ public final class EventStore {
     private var pendingContextTokens: Int?
     /// Whether the server has been asked since the last locally-folded turn.
     private var accountingPolled = true
+    /// Consecutive `/status` snapshots refused as stale since the last one that
+    /// was adopted. Bounds the refusal, so a client whose own turn count is wrong
+    /// still gets back in sync — see ``adoptAccounting(_:)``.
+    private var staleSnapshots = 0
+    /// How many polls in a row may be refused before the server is believed
+    /// anyway. Two, because the race being defended against is one snapshot
+    /// computed a few milliseconds before a persist; the poll runs every five
+    /// seconds, so the next answer is already fresh.
+    private static let staleSnapshotLimit = 2
+
+    /// `lhs + rhs`, clamped instead of trapping. The baseline is decoded straight
+    /// off the `/status` socket, so `baseline.turns + pendingTurns` is the same
+    /// unbounded door ``DoMoLLM/Usage/totalTokens`` saturates for.
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        guard overflow else { return sum }
+        return rhs > 0 ? Int.max : Int.min
+    }
 
     /// What this session has spent and how full its context is, or `nil` when
     /// nothing has said.
     ///
     /// The polled snapshot is the baseline and the locally-folded turns are a
     /// delta on top of it, so the number moves the instant a turn ends and is
-    /// re-based — delta discarded — the next time ``adopt(_:)`` runs. `nil` means
-    /// "not reported": no poll has landed and no turn has streamed. A renderer
-    /// must not read that as zero.
+    /// re-based — delta discarded — the next time ``adopt(_:)`` runs with a
+    /// snapshot that is not older than the fold (see ``adoptAccounting(_:)``).
+    /// `nil` means "not reported": no poll has landed and no turn has streamed. A
+    /// renderer must not read that as zero.
     ///
     /// ``SessionAccounting/contextWindow`` comes only from the server, because
     /// only the server knows the model's window; until a poll lands it is `nil`
@@ -523,7 +565,7 @@ public final class EventStore {
             costTotal: baseline.costTotal + pendingUsage.effectiveCostTotal,
             contextTokens: pendingContextTokens ?? baseline.contextTokens,
             contextWindow: baseline.contextWindow,
-            turns: baseline.turns + pendingTurns
+            turns: Self.saturatingAdd(baseline.turns, pendingTurns)
         )
     }
 
@@ -533,7 +575,10 @@ public final class EventStore {
     /// turn of a run would be shown from the local fold alone until the next
     /// prompt — and the local fold cannot see a compaction's own usage, which is
     /// billed to the session but never streamed as an assistant turn. Self-
-    /// limiting: one poll answers it, and only a new turn re-arms it.
+    /// limiting: one poll answers it, and only a new turn re-arms it — with one
+    /// bounded exception, a snapshot ``adoptAccounting(_:)`` refuses as older
+    /// than the fold, which leaves the flag set so the next poll can bring the
+    /// answer that includes the turn.
     public var wantsAccountingPoll: Bool { !accountingPolled }
 
     /// Record that the server could not be asked, so the client stops asking
@@ -551,10 +596,22 @@ public final class EventStore {
         pendingTurns += 1
         // The context this turn ran against, as the provider itself reported it:
         // the prompt it was given (billed, cached and cache-written alike) plus
-        // the completion it produced. It is an estimate of what the NEXT turn
-        // starts from — it cannot see a tool result appended afterwards — which
-        // is exactly why a polled `contextTokens` supersedes it.
-        pendingContextTokens = usage.input + usage.cacheRead + usage.cacheWrite + usage.output
+        // the completion it produced — which is exactly ``Usage/totalTokens``,
+        // spelled that way so this shares its saturation rather than trapping on
+        // a hostile frame. It is an estimate of what the NEXT turn starts from —
+        // it cannot see a tool result appended afterwards — which is exactly why
+        // a polled `contextTokens` supersedes it.
+        //
+        // A turn that reported NO usage at all leaves the estimate alone. An
+        // aborted turn is the case: `AgentLoop` emits `message_end` with
+        // `usage: .zero` when the user presses Esc, and taking that literally
+        // re-based a 60k context onto `ctx 0 (0%)` and left it there until the
+        // next poll. A turn that told us nothing has not told us the context
+        // shrank. The zero still counts as a turn and still folds into the
+        // totals; it is only the context ESTIMATE that needs a number to be an
+        // estimate of.
+        let context = usage.totalTokens
+        if context > 0 { pendingContextTokens = context }
         accountingPolled = false
     }
 
@@ -564,6 +621,7 @@ public final class EventStore {
         pendingTurns = 0
         pendingContextTokens = nil
         accountingPolled = true
+        staleSnapshots = 0
     }
 
     /// Whether any of `ids` names a prompt this store has neither parked nor

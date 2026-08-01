@@ -115,12 +115,15 @@ public enum AtomicFileWrite {
         let temporaryURL = URL(fileURLWithPath: temporary.string)
         do {
             if FileManager.default.fileExists(atPath: destination.string) {
-                // `.usingNewMetadataOnly` is what carries the temp's mode across
-                // the replace. Without it the result takes the *old* file's
-                // metadata — which lands on almost the same mode, since the temp
-                // was created at the old file's mode, but puts the decision in
-                // two places that can disagree. One of them masks to the
-                // permission bits and the other does not.
+                // `.usingNewMetadataOnly` says the result keeps the temp's
+                // metadata rather than inheriting the original's. It is belt and
+                // braces, not load-bearing, and this comment says so because it
+                // used to claim otherwise: the temp is created at the old file's
+                // mode and `fchmod`ed to it, so both paths land on the same
+                // permission bits and no test in the suite can tell the flag
+                // apart from its absence. What it buys is that the mode is
+                // decided in one place instead of two — this function's masked
+                // 0o7777, rather than whatever `replaceItemAt` chooses to copy.
                 _ = try FileManager.default.replaceItemAt(
                     destinationURL,
                     withItemAt: temporaryURL,
@@ -144,15 +147,23 @@ public enum AtomicFileWrite {
     /// not exist yet.
     ///
     /// Only the leaf, and only through `readlink(2)`'s answer: this deliberately
-    /// does *not* use `URL.resolvingSymlinksInPath()`, which also canonicalises
-    /// every parent component (turning `/tmp/x` into `/private/tmp/x` on macOS)
-    /// and so reports a path the caller never asked about.
+    /// does *not* use `URL.resolvingSymlinksInPath()`, which canonicalises every
+    /// parent component (so it reports a path the caller never asked about) and,
+    /// worse, resolves nothing at all unless the whole path already exists — it
+    /// falls back to lexical standardisation otherwise. `readlink` does not care
+    /// whether the target exists, so this answers the same thing before and
+    /// after the first write. That stability is why it is public: ``FileLock``
+    /// derives a document's lock path from it, and a lock path that moved the
+    /// instant the target appeared was a lock two writers could each take a
+    /// private copy of.
     ///
     /// A relative target resolves against the link's own directory, which is
     /// what `readlink` means. The hop limit ends a symlink cycle; the path
-    /// returned in that case is still a symlink, and the subsequent `open` fails
-    /// with `ELOOP`, which is the honest error.
-    private static func resolvingSymlinkLeaf(_ path: FilePath) -> FilePath {
+    /// returned in that case is *still* a symlink, and `replace(at:with:)`
+    /// refuses it in `existingPermissions(at:)` with "not a regular file" —
+    /// `attributesOfItem` does not follow symlinks, so it sees the link itself.
+    /// The `open` that would have failed with `ELOOP` is never reached.
+    public static func resolvingSymlinkLeaf(_ path: FilePath) -> FilePath {
         var current = path
         for _ in 0..<8 {
             guard

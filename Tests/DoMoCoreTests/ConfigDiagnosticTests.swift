@@ -151,10 +151,38 @@ struct JSONSourceIndexTests {
         #expect(Set(index.keys) == [[], ["ab"], ["c\td"]])
     }
 
-    @Test("A surrogate pair in a key becomes one scalar")
+    @Test("A surrogate pair escape in a key becomes one scalar")
     func surrogatePairKey() throws {
+        // The *escaped* form is the whole point. A fixture spelled with a
+        // literal emoji never reaches the surrogate-combining branch — the
+        // scanner copies those bytes through — so it left that branch free to be
+        // deleted with the suite green.
+        let index = try JSONSourceIndex.index(Array(#"{"\uD83D\uDE42": 1}"#.utf8))
+        #expect(Set(index.keys) == [[], ["🙂"]])
+    }
+
+    @Test("A key spelled with literal non-ASCII bytes is decoded as itself")
+    func literalNonASCIIKey() throws {
         let index = try JSONSourceIndex.index(Array(#"{"🙂": 1}"#.utf8))
         #expect(Set(index.keys) == [[], ["🙂"]])
+    }
+
+    @Test("A surrogate that cannot be paired becomes U+FFFD rather than an error")
+    func loneSurrogateKey() throws {
+        // Swift's `String` cannot hold a lone surrogate and the document is
+        // still legal JSON text, so refusing it would reject a file Foundation
+        // decodes happily.
+        let high = try JSONSourceIndex.index(Array(#"{"\uD83Dx": 1}"#.utf8))
+        #expect(Set(high.keys) == [[], ["\u{FFFD}x"]])
+
+        // A high surrogate followed by an escape that is not a low one: the
+        // first becomes the replacement, the second is itself.
+        let mismatched = try JSONSourceIndex.index(Array(#"{"\uD83D\u0041": 1}"#.utf8))
+        #expect(Set(mismatched.keys) == [[], ["\u{FFFD}A"]])
+
+        // And a low surrogate with nothing before it.
+        let low = try JSONSourceIndex.index(Array(#"{"\uDE42": 1}"#.utf8))
+        #expect(Set(low.keys) == [[], ["\u{FFFD}"]])
     }
 
     @Test("A leading byte-order mark is skipped, as Foundation skips it")
@@ -627,6 +655,23 @@ struct ConfigDiagnosticRenderingTests {
         #expect(diagnostic.description.hasPrefix(diagnostic.headline))
     }
 
+    @Test("A settings file whose broken key is named `authorization` keeps its diagnostic")
+    func aCredentialNamedKeyStillReadsAsADiagnostic() throws {
+        // The key *name* is the half the user has to read to fix the file, and
+        // it is not a secret. A masker that struck out every credential-shaped
+        // literal, rather than only the values, would erase it.
+        let json = "{\n  \"authorization\": 1,\n  \"cookie\": 2\n}"
+        let diagnostic = ConfigDiagnostic(
+            file: "settings.json",
+            source: Array(json.utf8),
+            byteOffset: try byteOffset(of: "1,", in: json),
+            keyPath: ["authorization"],
+            problem: "expected a string"
+        )
+        #expect(diagnostic.excerpt == "  \"authorization\": 1,")
+        #expect(diagnostic.caretColumn == 20)
+    }
+
     @Test("localizedDescription is the diagnostic, not Foundation's placeholder")
     func localized() {
         let diagnostic = ConfigDiagnostic(
@@ -635,5 +680,109 @@ struct ConfigDiagnosticRenderingTests {
         )
         let error: any Error = diagnostic
         #expect(error.localizedDescription == "s.json: model — expected a string")
+    }
+}
+
+// MARK: - A credential in the source
+
+/// A settings file holds `mcpServers.*.environment`, so the line this type
+/// quotes back at the user is routinely a live API key — and *any* unrelated key
+/// in the file failing to decode is enough to reach that line. Every test here
+/// is about what stderr must not contain.
+@Suite("ConfigDiagnostic: a credential in the source")
+struct ConfigDiagnosticMaskingTests {
+
+    /// Shaped like the key a settings.json hands an MCP child.
+    private static let credential = "sk-proj-a1b2c3d4e5f6g7h8i9j0klmn"
+
+    /// The excerpt scalar the caret is pointing at, and everything after it.
+    private static func atCaret(_ diagnostic: ConfigDiagnostic) throws -> String {
+        let excerpt = try #require(diagnostic.excerpt)
+        let caret = try #require(diagnostic.caretColumn)
+        let scalars = Array(excerpt.unicodeScalars)
+        try #require(caret >= 1 && caret <= scalars.count)
+        return String(String.UnicodeScalarView(scalars[(caret - 1)...]))
+    }
+
+    @Test("A credential on the offending line is masked, and the caret does not move")
+    func credentialOnTheOffendingLineIsMasked() throws {
+        // One physical line, because that is what a tool-written settings.json
+        // is: the credential and the mistake share it.
+        let json = #"{"apiKey": "\#(Self.credential)", "name": "x", "contextWindow": "big"}"#
+        let diagnostic = try diagnose(Sample.self, json)
+
+        #expect(diagnostic.keyPath == ["contextWindow"])
+        let excerpt = try #require(diagnostic.excerpt)
+        #expect(!excerpt.contains(Self.credential))
+        #expect(!excerpt.contains("sk-"))
+        #expect(!diagnostic.description.contains(Self.credential))
+
+        // Everything the user needs to fix the file is still there, including
+        // the *name* of the key that holds the credential.
+        #expect(excerpt.contains(#""apiKey""#))
+        #expect(excerpt.contains(#""contextWindow": "big""#))
+
+        // And the caret still points at the offending value. A mask that
+        // substituted a marker of a different width — `[redacted]`, say — would
+        // land it somewhere else on the line.
+        #expect(excerpt.unicodeScalars.count == json.unicodeScalars.count)
+        let tail = try Self.atCaret(diagnostic)
+        #expect(tail.hasPrefix(#""big""#))
+    }
+
+    @Test("A credential on another line never reaches the diagnostic at all")
+    func credentialOnAnotherLineIsNotQuoted() throws {
+        let json =
+            "{\n"
+            + "  \"apiKey\": \"\(Self.credential)\",\n"
+            + "  \"name\": \"x\",\n"
+            + "  \"contextWindow\": \"big\"\n"
+            + "}"
+        let diagnostic = try diagnose(Sample.self, json)
+        #expect(diagnostic.location?.line == 4)
+        #expect(diagnostic.excerpt == "  \"contextWindow\": \"big\"")
+        #expect(!diagnostic.description.contains(Self.credential))
+    }
+
+    @Test("An MCP server's environment block is masked where it stands")
+    func mcpEnvironmentBlockIsMasked() throws {
+        let json =
+            "{\n"
+            + "  \"mcpServers\": {\n"
+            + "    \"acme\": {\"command\": \"acme-mcp\", "
+            + "\"environment\": {\"ACME_TOKEN\": \"\(Self.credential)\"}}\n"
+            + "  }\n"
+            + "}"
+        let diagnostic = ConfigDiagnostic(
+            file: "settings.json",
+            source: Array(json.utf8),
+            byteOffset: try byteOffset(of: "acme-mcp", in: json),
+            keyPath: ["mcpServers", "acme", "command"],
+            problem: "expected a value of type Int"
+        )
+        let excerpt = try #require(diagnostic.excerpt)
+        #expect(!excerpt.contains(Self.credential))
+        // The variable's name is not a secret and is the only way to know which
+        // server the diagnostic is about.
+        #expect(excerpt.contains(#""ACME_TOKEN""#))
+        #expect(excerpt.contains(#""command": "acme-mcp""#))
+        let tail = try Self.atCaret(diagnostic)
+        #expect(tail.hasPrefix("acme-mcp"))
+    }
+
+    @Test("Masking a value that reads like a header does not eat the rest of the line")
+    func aHeaderShapedValueDoesNotEatTheLine() throws {
+        // The exact reason the excerpt is not run through `Redaction.patterns`:
+        // its header rule takes everything after the marker to end of line, so
+        // the sibling member, the caret's target and the closing brace would all
+        // go with it.
+        let json = #"{"name": "authorization: see the docs", "contextWindow": "big"}"#
+        let diagnostic = try diagnose(Sample.self, json)
+        let excerpt = try #require(diagnostic.excerpt)
+        #expect(!excerpt.contains("authorization: see"))
+        #expect(excerpt.hasSuffix(#", "contextWindow": "big"}"#))
+        #expect(excerpt.unicodeScalars.count == json.unicodeScalars.count)
+        let tail = try Self.atCaret(diagnostic)
+        #expect(tail.hasPrefix(#""big""#))
     }
 }

@@ -112,18 +112,26 @@ enum PrintUsageEncoding {
 
     /// - Parameters:
     ///   - usage: the token counts to report.
-    ///   - cost: the total to report alongside them. Callers pass
+    ///   - cost: the total to report alongside them, or `nil` when nobody ever
+    ///     stated one — see ``reportableCost(_:ratesConfigured:reportedCost:)``,
+    ///     which is how callers decide. A non-`nil` caller passes
     ///     ``DoMoLLM/Usage/effectiveCostTotal`` or
     ///     ``DoMoHarness/SessionAccounting/costTotal`` — never `cost.total`,
     ///     which silently discards a price the gateway itself reported.
-    static func object(_ usage: Usage, cost: Decimal) -> JSONValue {
+    static func object(_ usage: Usage, cost: Decimal?) -> JSONValue {
         var fields: [String: JSONValue] = [
             "input": .int(usage.input),
             "output": .int(usage.output),
             "cacheRead": .int(usage.cacheRead),
             "cacheWrite": .int(usage.cacheWrite),
-            "cost": .string(decimalString(cost)),
         ]
+        // ABSENT, not `"0"`, when nothing priced the model — the same rule
+        // `reasoning` follows one line below, and for the same reason: an
+        // unpriced run that emits `"cost":"0"` is not reporting a fact, it is
+        // claiming the run was free.
+        if let cost {
+            fields["cost"] = .string(decimalString(cost))
+        }
         // ABSENT, not `0`, when the provider said nothing about reasoning.
         // ``DoMoLLM/Usage/reasoning`` is Optional for exactly this reason: a
         // provider that reports no reasoning tokens and one that never mentions
@@ -132,6 +140,35 @@ enum PrintUsageEncoding {
             fields["reasoning"] = .int(reasoning)
         }
         return .object(fields)
+    }
+
+    /// The cost to report, or `nil` when nothing in this run can state one.
+    ///
+    /// Three independent things can make a cost real, and any one of them is
+    /// enough:
+    ///
+    /// - `ratesConfigured`: the alias has a ``DoMoLLM/ModelCostRates`` table, so
+    ///   the number is derived from prices the operator wrote down. **Rates that
+    ///   happen to price a model at zero still count** — "this model is free" is
+    ///   a statement, and reporting it as unknown would throw away the one thing
+    ///   the operator took the trouble to say.
+    /// - `reportedCost`: the gateway itself billed a number
+    ///   (`x-litellm-response-cost`), which outranks any local table.
+    /// - A non-zero `total`: whatever produced it, a number that is not zero is
+    ///   plainly known. This is what keeps a `--resume`d session honest — the
+    ///   totals are seeded by walking the whole file, so a session priced by an
+    ///   earlier invocation must not be re-reported as unknown just because this
+    ///   invocation was started without a rate table.
+    ///
+    /// Only the run where all three are absent is genuinely unpriced, and that
+    /// is the one this returns `nil` for.
+    static func reportableCost(
+        _ total: Decimal,
+        ratesConfigured: Bool,
+        reportedCost: Decimal?
+    ) -> Decimal? {
+        guard ratesConfigured || reportedCost != nil || total != 0 else { return nil }
+        return total
     }
 
     /// A `Decimal` as its exact decimal digits, in a JSON **string**.
@@ -212,6 +249,13 @@ struct PrintEventSink: AgentEventSink {
     /// one when this turn failed. See ``RunGuard`` and this file's header note on
     /// the harness gap.
     let runGuard: RunGuard
+    /// Whether this run's alias has a price table at all.
+    ///
+    /// The sink sees only ``DoMoLLM/Usage``, whose zero `cost` is the same value
+    /// for a model priced at zero and a model nobody priced. That distinction is
+    /// the run's, not the turn's, so it is carried in from ``PrintMode`` — see
+    /// ``PrintUsageEncoding/reportableCost(_:ratesConfigured:reportedCost:)``.
+    let ratesConfigured: Bool
 
     /// The tty's inline-image capability, cell pixel size, and column budget, for
     /// text mode. Detected only when stdout is a terminal (else `images` is `nil`),
@@ -346,6 +390,7 @@ struct PrintEventSink: AgentEventSink {
     /// numbers were missing until Phase 5a: `reasoning`, which is emitted only
     /// when the provider reported it, and `cost`, without which a `-p` run could
     /// not tell a caller what it had just spent even though the harness knew.
+    /// `cost` is likewise omitted — never `"0"` — on a run nothing priced.
     private func emitAssistant(_ assistant: AssistantMessage) {
         log.emit(
             "assistant",
@@ -361,7 +406,11 @@ struct PrintEventSink: AgentEventSink {
                 ),
                 "usage": PrintUsageEncoding.object(
                     assistant.usage,
-                    cost: assistant.usage.effectiveCostTotal
+                    cost: PrintUsageEncoding.reportableCost(
+                        assistant.usage.effectiveCostTotal,
+                        ratesConfigured: ratesConfigured,
+                        reportedCost: assistant.usage.reportedCost
+                    )
                 ),
             ]
         )
@@ -604,6 +653,7 @@ public struct PrintMode: Sendable {
             workingDirectory: workingDirectory,
             toolNames: tools.map(\.definition.name),
             runGuard: runGuard,
+            ratesConfigured: modelRuntime.rates != nil,
             imageCapabilities: graphics.capabilities,
             cell: graphics.cell,
             imageMaxWidth: graphics.maxWidth
@@ -775,7 +825,7 @@ public struct PrintMode: Sendable {
             if let accounting {
                 fields["usage"] = PrintUsageEncoding.object(
                     accounting.usage,
-                    cost: accounting.costTotal
+                    cost: sessionCost(accounting)
                 )
             }
             log.emit("result", fields)
@@ -846,11 +896,29 @@ public struct PrintMode: Sendable {
     /// only what this invocation added. For a fresh `-p` run the two are the same
     /// number. Nothing is printed when there is nothing to report — a run that
     /// used no tokens has no total worth a line.
+    ///
+    /// A run nothing priced says `cost unknown` rather than `$0`. `$0` is a
+    /// claim — "this cost you nothing" — and it is the wrong one to make about a
+    /// model whose price nobody ever stated; the same phase renders an unknown
+    /// context window as `?` for exactly this reason. A model configured at a
+    /// price of zero still prints `$0`, because that IS a statement.
     private func reportSessionTotal(_ accounting: SessionAccounting?) {
         guard mode == .text, let accounting, accounting.usage.totalTokens > 0 else { return }
-        channel.writeErr(
-            "… session total: \(accounting.usage.totalTokens) tokens · "
-                + "$\(PrintUsageEncoding.decimalString(accounting.costTotal))\n"
+        let cost =
+            sessionCost(accounting)
+            .map { "$" + PrintUsageEncoding.decimalString($0) } ?? "cost unknown"
+        channel.writeErr("… session total: \(accounting.usage.totalTokens) tokens · \(cost)\n")
+    }
+
+    /// The session total to report, or `nil` when nothing priced this session.
+    /// One decision, read by both the `result` event and the stderr line, so the
+    /// JSON stream and the human line can never disagree about whether the run
+    /// was priced.
+    private func sessionCost(_ accounting: SessionAccounting) -> Decimal? {
+        PrintUsageEncoding.reportableCost(
+            accounting.costTotal,
+            ratesConfigured: modelRuntime.rates != nil,
+            reportedCost: accounting.usage.reportedCost
         )
     }
 

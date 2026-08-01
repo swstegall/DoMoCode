@@ -75,6 +75,34 @@ struct RedactionRegistryTests {
         let text = "the build finished in 4.2 seconds with 0 warnings"
         #expect(vault.diagnostic(text) == text)
     }
+
+    @Test("A registered literal cannot switch a pattern rule off")
+    func aRegisteredLiteralCannotPoisonAPatternRule() {
+        let vault = RedactionVault()
+        // Not hypothetical: `authHeader` is a credential-carrying config key and
+        // its value is a *header name*. With the registry running first, this
+        // registration deleted the substring the header rule matches on, and
+        // `Basic Zm9vOmJhcg==` — which carries no vendor prefix and no bearer
+        // scheme, so no other rule sees it — was written to the session file.
+        vault.register("Authorization")
+        let result = vault.diagnostic("Authorization: Basic Zm9vOmJhcg==")
+        #expect(!result.contains("Zm9vOmJhcg=="))
+        // The name goes too, because the literal really is registered. Losing
+        // the header's name is a diagnostic cost; losing its value is a breach.
+        #expect(result == "[redacted]: [redacted]")
+    }
+
+    @Test("A registered literal is still removed when no pattern rule sees it")
+    func theRegistryIsStillTheBackstop() {
+        // The other half of the ordering: patterns first must not mean patterns
+        // only. This value has no shape any rule recognizes.
+        let vault = RedactionVault()
+        vault.register("zqx-domocore-literal-77413")
+        #expect(
+            vault.diagnostic("tenant acme rejected zqx-domocore-literal-77413 at 12:30:45")
+                == "tenant acme rejected [redacted] at 12:30:45"
+        )
+    }
 }
 
 // MARK: - Pattern rules
@@ -120,6 +148,61 @@ struct RedactionPatternTests {
             Redaction.patterns(text)
                 == "HTTP/1.1 401\r\nAuthorization: [redacted]\r\nX-Request-Id: req_9\r\n"
         )
+    }
+
+    @Test("A vendor-prefixed header name is still a header")
+    func prefixedHeaderNameIsStillAHeader() {
+        // The marker has to *end* the header name, not merely appear in it, so
+        // anchoring the rule must not cost us the names a gateway actually
+        // sends.
+        #expect(
+            Redaction.patterns("HTTP/1.1 401\nAnthropic-Api-Key: sk-ant-secret\nX-Request-Id: r1")
+                == "HTTP/1.1 401\nAnthropic-Api-Key: [redacted]\nX-Request-Id: r1"
+        )
+        #expect(
+            Redaction.patterns("  Set-Cookie: sid=xyz") == "  Set-Cookie: [redacted]"
+        )
+    }
+
+    @Test("A header block quoted inside a one-line body is still a header block")
+    func anEscapedLineBreakIsAHeaderPosition() {
+        // A response's headers reach an error message through a JSON string,
+        // where the line breaks are two characters. That is a header position
+        // even though the text is one physical line.
+        let body = #"upstream said: HTTP/1.1 401\r\nSet-Cookie: sid=abc123; HttpOnly"#
+        #expect(Redaction.patterns(body) == #"upstream said: HTTP/1.1 401\r\nSet-Cookie: [redacted]"#)
+    }
+
+    @Test("A sentence that only mentions a header still loses the credential in it")
+    func proseKeepsTheOtherRules() {
+        // Leaving a prose span alone rather than rewriting it is what makes this
+        // safe: the token and bearer rules run over the whole string afterwards,
+        // so declining to treat the marker as a header costs nothing.
+        #expect(
+            Redaction.patterns("the api-key: sk-1234567890ABCDEFGH was refused")
+                == "the api-key: [redacted] was refused"
+        )
+        #expect(
+            Redaction.patterns("no cookie: Bearer abcdefghijklmnopqrstuvwx was sent")
+                == "no cookie: Bearer [redacted] was sent"
+        )
+    }
+
+    @Test("A word before the marker makes it prose even at the start of a line")
+    func aWordBeforeTheMarkerIsProseOnAnyLine() {
+        // The blank may indent a header line; it may never separate a word from
+        // the header's name.
+        #expect(Redaction.patterns("a\nthe cookie: is stale") == "a\nthe cookie: is stale")
+    }
+
+    @Test("Every header on a multi-line block is redacted, and only the headers")
+    func everyHeaderInABlockIsRedacted() {
+        #expect(
+            Redaction.patterns("a\r\nAuthorization: 1\r\nCookie: 2\r\nEnd: 3")
+                == "a\r\nAuthorization: [redacted]\r\nCookie: [redacted]\r\nEnd: 3"
+        )
+        #expect(Redaction.patterns("a\rCookie: 2") == "a\rCookie: [redacted]")
+        #expect(Redaction.patterns("\tCookie: 2") == "\tCookie: [redacted]")
     }
 
     @Test("A header with no value is left alone rather than given a fake secret")
@@ -240,6 +323,17 @@ struct RedactionSurvivalTests {
             "Bearer short",
             "let x = a?b:c; const y=[1,2,3].map(v=>v*2);",
             "/Users/sam/Programming/DoMoCode/Sources/DoMoCore/Redaction.swift:42:11",
+            // A header *named* mid-sentence is prose, not a header. `DoMoError`
+            // promises one line and that line is persisted as an assistant
+            // message's `errorMessage`, so an unanchored header rule deleted the
+            // actionable half of every sentence like these.
+            "the api-key: header was rejected, rotate the key in the dashboard",
+            "no cookie: value was sent, so the session could not be resumed",
+            "set authorization: to a bearer scheme and retry the request",
+            "gateway says x-api-key: is required for this route; see the docs",
+            // The marker has to end the header name, so a longer word that
+            // merely starts with one is not a header even at the line start.
+            "cookieJar: enabled, 3 entries",
         ])
     func innocentTextSurvives(text: String) {
         #expect(Redaction.patterns(text) == text)
@@ -269,9 +363,29 @@ struct RedactionKeyNameTests {
             "prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens",
             "tokens_before", "token_count", "prompt_tokens_details",
             "completion_tokens_details", "cache_read_input_tokens",
+            // Everything below was called a credential by the enumeration this
+            // rule replaced. The old test listed exactly the names that already
+            // passed, so it could never have found them.
+            "audio_tokens", "text_tokens", "image_tokens",
+            "accepted_prediction_tokens", "rejected_prediction_tokens",
+            "cache_read_tokens", "cache_write_tokens", "cache_creation_input_tokens",
+            "num_tokens", "tokens", "tokenCount", "n_tokens", "server_tool_use_tokens",
         ])
     func tokenCountersAreNotSecrets(name: String) {
         #expect(!Redaction.isSecretKeyName(name))
+    }
+
+    @Test(
+        "A plural credential is a credential, however counter-shaped it reads",
+        arguments: [
+            "access_tokens", "refresh_tokens", "api_tokens", "auth_tokens",
+            "session_tokens", "id_tokens", "apiTokens", "AccessTokens",
+        ])
+    func pluralCredentialsAreStillSecrets(name: String) {
+        // The counter rule keys on the plural, so it has to be told that a
+        // credential can be plural too. A bare "ends in tokens" rule prints
+        // every one of these.
+        #expect(Redaction.isSecretKeyName(name))
     }
 
     @Test(
@@ -311,12 +425,30 @@ struct RedactionJSONTests {
             "completion_tokens": 678,
             "total_tokens": 13_023,
             "max_tokens": 8192,
-            "prompt_tokens_details": ["cached_tokens": 4096],
-            "completion_tokens_details": ["reasoning_tokens": 512],
+            "prompt_tokens_details": [
+                "cached_tokens": 4096, "audio_tokens": 0, "text_tokens": 12_000,
+                "image_tokens": 345, "cache_read_tokens": 4096, "cache_write_tokens": 0,
+            ],
+            "completion_tokens_details": [
+                "reasoning_tokens": 512, "accepted_prediction_tokens": 8,
+                "rejected_prediction_tokens": 3, "audio_tokens": 0,
+            ],
             "tokens_before": 900,
             "token_count": 42,
+            "num_tokens": 13_023,
+            "tokens": 13_023,
         ]
         #expect(RedactionVault().redact(usage) == usage)
+    }
+
+    @Test("A member whose key is a plural credential is still replaced")
+    func pluralCredentialMembersAreReplaced() {
+        // The mirror of the test above: the counter allow-list must not have
+        // opened a hole for `{"access_tokens": [...]}`.
+        let body: JSONValue = ["access_tokens": "wholly-unrecognizable-value", "total_tokens": 7]
+        let redacted = RedactionVault().redact(body)
+        #expect(redacted["access_tokens"] == .string("[redacted]"))
+        #expect(redacted["total_tokens"] == .int(7))
     }
 
     @Test("DoMoCode's own Usage shape round-trips completely unchanged")
@@ -415,6 +547,120 @@ struct RedactionHeaderTests {
         vault.register("hunter2correcthorse")
         let redacted = vault.redact(headers: ["X-Trace": "attempt with hunter2correcthorse"])
         #expect(redacted["X-Trace"] == "attempt with [redacted]")
+    }
+}
+
+// MARK: - Masking a line of source
+
+@Suite("Redaction: masking a source line")
+struct RedactionSourceLineTests {
+
+    /// A key shaped exactly like the one a settings.json hands an MCP child.
+    private static let credential = "sk-proj-a1b2c3d4e5f6g7h8i9j0klmn"
+
+    private static func stars(_ text: String) -> String {
+        String(repeating: "*", count: text.unicodeScalars.count)
+    }
+
+    @Test("A value under a credential-shaped key is masked, and the line keeps its length")
+    func aValueUnderACredentialKeyIsMasked() {
+        let line = #"    "OPENAI_API_KEY": "\#(Self.credential)","#
+        let masked = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(masked == #"    "OPENAI_API_KEY": "\#(Self.stars(Self.credential))","#)
+        // The invariant the caret depends on, asserted directly.
+        #expect(masked.unicodeScalars.count == line.unicodeScalars.count)
+    }
+
+    @Test("The key itself is never masked — it is the half the user has to read")
+    func theKeyIsNotMasked() {
+        let masked = Redaction.maskingSecrets(
+            inSourceLine: #"  "apiKey": "\#(Self.credential)""#
+        )
+        #expect(masked.contains(#""apiKey""#))
+        #expect(!masked.contains("sk-"))
+    }
+
+    @Test("A value a pattern rule recognizes is masked whatever its key is called")
+    func aRecognizableValueIsMaskedUnderAnyKey() {
+        let secret = "https://alice:hunter2@git.example.com/repo.git"
+        let line = #"  "repository": "\#(secret)","#
+        let masked = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(masked == #"  "repository": "\#(Self.stars(secret))","#)
+    }
+
+    @Test("Masking is bounded to the literal, not to the end of the line")
+    func maskingIsBoundedToTheLiteral() {
+        // The exact shape that rules `Redaction.patterns` out for this job: its
+        // header rule would take the value, the comma, the sibling member and
+        // the rest of the line with it.
+        let line = #"  "note": "authorization: rotate it", "model": "gpt-5""#
+        let masked = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(masked == #"  "note": "\#(Self.stars("authorization: rotate it"))", "model": "gpt-5""#)
+    }
+
+    @Test("An ordinary settings line is returned byte for byte")
+    func anOrdinaryLineIsUntouched() {
+        for line in [
+            #"  "contextWindow": 200000,"#,
+            #"  "model": "gpt-5-codex","#,
+            #"  "baseUrl": "https://gateway.example.com:8443/v1","#,
+            #"  "command": "/usr/local/bin/node","#,
+            #"  "prompt_tokens_details": {"cached_tokens": 4096},"#,
+            "{",
+            "",
+        ] {
+            #expect(Redaction.maskingSecrets(inSourceLine: line) == line)
+        }
+    }
+
+    @Test("A key is only attributed to the literal that really follows it")
+    func aKeyIsNotAttributedAcrossAStructuralCharacter() {
+        // `environment` is not a secret name and `OPENAI_API_KEY` is a key, not
+        // a value — so the only thing masked here is the value at the end.
+        let line = #"  "environment": {"OPENAI_API_KEY": "\#(Self.credential)"}"#
+        let masked = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(masked == #"  "environment": {"OPENAI_API_KEY": "\#(Self.stars(Self.credential))"}"#)
+    }
+
+    @Test("A literal the line ends inside of is masked to the end of the line")
+    func anUnterminatedLiteralIsMaskedWhole() {
+        let line = #"  "password": "hunter2correcthorse"#
+        let masked = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(masked == #"  "password": "\#(Self.stars("hunter2correcthorse"))"#)
+        #expect(masked.unicodeScalars.count == line.unicodeScalars.count)
+    }
+
+    @Test("An escaped quote does not end a literal early")
+    func anEscapedQuoteIsPartOfTheValue() {
+        let line = #"  "password": "ab\"cd", "model": "m""#
+        let masked = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(masked == #"  "password": "\#(Self.stars(##"ab\"cd"##))", "model": "m""#)
+    }
+
+    @Test("A tab inside a masked value stays a tab, so the columns after it do not move")
+    func aTabInsideAMaskedValueSurvives() {
+        // The excerpt expands tabs to a fixed stop. Turning one into `*` would
+        // preserve the scalar count and still move every column after it.
+        let line = "  \"password\": \"a\tb\""
+        #expect(Redaction.maskingSecrets(inSourceLine: line) == "  \"password\": \"*\t*\"")
+    }
+
+    @Test("Masking a line twice changes nothing further")
+    func maskingIsIdempotent() {
+        let line = #"    "OPENAI_API_KEY": "\#(Self.credential)","#
+        let once = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(Redaction.maskingSecrets(inSourceLine: once) == once)
+    }
+
+    @Test("Multi-scalar text is masked scalar for scalar, not byte for byte")
+    func maskingCountsScalarsNotBytes() {
+        // A byte-counted mask would emit two `*` for the `é` and four for the
+        // emoji, sliding every column after them by five. Spelled with escapes
+        // so the fixture cannot arrive decomposed and mean something else.
+        let line = "  \"password\": \"\u{E9}\u{1F642}x\""
+        let masked = Redaction.maskingSecrets(inSourceLine: line)
+        #expect(masked == "  \"password\": \"***\"")
+        #expect(masked.unicodeScalars.count == line.unicodeScalars.count)
     }
 }
 

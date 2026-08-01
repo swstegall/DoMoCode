@@ -103,8 +103,10 @@ public struct TrustStore: Sendable {
     /// already handles a throw and a lost trust decision is a security-relevant
     /// surprise.
     public func setDecision(_ trusted: Bool, for directory: FilePath) throws(DoMoError) {
-        // Before the lock, because the lock file is a sibling of trust.json and on a
-        // first run the config directory does not exist yet.
+        // Before the lock, because on a first run the config directory does not exist
+        // yet and both the lock file and trust.json need it. (For a symlinked store the
+        // lock is a sibling of the link's *target* instead; ``withLock(_:)`` creates
+        // that directory itself.)
         let parent = Self.parent(of: path.string)
         do {
             try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
@@ -130,13 +132,25 @@ public struct TrustStore: Sendable {
 
     /// The sidecar lock file guarding a write.
     ///
-    /// Derived from the **symlink-resolved** trust.json, so two processes reaching the
-    /// same store by different names — a dotfiles symlink, `/tmp` versus
-    /// `/private/tmp` — contend for one lock instead of each taking a private one and
-    /// both winning. Internal rather than private so a test can hold it and check that
-    /// a write respects it; there is no other way to assert the lock exists.
+    /// Derived with ``FileLock/lockPath(forDocumentAt:)``, which follows a symlinked
+    /// leaf exactly the way ``AtomicFileWrite`` follows it when it writes — so a
+    /// dotfiles-symlinked trust.json is locked where it is written. Processes that
+    /// spell the *parent* differently (`/tmp` versus `/private/tmp`, `$HOME` versus
+    /// its real location) need no help: `flock(2)` locks an inode, and both spellings
+    /// name the same one.
+    ///
+    /// It used to be `URL.resolvingSymlinksInPath()`, which resolves a symlink only
+    /// once the target exists. For a trust.json symlinked at a file no decision had
+    /// created yet, the lock therefore lived on `.trust.json.lock` before the first
+    /// write and on `.real.json.lock` after it — and this is the store where that is
+    /// worst, because ``setDecision(_:for:)`` then *succeeds* under a lock somebody
+    /// else is holding rather than throwing, silently bypassing the guarantee its own
+    /// documentation makes.
+    ///
+    /// Internal rather than private so a test can hold it and check that a write
+    /// respects it; there is no other way to assert the lock exists.
     var lockPath: String {
-        FileLock.sidecarPath(for: URL(fileURLWithPath: path.string).resolvingSymlinksInPath().path)
+        FileLock.lockPath(forDocumentAt: path.string)
     }
 
     /// Runs `body` holding an exclusive `flock(2)` on `.trust.json.lock`.
@@ -155,6 +169,20 @@ public struct TrustStore: Sendable {
     /// into a hard error on every later launch.
     private func withLock(_ body: () throws(DoMoError) -> Void) throws(DoMoError) {
         let lockPath = FilePath(self.lockPath)
+
+        // The lock is a sibling of the *resolved* trust.json, which for a symlinked
+        // store is a directory `setDecision(_:for:)` never created — it created the
+        // config directory the link lives in. `FileLock.withLock` creates its own
+        // parent for the same reason; this is the open-coded copy of that, and without
+        // it a store symlinked into a not-yet-created dotfiles directory fails to lock
+        // a write that would otherwise have succeeded.
+        let lockDirectory = lockPath.removingLastComponent().string
+        if !lockDirectory.isEmpty {
+            try? FileManager.default.createDirectory(
+                atPath: lockDirectory,
+                withIntermediateDirectories: true
+            )
+        }
 
         let descriptor: FileDescriptor
         do {

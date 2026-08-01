@@ -694,18 +694,25 @@ struct AgentHarnessTests {
             sessionDirectory: makeSessionDirectory(),
             configuration: configuration(streamFn: responder.fn(), ids: SequentialIDs(prefix: "s"))
         )
-        try await harness.persistMessage(.user("go"))
-        try await harness.persistMessage(.assistant(AssistantMessage(
-            content: [
-                .toolCall(ToolCallBlock(id: "answered", name: "echo")),
-                .toolCall(ToolCallBlock(id: "dangling", name: "park")),
-            ],
-            model: "test-model",
-            stopReason: .toolUse
-        )))
-        try await harness.persistMessage(.tool(ToolResultBlock(
-            toolCallID: "answered", toolName: "echo", output: "echoed"
-        )))
+        // `elapsedMs: nil` throughout: these are appended outside the event stream,
+        // so nothing timed them and `0` would be a claim about a stopwatch nobody
+        // started.
+        try await harness.persistMessage(.user("go"), elapsedMs: nil)
+        try await harness.persistMessage(
+            .assistant(AssistantMessage(
+                content: [
+                    .toolCall(ToolCallBlock(id: "answered", name: "echo")),
+                    .toolCall(ToolCallBlock(id: "dangling", name: "park")),
+                ],
+                model: "test-model",
+                stopReason: .toolUse
+            )),
+            elapsedMs: nil
+        )
+        try await harness.persistMessage(
+            .tool(ToolResultBlock(toolCallID: "answered", toolName: "echo", output: "echoed")),
+            elapsedMs: nil
+        )
 
         let sealed = try await harness.sealUnansweredToolCalls(reason: "cleared")
         #expect(sealed == ["dangling"], "sealed the wrong set: \(sealed)")
@@ -1042,6 +1049,55 @@ struct AgentHarnessTests {
             contextWindow: 200_000
         )
         #expect(roomy.compaction == CompactionSettings.default, "a window with room to spare must change nothing")
+    }
+
+    /// The constructor's clamp is not the last word, and this is what makes the
+    /// second one in `compactIfNeeded` load-bearing rather than defensive noise.
+    /// ``AgentHarness/Configuration`` is a struct the caller keeps, and both
+    /// `compaction` and `contextWindow` are `var`s: setting the window afterwards
+    /// leaves budgets that were clamped against a completely different one.
+    ///
+    /// Delete the re-clamp and this session never compacts at all — and does so
+    /// *silently*, which is the failure the clamp exists to prevent. A 1,000-token
+    /// reserve against a 1,000-token window puts `shouldCompact`'s threshold at
+    /// zero, so it fires on every turn; `prepareCompaction` then finds nothing
+    /// older than a 1,000-token recent budget in a ~400-token path, returns `nil`,
+    /// and the run proceeds over-full with no entry written and nothing said.
+    @Test("a window set after construction re-clamps the budgets, so compaction still fires")
+    func compactionReclampsAWindowChangedAfterConstruction() async throws {
+        let asked = CompactionSettings(enabled: true, reserveTokens: 1_000, keepRecentTokens: 1_000)
+        let text = String(repeating: "a", count: 400)
+        let responder = ScriptedResponder([assistant(text, usageInput: 5_000)])
+        let spy = SummarizerSpy(text: "SUMMARY")
+        var config = configuration(
+            streamFn: responder.fn(),
+            summarizer: spy.fn(),
+            compaction: asked,
+            contextWindow: nil,
+            ids: SequentialIDs(prefix: "rc")
+        )
+        // The premise: against the 200K fallback these budgets are roomy, so the
+        // constructor's clamp left them exactly as written…
+        #expect(config.compaction == asked, "the premise is budgets the constructor had no reason to touch")
+        // …and now the pairing is broken from outside, which is the one thing a
+        // clamp at construction cannot cover.
+        config.contextWindow = 1_000
+
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: config
+        )
+        let user = String(repeating: "b", count: 400)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+        _ = try await harness.run(prompt: user)
+
+        #expect(spy.recorded.count == 1, "compaction never summarized anything: the budgets were not re-clamped")
+        let compactions = try entries(of: await harness.sessionFilePath).filter {
+            if case .compaction = $0.payload { true } else { false }
+        }
+        #expect(compactions.count == 1, "no compaction entry was written")
     }
 
     @Test("compaction does not fire when disabled even over a tiny window")

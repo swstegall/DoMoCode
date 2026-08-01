@@ -168,6 +168,16 @@ enum FooterRow {
 
     // MARK: Formatting
     //
+    // **Every number on this row arrived over a socket.** The whole
+    // `SessionAccounting` is decoded from the `/status` body with no bounds
+    // applied anywhere on the way in, and the token halves of it are also folded
+    // from SSE `message_end` frames, so a buggy, older or hostile server can put
+    // `Int.max` in any field. Arithmetic here therefore either saturates
+    // (``DoMoLLM/Usage/totalTokens`` and `Usage.+`, which clamp) or clamps its
+    // operands before the operation (``formatContext``'s multiply). A trap in any
+    // of them is not a wrong number on a row — it is SIGTRAP with the alternate
+    // screen still on, which takes the session with it.
+    //
     // These three deliberately produce the SAME strings as
     // `DoMoCLI/InlineAccountingSummary`, which draws the identical numbers on the
     // inline REPL's status line. Two surfaces of one program that render the same
@@ -208,11 +218,22 @@ enum FooterRow {
     /// unknown with the same glyph the context meter uses for an unknown window
     /// rather than asserting either one. A session that has genuinely spent
     /// nothing (no turns at all) still reads `$0.00`, never a blank.
+    ///
+    /// `$0.00?` therefore means EXACTLY ONE THING: nobody priced this session.
+    /// The test is `!= 0` and not `> 0` because a NEGATIVE total is a different
+    /// fact, and one this side does not get to rule out: `costTotal` is whatever
+    /// number the server put in the `/status` body, decoded with no bounds (the
+    /// two local sources of a price — a validated `x-litellm-response-cost` and a
+    /// validated rate table — both refuse negatives, but neither is what this
+    /// argument comes through). Whatever produced it, a credit is a session that
+    /// WAS priced, so it renders as the negative number it is — `-$0.25`, sign in
+    /// front of the amount the way accounting spells a credit — instead of being
+    /// swept into the "unknown" bucket by a test that could not tell the two apart.
     static func formatCost(_ total: Decimal, turns: Int, tokens: Int) -> String {
-        guard total > 0 else {
+        guard total != 0 else {
             return turns > 0 && tokens > 0 ? "$0.00?" : "$0.00"
         }
-        return "$" + total.description
+        return total < 0 ? "-$" + (-total).description : "$" + total.description
     }
 
     /// The context meter: how big the context is, and how much of the window it
@@ -230,10 +251,11 @@ enum FooterRow {
     static func formatContext(_ accounting: SessionAccounting) -> String {
         let label = formatTokens(max(0, accounting.contextTokens))
         guard let window = accounting.contextWindow, window > 0 else { return "ctx \(label) (?)" }
-        // Clamped before the multiply, not after: these numbers arrive over a
-        // socket, and `contextTokens * 100` on a hostile value traps rather than
-        // wrapping. The inline surface takes its input from the local harness and
-        // has no such door.
+        // Clamped before the multiply, not after: `contextTokens * 100` on a
+        // hostile value traps rather than wrapping, and every number on this row
+        // arrives over a socket (see the section comment above — the token and
+        // cost segments answer the same door by saturating instead). The inline
+        // surface takes its input from the local harness and has no such door.
         let tokens = min(max(0, accounting.contextTokens), Int.max / 100)
         return "ctx \(label) (\(min(9_999, tokens * 100 / window))%)"
     }

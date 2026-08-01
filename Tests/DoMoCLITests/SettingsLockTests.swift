@@ -93,11 +93,12 @@ struct SettingsPersistenceTests {
         try "{}".write(toFile: path, atomically: true, encoding: .utf8)
         let persist = PermissionSetup.persister(configDirectory: config)
 
-        let held = await FileLock.withLock(at: PermissionSetup.settingsLockPath(path)) { () async -> Bool in
+        let held = try await FileLock.withLock(at: PermissionSetup.settingsLockPath(path)) {
+            () async -> Bool in
             await persist(grant("git *"))
             return true
         }
-        #expect(held == true, "the test could not take the lock it needs to hold, so it proved nothing")
+        #expect(held == .ran(true), "the test could not take the lock it needs to hold, so it proved nothing")
         #expect(
             try grantedPatterns(inSettingsAt: path).isEmpty,
             "the persister wrote while another holder had the lock"
@@ -106,6 +107,82 @@ struct SettingsPersistenceTests {
         // And the refusal above was contention, not a broken persister.
         await persist(grant("git *"))
         #expect(try grantedPatterns(inSettingsAt: path) == ["git *"])
+    }
+
+    /// A held lock and a lock that cannot be opened at all used to be the same
+    /// `nil`, so both were reported as "another process is writing \(path)" — which
+    /// for the second is a lie that sends the user looking for a `domo` that is not
+    /// running instead of at the thing standing in the lock file's place.
+    @Test("contention and an unopenable lock are told apart")
+    func contentionIsDistinguishedFromABrokenLock() async throws {
+        let config = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: config) }
+        let path = PermissionSetup.userSettingsPath(config)
+        try FileManager.default.createDirectory(atPath: config, withIntermediateDirectories: true)
+
+        // Genuine contention: somebody else is holding the very lock the persist wants.
+        let whileHeld = try await FileLock.withLock(at: PermissionSetup.settingsLockPath(path)) {
+            () async -> PermissionSetup.PersistResult in
+            await PermissionSetup.persistGrants(
+                grant("git *"), settingsPath: path, configDirectory: config)
+        }
+        #expect(whileHeld == .ran(.contended))
+        #expect(FileManager.default.fileExists(atPath: path) == false, "it wrote anyway")
+
+        // Not contention: a directory sitting where the lock file goes, so `open` fails
+        // EISDIR and no wait would ever have helped.
+        let broken = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: broken) }
+        let brokenPath = PermissionSetup.userSettingsPath(broken)
+        try FileManager.default.createDirectory(
+            atPath: PermissionSetup.settingsLockPath(brokenPath), withIntermediateDirectories: true)
+
+        let result = await PermissionSetup.persistGrants(
+            grant("git *"), settingsPath: brokenPath, configDirectory: broken)
+
+        guard case .lockUnopenable = result else {
+            Issue.record("an unopenable lock was reported as \(result)")
+            return
+        }
+        #expect(FileManager.default.fileExists(atPath: brokenPath) == false, "it wrote anyway")
+    }
+
+    /// The lock has to name the same file before and after the first save, and
+    /// `URL.resolvingSymlinksInPath()` did not: it resolves a symlink only once the
+    /// target exists, and the first save is what creates the target. So writer A
+    /// locked `.settings.json.lock`, created the target inside its critical section,
+    /// and writer B — arriving one instant later — locked `.real.json.lock` and
+    /// read-modify-wrote right alongside it.
+    @Test("the settings lock does not move when a dangling symlink's target appears")
+    func settingsLockIsStableAcrossADanglingSymlink() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let dotfiles = root + "/dotfiles"
+        let config = root + "/config"
+        try FileManager.default.createDirectory(atPath: dotfiles, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: config, withIntermediateDirectories: true)
+        let target = dotfiles + "/settings.json"
+        let link = PermissionSetup.userSettingsPath(config)
+        // Dangling: the dotfiles repository has no settings.json yet.
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: target)
+
+        // What writer A computed before anything existed.
+        let before = PermissionSetup.settingsLockPath(link)
+        await PermissionSetup.persister(configDirectory: config)(grant("git *"))
+        #expect(FileManager.default.fileExists(atPath: target), "the first save did not create it")
+        #expect(PermissionSetup.settingsLockPath(link) == before, "the lock moved under the holder")
+
+        // And writer B, entering now, contends with the lock A is still holding.
+        let second = try await FileLock.withLock(at: before) {
+            () async -> PermissionSetup.PersistResult in
+            await PermissionSetup.persistGrants(
+                grant("npm *"), settingsPath: link, configDirectory: config)
+        }
+        #expect(second == .ran(.contended))
+        #expect(
+            try grantedPatterns(inSettingsAt: target) == ["git *"],
+            "the second writer wrote inside the first one's critical section"
+        )
     }
 
     @Test("a settings.json that is a symlink is written THROUGH, not replaced")
@@ -295,18 +372,82 @@ struct TrustStoreLockTests {
         let store = TrustStore(configDirectory: FilePath(config))
         let project = FilePath(root + "/project")
 
-        let held = await FileLock.withLock(at: store.lockPath) { () -> Bool in
+        let held = try await FileLock.withLock(at: store.lockPath) { () -> Bool in
             #expect(throws: DoMoError.self) {
                 try store.setDecision(true, for: project)
             }
             return true
         }
-        #expect(held == true, "the test could not take the lock it needs to hold, so it proved nothing")
+        #expect(held == .ran(true), "the test could not take the lock it needs to hold, so it proved nothing")
         #expect(try store.decision(for: project) == nil, "the decision was written despite the held lock")
 
         // And the refusal was contention, not a broken store.
         try store.setDecision(true, for: project)
         #expect(try store.decision(for: project) == true)
+    }
+
+    /// The same moving-lock defect as settings.json, and worse here: `setDecision`
+    /// does not merely lose a decision when it takes the wrong lock, it *succeeds*
+    /// under somebody else's — bypassing the "a lock timeout is a real error here"
+    /// guarantee its own documentation makes, rather than degrading it.
+    ///
+    /// `URL.resolvingSymlinksInPath()` resolves a symlink only once the target
+    /// exists, and the first `setDecision` is what creates the target. So the lock
+    /// path before the first write and after it were two different files.
+    @Test("the trust lock does not move when a dangling symlink's target appears")
+    func trustLockIsStableAcrossADanglingSymlink() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let dotfiles = root + "/dotfiles"
+        let config = root + "/config"
+        try FileManager.default.createDirectory(atPath: dotfiles, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: config, withIntermediateDirectories: true)
+        let store = TrustStore(configDirectory: FilePath(config))
+        let target = dotfiles + "/trust.json"
+        // Dangling: the dotfiles repository has no trust.json yet.
+        try FileManager.default.createSymbolicLink(
+            atPath: store.path.string, withDestinationPath: target)
+
+        // What a second process computed before any decision had been written.
+        let before = store.lockPath
+        try store.setDecision(true, for: FilePath(root + "/first"))
+        #expect(FileManager.default.fileExists(atPath: target), "the first write did not create it")
+        #expect(store.lockPath == before, "the lock moved under the holder")
+
+        // So a writer entering now contends with the lock the first one holds.
+        let held = try await FileLock.withLock(at: before) { () -> Bool in
+            #expect(throws: DoMoError.self) {
+                try store.setDecision(true, for: FilePath(root + "/second"))
+            }
+            return true
+        }
+        #expect(held == .ran(true), "the test could not take the lock it needs to hold")
+        #expect(
+            try store.decision(for: FilePath(root + "/second")) == nil,
+            "the write went through under another holder's lock"
+        )
+        #expect(try store.decision(for: FilePath(root + "/first")) == true)
+    }
+
+    /// A trust.json symlinked into a dotfiles directory that does not exist yet: the
+    /// lock is a sibling of the *target*, so nothing has created the directory it
+    /// belongs in. Locking has to create it, exactly as `FileLock.withLock` does,
+    /// or a first run fails a write that has nothing wrong with it.
+    @Test("a symlinked store whose target directory is missing still records a decision")
+    func createsTheLockDirectoryForASymlinkedStore() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let config = root + "/config"
+        try FileManager.default.createDirectory(atPath: config, withIntermediateDirectories: true)
+        let store = TrustStore(configDirectory: FilePath(config))
+        // Neither the target nor its directory exists.
+        try FileManager.default.createSymbolicLink(
+            atPath: store.path.string, withDestinationPath: root + "/dotfiles/trust.json")
+
+        try store.setDecision(true, for: FilePath(root + "/project"))
+
+        #expect(try store.decision(for: FilePath(root + "/project")) == true)
+        #expect(FileManager.default.fileExists(atPath: root + "/dotfiles/trust.json"))
     }
 
     @Test("an existing trust.json keeps its mode", arguments: [0o600, 0o640])

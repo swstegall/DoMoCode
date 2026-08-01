@@ -265,20 +265,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
         // Teach the redaction vault this process's ACTUAL secrets, at the one
         // moment they are all known and before anything can print a diagnostic.
-        // The pattern rules alone cannot catch a gateway key that carries no
-        // recognizable prefix, and the code that resolves a key and the code that
-        // renders a failure live in different modules and never meet — which is
-        // exactly why the vault is process-wide.
-        //
-        // Every `mcpServers[*].environment` value is registered wholesale rather
-        // than only the credential-looking ones: that block exists to hand
-        // secrets to a child, and a name-based filter would miss the one a user
-        // spelled `GH_PAT`. The cost is that an innocuous value of eight
-        // characters or more (`production`) is also scrubbed out of diagnostics.
-        Redaction.register(configuration.apiKey)
-        Redaction.registerAll(
-            configuration.mcpServers.values.flatMap { server in (server.environment ?? [:]).values }
-        )
+        Self.registerProcessSecrets(configuration)
 
         // Bootstrap logging to stderr *before* anything can log. The stock
         // swift-log handler writes to stdout, which would corrupt the output
@@ -290,8 +277,19 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // `-p` and `--json` stay byte-clean for a pipe. Without this the
         // resolver's diagnosis is computed and thrown away, which is the exact
         // kind of dead substrate this phase exists to remove.
+        //
+        // Scrubbed on the way out, like every other diagnostic. A warning QUOTES
+        // the value it could not understand, and a settings value is now allowed
+        // to be an interpolated `{env:…}` — so `"logLevel": "{env:MY_GATEWAY_KEY}"`
+        // is a one-line typo that otherwise prints the gateway key to stderr and
+        // into whatever CI log is capturing it. (The three BUILT-IN credential
+        // variables cannot be reached that way at all — they are on
+        // ``DoMoCore/InterpolationPolicy/deniedEnvironmentNames`` — but a key under
+        // a name the operator chose is exactly the case `apiKeyEnv` exists for.)
+        // This is emitted after ``registerProcessSecrets(_:)`` on purpose: the
+        // vault has to know the secret before anything asks it to scrub one.
         for warning in configuration.warnings {
-            Self.writeStderr("warning: \(warning)\n")
+            Self.writeStderr("warning: \(Redaction.diagnostic(warning))\n")
         }
 
         guard let model = configuration.model, !model.isEmpty else {
@@ -476,6 +474,31 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
     // MARK: Credential hygiene
 
+    /// Hands every secret this run resolved to the process-wide redaction vault.
+    ///
+    /// The pattern rules alone cannot catch a gateway key that carries no
+    /// recognizable prefix, and the code that resolves a key and the code that
+    /// renders a failure live in different modules and never meet — which is
+    /// exactly why the vault is process-wide, and why this has to happen before
+    /// anything can print a diagnostic.
+    ///
+    /// Every `mcpServers[*].environment` value is registered wholesale rather
+    /// than only the credential-looking ones: that block exists to hand secrets
+    /// to a child, and a name-based filter would miss the one a user spelled
+    /// `GH_PAT`. The cost is that an innocuous value of eight characters or more
+    /// (`production`) is also scrubbed out of diagnostics — the same trade
+    /// ``Settings/keyCarriesCredential(_:)`` makes for that block.
+    ///
+    /// A named function rather than two lines inline, so the `GH_PAT` defence is
+    /// something a test can call. Deleting either line used to leave the whole
+    /// suite green.
+    static func registerProcessSecrets(_ configuration: ResolvedConfiguration) {
+        Redaction.register(configuration.apiKey)
+        Redaction.registerAll(
+            configuration.mcpServers.values.flatMap { server in (server.environment ?? [:]).values }
+        )
+    }
+
     /// Every environment variable name that holds THIS run's LLM-gateway
     /// credential.
     ///
@@ -516,13 +539,23 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     /// The alias compaction should summarize with, or `nil` to leave the harness's
     /// own same-model fallback in place.
     ///
+    /// `compaction.model` FIRST, then `smallModel`. Both name "the model to
+    /// summarize with", and the more specific statement wins: `smallModel` is the
+    /// general "use this cheaper alias for the small jobs", while
+    /// `compaction.model` is about this job in particular. Reading only
+    /// `smallModel` — which is what this did — made `compaction.model` a setting
+    /// that parsed, merged, persisted and was asserted in tests while no
+    /// production code ever read it.
+    ///
     /// `smallModel` DEFAULTS to `model` (see ``ResolvedConfiguration/resolve(cli:environment:project:user:)``),
     /// so keying this on "is it non-nil" would install a CLI-built summarizer for
     /// every existing user and change a compaction path nobody asked to change.
-    /// Only a genuinely different alias earns one.
+    /// Only a genuinely different alias earns one — which is why the `!= model`
+    /// guard applies to whichever of the two answered.
     static func compactionModel(_ configuration: ResolvedConfiguration, model: String) -> String? {
-        guard let small = configuration.smallModel, !small.isEmpty, small != model else { return nil }
-        return small
+        let configured = configuration.compactionModel ?? configuration.smallModel
+        guard let configured, !configured.isEmpty, configured != model else { return nil }
+        return configured
     }
 
     /// The compaction summarizer for this run, or `nil` when nothing configured a

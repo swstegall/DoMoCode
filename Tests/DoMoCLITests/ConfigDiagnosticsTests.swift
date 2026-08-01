@@ -16,6 +16,7 @@ import DoMoCLI
 import DoMoCore
 import DoMoLLM
 import Foundation
+import Synchronization
 import SystemPackage
 import Testing
 
@@ -217,6 +218,94 @@ struct ConfigDiagnosticsTests {
         }
     }
 
+    /// The lexical check is not the confinement, and a cloned repository can
+    /// prove it: `.domocode/looks-local.key -> ~/.ssh/id_rsa` names nothing
+    /// outside the project, collapses to nothing outside the project, and the
+    /// kernel walks straight out of it.
+    ///
+    /// So the refusal has to happen where the file is opened, and it has to
+    /// happen *before* the open — a reader that raises after slurping the bytes
+    /// has already put them in this process's memory and one careless
+    /// `\(error)` away from a log line.
+    @Test
+    func aSymlinkPlantedInsideTheProjectMayNotReachOutsideIt() throws {
+        try withTemporaryDirectory { directory in
+            let root = directory + "/project"
+            try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+            let secret = "id-rsa-body-4b8c1e7a-do-not-print"
+            try write(secret + "\n", to: directory + "/outside.key")
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/looks-local.key",
+                withDestinationPath: directory + "/outside.key"
+            )
+
+            let path = root + "/settings.json"
+            try write(#"{"model": "{file:looks-local.key}"}"#, to: path)
+
+            let failure = #expect(throws: DoMoError.self) {
+                try Settings.load(fromPath: path, interpolation: .untrusted(root: root))
+            }
+            let text = try #require(failure?.description)
+            #expect(text.contains("{file:looks-local.key}"))
+            // The token is named. What it pointed at never is.
+            #expect(!text.contains(secret))
+
+            // And nothing was read: the injected reader — which is confined too,
+            // because a caller must not be able to opt out of the confinement it
+            // asked for — is never called at all.
+            let attempted = Mutex<[String]>([])
+            #expect(throws: ConfigDiagnostic.self) {
+                _ = try Settings(model: "{file:looks-local.key}").resolvingInterpolations(
+                    policy: .untrusted(root: root),
+                    environment: [:],
+                    baseDirectory: root,
+                    file: path,
+                    readFile: { requested in
+                        attempted.withLock { $0.append(requested) }
+                        return secret
+                    }
+                )
+            }
+            #expect(attempted.withLock { $0 }.isEmpty)
+        }
+    }
+
+    /// The other half of that rule, and the half a careless fix welds shut.
+    ///
+    /// Confinement is on the *resolved* location, not on "is a symlink": a link
+    /// inside the project pointing at another file inside the project never
+    /// leaves, and refusing it would break a repository that keeps its config
+    /// fragments behind links. And a trusted policy has no root at all, so the
+    /// user's own `{file:~/.gateway-key}` still follows wherever it points.
+    @Test
+    func aSymlinkThatStaysInsideTheProjectIsStillReadAndATrustedPolicyIsStillUnconfined() throws {
+        try withTemporaryDirectory { directory in
+            let root = directory + "/project"
+            try FileManager.default.createDirectory(
+                atPath: root + "/secrets", withIntermediateDirectories: true)
+            try write("in-project-token\n", to: root + "/secrets/real.key")
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/link.key", withDestinationPath: root + "/secrets/real.key")
+
+            let path = root + "/settings.json"
+            try write(#"{"model": "{file:link.key}"}"#, to: path)
+            let confined = try #require(
+                try Settings.load(fromPath: path, interpolation: .untrusted(root: root))
+            )
+            #expect(confined.model == "in-project-token")
+
+            // A link out of the project, read under the user's own policy.
+            try write("outside-token\n", to: directory + "/outside.key")
+            try FileManager.default.createSymbolicLink(
+                atPath: root + "/escape.key", withDestinationPath: directory + "/outside.key")
+            try write(#"{"model": "{file:escape.key}"}"#, to: path)
+            let trusted = try #require(
+                try Settings.load(fromPath: path, interpolation: .trusted)
+            )
+            #expect(trusted.model == "outside-token")
+        }
+    }
+
     /// An unset variable is a hard error naming it, not the empty string.
     ///
     /// Substituting `""` — which is what opencode does — turns one typo in a
@@ -306,27 +395,287 @@ struct ConfigDiagnosticsTests {
     }
 
     /// Whatever a user kept out of their config file is exactly what must never
-    /// appear in a diagnostic or a log line, so every substituted value is
-    /// registered with the redaction vault as it is resolved.
+    /// appear in a diagnostic or a log line, so a value substituted into a slot
+    /// that genuinely holds a credential is registered with the redaction vault
+    /// as it is resolved.
+    ///
+    /// `mcpServers.*.environment` is that slot: the block exists to hand secrets
+    /// to a child process, so every value in it qualifies regardless of the name
+    /// it was given — a name filter would miss the one a user spelled `GH_PAT`.
     @Test
     func anInterpolatedSecretIsRegisteredForRedaction() throws {
         try withTemporaryDirectory { directory in
             let path = directory + "/settings.json"
             let secret = "interpolated-9f3a2b7c-do-not-print"
-            try write(#"{"authScheme": "{env:MY_TEST_SCHEME_SECRET}"}"#, to: path)
+            try write(
+                #"{"mcpServers": {"gh": {"command": ["gh-mcp"], "environment": {"GH_PAT": "{env:MY_TEST_MCP_SECRET}"}}}}"#,
+                to: path
+            )
 
             let settings = try #require(
                 try Settings.load(
                     fromPath: path,
                     interpolation: .trusted,
-                    environment: ["MY_TEST_SCHEME_SECRET": secret]
+                    environment: ["MY_TEST_MCP_SECRET": secret]
                 )
             )
-            #expect(settings.authScheme == secret)
+            #expect(settings.mcpServers?["gh"]?.environment?["GH_PAT"] == secret)
             #expect(
-                Redaction.diagnostic("scheme was \(secret) here")
-                    == "scheme was \(Redaction.placeholder) here"
+                Redaction.diagnostic("spawn failed with \(secret) set")
+                    == "spawn failed with \(Redaction.placeholder) set"
             )
+        }
+    }
+
+    /// The same secret, spelled as a command argument instead of an environment
+    /// variable, has to be registered too.
+    ///
+    /// It used not to be, and the asymmetry was the whole bug: `--token=…` is
+    /// the case ``Settings``' own doc comment argues for, and an unregistered
+    /// one goes verbatim into the spawn-failure line that quotes the argv while
+    /// the identical value under `environment` is masked.
+    @Test
+    func aSecretInterpolatedIntoAnMCPCommandArgumentIsRegisteredToo() throws {
+        try withTemporaryDirectory { directory in
+            let path = directory + "/settings.json"
+            let secret = "argv-secret-51c7d0e9-do-not-print"
+            try write(
+                #"{"mcpServers": {"gh": {"command": ["gh-mcp", "--token={env:MY_TEST_ARG_SECRET}"]}}}"#,
+                to: path
+            )
+
+            let settings = try #require(
+                try Settings.load(
+                    fromPath: path,
+                    interpolation: .trusted,
+                    environment: ["MY_TEST_ARG_SECRET": secret]
+                )
+            )
+            #expect(settings.mcpServers?["gh"]?.command == ["gh-mcp", "--token=\(secret)"])
+            #expect(
+                Redaction.diagnostic("could not spawn gh-mcp --token=\(secret)")
+                    == "could not spawn gh-mcp --token=\(Redaction.placeholder)"
+            )
+        }
+    }
+
+    /// `authHeader` holds a header **name**, and registering a name as a secret
+    /// literal does not hide a credential — it uncovers one.
+    ///
+    /// The literal registry runs before the pattern rules, so a registered
+    /// `X-Gateway-Authorization` is rewritten to `[redacted]` first, and the
+    /// header-line rule — which recognises the line by exactly that name and
+    /// eats the value after the colon — then matches nothing. The name was
+    /// hidden and the credential beside it was printed. `authScheme` (`Bearer`)
+    /// is the same mistake one field over.
+    @Test
+    func aHeaderNameAndSchemeAreNeverRegisteredAsSecrets() throws {
+        try withTemporaryDirectory { directory in
+            let path = directory + "/settings.json"
+            let headerName = "X-Gateway-Authorization"
+            try write(
+                #"{"authHeader": "{env:MY_TEST_HEADER_NAME}", "authScheme": "{env:MY_TEST_SCHEME}"}"#,
+                to: path
+            )
+
+            let settings = try #require(
+                try Settings.load(
+                    fromPath: path,
+                    interpolation: .trusted,
+                    environment: [
+                        "MY_TEST_HEADER_NAME": headerName,
+                        "MY_TEST_SCHEME": "Gateway-Signature-V4",
+                    ]
+                )
+            )
+            #expect(settings.authHeader == headerName)
+            #expect(settings.authScheme == "Gateway-Signature-V4")
+
+            // The value is one no pattern rule recognises on its own, so the
+            // header-line rule is the only thing standing between it and the
+            // log — and it only fires while the header name is still readable.
+            let credential = "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+            let line = "\(headerName): \(credential)"
+            let scrubbed = Redaction.diagnostic(line)
+            #expect(!scrubbed.contains(credential))
+            #expect(scrubbed == "\(headerName): \(Redaction.placeholder)")
+
+            // And the scheme word survives too: "which scheme did I send?" is a
+            // fact an auth failure needs, not a secret.
+            #expect(
+                Redaction.diagnostic("sent Gateway-Signature-V4 to the gateway")
+                    == "sent Gateway-Signature-V4 to the gateway"
+            )
+        }
+    }
+
+    /// `apiKeyEnv` is the third name-not-value field, and the one whose spelling
+    /// makes `isSecretKeyName` say yes: `apikeyenv` contains `apikey`.
+    ///
+    /// It holds the name of an environment variable, never its contents, and
+    /// registering it scrubs that name out of the "which credential did I use?"
+    /// hint an auth failure most needs.
+    @Test
+    func theNameOfTheAPIKeyVariableIsNotItselfASecret() throws {
+        try withTemporaryDirectory { directory in
+            let path = directory + "/settings.json"
+            let variable = "ACME_GATEWAY_CREDENTIAL"
+            try write(#"{"apiKeyEnv": "{env:MY_TEST_KEY_VARIABLE_NAME}"}"#, to: path)
+
+            let settings = try #require(
+                try Settings.load(
+                    fromPath: path,
+                    interpolation: .trusted,
+                    environment: ["MY_TEST_KEY_VARIABLE_NAME": variable]
+                )
+            )
+            #expect(settings.apiKeyEnv == variable)
+            let hint = "no key found; set \(variable)"
+            #expect(Redaction.diagnostic(hint) == hint)
+        }
+    }
+
+    /// Every field the resolver claims to interpolate, proved one at a time.
+    ///
+    /// Five of these lines used to survive deletion with the whole suite green,
+    /// which is how `authHeader` came to be interpolated by a line nothing
+    /// tested. A table is the only shape that cannot rot that way: adding a
+    /// field to the resolver without adding it here leaves the new field
+    /// untested, but it can no longer *silently* break an old one.
+    @Test
+    func everyInterpolatableSettingsFieldIsActuallyInterpolated() throws {
+        let reads: [(key: String, value: (Settings) -> String?)] = [
+            ("baseUrl", { $0.baseURL }),
+            ("model", { $0.model }),
+            ("smallModel", { $0.smallModel }),
+            ("authHeader", { $0.authHeader }),
+            ("authScheme", { $0.authScheme }),
+            ("reasoningEffort", { $0.reasoningEffort }),
+            ("logLevel", { $0.logLevel }),
+            ("sessionDir", { $0.sessionDir }),
+            ("apiKeyEnv", { $0.apiKeyEnv }),
+        ]
+
+        try withTemporaryDirectory { directory in
+            let path = directory + "/settings.json"
+            for field in reads {
+                try write(#"{"\#(field.key)": "{env:PROBE}-\#(field.key)"}"#, to: path)
+                let settings = try #require(
+                    try Settings.load(
+                        fromPath: path,
+                        interpolation: .trusted,
+                        environment: ["PROBE": "probe-8e21"]
+                    )
+                )
+                // The expected string names the field, so a failure says which.
+                #expect(field.value(settings) == "probe-8e21-\(field.key)")
+            }
+
+            // The three nested ones, in one file: command argument, environment
+            // value, and cwd.
+            try write(
+                """
+                {"mcpServers": {"gh": {
+                  "command": ["gh-mcp", "--flag={env:PROBE}-command"],
+                  "environment": {"K": "{env:PROBE}-environment"},
+                  "cwd": "{env:PROBE}-cwd"
+                }}}
+                """,
+                to: path
+            )
+            let nested = try #require(
+                try Settings.load(
+                    fromPath: path,
+                    interpolation: .trusted,
+                    environment: ["PROBE": "probe-8e21"]
+                )
+            )
+            let server = try #require(nested.mcpServers?["gh"])
+            #expect(server.command == ["gh-mcp", "--flag=probe-8e21-command"])
+            #expect(server.environment?["K"] == "probe-8e21-environment")
+            #expect(server.cwd == "probe-8e21-cwd")
+        }
+    }
+
+    /// Two broken servers, and the same one is always the one reported.
+    ///
+    /// `servers.keys.sorted()` carries a comment promising exactly this and
+    /// nothing tested it. Dictionary iteration order is seeded per process, so
+    /// a single pair would let an unsorted resolver pass half the time; twenty
+    /// independent pairs make that a one-in-a-million accident instead.
+    @Test
+    func theBrokenMCPTokenReportedIsAlwaysTheAlphabeticallyFirstServer() throws {
+        try withTemporaryDirectory { directory in
+            let path = directory + "/settings.json"
+            for round in 0..<20 {
+                // "alpha-n" sorts before "zeta-n"; which one a Dictionary hands
+                // back first is anybody's guess.
+                try write(
+                    """
+                    {"mcpServers": {
+                      "zeta-\(round)": {"command": ["z", "{env:MY_MISSING_Z_\(round)}"]},
+                      "alpha-\(round)": {"command": ["a", "{env:MY_MISSING_A_\(round)}"]}
+                    }}
+                    """,
+                    to: path
+                )
+                let failure = #expect(throws: DoMoError.self) {
+                    try Settings.load(fromPath: path, interpolation: .trusted, environment: [:])
+                }
+                let text = try #require(failure?.description)
+                #expect(text.contains("MY_MISSING_A_\(round)"))
+                #expect(!text.contains("MY_MISSING_Z_\(round)"))
+            }
+        }
+    }
+
+    /// A rejected `logLevel` is quoted back so the user can see their typo — but
+    /// `logLevel` is one of the interpolated fields, so "the value" can be
+    /// whatever `{env:}` produced. The rule that a config diagnostic never
+    /// prints a resolved value is only absolute if this layer keeps it too.
+    @Test
+    func anUnparseableLogLevelIsNotEchoedBackInFull() throws {
+        try withTemporaryDirectory { directory in
+            let configDirectory = directory + "/config"
+            let workingDirectory = directory + "/work"
+            try FileManager.default.createDirectory(
+                atPath: configDirectory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                atPath: workingDirectory, withIntermediateDirectories: true)
+
+            let secret = "verbose-6d0b4a1f2c8e-do-not-print"
+            try write(
+                #"{"logLevel": "{env:MY_TEST_LOG_LEVEL}"}"#, to: configDirectory + "/settings.json")
+
+            let config = try ResolvedConfiguration.load(
+                cli: CLIOverrides(),
+                environment: [
+                    EnvName.configDir: configDirectory,
+                    "MY_TEST_LOG_LEVEL": secret,
+                ],
+                workingDirectory: FilePath(workingDirectory)
+            )
+            let warning = try #require(config.warnings.first)
+            #expect(!warning.contains(secret))
+            // Not even a PREFIX of it. The value is measured, not quoted: the
+            // scrub only replaces what the vault was told about, and `logLevel`
+            // is not a credential-shaped key, so nothing registered this value
+            // and a surviving prefix would be a surviving prefix of a secret.
+            #expect(!warning.contains(secret.prefix(8)))
+            #expect(warning.contains("\(secret.count)-character value"))
+            #expect(warning.contains("user settings.json"))
+
+            // A real typo is short and survives whole: the warning has to stay
+            // useful, or hiding the value is just a different way of saying
+            // nothing.
+            let plain = try ResolvedConfiguration.resolve(
+                cli: CLIOverrides(),
+                environment: [:],
+                project: nil,
+                user: Settings(logLevel: "verbose")
+            )
+            let typo = try #require(plain.warnings.first)
+            #expect(typo.contains("\"verbose\""))
         }
     }
 

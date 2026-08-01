@@ -26,21 +26,19 @@ public protocol SessionMessagePersisting: Sendable {
     /// non-throwing ``AgentEventSink/emit(_:)``, so it is captured instead (see
     /// ``PersistenceErrorBox``).
     ///
-    /// - Parameter elapsedMs: How long this message took to produce, measured
-    ///   from its `messageStart` to its `messageEnd`. `nil` means **nothing was
-    ///   measured**, which is not the same as "it took no time": a caller that
-    ///   appends a message outside the event stream has no interval to report, and
-    ///   writing `0` there would be a claim about a stopwatch nobody started.
+    /// - Parameter elapsedMs: How long the model call that produced this message
+    ///   took, measured from its `messageStart` to its `messageEnd`. `nil` means
+    ///   **nothing was measured**, which is not the same as "it took no time".
+    ///
+    ///   Only an assistant turn is ever timed. A user prompt, a steering
+    ///   injection and a tool result are all *already finished* by the time the
+    ///   loop announces them — their `messageStart` and `messageEnd` are emitted
+    ///   back to back around a value that already exists — so there is no
+    ///   interval to report for them and they persist with `nil`. Writing the `0`
+    ///   those adjacent boundaries measure would be a claim about a stopwatch
+    ///   nobody started, indistinguishable on the wire from a real measurement,
+    ///   and — because a session file is append-only — permanent.
     func persistMessage(_ message: Message, elapsedMs: Int?) async throws
-}
-
-extension SessionMessagePersisting {
-    /// The pre-timing spelling, kept because this is a public protocol and an
-    /// embedding's call sites are not ours to break. It reports no measurement,
-    /// which is exactly what a caller outside the event stream has.
-    public func persistMessage(_ message: Message) async throws {
-        try await persistMessage(message, elapsedMs: nil)
-    }
 }
 
 // MARK: - Monotonic elapsed time
@@ -66,7 +64,7 @@ func elapsedMilliseconds(from start: ContinuousClock.Instant, to end: Continuous
 
 // MARK: - Message-scoped stopwatch
 
-/// The instant the message currently being assembled started.
+/// The instant the assistant message currently being streamed started.
 ///
 /// A class around a `Mutex` for the same reason ``PersistenceErrorBox`` is one:
 /// ``SessionPersistenceSink`` is a `struct` and its `emit` is non-mutating, so it
@@ -75,11 +73,20 @@ func elapsedMilliseconds(from start: ContinuousClock.Instant, to end: Continuous
 /// before another `messageStart`, in ``AgentLoop`` and in ``ToolDispatch`` alike,
 /// including the parallel tool path, which emits result messages serially in phase
 /// C — so a single slot is enough and a stack would be dead structure.
+///
+/// The slot is filled only for a message whose interval is a real measurement;
+/// any other message boundary ``clear()``s it, so an untimed message can neither
+/// start a stopwatch nor inherit one.
 private final class MessageStopwatch: Sendable {
     private let startedAt = Mutex<ContinuousClock.Instant?>(nil)
 
     func start(_ instant: ContinuousClock.Instant) {
         startedAt.withLock { $0 = instant }
+    }
+
+    /// Forget any pending start without reading it.
+    func clear() {
+        startedAt.withLock { $0 = nil }
     }
 
     /// The pending start, cleared. A second `messageEnd` with no start between
@@ -137,13 +144,33 @@ public final class PersistenceErrorBox: Sendable {
 /// dispatch for `message_end`: the durable write lands before the UI is told the
 /// message is done, so a UI that reacts by re-reading the file always sees it.
 ///
-/// This is also where a message's wall time is measured, because this is the only
-/// place both ends of it are visible. The interval is **message**-scoped
+/// This is also where an assistant turn's wall time is measured, because this is
+/// the only place both ends of it are visible. The interval is **message**-scoped
 /// (`messageStart` → `messageEnd`) and not turn-scoped: the turn events are not
 /// balanced — the `maxTurns` return sits before a `turnStart`, and an aborted
 /// settle emits a `turnEnd` for an iteration whose `turnStart` never fired — so a
 /// turn-scoped stopwatch would silently mis-pair on exactly the runs whose timings
 /// matter most.
+///
+/// **Only assistant messages are timed.** Every other message the loop announces
+/// is complete before its `messageStart` is emitted: ``AgentLoop`` emits the
+/// prompt's and each steering message's start and end on consecutive lines, and
+/// ``ToolDispatch``'s `emitResultMessage` does the same for a tool result once the
+/// tool has already returned. Timing those measures the two `await`s between the
+/// emits and nothing else, and the `0` it yields is a lie a session file keeps
+/// forever — it cannot be told from a genuinely instantaneous turn, and there is
+/// no backfilling an append-only log. So they persist with `elapsedMs == nil`,
+/// which is the field's documented spelling for "nothing was measured".
+///
+/// What an assistant turn's number actually is, stated exactly so nobody has to
+/// guess: the interval from its **first stream boundary** to its terminal one.
+/// `AgentLoop.streamAssistantResponse` emits `messageStart` when the assembly
+/// yields `.start`, i.e. when the first chunk lands, so the wait *before* that —
+/// connection, queueing, prompt processing — is outside the measurement. It is
+/// streaming latency, not round-trip latency. A turn that never opened a stream
+/// at all (a transport failure, or the synthesized `.aborted` settle) has both
+/// boundaries emitted back to back and measures ~0, which is a true statement
+/// about the settle it is measuring and the only interval that exists for it.
 public struct SessionPersistenceSink: AgentEventSink {
     private let persister: any SessionMessagePersisting
     private let forward: (any AgentEventSink)?
@@ -170,15 +197,34 @@ public struct SessionPersistenceSink: AgentEventSink {
         self.monotonicNow = monotonicNow
     }
 
+    /// Whether this message's boundaries bracket work that was actually done.
+    ///
+    /// Only an assistant turn does: it is the one message the loop *produces*,
+    /// by making a model call and streaming the answer between the two events.
+    /// Every other message — the user prompt, a steering injection, a tool result
+    /// — exists in full before its `messageStart` is emitted, so its boundaries
+    /// bracket nothing and there is no interval to report.
+    private static func isTimed(_ message: Message) -> Bool {
+        if case .assistant = message { return true }
+        return false
+    }
+
     public func emit(_ event: AgentEvent) async {
         switch event {
-        case .messageStart:
-            stopwatch.start(monotonicNow())
+        case .messageStart(let message):
+            // The clock is not even read for an untimed message: reading it would
+            // start a stopwatch whose only possible answer is a fabricated one.
+            if Self.isTimed(message) { stopwatch.start(monotonicNow()) } else { stopwatch.clear() }
         case .messageEnd(let message):
+            // Always taken, so the slot is cleared by whichever boundary arrives.
             // `nil` when no start was seen for this message — a message appended
-            // by something other than the loop is not timed, and is not claimed
-            // to have taken zero.
-            let elapsed = stopwatch.takeStart().flatMap { elapsedMilliseconds(from: $0, to: monotonicNow()) }
+            // by something other than the loop, or one that is not timed at all —
+            // and never `0`, which would be a claim about a stopwatch nobody
+            // started.
+            let started = stopwatch.takeStart()
+            let elapsed: Int? = Self.isTimed(message)
+                ? started.flatMap { elapsedMilliseconds(from: $0, to: monotonicNow()) }
+                : nil
             do {
                 try await persister.persistMessage(message, elapsedMs: elapsed)
             } catch {

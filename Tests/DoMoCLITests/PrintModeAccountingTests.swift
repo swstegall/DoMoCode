@@ -9,16 +9,22 @@
 // never removed, never reordered (`PrintModeEndToEndTests` pins the sequence).
 //
 // The load-bearing test in this file is `configuredRatesMakeTheCostNonZero`.
-// Without a rate table every cost in the stream is `0`, and every other assertion
-// about cost in this file would pass just as happily against an implementation
-// that hardcoded a zero. It is the one that proves the whole per-alias rates path
-// — settings.json → `ModelRuntime` → `makeStreamFn` → `Usage.costed(at:)` →
-// `AgentHarness.accounting()` → the wire — is actually live.
+// Without a rate table there is no cost in the stream at all, and every other
+// assertion about cost in this file would pass just as happily against an
+// implementation that hardcoded a constant. It is the one that proves the whole
+// per-alias rates path — settings.json → `ModelRuntime` → `makeStreamFn` →
+// `Usage.costed(at:)` → `AgentHarness.accounting()` → the wire — is actually live.
+//
+// Its counterpart is `anUnpricedRunOmitsCostRatherThanClaimingItWasFree`. A run
+// nothing priced reports NO cost — not `"0"`, which is a claim that the run was
+// free — and `aModelPricedAtZeroStillReportsZeroRatherThanUnknown` is the other
+// side of that line: a price of zero somebody actually stated is still a price.
 
-// `@testable` only to reach ``StatusLine``, which is an internal UI component and
-// should stay one. Everything else this file touches — ``InlineAccountingSummary``
-// and the compiled binary — is reachable without it, so the new API still survives
-// a plain `import` in `-c release`.
+// `@testable` reaches two internals that should stay internal: ``StatusLine``, an
+// internal UI component, and ``PrintUsageEncoding``, which is print mode's own wire
+// encoder and has no business being public. Everything else this file touches —
+// ``InlineAccountingSummary`` and the compiled binary — is reachable without it, so
+// the new public API still survives a plain `import` in `-c release`.
 @testable import DoMoCLI
 import DoMoCore
 import DoMoHarness
@@ -104,6 +110,13 @@ struct PrintModeAccountingTests {
         let workspace = try Workspace()
         defer { workspace.cleanUp() }
         try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+        // Priced, because `cost` is REPORTED only when something priced the run —
+        // an unpriced run omits the key rather than claiming `"0"`. See
+        // `anUnpricedRunOmitsCostRatherThanClaimingItWasFree`.
+        try Self.writeUserSettings(
+            workspace,
+            #"{"modelOverrides": {"mock-model": {"input": 3, "output": 15}}}"#
+        )
 
         let result = try runDomo(
             arguments: [
@@ -206,6 +219,12 @@ struct PrintModeAccountingTests {
         let workspace = try Workspace()
         defer { workspace.cleanUp() }
         try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+        // Priced, for the same reason as the assistant-event test above: an
+        // unpriced run reports no `cost` at all.
+        try Self.writeUserSettings(
+            workspace,
+            #"{"modelOverrides": {"mock-model": {"input": 3, "output": 15}}}"#
+        )
 
         let result = try runDomo(
             arguments: [
@@ -282,10 +301,17 @@ struct PrintModeAccountingTests {
         #expect(Decimal(string: totalCost) != 0, "the whole rates path is dead if this is zero")
     }
 
-    /// With no rates configured the same run bills zero — which is what makes the
-    /// test above the only non-vacuous statement about cost in this file.
+    // MARK: Unpriced is not free
+
+    /// With no rates configured, nothing on any surface may state a cost.
+    ///
+    /// The stream used to emit `"cost":"0"` and stderr `$0` for this run, which is
+    /// not a missing number but a WRONG one: it says the run was free about a model
+    /// whose price nobody ever wrote down. The same file already omits `reasoning`
+    /// when the provider said nothing, and the same phase renders an unknown context
+    /// window as `?` — this is that rule applied to the third unknown.
     @Test
-    func withoutRatesTheCostIsHonestlyZero() async throws {
+    func anUnpricedRunOmitsCostRatherThanClaimingItWasFree() async throws {
         let gateway = try MockGateway(chatCompletionBodies: [Self.toolCallTurn, Self.finalTextTurn])
         gateway.start()
         defer { gateway.stop() }
@@ -305,9 +331,83 @@ struct PrintModeAccountingTests {
 
         let events = try Self.parseEventStream(result.standardOutput)
         let final = try #require(events.first { $0["type"]?.stringValue == "result" })
-        let cost = try #require(final["usage"]?["cost"]?.stringValue)
+        let total = try #require(final["usage"]?.objectValue, "result carried no usage: \(final)")
+        #expect(total["cost"] == nil, "an unpriced run claimed a cost: \(total)")
+        // CONTROL: the usage object is still there and still real. "No cost key" is
+        // equally true of a run that emitted no usage at all.
+        #expect(total["input"]?.intValue == 102)
+        #expect(total["output"]?.intValue == 14)
+
+        // Per-turn, the same rule.
+        let assistants = events.filter { $0["type"]?.stringValue == "assistant" }
+        #expect(assistants.count == 2)
+        for assistant in assistants {
+            let usage = try #require(assistant["usage"]?.objectValue)
+            #expect(usage["cost"] == nil, "an unpriced turn claimed a cost: \(usage)")
+        }
+    }
+
+    /// The human-facing half: `cost unknown`, never `$0`.
+    @Test
+    func anUnpricedTextRunSaysCostUnknownOnStderr() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.toolCallTurn, Self.finalTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+
+        let result = try runDomo(
+            arguments: ["-p", "list the files here", "--model", "mock-model", "--base-url", gateway.baseURL],
+            workspace: workspace
+        )
+        #expect(result.exitCode == 0, "stderr: \(result.standardError)")
+
+        // CONTROL: the line was printed at all, with the tokens the run really used.
+        #expect(result.standardError.contains("session total: 116 tokens"), "stderr: \(result.standardError)")
+        #expect(result.standardError.contains("cost unknown"), "stderr: \(result.standardError)")
+        #expect(!result.standardError.contains("$0"), "stderr claimed a free run: \(result.standardError)")
+        // stdout stays byte-clean whatever the cost line says.
+        #expect(result.standardOutput == "I found the files.\n", "stdout: \(result.standardOutput.debugDescription)")
+    }
+
+    /// The case the fix above must NOT break: a model an operator priced AT ZERO.
+    ///
+    /// "Nobody stated a price" and "the operator stated a price of zero" are
+    /// different facts, and only the first is unknown. An implementation that
+    /// decided on the total instead of on whether rates exist — `total == 0 ?
+    /// unknown : known` — passes every other test in this file and fails this one.
+    @Test
+    func aModelPricedAtZeroStillReportsZeroRatherThanUnknown() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.toolCallTurn, Self.finalTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+        try Self.writeUserSettings(
+            workspace,
+            #"{"modelOverrides": {"mock-model": {"input": 0, "output": 0}}}"#
+        )
+
+        let result = try runDomo(
+            arguments: [
+                "-p", "list the files here", "--model", "mock-model",
+                "--base-url", gateway.baseURL, "--json",
+            ],
+            workspace: workspace
+        )
+        #expect(result.exitCode == 0, "stderr: \(result.standardError)")
+
+        let events = try Self.parseEventStream(result.standardOutput)
+        let final = try #require(events.first { $0["type"]?.stringValue == "result" })
+        let cost = try #require(
+            final["usage"]?["cost"]?.stringValue,
+            "a stated price of zero was reported as unknown: \(final)"
+        )
         #expect(Decimal(string: cost) == 0, "cost: \(cost)")
-        // Zero cost is still real usage; the token counts must not vanish with it.
         #expect(final["usage"]?["input"]?.intValue == 102)
     }
 
@@ -346,6 +446,34 @@ struct PrintModeAccountingTests {
         #expect(result.standardError.contains("session total"), "stderr: \(result.standardError)")
         #expect(result.standardError.contains("116 tokens"), "stderr: \(result.standardError)")
         #expect(result.standardError.contains("$0.000516"), "stderr: \(result.standardError)")
+    }
+
+    // MARK: The decision itself
+
+    /// ``PrintUsageEncoding/reportableCost(_:ratesConfigured:reportedCost:)`` has
+    /// three independent reasons to call a cost known, and each is pinned here.
+    ///
+    /// The end-to-end tests above can only reach the first of them. The third —
+    /// "the total is not zero, so obviously something knows" — exists for the
+    /// `--resume` case, where the harness seeds its totals by walking a file an
+    /// EARLIER invocation priced: dropping that clause would re-report a real,
+    /// non-zero, already-billed session as unknown.
+    @Test
+    func aCostIsKnownWhenRatesOrTheGatewayOrTheTotalItselfSaysSo() {
+        let unpriced = PrintUsageEncoding.reportableCost(0, ratesConfigured: false, reportedCost: nil)
+        #expect(unpriced == nil)
+
+        // A rate table, even one that prices the model at zero.
+        #expect(PrintUsageEncoding.reportableCost(0, ratesConfigured: true, reportedCost: nil) == 0)
+        // The gateway billed it, even at zero.
+        #expect(PrintUsageEncoding.reportableCost(0, ratesConfigured: false, reportedCost: 0) == 0)
+        // A non-zero total from a session someone else priced (a resumed run).
+        let resumed = PrintUsageEncoding.reportableCost(
+            Decimal(string: "0.000516")!,
+            ratesConfigured: false,
+            reportedCost: nil
+        )
+        #expect(resumed == Decimal(string: "0.000516"))
     }
 
     // MARK: Helpers

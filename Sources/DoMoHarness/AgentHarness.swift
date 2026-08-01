@@ -847,6 +847,79 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
         self.contextWindow = contextWindow
         self.turns = turns
     }
+
+    // MARK: - Wire form
+
+    /// Written by hand for one field: ``costTotal``.
+    ///
+    /// This value is published over the REST surface, and a `Decimal` encoded by
+    /// the synthesized conformance goes out as a JSON **number**. Swift reads that
+    /// back into a `Decimal` losslessly; nothing else does. A JavaScript client
+    /// parses `0.000003` into the nearest IEEE double and then accumulates the
+    /// error the type exists to avoid — see ``DoMoLLM/Cost``, "`Decimal` and not
+    /// `Double`", and `PrintUsageEncoding.decimalString`, which already emits the
+    /// print stream's cost as a string for exactly this reason. Two published
+    /// surfaces spelling the same quantity two incompatible ways is the drift, not
+    /// merely the risk of it.
+    ///
+    /// So it encodes as its `description` — the exact decimal digits — and decodes
+    /// from **either** a string or a number, which is what lets a payload written
+    /// by an older server still read here without a protocol version bump. The
+    /// tolerance is on the reading side only and deliberately: the wire form has
+    /// one spelling, and it is the lossless one.
+    ///
+    /// Everything else keeps the synthesized shape exactly, ``contextWindow``
+    /// included: it stays `encodeIfPresent`, so an unknown window writes no key
+    /// rather than a `null` a reader could mistake for a number.
+    private enum CodingKeys: String, CodingKey {
+        case usage
+        case costTotal
+        case contextTokens
+        case contextWindow
+        case turns
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            usage: try container.decode(Usage.self, forKey: .usage),
+            costTotal: try Self.decodeDecimal(from: container, forKey: .costTotal),
+            contextTokens: try container.decode(Int.self, forKey: .contextTokens),
+            contextWindow: try container.decodeIfPresent(Int.self, forKey: .contextWindow),
+            turns: try container.decode(Int.self, forKey: .turns)
+        )
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(usage, forKey: .usage)
+        try container.encode(costTotal.description, forKey: .costTotal)
+        try container.encode(contextTokens, forKey: .contextTokens)
+        try container.encodeIfPresent(contextWindow, forKey: .contextWindow)
+        try container.encode(turns, forKey: .turns)
+    }
+
+    /// A decimal written either as a string (what this type now emits) or as a
+    /// JSON number (what it used to emit, and what an older peer still sends).
+    ///
+    /// A string that is not a decimal is an error rather than a zero: a total that
+    /// could not be read is not a total of nothing.
+    private static func decodeDecimal(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKey key: CodingKeys
+    ) throws -> Decimal {
+        guard let text = try? container.decode(String.self, forKey: key) else {
+            return try container.decode(Decimal.self, forKey: key)
+        }
+        guard let value = Decimal(string: text) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "Expected a decimal number spelled as a string; got \"\(text)\""
+            )
+        }
+        return value
+    }
 }
 
 // MARK: - Persistence conformance

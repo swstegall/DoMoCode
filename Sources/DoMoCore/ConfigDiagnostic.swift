@@ -118,8 +118,14 @@ public struct ConfigDiagnostic: Error, Sendable, Hashable, CustomStringConvertib
     /// this package's error text.
     public var problem: String
 
-    /// The offending source line with tabs expanded to spaces, or `nil` when
-    /// there is no line to show.
+    /// The offending source line, with any credential on it masked and tabs
+    /// expanded to spaces, or `nil` when there is no line to show.
+    ///
+    /// The masking is not optional: a settings file holds
+    /// `mcpServers.*.environment`, so the line quoted back here is routinely a
+    /// live API key. It is done by ``Redaction/maskingSecrets(inSourceLine:)``,
+    /// which is length-preserving in Unicode scalars precisely so that
+    /// ``caretColumn`` still points at the character it accuses.
     ///
     /// Tabs are expanded rather than emitted because the caret line beneath is
     /// built from spaces: a tab in the excerpt would be re-expanded by the
@@ -253,7 +259,15 @@ extension ConfigDiagnostic {
         if end > start, bytes[end - 1] == 0x0D { end -= 1 }
         guard start < end else { return nil }
 
-        let line = String(decoding: bytes[start..<end], as: UTF8.self)
+        // Mask before anything is measured. A settings file's offending line is
+        // as likely as not to be the one holding an MCP server's credential, and
+        // an unrelated key three lines away failing to decode was enough to
+        // print it. The mask preserves the scalar count of the line, which is
+        // the unit both the caret loop below and `location.column` count in, so
+        // the caret still lands on the character it accuses.
+        let line = Redaction.maskingSecrets(
+            inSourceLine: String(decoding: bytes[start..<end], as: UTF8.self)
+        )
         let tab: Unicode.Scalar = "\t"
         let space: Unicode.Scalar = " "
 

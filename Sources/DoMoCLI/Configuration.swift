@@ -338,48 +338,22 @@ extension Settings {
     ///   into them, for ``DoMoCore/Redaction/registerAll(_:)``.
     /// - Throws: ``DoMoCore/ConfigDiagnostic`` naming the token that failed —
     ///   never the value it would have produced.
-    /// Whether a value substituted into this key should be registered as a
-    /// secret, so it is masked wherever it is later printed.
-    ///
-    /// Not every interpolated value is a credential, and treating them as if
-    /// they were does real damage. The first cut of this registered *every*
-    /// substituted value, and `"baseUrl": "http://{env:MY_GATEWAY_HOST}:4000/v1"`
-    /// then registered the hostname — so a later connection failure read
-    /// `connect to https://[redacted]@[redacted] failed`, blanking the one fact
-    /// the URL-userinfo rule goes out of its way to preserve: which endpoint
-    /// refused you. A host a user happened to keep in an environment variable is
-    /// not thereby a secret.
-    ///
-    /// Three things qualify. `authHeader` and `authScheme` are named explicitly
-    /// because they hold a credential while matching none of
-    /// ``DoMoCore/Redaction/isSecretKeyName(_:)``'s markers. Every
-    /// `mcpServers.*.environment` value qualifies regardless of its name, because
-    /// that block exists to hand secrets to a child and a name filter would miss
-    /// the one a user spelled `GH_PAT` — the same trade
-    /// ``DoMoCodeCommand`` makes when it registers those values at startup.
-    /// Anything else qualifies only on a secret-shaped name.
-    ///
-    /// `apiKeyEnv` is deliberately absent: it holds the *name* of a variable,
-    /// which is not a secret, and registering it would scrub that name out of
-    /// the "which credential did I use?" hint an auth failure most needs.
-    static func keyCarriesCredential(_ keyPath: [String]) -> Bool {
-        guard let key = keyPath.last else { return false }
-        if keyPath.count == 1 { return ["authHeader", "authScheme"].contains(key) }
-        if keyPath.count == 4, keyPath[0] == "mcpServers", keyPath[2] == "environment" { return true }
-        return Redaction.isSecretKeyName(key)
-    }
-
     public func resolvingInterpolations(
         policy: InterpolationPolicy,
         environment: [String: String],
         baseDirectory: String?,
         file: String?,
-        readFile: @Sendable (String) throws -> String = {
-            try String(contentsOf: URL(fileURLWithPath: $0), encoding: .utf8)
-        }
+        readFile: (@Sendable (String) throws -> String)? = nil
     ) throws(ConfigDiagnostic) -> (settings: Settings, substituted: [String]) {
         var resolved = self
         var substituted: [String] = []
+        // Confinement is enforced HERE, around the reader, because this is the
+        // only layer that opens the file. `resolveConfigValue`'s own check is
+        // lexical and says so: it collapses `..` as text and never asks the
+        // filesystem, so a symlink planted *inside* the project root passes it.
+        // See ``confinedReader(_:root:)``. An injected reader is wrapped too —
+        // a caller must not be able to opt out of the confinement it asked for.
+        let read = Settings.confinedReader(readFile ?? Settings.plainFileReader, root: policy.fileRoot)
 
         func apply(_ value: String?, _ keyPath: [String]) throws(ConfigDiagnostic) -> String? {
             guard let value else { return nil }
@@ -390,7 +364,7 @@ extension Settings {
                 baseDirectory: baseDirectory,
                 keyPath: keyPath,
                 file: file,
-                readFile: readFile
+                readFile: read
             )
             if Settings.keyCarriesCredential(keyPath) {
                 substituted.append(contentsOf: result.substituted)
@@ -442,6 +416,137 @@ extension Settings {
         }
 
         return (resolved, substituted)
+    }
+
+    // MARK: What counts as a secret
+
+    /// Whether a value substituted into this key should be registered as a
+    /// secret, so it is masked wherever it is later printed.
+    ///
+    /// Not every interpolated value is a credential, and treating them as if
+    /// they were does real damage — in **both** directions.
+    ///
+    /// Over-registering blanks the diagnostic. The first cut of this registered
+    /// *every* substituted value, and
+    /// `"baseUrl": "http://{env:MY_GATEWAY_HOST}:4000/v1"` then registered the
+    /// hostname — so a later connection failure read
+    /// `connect to https://[redacted]@[redacted] failed`, blanking the one fact
+    /// the URL-userinfo rule goes out of its way to preserve: which endpoint
+    /// refused you. A host a user happened to keep in an environment variable is
+    /// not thereby a secret.
+    ///
+    /// Worse, over-registering can *leak*. `authHeader` and `authScheme` used to
+    /// be named here as credential-carrying. They are not: `authHeader` holds a
+    /// header **name** (`Authorization`) and `authScheme` a scheme word
+    /// (`Bearer`). Registering a header name as a process-wide secret literal
+    /// makes ``DoMoCore/Redaction/diagnostic(_:)`` rewrite that name to
+    /// `[redacted]` *before* the pattern rules run — which is precisely how
+    /// ``DoMoCore/Redaction``'s header-line rule recognises the line whose value
+    /// it must eat. The name was hidden and the credential on the same line was
+    /// printed. Neither is registered now, for the same reason `apiKeyEnv` never
+    /// was: it holds the *name* of a variable, and registering it would scrub
+    /// that name out of the "which credential did I use?" hint an auth failure
+    /// most needs.
+    ///
+    /// What does qualify: every `mcpServers.*.environment` value and every
+    /// `mcpServers.*.command` argument, regardless of its name. That block
+    /// exists to hand secrets to a child process — a name filter would miss the
+    /// one a user spelled `GH_PAT` — and an argument is the same slot by another
+    /// spelling: `["gh-mcp", "--token={env:GH_PAT}"]` ends up verbatim in the
+    /// spawn-failure line if it is not registered. Anything else qualifies only
+    /// on a secret-shaped name.
+    ///
+    /// The cost of those two, stated rather than hidden: only the *substituted*
+    /// span is registered, never the whole argument, but an innocuous
+    /// substitution of eight characters or more — `--root={env:HOME}` — is
+    /// scrubbed out of later diagnostics as well. That is the same trade
+    /// ``DoMoCLI/DoMoCodeCommand`` already makes for the environment block, and
+    /// it is the right way round: an argv fragment a user deliberately kept out
+    /// of their config file is far more often a credential than a hostname is.
+    static func keyCarriesCredential(_ keyPath: [String]) -> Bool {
+        guard let key = keyPath.last else { return false }
+        // `apiKeyEnv` matches `isSecretKeyName` on its spelling alone, and must
+        // not: see above.
+        if keyPath.count == 1, key == "apiKeyEnv" { return false }
+        if keyPath.count == 4, keyPath[0] == "mcpServers",
+            keyPath[2] == "environment" || keyPath[2] == "command"
+        {
+            return true
+        }
+        return Redaction.isSecretKeyName(key)
+    }
+
+    // MARK: Confined file reads
+
+    /// A `{file:}` target whose *resolved* location is outside the root the
+    /// policy confined reads to.
+    ///
+    /// It carries paths and never contents: the file is refused before it is
+    /// opened, so there are no contents to carry.
+    struct FileConfinementError: Error, Hashable {
+        var requested: String
+        var resolved: String
+        var root: String
+    }
+
+    /// The reader used when no other is injected. Follows symlinks, which is
+    /// correct for a trusted policy and is exactly why the untrusted one wraps
+    /// it in ``confinedReader(_:root:)``.
+    static let plainFileReader: @Sendable (String) throws -> String = {
+        try String(contentsOf: URL(fileURLWithPath: $0), encoding: .utf8)
+    }
+
+    /// `readFile`, refusing anything whose resolved location escapes `root`.
+    ///
+    /// ``DoMoCore/InterpolationPolicy/fileRoot``'s check is lexical by
+    /// construction — `resolveConfigValue` is pure and never consults the
+    /// filesystem — so `.domocode/id_rsa -> ~/.ssh/id_rsa`, a symlink a cloned
+    /// repository is free to commit, passes it: the path names nothing outside
+    /// the project. The kernel disagrees. So confinement is decided again here,
+    /// against a path resolved through every symlink, and the read is issued
+    /// against **that** resolved path rather than the one the config asked for,
+    /// so the answer cannot change between the check and the open.
+    ///
+    /// A `nil` or empty root returns `readFile` untouched. That is the trusted
+    /// policy, and it must stay unconfined: a user's own settings.json pointing
+    /// `{file:~/.gateway-key}` at a symlinked key file is the feature working.
+    static func confinedReader(
+        _ readFile: @escaping @Sendable (String) throws -> String,
+        root: String?
+    ) -> @Sendable (String) throws -> String {
+        guard let root, !root.isEmpty else { return readFile }
+        return { path in
+            try readFile(Settings.resolvedPath(path, confinedTo: root))
+        }
+    }
+
+    /// `path` resolved through every symlink, if that lands inside `root`.
+    ///
+    /// - Throws: ``FileConfinementError`` when it does not, *before* any read.
+    static func resolvedPath(_ path: String, confinedTo root: String) throws -> String {
+        let resolvedRoot = canonicalized(root)
+        let target = canonicalized(path)
+        // An empty root would make `starts(with:)` vacuously true and confine
+        // nothing, which is the one answer that must not happen — the same guard
+        // `resolveConfigValue` keeps for the lexical check.
+        guard !resolvedRoot.isEmpty,
+            target == resolvedRoot || target.starts(with: resolvedRoot)
+        else {
+            throw FileConfinementError(
+                requested: path, resolved: target.string, root: resolvedRoot.string)
+        }
+        return target.string
+    }
+
+    /// A path with its symlinks resolved and `.`/`..` collapsed.
+    ///
+    /// Applied to the root as well as to the target, so the platforms where the
+    /// root itself sits under a link — macOS resolves `/tmp` to `/private/tmp` —
+    /// compare like with like. A component that does not exist resolves to
+    /// itself, which is harmless: the read that follows fails with `ENOENT`
+    /// instead of returning something.
+    private static func canonicalized(_ path: String) -> FilePath {
+        FilePath(URL(fileURLWithPath: path).resolvingSymlinksInPath().path).lexicallyNormalized()
     }
 }
 
@@ -660,9 +765,13 @@ public struct ResolvedConfiguration: Sendable {
     /// The global one is the fallback, not the override.
     ///
     /// ``ModelRuntime/contextWindow`` stays `nil` when neither the alias nor the
-    /// global setting states one. ``defaultContextWindow`` is deliberately *not*
-    /// substituted here: it is compaction's floor, and returning it would turn
-    /// "unknown" into a number a meter would render as a confident percentage.
+    /// global setting states one, and no fallback is substituted here. The
+    /// harness has one — `AgentHarness.Configuration.fallbackContextWindow` —
+    /// but it is compaction's floor, not a fact about the model, and it lives
+    /// there alone: returning it from here would turn "unknown" into a number a
+    /// meter would render as a confident percentage, and a second copy of it in
+    /// this file would be a number that could drift from the one the harness
+    /// actually compacts against.
     public func modelRuntime(for alias: String) -> ModelRuntime {
         let specific = override(for: alias)
         return ModelRuntime(
@@ -705,16 +814,13 @@ public struct ResolvedConfiguration: Sendable {
     public static let defaultRetryDelayBudget: Duration? = .seconds(300)
     public static let defaultLogLevel = Logger.Level.warning
 
-    /// The window to assume when nothing knows the real one.
-    ///
-    /// It is **not** a fact about any model and is never reported as one — see
-    /// ``modelRuntime(for:)``. It exists so that a session against an unknown
-    /// model still compacts, rather than growing until the provider rejects the
-    /// turn. Must equal `AgentHarness.Configuration.fallbackContextWindow`,
-    /// which is the value the harness actually compacts against; two different
-    /// numbers would mean the CLI and the harness disagree about when a session
-    /// is full.
-    public static let defaultContextWindow = 200_000
+    // There is deliberately no `defaultContextWindow` here. One existed, equal
+    // to `AgentHarness.Configuration.fallbackContextWindow` and pinned to it by
+    // a test — and read by nothing else, in the phase whose stated purpose was
+    // removing exactly that kind of substrate. A window nobody stated stays
+    // `nil` all the way through this type (see ``modelRuntime(for:)``); the only
+    // code that needs a number to compact against is the harness, which owns
+    // the one number. A copy here could only ever agree with it or drift.
 
     /// The `LiteLLMClient` configuration this resolves to. The one place the CLI
     /// hands its resolved settings to the wire client.
@@ -838,7 +944,7 @@ extension ResolvedConfiguration {
         func level(_ raw: String?, _ source: String) -> Logger.Level? {
             guard let raw, !raw.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
             if let parsed = Logger.Level(caseInsensitive: raw) { return parsed }
-            warnings.append("\(source) is not a log level (got \"\(raw)\"); ignoring it")
+            warnings.append("\(source) is not a log level (got \(quotable(raw))); ignoring it")
             return nil
         }
         let logLevel =
@@ -908,6 +1014,40 @@ extension ResolvedConfiguration {
             warnings: warnings
         )
     }
+
+    /// The most of a rejected configuration value that may be quoted back.
+    ///
+    /// `logLevel` is one of the interpolated fields, so the string this warning
+    /// echoes can be whatever `{env:X}` or `{file:X}` produced — and
+    /// ``DoMoCore/resolveConfigValue(_:policy:environment:baseDirectory:keyPath:file:readFile:)``
+    /// states that a diagnostic never shows a resolved value. That rule is only
+    /// absolute if the layer above keeps it, so the value is scrubbed against
+    /// the redaction registry and then cut.
+    ///
+    /// The cut still has to leave the warning useful: the point of it is a user
+    /// staring at a level they set and a harness plainly not using it. Every
+    /// level name is at most eight characters, so a typo worth showing —
+    /// `verbose`, `loud`, `WARN ` — is quoted whole.
+    ///
+    /// Anything LONGER than a level name could ever be is not quoted at all,
+    /// only measured. Truncating it instead was the first attempt and it was
+    /// worse than either doing nothing or doing this: the scrub only replaces a
+    /// value the vault was told about, and `logLevel` is not a credential-shaped
+    /// key, so an unregistered secret reached the prefix intact — and a
+    /// twelve-character prefix of a secret is twelve characters of a secret. The
+    /// length alone already tells the user the value is not a level, which is
+    /// the whole question the warning exists to answer.
+    /// Returns the value already quoted when it is short enough to show, and an
+    /// unquoted description of it when it is not — so the caller interpolates
+    /// this verbatim rather than deciding where the quotation marks go.
+    static func quotable(_ raw: String) -> String {
+        let scrubbed = Redaction.diagnostic(raw)
+        guard scrubbed.count > quotableLimit else { return "\"\(scrubbed)\"" }
+        return "a \(scrubbed.count)-character value"
+    }
+
+    /// Half again the longest level name (`critical`), rounded up.
+    static let quotableLimit = 12
 
     /// `nil` for an absent *or* empty string, so the two spellings of "not set"
     /// are one value everywhere below.

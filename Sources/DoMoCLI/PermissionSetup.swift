@@ -30,16 +30,25 @@ enum PermissionSetup {
 
     /// The lock file guarding a read-modify-write of `settingsPath`.
     ///
-    /// Derived from the **symlink-resolved** settings path, not the path as written,
-    /// so two processes that reach the same file by different names — a dotfiles
-    /// symlink, `/tmp` versus `/private/tmp`, `$HOME` versus its real location —
-    /// still contend for one lock instead of each taking their own and both winning.
+    /// Derived with ``FileLock/lockPath(forDocumentAt:)``, which follows a symlinked
+    /// leaf exactly the way ``AtomicFileWrite`` follows it, so a dotfiles-symlinked
+    /// settings.json is locked where it is written. Two processes reaching the same
+    /// file by different *parent* spellings (`/tmp` versus `/private/tmp`, `$HOME`
+    /// versus its real location) already exclude each other without any help here:
+    /// `flock(2)` locks an inode, and both spellings name the same one.
+    ///
+    /// It used to be `URL.resolvingSymlinksInPath()`, which is not the same function.
+    /// That one resolves a symlink only once the target exists, so for a settings.json
+    /// symlinked at a file no grant had created yet the lock lived on
+    /// `.settings.json.lock` before the first save and on `.real.json.lock` after it —
+    /// and the second writer to arrive took a lock file the first writer was not
+    /// holding.
     ///
     /// The lock is a sidecar (`.settings.json.lock`), never settings.json itself:
     /// locking the document means opening it `O_CREAT`, and a 0-byte settings.json
     /// left behind by an aborted merge is a hard failure on every later launch.
     static func settingsLockPath(_ settingsPath: String) -> String {
-        FileLock.sidecarPath(for: URL(fileURLWithPath: settingsPath).resolvingSymlinksInPath().path)
+        FileLock.lockPath(forDocumentAt: settingsPath)
     }
 
     /// The `permission` config in a settings.json, order preserved, together with the
@@ -139,12 +148,35 @@ enum PermissionSetup {
         )
     }
 
-    /// Why a persist attempt did not save. Returned rather than thrown so the body of
-    /// the ``FileLock/withLock(at:timeout:_:)`` call stays non-throwing and the lock's
-    /// own `nil` (contention) is not confused with a failure inside it.
-    private enum PersistOutcome: Sendable {
+    /// What happened inside the lock. Returned rather than thrown so the body of the
+    /// ``FileLock/withLock(at:timeout:_:)`` call stays non-throwing and a failure
+    /// inside the critical section is not confused with the lock's own outcomes.
+    private enum WriteOutcome: Sendable {
         case saved
         case failed(String)
+    }
+
+    /// What a whole persist attempt did, including why it did not save.
+    ///
+    /// Returned as well as warned about because the four not-saved cases get four
+    /// different sentences and a test has no other way to tell them apart — stderr is
+    /// not capturable in-process. They were once a single `nil`, so a lock file the
+    /// process could not open (0400, ENOTDIR, a read-only mount, a directory in the
+    /// lock's place) was reported as "another process is writing", which is a lie that
+    /// sends the user hunting for a second `domo`.
+    ///
+    /// Production callers ignore it; the warning on stderr is the user-facing half.
+    enum PersistResult: Sendable, Equatable {
+        /// The grants are in the file.
+        case saved
+        /// The lock was held, but the read-merge-write inside it failed.
+        case writeFailed(String)
+        /// Another holder had the lock for the whole timeout.
+        case contended
+        /// The task was cancelled while waiting for the lock.
+        case cancelled
+        /// The lock file itself could not be opened; nothing was attempted.
+        case lockUnopenable(String)
     }
 
     /// A persister that writes "allow always" grants into the GLOBAL user
@@ -180,73 +212,109 @@ enum PermissionSetup {
     /// The directory is created **before** the lock rather than between the read and
     /// the write, where it used to sit: the lock file lives in that directory, and on
     /// a first run there is no config directory at all — a lock that cannot be created
-    /// reports "busy", which would be a lie. It is belt and braces rather than a fix
-    /// on its own, because ``FileLock/withLock(at:timeout:_:)`` also creates its own
-    /// parent; stated here so the ordering is a decision and not an accident.
-    static func persistGrants(_ grants: Ruleset, settingsPath path: String, configDirectory: String) async {
+    /// would fail the save on a machine where nothing is wrong. It is belt and braces
+    /// rather than a fix on its own, because ``FileLock/withLock(at:timeout:_:)`` also
+    /// creates its own parent; stated here so the ordering is a decision and not an
+    /// accident.
+    ///
+    /// The four ways this can fail are four different sentences, and ``PersistResult``
+    /// is what keeps them apart. "Another process is writing" is said only when that is
+    /// actually what happened.
+    @discardableResult
+    static func persistGrants(
+        _ grants: Ruleset,
+        settingsPath path: String,
+        configDirectory: String
+    ) async -> PersistResult {
         try? FileManager.default.createDirectory(atPath: configDirectory, withIntermediateDirectories: true)
 
-        let outcome = await FileLock.withLock(at: settingsLockPath(path)) { () -> PersistOutcome in
-            let existing: String
-            if FileManager.default.fileExists(atPath: path) {
-                // Present but unreadable: report it rather than clobbering the user's
-                // settings with "{}" plus one grant.
-                guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else {
-                    return .failed("it could not be read")
+        let lock = settingsLockPath(path)
+        let outcome: FileLock.Outcome<WriteOutcome>
+        do {
+            outcome = try await FileLock.withLock(at: lock) { () -> WriteOutcome in
+                let existing: String
+                if FileManager.default.fileExists(atPath: path) {
+                    // Present but unreadable: report it rather than clobbering the
+                    // user's settings with "{}" plus one grant.
+                    guard let text = try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8) else {
+                        return .failed("it could not be read")
+                    }
+                    existing = text
+                } else {
+                    existing = "{}"
                 }
-                existing = text
-            } else {
-                existing = "{}"
-            }
 
-            let updated: String
-            do {
-                updated = try settingsText(parsing: existing, mergingGrants: grants, file: path)
-            } catch {
-                return .failed("\(error)")
-            }
+                let updated: String
+                do {
+                    updated = try settingsText(parsing: existing, mergingGrants: grants, file: path)
+                } catch {
+                    return .failed("\(error)")
+                }
 
-            do {
-                // `AtomicFileWrite`, not `String.write(toFile:atomically:)`. Two
-                // behaviours were measured on Darwin 27 / Swift 6.3.3 under umask
-                // 022, not assumed:
-                //
-                //  - Foundation CREATES the file at 0644, so the first grant a user
-                //    ever makes leaves their settings.json world-readable — and this
-                //    is the file holding `apiKeyEnv` and every permission decision.
-                //  - Foundation REPLACES a symlink with a regular file, so a
-                //    settings.json symlinked out of a dotfiles repository is silently
-                //    detached from it by one saved grant.
-                //
-                // Foundation does happen to carry an *existing* file's mode across on
-                // Darwin (`replaceItemAt` copies metadata), so the mode-preservation
-                // tests would pass either way here. That is an implementation detail
-                // of one platform's replace, not a promise — which is exactly why the
-                // guarantee lives in `AtomicFileWrite` instead of being inherited.
-                try AtomicFileWrite.replace(at: path, with: updated)
-            } catch {
-                // Interpolated rather than `.message`: this `do` block sits inside a
-                // closure whose context type is `throws`, so the catch binds
-                // `any Error` and `DoMoError`'s one-line `description` is the right
-                // rendering anyway.
-                return .failed("\(error)")
+                do {
+                    // `AtomicFileWrite`, not `String.write(toFile:atomically:)`. Two
+                    // behaviours were measured on Darwin 27 / Swift 6.3.3 under umask
+                    // 022, not assumed:
+                    //
+                    //  - Foundation CREATES the file at 0644, so the first grant a user
+                    //    ever makes leaves their settings.json world-readable — and this
+                    //    is the file holding `apiKeyEnv` and every permission decision.
+                    //  - Foundation REPLACES a symlink with a regular file, so a
+                    //    settings.json symlinked out of a dotfiles repository is silently
+                    //    detached from it by one saved grant.
+                    //
+                    // Foundation does happen to carry an *existing* file's mode across
+                    // on Darwin (`replaceItemAt` copies metadata), so the
+                    // mode-preservation tests would pass either way here. That is an
+                    // implementation detail of one platform's replace, not a promise —
+                    // which is exactly why the guarantee lives in `AtomicFileWrite`
+                    // instead of being inherited.
+                    try AtomicFileWrite.replace(at: path, with: updated)
+                } catch {
+                    // Interpolated rather than `.message`: `DoMoError`'s one-line
+                    // `description` is the right rendering for a warning either way.
+                    return .failed("\(error)")
+                }
+                return .saved
             }
-            return .saved
+        } catch {
+            // Not contention: the lock file could not be opened at all. Saying
+            // "another process is writing" here would send the user looking for a
+            // second `domo` instead of at the 0400 lock file, the read-only mount, or
+            // the directory sitting where the lock belongs — and the `errno` that names
+            // which of those it is rides along in the error.
+            warn(
+                "could not save the permission grant to \(path): its lock file could not be opened — \(error)\n"
+                    + "The grant applies for the rest of this session only."
+            )
+            return .lockUnopenable("\(error)")
         }
 
         switch outcome {
-        case .some(.saved):
-            return
-        case .some(.failed(let reason)):
+        case .ran(.saved):
+            return .saved
+        case .ran(.failed(let reason)):
             warn(
                 "could not save the permission grant to \(path): \(reason)\n"
                     + "The grant applies for the rest of this session only."
             )
-        case .none:
+            return .writeFailed(reason)
+        case .contended:
             warn(
                 "could not save the permission grant: another process is writing \(path).\n"
                     + "The grant applies for the rest of this session only."
             )
+            return .contended
+        case .cancelled:
+            // Rare by construction: an uncontended acquire succeeds even in a cancelled
+            // task, so this needs a peer holding the lock *and* a shutdown at the same
+            // moment. Still said out loud, because the grant is gone either way.
+            warn(
+                "could not save the permission grant to \(path): the save was cancelled "
+                    + "while waiting for another process to finish writing.\n"
+                    + "The grant applies for the rest of this session only."
+            )
+            return .cancelled
         }
     }
 

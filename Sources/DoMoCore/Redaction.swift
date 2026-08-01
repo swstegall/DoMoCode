@@ -15,13 +15,15 @@ import Synchronization
 ///
 /// Two mechanisms, applied in that order:
 ///
-/// 1. A **literal registry**. Whoever resolved a secret — the env layer, config
+/// 1. **Pattern rules** for the secrets nobody registered: a key the *user*
+///    pasted into a prompt, a `Set-Cookie` from a proxy, a token quoted back by
+///    an upstream error. They run first because they are structural and a
+///    registered literal must not be able to disable one — see
+///    ``RedactionVault/diagnostic(_:)``.
+/// 2. A **literal registry**. Whoever resolved a secret — the env layer, config
 ///    interpolation — hands the resolved value here, and every later occurrence
 ///    of that exact string is replaced. This is the only mechanism that can be
-///    exact, so it runs first.
-/// 2. **Pattern rules** for the secrets nobody registered: a key the *user*
-///    pasted into a prompt, a `Set-Cookie` from a proxy, a token quoted back by
-///    an upstream error.
+///    exact, and it is the backstop for everything the rules cannot recognize.
 ///
 /// There is deliberately **no entropy heuristic**. Base64 image data, git SHAs,
 /// UUIDv7 ids and minified JavaScript all read as "high entropy", and a
@@ -84,21 +86,38 @@ public final class RedactionVault: Sendable {
         secret.count >= minimumSecretLength && secret.contains(where: { !$0.isWhitespace })
     }
 
-    /// Scrubs a string bound for a human: the literal registry first, then the
-    /// pattern rules.
+    /// Scrubs a string bound for a human: the pattern rules first, then the
+    /// literal registry.
+    ///
+    /// **The order is a security property, not a preference.** A registered
+    /// literal is replaced everywhere it occurs, so a literal that happens to be
+    /// the substring a rule matches on deletes that rule's trigger. This is not
+    /// hypothetical: `authHeader` is a credential-carrying config key, its value
+    /// is a *header name* — `Authorization` — and registering it made
+    /// `Authorization: Basic …` become `[redacted]: Basic …`, with the
+    /// credential intact, right past a rule written to catch exactly that line.
+    /// Patterns are structural and nothing a literal replacement does to the
+    /// text makes them match *more*, so they go first and the registry mops up
+    /// whatever is left.
+    ///
+    /// The cost of this order is small and one-directional: a pattern that
+    /// rewrites part of a registered literal — the userinfo inside a registered
+    /// `postgres://user:pw@host` — leaves the rest of that literal unmatched.
+    /// What survives is the half the rule deliberately preserves (the host),
+    /// and the credential is gone either way.
     ///
     /// This is a hot path — it runs on every error and on every re-render of
-    /// the client's diagnostics panel — so both halves short-circuit. An empty
-    /// registry costs one `isEmpty`, and text carrying none of the pattern
-    /// rules' trigger substrings never reaches a regex engine.
+    /// the client's diagnostics panel — so both halves short-circuit. Text
+    /// carrying none of the pattern rules' trigger substrings never reaches a
+    /// regex engine, and an empty registry costs one loop over nothing.
     public func diagnostic(_ text: String) -> String {
         guard !text.isEmpty else { return text }
+        var result = Redaction.patterns(text)
         let known = literals.withLock { $0 }
-        var result = text
         for secret in known where result.contains(secret) {
             result = result.replacingOccurrences(of: secret, with: Redaction.placeholder)
         }
-        return Redaction.patterns(result)
+        return result
     }
 
     /// Scrubs a header dictionary, dropping the value of any header whose
@@ -107,6 +126,11 @@ public final class RedactionVault: Sendable {
     /// Values of ordinary headers still go through ``diagnostic(_:)`` because a
     /// redirect `Location` can carry URL userinfo, which is a password in a
     /// header that no name-based rule would catch.
+    ///
+    /// > Note: no production code calls this yet. The natural site is
+    /// > `ResponseMetadata.headers` in DoMoLLM, which is the only place the
+    /// > harness holds a response's headers as a dictionary; until that is wired
+    /// > up this is exercised only by its tests.
     public func redact(headers: [String: String]) -> [String: String] {
         var result: [String: String] = [:]
         result.reserveCapacity(headers.count)
@@ -123,6 +147,10 @@ public final class RedactionVault: Sendable {
     /// — `{"api_key": "…"}` — where the value itself carries no recognizable
     /// prefix. A `null` under such a key is left alone: rewriting it would
     /// claim a credential was present when none was.
+    ///
+    /// > Note: no production code calls this yet either. Error bodies reach
+    /// > ``diagnostic(_:)`` as text, not as parsed JSON, so nothing in the
+    /// > harness currently has a `JSONValue` on a path bound for a human.
     public func redact(_ value: JSONValue) -> JSONValue {
         switch value {
         case .null, .bool, .int, .double:
@@ -193,13 +221,15 @@ public enum Redaction {
     /// (a pure formatting helper) can still scrub.
     public static func patterns(_ text: String) -> String {
         guard containsPatternTrigger(text) else { return text }
-        // Header lines first: they subsume every other rule for the text they
-        // cover, so running them first means one replacement instead of a
-        // `[redacted]` nested inside another.
+        // Header lines first: where one really is a header it subsumes every
+        // other rule for the text it covers, so running it first means one
+        // replacement instead of a `[redacted]` nested inside another. Where the
+        // marker turns out to be prose the span is left untouched and the rules
+        // below still get their look at it.
         var result = replacingMatches(in: text, of: headerLineRule.regex, with: redactHeaderLine)
-        result = replacingMatches(in: result, of: urlUserinfoRule.regex) { _ in "://\(placeholder)@" }
-        result = replacingMatches(in: result, of: bearerRule.regex, with: redactBearer)
-        result = replacingMatches(in: result, of: tokenRule.regex, with: redactToken)
+        result = replacingMatches(in: result, of: urlUserinfoRule.regex) { _, _ in "://\(placeholder)@" }
+        result = replacingMatches(in: result, of: bearerRule.regex) { redactBearer($0[$1]) }
+        result = replacingMatches(in: result, of: tokenRule.regex) { redactToken($0[$1]) }
         return result
     }
 
@@ -256,6 +286,15 @@ public enum Redaction {
     /// earlier stop risks leaving the tail of the secret behind. A truncated
     /// diagnostic beats a leaked key. The rule is line-bounded, so the lines
     /// around it survive.
+    ///
+    /// The rule finds the marker *anywhere*; whether the marker is actually a
+    /// header is decided by ``isAtHeaderPosition(_:_:)`` in the replacement, not
+    /// here. Writing the anchor into the pattern is the obvious alternative and
+    /// it does not work: `Regex` fails to backtrack a greedy quantifier that
+    /// follows a character class, so `/[\r\n][A-Za-z0-9_\-]*api-key/` finds
+    /// nothing at all in `"\nanthropic-api-key:"`. For a redaction rule that
+    /// engine bug is a silent leak, so the decision is made in code that can be
+    /// read and tested directly.
     private static let headerLineRule = PatternRule(
         /(?:proxy-authorization|authorization|x-api-key|api-key|set-cookie|cookie)[ \t]*:[^\r\n]*/
             .ignoresCase()
@@ -279,13 +318,72 @@ public enum Redaction {
             .ignoresCase()
     )
 
-    private static func redactHeaderLine(_ matched: Substring) -> String {
+    private static func redactHeaderLine(_ text: String, _ range: Range<String.Index>) -> String {
+        let matched = text[range]
+        // A marker in the middle of a sentence is prose, not a header. This is
+        // the whole reason the check exists: `DoMoError.description` is a
+        // documented one-line string that is persisted as an
+        // `AssistantMessage.errorMessage`, and taking everything to end of line
+        // from an unanchored marker wrote "the api-key: header was rejected,
+        // rotate the key in the dashboard" to the session file with its entire
+        // actionable half missing.
+        //
+        // Leaving the span alone rather than rewriting it is deliberate: the
+        // later rules run over the whole string afterwards, so a token or a
+        // bearer run inside this sentence is still redacted by the rule that
+        // recognizes it.
+        guard isAtHeaderPosition(text, range.lowerBound) else { return String(matched) }
         guard let colon = matched.firstIndex(of: ":") else { return placeholder }
         let value = matched[matched.index(after: colon)...]
         // An absent value is not a secret. Turning `Cookie:` into
         // `Cookie: [redacted]` would tell the reader a credential was there.
         guard value.contains(where: { !$0.isWhitespace }) else { return String(matched) }
         return "\(matched[...colon]) \(placeholder)"
+    }
+
+    /// Whether a marker starting at `start` is where a header name would be.
+    ///
+    /// Walking backwards, a header position is: the rest of the header's name,
+    /// then optional indentation, then the start of a line. So
+    /// `Anthropic-Api-Key:` and `  Set-Cookie:` are headers, `cookieJar:` is not
+    /// (the marker has to *end* the name, which the pattern already requires),
+    /// and `the api-key:` is not — a blank may indent a line but may never
+    /// separate a word from the header name.
+    ///
+    /// The start of a line is the start of the text, a real `CR` or `LF`, or an
+    /// *escaped* one: the two characters `\` and `r`/`n`, which is the form a
+    /// header block takes once it has been through a JSON string. That is the
+    /// only way a header block reaches a persisted one-line error message.
+    private static func isAtHeaderPosition(_ text: String, _ start: String.Index) -> Bool {
+        var index = start
+        var sawBlank = false
+        while index > text.startIndex {
+            let previous = text.index(before: index)
+            let character = text[previous]
+            if character.isNewline { return true }
+            if character == "r" || character == "n", previous > text.startIndex,
+                text[text.index(before: previous)] == "\\"
+            {
+                // An escaped line break: the two characters `\` and `r`/`n`.
+                return true
+            }
+            if character == " " || character == "\t" {
+                sawBlank = true
+                index = previous
+                continue
+            }
+            // Name characters may only sit between the marker and the start of
+            // the line; once a blank has been crossed there is a word here, and
+            // a word before a marker makes it prose.
+            guard !sawBlank, isHeaderNameCharacter(character) else { return false }
+            index = previous
+        }
+        return true
+    }
+
+    private static func isHeaderNameCharacter(_ character: Character) -> Bool {
+        character.isASCII
+            && (character.isLetter || character.isNumber || character == "_" || character == "-")
     }
 
     private static func redactToken(_ matched: Substring) -> String {
@@ -319,10 +417,14 @@ public enum Redaction {
     /// every rule can share one path regardless of how many groups it has.
     /// Returns the original string untouched when nothing matched, so the
     /// no-secret case allocates nothing.
+    ///
+    /// `transform` is handed the whole text and the matched range, not just the
+    /// match, because a rule may need to see what *precedes* it: the header rule
+    /// is only a header rule when its marker starts a header name.
     private static func replacingMatches(
         in text: String,
         of rule: some RegexComponent,
-        with transform: (Substring) -> String
+        with transform: (String, Range<String.Index>) -> String
     ) -> String {
         let ranges = text.ranges(of: rule)
         guard !ranges.isEmpty else { return text }
@@ -331,11 +433,135 @@ public enum Redaction {
         var cursor = text.startIndex
         for range in ranges {
             result += text[cursor..<range.lowerBound]
-            result += transform(text[range])
+            result += transform(text, range)
             cursor = range.upperBound
         }
         result += text[cursor...]
         return result
+    }
+
+    // MARK: - Length-preserving source masking
+
+    /// Masks the credentials on one line of JSON source **without changing how
+    /// long it is**.
+    ///
+    /// ``ConfigDiagnostic`` quotes the offending line of a settings file back at
+    /// the user with a caret under the offending column, and a settings file
+    /// holds `mcpServers.*.environment` — so that line is routinely a live
+    /// credential, and any unrelated key in the file failing to decode was
+    /// enough to print it to stderr.
+    ///
+    /// ``patterns(_:)`` is the wrong tool for that line, twice over:
+    ///
+    /// * Every rule substitutes `[redacted]`, whose length is not the length of
+    ///   what it replaced. The caret is counted in Unicode scalars of this exact
+    ///   line, so any substitution of a different width slides it off the
+    ///   character it is accusing — the one thing the excerpt exists to point at.
+    /// * The header rule takes everything after its marker to end of line, so a
+    ///   line holding `"note": "authorization: see the docs"` would lose its
+    ///   value, its closing brace and every sibling after it.
+    ///
+    /// So this walks the line's JSON string literals and replaces the *contents*
+    /// of the ones that are credentials — a literal that is the value of a member
+    /// whose key passes ``isSecretKeyName(_:)``, or one whose contents
+    /// ``patterns(_:)`` would touch — with a run of `*` of exactly the same
+    /// number of Unicode scalars. Quotes, keys, structure, and every column stay
+    /// where they were.
+    ///
+    /// Two details earn their keep. A tab inside a literal survives as a tab,
+    /// because the excerpt expands tabs to a fixed stop and turning one into `*`
+    /// would move every column after it. And a literal left unterminated at end
+    /// of line is masked to end of line: the rest of it is its value, and the
+    /// line came from a file that failed to parse in the first place.
+    public static func maskingSecrets(inSourceLine line: String) -> String {
+        let scalars = Array(line.unicodeScalars)
+        guard scalars.contains("\"") else { return line }
+
+        // One JSON string literal on the line. `close` is `nil` for a literal
+        // the line ends inside of.
+        struct Literal {
+            var open: Int
+            var contents: Range<Int>
+            var close: Int?
+            var text: String
+        }
+
+        var literals: [Literal] = []
+        var index = 0
+        while index < scalars.count {
+            guard scalars[index] == "\"" else {
+                index += 1
+                continue
+            }
+            var cursor = index + 1
+            var close: Int?
+            while cursor < scalars.count {
+                if scalars[cursor] == "\\" {
+                    // A backslash escapes whatever follows it, including a
+                    // quote, so the pair is skipped whole.
+                    cursor += 2
+                    continue
+                }
+                if scalars[cursor] == "\"" {
+                    close = cursor
+                    break
+                }
+                cursor += 1
+            }
+            let contents = (index + 1)..<min(close ?? scalars.count, scalars.count)
+            var view = String.UnicodeScalarView()
+            view.append(contentsOf: scalars[contents])
+            literals.append(
+                Literal(open: index, contents: contents, close: close, text: String(view))
+            )
+            index = close.map { $0 + 1 } ?? scalars.count
+        }
+
+        // The key of the member `position` is the value of, if it is one: the
+        // literal before it, separated by exactly one colon and blanks.
+        //
+        // The "and nothing else" is what keeps `"environment": {"K": "v"}` from
+        // attributing `v` to `environment` — the `{` between them ends the
+        // question — and it is why a nested key is read from the literal that
+        // really precedes it.
+        func keyOfMember(at position: Int) -> String? {
+            guard position > 0, let close = literals[position - 1].close else { return nil }
+            var sawColon = false
+            for offset in (close + 1)..<literals[position].open {
+                let scalar = scalars[offset]
+                if scalar == ":" {
+                    guard !sawColon else { return nil }
+                    sawColon = true
+                } else if !isJSONWhitespace(scalar) {
+                    return nil
+                }
+            }
+            return sawColon ? literals[position - 1].text : nil
+        }
+
+        var masked = scalars
+        var changed = false
+        for position in literals.indices {
+            let literal = literals[position]
+            guard !literal.contents.isEmpty else { continue }
+            let isCredential =
+                (keyOfMember(at: position).map(isSecretKeyName) ?? false)
+                || patterns(literal.text) != literal.text
+            guard isCredential else { continue }
+            for offset in literal.contents where masked[offset] != "\t" {
+                masked[offset] = "*"
+            }
+            changed = true
+        }
+        guard changed else { return line }
+
+        var view = String.UnicodeScalarView()
+        view.append(contentsOf: masked)
+        return String(view)
+    }
+
+    private static func isJSONWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        scalar == " " || scalar == "\t" || scalar == "\n" || scalar == "\r"
     }
 
     // MARK: - Name tests
@@ -346,22 +572,48 @@ public enum Redaction {
         "authorization", "bearer", "privatekey", "accesskey", "sessionkey",
     ]
 
-    /// Counter names that contain `token` and must never be redacted.
+    /// Markers that name a credential outright, and therefore beat the token
+    /// counter allow-list.
     ///
-    /// This allow-list is not optional. Without it every `prompt_tokens`,
-    /// `max_tokens` and `total_tokens` in a usage object is replaced by
-    /// `[redacted]`, which destroys the exact numbers this phase exists to make
-    /// honest — the cost total, the context meter and the session accounting
-    /// all read them.
-    ///
-    /// Matched as a substring so the nested wire shapes qualify too
-    /// (`prompt_tokens_details`, `cache_read_input_tokens`). The narrow cost is
-    /// that a name combining a marker *and* a counter — `secret_token_count` —
-    /// is allowed through; the counters are worth that.
-    private static let tokenCounterNames = [
-        "maxtokens", "inputtokens", "outputtokens", "totaltokens", "prompttokens",
-        "completiontokens", "cachedtokens", "reasoningtokens", "tokensbefore", "tokencount",
+    /// The counter rule keys on the plural — see ``isTokenCounterName(_:)`` —
+    /// and a credential can be plural too. Without this list `access_tokens`,
+    /// `refresh_tokens` and `api_tokens` all read as counters and are printed.
+    /// The singular forms need no help; these exist for the names where both
+    /// signals are present at once.
+    private static let unambiguousSecretKeyMarkers = [
+        "apikey", "secret", "password", "passwd", "credential",
+        "authorization", "bearer", "privatekey", "accesskey", "sessionkey",
+        "apitoken", "accesstoken", "refreshtoken", "authtoken", "idtoken",
+        "sessiontoken",
     ]
+
+    /// Whether a *normalized* name counts tokens rather than being one.
+    ///
+    /// The distinguishing signal is the plural. Every counter a provider emits
+    /// is a count *of tokens* — `prompt_tokens`, `audio_tokens`, `text_tokens`,
+    /// `image_tokens`, `accepted_prediction_tokens`, `cache_read_input_tokens`,
+    /// `num_tokens`, bare `tokens` — and the nested wire shapes keep the plural
+    /// inside them (`prompt_tokens_details`, `tokens_before`). A credential is a
+    /// token, singular: `access_token`, `api_token`. `token_count` says "count"
+    /// outright and is admitted by name.
+    ///
+    /// This rule replaced an enumeration of ten literal counter names, which was
+    /// wrong in the way an allow-list is always wrong: it silently called
+    /// `audio_tokens`, `text_tokens`, `image_tokens`,
+    /// `accepted_prediction_tokens`, `rejected_prediction_tokens`,
+    /// `cache_read_tokens`, `cache_write_tokens`, `num_tokens` and `tokens`
+    /// credentials, and the test that "pinned" it listed exactly the names it
+    /// already contained, so the gap could not fail a test.
+    ///
+    /// The allow-list is mostly **pre-emptive**. Its one live reader is
+    /// DoMoCLI's config interpolation, which asks ``isSecretKeyName(_:)`` which
+    /// substituted values to register as process-wide secrets — a `maxTokens`
+    /// read from the environment must not become a string that is struck out of
+    /// every later diagnostic. ``RedactionVault/redact(_:)``, the usage-object
+    /// path this list is really shaped for, has no production caller yet.
+    private static func isTokenCounterName(_ normalized: String) -> Bool {
+        normalized.contains("tokens") || normalized.contains("tokencount")
+    }
 
     /// Header names whose value is a credential but whose *name* carries none
     /// of ``secretKeyMarkers``. `Cookie` is the whole reason this exists: a
@@ -375,9 +627,11 @@ public enum Redaction {
     public static func isSecretKeyName(_ name: String) -> Bool {
         let normalized = normalizedName(name)
         guard !normalized.isEmpty else { return false }
-        // The allow-list is checked FIRST and unconditionally; see
-        // ``tokenCounterNames``.
-        if tokenCounterNames.contains(where: { normalized.contains($0) }) { return false }
+        // A name that says "credential" outright wins over the counter rule, so
+        // that a plural credential is not mistaken for a plural counter.
+        if unambiguousSecretKeyMarkers.contains(where: { normalized.contains($0) }) { return true }
+        // Then the allow-list; see ``isTokenCounterName(_:)``.
+        if isTokenCounterName(normalized) { return false }
         return secretKeyMarkers.contains(where: { normalized.contains($0) })
     }
 
