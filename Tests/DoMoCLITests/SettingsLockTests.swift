@@ -58,7 +58,7 @@ private func setMode(_ mode: Int, of path: String) throws {
 
 // MARK: - settings.json
 
-@Suite("settings.json grant persistence")
+@Suite("settings.json grant persistence", .serialized)
 struct SettingsPersistenceTests {
 
     @Test("every one of eight concurrent grants survives")
@@ -337,7 +337,7 @@ struct SettingsPersistenceTests {
 
 // MARK: - trust.json
 
-@Suite("trust store writes")
+@Suite("trust store writes", .serialized)
 struct TrustStoreLockTests {
 
     @Test("every one of four concurrent trust decisions survives")

@@ -12,7 +12,7 @@ import Testing
 
 @testable import DoMoClient
 
-@Suite("Prompt history store")
+@Suite("Prompt history store", .serialized)
 struct PromptHistoryTests {
     /// A throwaway directory, in the pattern the client's integration tests use.
     private func sandbox() -> FilePath {

@@ -7,7 +7,7 @@ import Foundation
 import SystemPackage
 import Testing
 
-@Suite
+@Suite(.serialized)
 struct TrustStoreTests {
 
     /// A throwaway directory tree under the system temp dir, removed on cleanup.
