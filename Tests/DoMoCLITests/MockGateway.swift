@@ -52,6 +52,7 @@ final class MockGateway: @unchecked Sendable {
     private var served = 0
     private var recorded: [RecordedRequest] = []
     private var stopped = false
+    private var activeClientFDs: Set<Int32> = []
     private var acceptLoopFinished = false
     private var thread: Thread?
 
@@ -177,6 +178,7 @@ final class MockGateway: @unchecked Sendable {
         lock.lock()
         let alreadyStopped = stopped
         stopped = true
+        let activeClients = activeClientFDs
         lock.unlock()
         if !alreadyStopped {
             // The listener is non-blocking, so the accept loop can observe the
@@ -184,6 +186,12 @@ final class MockGateway: @unchecked Sendable {
             // thread does not reliably wake a blocking accept immediately.
             _ = shutdown(listenFD, Int32(SHUT_RDWR))
             close(listenFD)
+        }
+
+        // Interrupt any connection the serial accept loop is currently reading
+        // or writing before waiting for that loop to finish.
+        for client in activeClients {
+            _ = shutdown(client, Int32(SHUT_RDWR))
         }
 
         // Do not let the OS reuse this descriptor while the old accept loop can
@@ -222,7 +230,21 @@ final class MockGateway: @unchecked Sendable {
                 }
                 return  // listen fd closed by stop()
             }
+
+            lock.lock()
+            let stopping = stopped
+            if !stopping { activeClientFDs.insert(client) }
+            lock.unlock()
+            if stopping {
+                _ = shutdown(client, Int32(SHUT_RDWR))
+                close(client)
+                return
+            }
+
             handleConnection(client)
+            lock.lock()
+            activeClientFDs.remove(client)
+            lock.unlock()
             close(client)
         }
     }
