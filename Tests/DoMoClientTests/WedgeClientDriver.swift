@@ -81,6 +81,7 @@ final class WedgeClient {
     private let inputCont: AsyncStream<[UInt8]>.Continuation
     private let resizeCont: AsyncStream<TerminalSize>.Continuation
     private let task: Task<Void, Never>
+    private let gateLease: FullScreenClientGateLease?
     private var stopped = false
 
     /// Needles that have been on screen at least once since the run started.
@@ -104,8 +105,12 @@ final class WedgeClient {
         watching: [String] = [],
         ownsFullScreenGate: Bool = true
     ) async -> WedgeClient {
+        let gateLease: FullScreenClientGateLease?
         if ownsFullScreenGate {
             await FullScreenClientGate.shared.enter()
+            gateLease = FullScreenClientGateLease(gate: FullScreenClientGate.shared)
+        } else {
+            gateLease = nil
         }
         return WedgeClient(
             baseURL: baseURL,
@@ -115,8 +120,7 @@ final class WedgeClient {
             oracleColumns: oracleColumns,
             oracleRows: oracleRows,
             watching: watching,
-            ownsFullScreenGate: ownsFullScreenGate,
-            gateAlreadyAcquired: ownsFullScreenGate
+            gateLease: gateLease
         )
     }
 
@@ -138,22 +142,20 @@ final class WedgeClient {
         oracleColumns: Int? = nil,
         oracleRows: Int? = nil,
         watching: [String] = [],
-        ownsFullScreenGate: Bool = true,
-        gateAlreadyAcquired: Bool = false
+        gateLease: FullScreenClientGateLease? = nil
     ) {
         self.target = WedgeCaptureTarget(
             columns: columns, rows: rows, oracleColumns: oracleColumns, oracleRows: oracleRows
         )
         self.watching = Set(watching)
+        self.gateLease = gateLease
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
         self.inputCont = inputCont
         self.resizeCont = resizeCont
         let target = self.target
+        let gateLease = self.gateLease
         self.task = Task { @MainActor in
-            if ownsFullScreenGate, !gateAlreadyAcquired {
-                await FullScreenClientGate.shared.enter()
-            }
             try? await runFullScreenClient(
                 baseURL: baseURL,
                 token: token,
@@ -162,9 +164,7 @@ final class WedgeClient {
                 resize: resize,
                 lifecycle: WedgeNoopLifecycle()
             )
-            if ownsFullScreenGate {
-                await FullScreenClientGate.shared.leave()
-            }
+            await gateLease?.release()
         }
     }
 
@@ -194,6 +194,11 @@ final class WedgeClient {
         inputCont.finish()
         resizeCont.finish()
         task.cancel()
+        // Release before waiting for the cancelled HTTP body reader. If that
+        // reader is parked in async-http-client shutdown on Linux, a later test
+        // must still be able to start; the lease makes the task's eventual
+        // cleanup release a harmless no-op.
+        await gateLease?.release()
         _ = await task.result
     }
 

@@ -326,8 +326,8 @@ struct SelectionCopyAndDropEndToEndTests {
         // graceful shutdown suspended, so do not let one completed case hold the
         // cross-suite gate while its owned client is trying to close.
         clientTask.cancel()
-        _ = await clientTask.result
         await FullScreenClientGate.shared.leave()
+        _ = await clientTask.result
         return target
     }
 
@@ -901,8 +901,9 @@ struct SelectionCopyAndDropEndToEndTests {
         inputCont.yield([0x03])
         inputCont.finish()
         resizeCont.finish()
-        _ = await clientTask.result
+        clientTask.cancel()
         await FullScreenClientGate.shared.leave()
+        _ = await clientTask.result
 
         // Asserted on the PERSISTENT row, not on the transient notice. `post(notice:)`
         // is a single slot with a TTL and several sources, so any other event inside

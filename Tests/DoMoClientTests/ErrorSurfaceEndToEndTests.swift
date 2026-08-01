@@ -164,8 +164,8 @@ struct ErrorSurfaceEndToEndTests {
         // Keep a stalled HTTP body from making the next full-screen case wait on
         // this client's graceful shutdown forever on Linux.
         clientTask.cancel()
-        _ = await clientTask.result
         await FullScreenClientGate.shared.leave()
+        _ = await clientTask.result
         return target
     }
 

@@ -45,3 +45,24 @@ actor FullScreenClientGate {
         waiters.removeFirst().resume()
     }
 }
+
+/// An idempotent permit for one full-screen client.
+///
+/// A client can be asked to stop from either its normal input path or the test
+/// task's cancellation path. Keeping release separate from the client task
+/// means either path can hand the permit back without double-releasing it — or
+/// leaving the next test queued behind a task that was already cancelled.
+actor FullScreenClientGateLease {
+    private let gate: FullScreenClientGate
+    private var released = false
+
+    init(gate: FullScreenClientGate) {
+        self.gate = gate
+    }
+
+    func release() async {
+        guard !released else { return }
+        released = true
+        await gate.leave()
+    }
+}
