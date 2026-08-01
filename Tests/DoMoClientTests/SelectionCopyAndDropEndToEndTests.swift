@@ -321,6 +321,11 @@ struct SelectionCopyAndDropEndToEndTests {
         inputCont.yield([0x03])
         inputCont.finish()
         resizeCont.finish()
+        // The input byte requests a graceful quit; cancellation is the second
+        // half of teardown. On Linux an async-http-client body reader can keep the
+        // graceful shutdown suspended, so do not let one completed case hold the
+        // cross-suite gate while its owned client is trying to close.
+        clientTask.cancel()
         _ = await clientTask.result
         await FullScreenClientGate.shared.leave()
         return target

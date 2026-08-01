@@ -193,6 +193,7 @@ final class WedgeClient {
         inputCont.yield([0x03])
         inputCont.finish()
         resizeCont.finish()
+        task.cancel()
         _ = await task.result
     }
 

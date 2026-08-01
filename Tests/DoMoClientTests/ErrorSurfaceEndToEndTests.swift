@@ -161,6 +161,9 @@ struct ErrorSurfaceEndToEndTests {
         inputCont.yield([0x03])   // ^C quits
         inputCont.finish()
         resizeCont.finish()
+        // Keep a stalled HTTP body from making the next full-screen case wait on
+        // this client's graceful shutdown forever on Linux.
+        clientTask.cancel()
         _ = await clientTask.result
         await FullScreenClientGate.shared.leave()
         return target
