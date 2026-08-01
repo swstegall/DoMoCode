@@ -227,12 +227,6 @@ public final class TerminalDriver {
     /// The exit reasons a child of the run group can report. `quit` and
     /// `inputEnded` end the session; a finished resize stream or completed
     /// background job do not (the user is still typing).
-    private enum RunOutcome: Sendable {
-        case quit
-        case inputEnded
-        case resizeEnded
-    }
-
     /// Run the interactive session until quit, input EOF, or cancellation.
     ///
     /// - Parameters:
@@ -294,64 +288,40 @@ public final class TerminalDriver {
             backgroundTask = Task { await background() }
         }
 
-        // Keep the three pumps concurrent, but coordinate their completion with
-        // an AsyncStream rather than a task group. The live full-screen path
-        // cancels these pumps while a child process and an HTTP stream are also
-        // unwinding; avoiding a nested task-group teardown keeps optimized Swift
-        // runtimes from tripping their stack-allocation assertion.
-        let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: RunOutcome.self)
+        // Keep the pumps concurrent, but use the existing quit signal as their
+        // one completion channel rather than nesting another AsyncStream
+        // coordinator. Input EOF is a normal session-ending event, just like a
+        // quit key; resize EOF is not, because a resize source may be closed
+        // while the UI itself remains live. Avoiding a nested task-group teardown
+        // keeps optimized Swift runtimes from tripping their stack assertion.
         // These streams must be pumped from outside the main actor. The app
         // callback hops back to the actor, while the client/network work keeps
         // getting scheduled when input is busy or a stream reconnects. Detached
         // tasks preserve the old task-group child isolation without inheriting
         // the caller's actor through Swift 6.3's `Task { @concurrent in }` form.
-        let inputTask = Task.detached { [input] in
-            defer { outcomeContinuation.yield(.inputEnded) }
+        let inputTask = Task.detached { [input, quit] in
             for await chunk in input {
                 await self.ingest(chunk, app: app)
             }
+            quit.quit()
         }
         let resizeTask = Task.detached { [resize] in
-            defer { outcomeContinuation.yield(.resizeEnded) }
             for await size in resize {
                 await self.handleResize(size, app: app)
             }
         }
-        let quitTask = Task.detached {
-            defer { outcomeContinuation.yield(.quit) }
-            await quit.wait()
-        }
 
         await withTaskCancellationHandler(operation: {
-            var iterator = outcomes.makeAsyncIterator()
-            while let outcome = await iterator.next() {
-                switch outcome {
-                case .quit, .inputEnded:
-                    // Session over. Cancellation unblocks the remaining stream
-                    // iterators, and the background task is canceled by the outer
-                    // defer rather than delaying terminal restoration.
-                    inputTask.cancel()
-                    resizeTask.cancel()
-                    quitTask.cancel()
-                    return
-                case .resizeEnded:
-                    continue
-                }
-            }
+            await quit.wait()
         }, onCancel: {
             inputTask.cancel()
             resizeTask.cancel()
-            quitTask.cancel()
-            outcomeContinuation.finish()
         })
 
         inputTask.cancel()
         resizeTask.cancel()
-        quitTask.cancel()
         await inputTask.value
         await resizeTask.value
-        await quitTask.value
-        outcomeContinuation.finish()
     }
 
     // MARK: Input
