@@ -574,6 +574,17 @@ final class InteractiveCoordinator {
         }
 
         if popupList != nil {
+            // A completion overlay is non-capturing: it must not steal the
+            // interrupt gesture from a live agent. An asynchronous completion
+            // result can arrive after submit and briefly recreate the overlay,
+            // so check the running state before treating Escape as merely
+            // "close popup".
+            if running, matchesKey(data, Key.escape) {
+                closePopup()
+                abortRun()
+                render()
+                return
+            }
             if kb.matches(data, .selectUp) || kb.matches(data, .selectDown) {
                 popupList?.handleInput(data)
                 render()

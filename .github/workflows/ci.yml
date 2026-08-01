@@ -61,7 +61,6 @@ jobs:
             DoMoLLMTests
             DoMoMCPTests
             DoMoTermIOTests
-            DoMoCLITests
             DoMoServerTests
             DoMoClientTests
             DoMoTUITests
@@ -76,6 +75,15 @@ jobs:
             DoMoHarnessTests
             DoMoToolsUITests
           )
+
+          # Keep the CLI's process/PTY fixtures in one bounded worker on macOS.
+          # Running the whole package in that worker lets unrelated @MainActor
+          # client suites starve it; restarting the CLI target as a separate
+          # process, however, makes its loopback fixtures contend with leftover
+          # child teardown. The single target worker is the stable middle ground.
+          if [[ "${{ matrix.os }}" == "macos-latest" ]]; then
+            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 1 --filter '^DoMoCLITests\.'
+          fi
 
           for target in "${serial_targets[@]}"; do
             swift test --configuration ${{ matrix.configuration }} --no-parallel --filter "^${target}\."
