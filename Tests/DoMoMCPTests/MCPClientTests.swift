@@ -60,7 +60,13 @@ struct MCPClientTests {
                 send({"jsonrpc":"2.0","id":mid,"result":{}})
         """#
 
-    private func fixtureConfig(timeoutMS: Int = 4000) throws -> (dir: URL, config: MCPServerConfig)? {
+    /// 20s, which is not a latency claim — it is the budget for spawning
+    /// `/usr/bin/python3`, completing the initialize/tools-list handshake AND any
+    /// request the test then makes, because `MCPServerConfig.timeout` is one knob
+    /// for all three. At 4s a loaded CI runner returned NO tools at all and every
+    /// test in this suite failed on `tool(tools, …) -> nil`, several steps before
+    /// its own subject. Nothing here asserts how FAST anything is.
+    private func fixtureConfig(timeoutMS: Int = 20_000) throws -> (dir: URL, config: MCPServerConfig)? {
         guard FileManager.default.fileExists(atPath: "/usr/bin/python3") else { return nil }
         let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("domo-mcp-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -109,18 +115,13 @@ struct MCPClientTests {
 
     @Test("A tool that never responds times out into an error result")
     func timeout() async throws {
-        // 5s, not 500ms. This one knob is BOTH the per-request timeout this test
-        // is about and the budget the initialize/tools-list handshake runs under,
-        // and on a loaded CI runner spawning the python fixture and completing
-        // that handshake does not fit in 500ms — `connect` then returned no tools
-        // at all and this failed on `#require(tool(tools, "srv_slow"))`, several
-        // steps before the behaviour under test.
-        //
-        // Nothing is weakened by the larger value: the fixture's `slow` tool
-        // never responds AT ALL, so any finite timeout proves the same thing.
-        // Without the timeout, `execute` hangs forever and the test times out
-        // rather than passing.
-        guard let (dir, config) = try fixtureConfig(timeoutMS: 5_000) else { return }
+        // The suite default, deliberately: this knob is BOTH the per-request
+        // timeout this test is about and the handshake budget, and nothing is
+        // weakened by the larger value — the fixture's `slow` tool never responds
+        // AT ALL, so any finite timeout proves the same thing. Without the
+        // timeout, `execute` hangs forever and the test times out rather than
+        // passing.
+        guard let (dir, config) = try fixtureConfig() else { return }
         defer { try? FileManager.default.removeItem(at: dir) }
         let manager = MCPManager()
         let tools = await manager.connect(servers: ["srv": config], workspaceDirectory: dir.path)
