@@ -102,12 +102,12 @@ struct StreamIdleGuardTests {
         //
         // The property is a RATIO, not these particular numbers: each gap must sit
         // well inside the idle window while the whole stream runs well past it.
-        // 100 chunks 40ms apart is ~4s of stream against a 2s window — so the
-        // "total elapsed" regression still fails this — and 40ms against 2s
-        // tolerates a fiftyfold per-sleep slowdown before a healthy stream is
-        // wrongly cut off. The original 40ms-against-300ms held that ratio far
-        // too tightly: CI delivered 4 of 30 chunks before the guard fired.
-        let count = 100
+        // 150 chunks 40ms apart is ~6s of stream against a 5s window — so the
+        // "total elapsed" regression still fails this — and 40ms against 5s
+        // leaves room for a busy CI runner to pause the task for a few seconds.
+        // The original 40ms-against-300ms held that ratio far too tightly: CI
+        // delivered 4 of 30 chunks before the guard fired.
+        let count = 150
         let upstream = AsyncThrowingStream<[UInt8], any Error> { continuation in
             let producer = Task {
                 for index in 0..<count {
@@ -119,7 +119,7 @@ struct StreamIdleGuardTests {
             continuation.onTermination = { _ in producer.cancel() }
         }
 
-        let result = await drain(idleGuarded(upstream, idle: .seconds(2), overall: .seconds(120)))
+        let result = await drain(idleGuarded(upstream, idle: .seconds(5), overall: .seconds(120)))
         #expect(result.error == nil, "a healthy slow stream was failed: \(String(describing: result.error))")
         #expect(result.chunks.count == count, "delivered \(result.chunks.count) of \(count) chunks")
         #expect(result.chunks.map { $0[0] } == (0..<count).map { UInt8($0) }, "chunks arrived out of order or were dropped")

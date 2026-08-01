@@ -316,8 +316,13 @@ public final class ClientApp {
         })
 
         let tasks = actionTasks + [eventTask, spinnerTask].compactMap { $0 }
+        // Cancellation is the hand-off to the owned HTTPClient below. Waiting for
+        // every task here can deadlock on Linux when an async-http-client body
+        // reader is already parked on its connection: the reader needs the
+        // client's shutdown to finish, while shutdown cannot begin until this
+        // method returns. The tasks are cancellation-aware, and the HTTP client is
+        // the authority that closes any request still holding a connection.
         for task in tasks { task.cancel() }
-        for task in tasks { await task.value }
         actionTasks.removeAll()
         eventTask = nil
         spinnerTask = nil
