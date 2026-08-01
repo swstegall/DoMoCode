@@ -70,3 +70,6 @@ fastlane/test_output
 
 # Ephemeral git worktrees created by review agents.
 .claude/worktrees/
+
+# Scratch path for cross-checking the Linux build in Docker.
+.build-linux/

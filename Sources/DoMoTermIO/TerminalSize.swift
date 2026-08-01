@@ -172,7 +172,7 @@ extension TerminalSize {
             source.setEventHandler {
                 continuation.yield(TerminalSize.current(fileDescriptor: fileDescriptor))
             }
-            let box = SignalSourceBox(source)
+            let box = DispatchSourceBox(source)
             continuation.onTermination = { _ in
                 box.source.cancel()
             }
@@ -181,27 +181,4 @@ extension TerminalSize {
             source.resume()
         }
     }
-}
-
-/// Carries a dispatch source into a `@Sendable` closure.
-///
-/// A PLATFORM discrepancy, not a hazard. `DispatchSourceSignal` is `Sendable` on
-/// Darwin and is not on swift-corelibs-libdispatch, so capturing one directly in
-/// `AsyncStream.Continuation.onTermination` compiles on macOS and is a hard error
-/// on Linux — which is exactly why it never appeared in local builds.
-///
-/// The two obvious spellings both fail somewhere. `@preconcurrency import
-/// Dispatch`, which the compiler itself suggests, downgrades the error to a
-/// warning, and this package builds with `treatAllWarnings(as: .error)`. And
-/// `nonisolated(unsafe)` on the local is *required* on Linux while being
-/// diagnosed as *unnecessary* on Darwin, where the type already conforms — an
-/// error on whichever platform you are not looking at.
-///
-/// So the discrepancy is absorbed once, here, by a type this package owns.
-/// Dispatch sources are documented as safe to use from any thread, `cancel()`
-/// included, so the missing conformance is a corelibs gap rather than a claim
-/// this box is papering over.
-private final class SignalSourceBox: @unchecked Sendable {
-    let source: any DispatchSourceSignal
-    init(_ source: any DispatchSourceSignal) { self.source = source }
 }

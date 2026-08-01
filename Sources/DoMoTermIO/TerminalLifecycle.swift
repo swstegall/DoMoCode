@@ -195,10 +195,15 @@ public final class TerminalLifecycle: Sendable {
     /// at init, and readable, for the same reasons as ``useAlternateScreen``.
     public let enableMouse: Bool
 
-    /// The signal sources, retained so they keep firing. Non-`Sendable`
-    /// `DispatchSource`s live safely inside the `Mutex`, which serialises every
-    /// access to them.
-    private let sources = Mutex<[any DispatchSourceSignal]>([])
+    /// The signal sources, retained so they keep firing, and serialised by the
+    /// `Mutex`.
+    ///
+    /// Boxed rather than stored bare: the `Mutex` serialises ACCESS, which is a
+    /// different thing from making the element type `Sendable`, and on
+    /// swift-corelibs-libdispatch `DispatchSourceSignal` is not — so assigning a
+    /// task-isolated array of them through `withLock` is a hard error on Linux
+    /// and compiles on Darwin. See ``DispatchSourceBox``.
+    private let sources = Mutex<[DispatchSourceBox]>([])
 
     /// - Parameters:
     ///   - inputDescriptor: the tty whose line discipline becomes raw — stdin.
@@ -357,7 +362,7 @@ public final class TerminalLifecycle: Sendable {
         }
 
         let terminatingSignals: [Int32] = [SIGINT, SIGTERM, SIGHUP]
-        var installed: [any DispatchSourceSignal] = []
+        var installed: [DispatchSourceBox] = []
         for signalNumber in terminatingSignals {
             signal(signalNumber, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
@@ -367,7 +372,7 @@ public final class TerminalLifecycle: Sendable {
                 raise(signalNumber)
             }
             source.resume()
-            installed.append(source)
+            installed.append(DispatchSourceBox(source))
         }
         sources.withLock { $0 = installed }
     }

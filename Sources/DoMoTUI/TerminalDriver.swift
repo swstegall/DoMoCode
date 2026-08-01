@@ -459,7 +459,10 @@ extension TerminalDriver {
                 continuation.yield([UInt8](data))
             }
             source.setCancelHandler {}
-            continuation.onTermination = { _ in source.cancel() }
+            // Boxed for the same Linux-only reason as the signal sources; see
+            // `DoMoTermIO.DispatchSourceBox`.
+            let box = DispatchSourceBox(source)
+            continuation.onTermination = { _ in box.cancel() }
             source.resume()
         }
     }
