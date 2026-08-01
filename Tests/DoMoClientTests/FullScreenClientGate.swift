@@ -5,7 +5,7 @@
 // binary.
 //
 // `@Suite(.serialized)` serializes a suite against ITSELF and nothing else, and
-// there are now two suites that each stand up a real `DoMoServer`, a real
+// there are now several suites that each stand up a real `DoMoServer`, a real
 // `ServerClient`, a real `TerminalDriver` and an SSE stream, then drive them
 // from the SAME main actor while polling a VT100 emulator. Run two of those at
 // once and they do not fail cleanly: they starve each other's render loop, and
@@ -17,6 +17,9 @@
 // test from being starved by a stream of new arrivals.
 
 /// A one-at-a-time gate for tests that run the whole full-screen client.
+///
+/// `WedgeClient` owns the gate by default; tests that acquire it before creating
+/// a client pass `ownsFullScreenGate: false` to avoid acquiring it twice.
 actor FullScreenClientGate {
     static let shared = FullScreenClientGate()
 

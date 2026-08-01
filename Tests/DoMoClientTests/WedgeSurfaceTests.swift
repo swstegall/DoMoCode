@@ -491,7 +491,7 @@ struct WedgeSurfaceTests {
         #expect(await client.wait(for: "Connection & run state"), "screen:\n\(client.joined())")
         // The modal is still there underneath — the panel is a second overlay, not
         // a replacement, and answering the prompt is still what the user must do.
-        #expect(client.showing("client prompt"), "screen:\n\(client.joined())")
+        #expect(await client.wait(for: "client prompt"), "screen:\n\(client.joined())")
 
         // And ^C still quits, over BOTH of them. If it does not, the suite's time
         // limit fails this test rather than hanging the run.

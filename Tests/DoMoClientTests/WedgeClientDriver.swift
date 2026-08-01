@@ -106,7 +106,8 @@ final class WedgeClient {
         // ``WedgeCaptureTarget/oracleColumns``.
         oracleColumns: Int? = nil,
         oracleRows: Int? = nil,
-        watching: [String] = []
+        watching: [String] = [],
+        ownsFullScreenGate: Bool = true
     ) {
         self.target = WedgeCaptureTarget(
             columns: columns, rows: rows, oracleColumns: oracleColumns, oracleRows: oracleRows
@@ -118,6 +119,9 @@ final class WedgeClient {
         self.resizeCont = resizeCont
         let target = self.target
         self.task = Task { @MainActor in
+            if ownsFullScreenGate {
+                await FullScreenClientGate.shared.enter()
+            }
             try? await runFullScreenClient(
                 baseURL: baseURL,
                 token: token,
@@ -126,6 +130,9 @@ final class WedgeClient {
                 resize: resize,
                 lifecycle: WedgeNoopLifecycle()
             )
+            if ownsFullScreenGate {
+                await FullScreenClientGate.shared.leave()
+            }
         }
     }
 
