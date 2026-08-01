@@ -196,11 +196,11 @@ public actor PromptHistoryStore {
     /// prompt-history save can never interrupt the interactive client.
     private func rename(_ source: FilePath, to destination: FilePath) -> Bool {
         #if canImport(Darwin)
-        return Darwin.rename(source.string, destination.string) == 0
+        return unsafe Darwin.rename(source.string, destination.string) == 0
         #elseif canImport(Glibc)
-        return Glibc.rename(source.string, destination.string) == 0
+        return unsafe Glibc.rename(source.string, destination.string) == 0
         #elseif canImport(Musl)
-        return Musl.rename(source.string, destination.string) == 0
+        return unsafe Musl.rename(source.string, destination.string) == 0
         #else
         return false
         #endif

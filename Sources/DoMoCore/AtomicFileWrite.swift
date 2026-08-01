@@ -130,11 +130,11 @@ public enum AtomicFileWrite {
     /// Atomically replaces `destination` with `source`, retaining POSIX errno.
     private static func rename(_ source: FilePath, to destination: FilePath) throws(DoMoError) {
         #if canImport(Darwin)
-        let result = Darwin.rename(source.string, destination.string)
+        let result = unsafe Darwin.rename(source.string, destination.string)
         #elseif canImport(Glibc)
-        let result = Glibc.rename(source.string, destination.string)
+        let result = unsafe Glibc.rename(source.string, destination.string)
         #elseif canImport(Musl)
-        let result = Musl.rename(source.string, destination.string)
+        let result = unsafe Musl.rename(source.string, destination.string)
         #else
         let result: CInt = -1
         #endif
