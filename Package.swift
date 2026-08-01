@@ -43,7 +43,25 @@ let package = Package(
         .library(name: "DoMoCore", targets: ["DoMoCore"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-system", from: "1.7.5"),
+        // PINNED BELOW 1.7.0 ON PURPOSE — do not "helpfully" bump this.
+        //
+        // swift-system 1.7.0 added a batch of file-mode and `openat` constants,
+        // one of them behind `#if canImport(Darwin, _version: 346) || os(FreeBSD)`:
+        //
+        //     internal var _AT_RESOLVE_BENEATH: CInt { AT_RESOLVE_BENEATH }
+        //
+        // That gate admits the code on the SDK CI builds against while
+        // `AT_RESOLVE_BENEATH` is not declared there, so `SystemPackage` itself
+        // fails to compile with `cannot find 'AT_RESOLVE_BENEATH' in scope`. It
+        // builds fine on a newer toolchain, which is exactly why it is invisible
+        // locally and only ever fails in CI.
+        //
+        // This package declares a **Swift 6.2 floor** and CI pins 6.2 precisely so
+        // that floor is tested rather than assumed. A dependency that needs
+        // something newer does not meet it, so the floor wins and the dependency
+        // is constrained. Revisit when swift-system tightens the gate — or, if the
+        // floor is ever raised to 6.3, this range can go back to `from:`.
+        .package(url: "https://github.com/apple/swift-system", "1.6.6"..<"1.7.0"),
         .package(url: "https://github.com/apple/swift-log", from: "1.14.0"),
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.8.2"),
         .package(url: "https://github.com/swift-server/async-http-client", from: "1.35.0"),
