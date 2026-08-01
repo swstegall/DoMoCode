@@ -13,7 +13,7 @@ import Testing
 
 @testable import DoMoMCP
 
-@Suite("MCP client (fixture server)")
+@Suite("MCP client (fixture server)", .serialized)
 struct MCPClientTests {
     /// A minimal MCP stdio server: initialize, tools/list (echo/boom/slow), tools/call,
     /// ping. `slow` never responds (to exercise the per-request timeout).

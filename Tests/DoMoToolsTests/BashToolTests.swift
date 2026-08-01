@@ -4,7 +4,7 @@ import Foundation
 import SystemPackage
 import Testing
 
-@Suite("bash")
+@Suite("bash", .serialized)
 struct BashToolTests {
 
     @Test("runs a command and returns stdout")

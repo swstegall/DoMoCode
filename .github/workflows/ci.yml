@@ -14,6 +14,7 @@ jobs:
   test:
     name: ${{ matrix.os }} / ${{ matrix.configuration }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -49,16 +50,9 @@ jobs:
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 
-      # `--no-parallel` because this suite contends with ITSELF. swift-testing
-      # runs suites concurrently, and a large fraction of these spawn processes,
-      # open sockets, drive ptys or assert on wall-clock intervals. On a small,
-      # oversubscribed runner they starve each other: successive runs failed
-      # DIFFERENT suites (bash, Shell termination, FileLock, the idle guard, the
-      # MCP fixture) while the same jobs passed in between, and one 40ms sleep
-      # inside a 2s window overran by more than fiftyfold.
-      #
-      # Serial execution trades wall-clock for a signal that means something. The
-      # alternative — widening every timing bound until nothing can fail — is how
-      # a suite stops detecting the regressions it exists to catch.
+      # Keep package-level parallelism enabled. Suites that own processes, sockets,
+      # PTYs, or wall-clock fixtures opt into Swift Testing's `.serialized` trait
+      # in their source file, limiting contention without making the whole suite
+      # execute one test after another.
       - name: Test
-        run: swift test --configuration ${{ matrix.configuration }} --no-parallel
+        run: swift test --configuration ${{ matrix.configuration }}

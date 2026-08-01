@@ -97,7 +97,7 @@ private func holdInBackground(_ lock: String) async throws -> BackgroundHolder {
 
 // MARK: - The primitive
 
-@Suite("FileLock — the flock(2) contract")
+@Suite("FileLock — the flock(2) contract", .serialized)
 struct FileLockPrimitiveTests {
 
     /// What `flock(2)` promises, demonstrated on raw descriptors: it locks the
@@ -217,7 +217,7 @@ struct FileLockPrimitiveTests {
 
 // MARK: - withLock
 
-@Suite("FileLock — withLock")
+@Suite("FileLock — withLock", .serialized)
 struct FileLockScopeTests {
 
     /// The reason the whole type exists: without the lock every task reads the
@@ -504,7 +504,7 @@ struct FileLockScopeTests {
 
 // MARK: - AtomicFileWrite
 
-@Suite("AtomicFileWrite")
+@Suite("AtomicFileWrite", .serialized)
 struct AtomicFileWriteTests {
 
     /// Foundation's `atomically: true` re-creates the file at 0644, so a user's

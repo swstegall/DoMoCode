@@ -22,7 +22,7 @@ import Testing
 
 import DoMoLLM
 
-@Suite("Stream idle guard")
+@Suite("Stream idle guard", .serialized)
 struct StreamIdleGuardTests {
 
     /// Drain a guarded stream, returning the chunks it delivered and how it ended.
