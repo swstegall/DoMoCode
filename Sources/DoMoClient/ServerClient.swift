@@ -367,12 +367,13 @@ public struct ServerClient: Sendable {
                     watchdogTask.cancel()
                     completionContinuation.finish()
                 })
-                // Whichever finishes first ends the stream; explicitly retire the
-                // other task and await both so its HTTP body cannot outlive the client.
+                // Whichever finishes first ends the stream. Explicitly retire the
+                // other task, but do not await canceled task values here: on Linux,
+                // an async-http-client body reader can be parked on its connection
+                // until the owning HTTPClient shuts down. The caller performs that
+                // shutdown immediately after its canceled client task returns.
                 readerTask.cancel()
                 watchdogTask.cancel()
-                await readerTask.value
-                await watchdogTask.value
                 completionContinuation.finish()
             }
             continuation.onTermination = { _ in task.cancel() }

@@ -182,18 +182,22 @@ struct ToolDispatch: Sendable {
         // task-group frame.
         var finishedByIndex: [Int: Finalized] = [:]
         let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: (Int, Finalized).self)
-        var tasks: [Task<Void, Never>] = []
+        var tasks: [(index: Int, task: Task<Finalized, Never>)] = []
         for (index, slot) in slots.enumerated() {
             guard case .deferred(let tool, let toolCall, let arguments) = slot else { continue }
-            tasks.append(Task {
-                let outcome = await executeAndFinalize(
+            let task = Task {
+                await executeAndFinalize(
                     tool: tool,
                     toolCall: toolCall,
                     arguments: arguments,
                     from: assistantMessage
                 )
+            }
+            tasks.append((index: index, task: task))
+            Task {
+                let outcome = await task.value
                 outcomeContinuation.yield((index, outcome))
-            })
+            }
         }
         if tasks.isEmpty { outcomeContinuation.finish() }
 
@@ -205,9 +209,17 @@ struct ToolDispatch: Sendable {
                 outcomeContinuation.finish()
             }
         }
-        for task in tasks {
+        for (index, task) in tasks {
             task.cancel()
-            await task.value
+            let outcome = await task.value
+            // Cancellation can make the outcome stream's iterator return nil
+            // before its final yield is observed. The task still owns the
+            // authoritative result, so collect it here instead of dropping the
+            // tool-result block from the canceled transcript.
+            if finishedByIndex[index] == nil {
+                await emitEnd(outcome)
+                finishedByIndex[index] = outcome
+            }
         }
         outcomeContinuation.finish()
 
