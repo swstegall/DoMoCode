@@ -109,7 +109,18 @@ struct MCPClientTests {
 
     @Test("A tool that never responds times out into an error result")
     func timeout() async throws {
-        guard let (dir, config) = try fixtureConfig(timeoutMS: 500) else { return }
+        // 5s, not 500ms. This one knob is BOTH the per-request timeout this test
+        // is about and the budget the initialize/tools-list handshake runs under,
+        // and on a loaded CI runner spawning the python fixture and completing
+        // that handshake does not fit in 500ms — `connect` then returned no tools
+        // at all and this failed on `#require(tool(tools, "srv_slow"))`, several
+        // steps before the behaviour under test.
+        //
+        // Nothing is weakened by the larger value: the fixture's `slow` tool
+        // never responds AT ALL, so any finite timeout proves the same thing.
+        // Without the timeout, `execute` hangs forever and the test times out
+        // rather than passing.
+        guard let (dir, config) = try fixtureConfig(timeoutMS: 5_000) else { return }
         defer { try? FileManager.default.removeItem(at: dir) }
         let manager = MCPManager()
         let tools = await manager.connect(servers: ["srv": config], workspaceDirectory: dir.path)

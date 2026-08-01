@@ -52,7 +52,7 @@ struct StreamIdleGuardTests {
         }
 
         let start = ContinuousClock.now
-        let result = await drain(idleGuarded(upstream, idle: .milliseconds(200), overall: .seconds(30)))
+        let result = await drain(idleGuarded(upstream, idle: .milliseconds(200), overall: .seconds(120)))
         let elapsed = ContinuousClock.now - start
 
         #expect(result.chunks.count == 2, "the bytes that DID arrive must still be delivered")
@@ -62,7 +62,11 @@ struct StreamIdleGuardTests {
         // retryable classification off this wording.
         #expect(error.description.lowercased().contains("timed out"), "message was \(error.description)")
         #expect(error.isRetryable)
-        #expect(elapsed < .seconds(3), "took \(elapsed) to notice the stall")
+        // Bounded against the OVERALL deadline, which is what this number
+        // distinguishes: 15s proves the IDLE window fired and not the 120s
+        // overall one. It is not a latency budget — the original 3s was, and a
+        // loaded runner took 8.9s to notice a stall it had correctly detected.
+        #expect(elapsed < .seconds(15), "took \(elapsed) to notice the stall")
     }
 
     @Test("The overall deadline fires even while chunks keep arriving")
@@ -91,11 +95,19 @@ struct StreamIdleGuardTests {
 
     @Test("A slow but live stream is never cut off")
     func slowLiveStreamSurvives() async throws {
-        // A chunk every 40ms for ~1.2s, guarded with a 300ms idle window. Every
-        // gap is well inside the window, but the WHOLE stream is four times it —
-        // so a guard that measured total elapsed time instead of silence would
-        // kill this, and that is the regression this pins.
-        let count = 30
+        // A chunk every 40ms, guarded with an idle window every gap sits well
+        // inside — but the WHOLE stream runs far past that window, so a guard
+        // measuring total elapsed time instead of silence kills this. That is the
+        // regression this pins.
+        //
+        // The property is a RATIO, not these particular numbers: each gap must sit
+        // well inside the idle window while the whole stream runs well past it.
+        // 100 chunks 40ms apart is ~4s of stream against a 2s window — so the
+        // "total elapsed" regression still fails this — and 40ms against 2s
+        // tolerates a fiftyfold per-sleep slowdown before a healthy stream is
+        // wrongly cut off. The original 40ms-against-300ms held that ratio far
+        // too tightly: CI delivered 4 of 30 chunks before the guard fired.
+        let count = 100
         let upstream = AsyncThrowingStream<[UInt8], any Error> { continuation in
             let producer = Task {
                 for index in 0..<count {
@@ -107,7 +119,7 @@ struct StreamIdleGuardTests {
             continuation.onTermination = { _ in producer.cancel() }
         }
 
-        let result = await drain(idleGuarded(upstream, idle: .milliseconds(300), overall: .seconds(60)))
+        let result = await drain(idleGuarded(upstream, idle: .seconds(2), overall: .seconds(120)))
         #expect(result.error == nil, "a healthy slow stream was failed: \(String(describing: result.error))")
         #expect(result.chunks.count == count, "delivered \(result.chunks.count) of \(count) chunks")
         #expect(result.chunks.map { $0[0] } == (0..<count).map { UInt8($0) }, "chunks arrived out of order or were dropped")
@@ -181,9 +193,12 @@ struct StreamIdleGuardTests {
         // the stream at the first tick.
         let upstream = AsyncThrowingStream<[UInt8], any Error> { _ in }
         let start = ContinuousClock.now
-        let result = await drain(idleGuarded(upstream, idle: .zero, overall: .seconds(30)))
+        let result = await drain(idleGuarded(upstream, idle: .zero, overall: .seconds(120)))
         #expect(result.error is DoMoError)
-        #expect(ContinuousClock.now - start < .seconds(2))
+        // Same rule as above: well under the overall deadline proves the zero
+        // window fired at the first tick rather than the stream hanging to the
+        // overall bound. 2s was measuring the runner, not the guard.
+        #expect(ContinuousClock.now - start < .seconds(15))
     }
 
     // MARK: The production wiring
