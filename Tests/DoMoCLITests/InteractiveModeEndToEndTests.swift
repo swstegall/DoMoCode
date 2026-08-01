@@ -1669,6 +1669,10 @@ final class SteerableGateway: @unchecked Sendable {
                 }
                 return
             }
+            guard makeBlockingSocket(client) else {
+                close(client)
+                continue
+            }
 
             lock.lock()
             let stopping = stopped

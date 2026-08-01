@@ -24,6 +24,15 @@ private let streamSocketType = Int32(SOCK_STREAM.rawValue)
 private let streamSocketType = SOCK_STREAM
 #endif
 
+/// The listener is nonblocking so its accept loop can observe `stop()` without
+/// a cross-thread close. On Darwin, an accepted descriptor can retain that
+/// flag; request parsing expects the client socket itself to block until the
+/// request bytes arrive, so normalize it immediately after `accept(2)`.
+func makeBlockingSocket(_ fd: Int32) -> Bool {
+    let flags = fcntl(fd, F_GETFL, 0)
+    return flags >= 0 && fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0
+}
+
 /// One parsed HTTP request the gateway received. Enough to route on and to let a
 /// test assert what the binary actually sent.
 struct RecordedRequest: Sendable {
@@ -235,6 +244,10 @@ final class MockGateway: @unchecked Sendable {
                     continue
                 }
                 return  // listen fd closed by stop()
+            }
+            guard makeBlockingSocket(client) else {
+                close(client)
+                continue
             }
 
             lock.lock()
