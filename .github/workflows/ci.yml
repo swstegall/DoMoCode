@@ -29,9 +29,17 @@ jobs:
 
       # The project targets a 6.3 *floor*, so CI pins the floor rather than
       # whatever the runner ships. .swift-version is deliberately gitignored —
-      # see the note there.
+      # see the note there. Pinning it here is what makes the floor a tested
+      # claim instead of an assumption: it broke in CI while every local build
+      # stayed green, because development happens on a newer toolchain.
+      #
+      # `@v3` and not `@v2`: v2 carries a HARDCODED version table that stops at
+      # 6.2.1, so it answers `Version "6.3" is not available` no matter what the
+      # toolchain situation actually is. v3 resolves versions dynamically. It is
+      # still pre-release, which is a deliberate trade — the alternative is
+      # hand-rolling a swiftly install across two operating systems.
       - name: Install Swift
-        uses: swift-actions/setup-swift@v2
+        uses: swift-actions/setup-swift@v3
         with:
           swift-version: "6.3"
 
