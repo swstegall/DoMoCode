@@ -384,17 +384,19 @@ final class MockGateway: @unchecked Sendable {
     // MARK: Response building
 
     private static func sseResponse(callID: String, body: String) -> [UInt8] {
+        let bodyBytes = Array(body.utf8)
         let headers = [
             "HTTP/1.1 200 OK",
             "Content-Type: text/event-stream",
             "Cache-Control: no-cache",
             "x-litellm-call-id: \(callID)",
             "x-litellm-model-id: mock-deployment",
+            "Content-Length: \(bodyBytes.count)",
             "Connection: close",
             "",
             "",
         ].joined(separator: "\r\n")
-        return Array(headers.utf8) + Array(body.utf8)
+        return Array(headers.utf8) + bodyBytes
     }
 
     /// A non-2xx JSON answer, the shape LiteLLM returns when it refuses outright.
