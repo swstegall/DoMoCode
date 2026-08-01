@@ -18,8 +18,9 @@
 
 /// A one-at-a-time gate for tests that run the whole full-screen client.
 ///
-/// `WedgeClient` owns the gate by default; tests that acquire it before creating
-/// a client pass `ownsFullScreenGate: false` to avoid acquiring it twice.
+/// `WedgeClient.make` acquires the gate before returning a client; tests that
+/// acquire it before creating one pass `ownsFullScreenGate: false` to avoid
+/// acquiring it twice.
 actor FullScreenClientGate {
     static let shared = FullScreenClientGate()
 

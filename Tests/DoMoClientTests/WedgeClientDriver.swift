@@ -89,7 +89,38 @@ final class WedgeClient {
     /// against the CURRENT screen.
     private var watching: Set<String> = []
 
-    init(
+    /// Acquire the cross-suite full-screen permit before handing the client to a
+    /// test. Starting a task that waits for the permit is not enough: the test
+    /// would begin polling an empty screen, time out, and then wait forever in
+    /// `quit()` for that queued task while the current permit holder waits behind
+    /// it.
+    static func make(
+        baseURL: String,
+        token: String,
+        columns: Int = 220,
+        rows: Int = 34,
+        oracleColumns: Int? = nil,
+        oracleRows: Int? = nil,
+        watching: [String] = [],
+        ownsFullScreenGate: Bool = true
+    ) async -> WedgeClient {
+        if ownsFullScreenGate {
+            await FullScreenClientGate.shared.enter()
+        }
+        return WedgeClient(
+            baseURL: baseURL,
+            token: token,
+            columns: columns,
+            rows: rows,
+            oracleColumns: oracleColumns,
+            oracleRows: oracleRows,
+            watching: watching,
+            ownsFullScreenGate: ownsFullScreenGate,
+            gateAlreadyAcquired: ownsFullScreenGate
+        )
+    }
+
+    private init(
         baseURL: String,
         token: String,
         // Wide on purpose. The status line composes a disconnect reason, a run
@@ -107,7 +138,8 @@ final class WedgeClient {
         oracleColumns: Int? = nil,
         oracleRows: Int? = nil,
         watching: [String] = [],
-        ownsFullScreenGate: Bool = true
+        ownsFullScreenGate: Bool = true,
+        gateAlreadyAcquired: Bool = false
     ) {
         self.target = WedgeCaptureTarget(
             columns: columns, rows: rows, oracleColumns: oracleColumns, oracleRows: oracleRows
@@ -119,7 +151,7 @@ final class WedgeClient {
         self.resizeCont = resizeCont
         let target = self.target
         self.task = Task { @MainActor in
-            if ownsFullScreenGate {
+            if ownsFullScreenGate, !gateAlreadyAcquired {
                 await FullScreenClientGate.shared.enter()
             }
             try? await runFullScreenClient(
