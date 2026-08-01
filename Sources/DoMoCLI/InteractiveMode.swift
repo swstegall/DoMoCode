@@ -404,6 +404,11 @@ final class InteractiveCoordinator {
     // Run state.
     private var running = false
     private var currentRunTask: Task<RunStopReason, Never>?
+    /// Escape is a user-visible action even if an upstream transport is slow to
+    /// acknowledge cancellation. The marker is emitted once at the action site;
+    /// the run still owns cleanup and settles normally in ``runOne(_:)``.
+    private var abortRequested = false
+    private var interruptedShown = false
 
     // Streaming assistant turn.
     private var currentAssistant: Markdown?
@@ -650,7 +655,14 @@ final class InteractiveCoordinator {
     /// and returns a clean transcript — no throw — so ``runOne(_:)`` simply resumes
     /// past its `await` and marks the turn interrupted.
     private func abortRun() {
+        guard running else { return }
+        abortRequested = true
         currentRunTask?.cancel()
+        if !interruptedShown {
+            interruptedShown = true
+            appendInterrupted()
+            render()
+        }
     }
 
     // MARK: Submit + slash commands
@@ -1122,6 +1134,8 @@ final class InteractiveCoordinator {
     private func runOne(_ submission: PendingSubmission) async {
         let prompt = submission.text
         running = true
+        abortRequested = false
+        interruptedShown = false
         currentAssistant = nil
         assistantBuffer = ""
         statusLine.text = runningStatus
@@ -1149,6 +1163,9 @@ final class InteractiveCoordinator {
             } catch is CancellationError {
                 return .aborted
             } catch {
+                if Task.isCancelled || DoMoError.isCancellation(error) {
+                    return .aborted
+                }
                 self.appendError(error)
                 return .errored
             }
@@ -1176,8 +1193,9 @@ final class InteractiveCoordinator {
         // and the one refresh that is guaranteed to happen even if every mid-run
         // one was coalesced away.
         await refreshAccounting()
-        if reason == .aborted {
-            appendInterrupted()
+        let wasAborted = abortRequested || reason == .aborted
+        if wasAborted {
+            if !interruptedShown { appendInterrupted() }
         } else if let notice = Self.stopNotice(for: reason) {
             // A run that stopped WITHOUT finishing has to say so. Before this,
             // `.maxTurnsReached` produced no output whatsoever here — the REPL
@@ -1185,6 +1203,8 @@ final class InteractiveCoordinator {
             // deciding it was done.
             appendStopNotice(notice)
         }
+        abortRequested = false
+        interruptedShown = false
         render()
     }
 

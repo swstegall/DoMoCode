@@ -13,7 +13,7 @@ import Testing
 /// These drive the real binary against a gateway that refuses once and then
 /// answers, so they prove the whole path: HTTP 503 → classify → `.retrying` →
 /// the loop's fold → `AgentEvent.notice` → print mode's stderr line.
-@Suite
+@Suite(.serialized)
 struct RetryVisibilityEndToEndTests {
 
     private static let finalTextTurn = #"""
