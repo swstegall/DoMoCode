@@ -342,13 +342,11 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
     /// arrive within ``connectTimeout``.
     ///
     /// `client.execute` resolves as soon as the response head is available and
-    /// then streams the body separately, so racing it against a sleep bounds
-    /// exactly the connect-and-headers phase without touching the body budget —
-    /// the returned response's body is bounded separately, by
+    /// then streams the body separately, so its deadline bounds exactly the
+    /// connect-and-headers phase without touching the body budget — the returned
+    /// response's body is bounded separately, by
     /// ``idleGuarded(_:idle:overall:clock:)``, because `deadline` stops applying
-    /// the moment the head lands. The losing
-    /// child is cancelled on exit, which is what tells AsyncHTTPClient to abandon
-    /// a connection attempt that is going nowhere rather than leak it.
+    /// the moment the head lands.
     ///
     /// A connection the OS refuses outright still errors on its own, faster than
     /// this deadline; the race only covers the case that actually hangs — a host
@@ -358,36 +356,27 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         deadline: Duration,
         host: String?
     ) async throws -> HTTPClientResponse {
-        try await withThrowingTaskGroup(of: HTTPClientResponse.self) { group in
-            group.addTask { [client] in
-                try await client.execute(request, timeout: .nanoseconds(Self.nanoseconds(deadline)))
-            }
-            group.addTask { [connectTimeout] in
-                try await Task.sleep(for: connectTimeout)
-                throw ConnectDeadlineReached()
-            }
-
-            do {
-                guard let response = try await group.next() else {
-                    group.cancelAll()
-                    throw DoMoError(.transport, "The transport produced no response")
-                }
-                group.cancelAll()
-                return response
-            } catch is ConnectDeadlineReached {
-                group.cancelAll()
-                let where_ = host.map { " from \($0)" } ?? ""
-                throw DoMoError(
-                    .transport,
-                    "No response\(where_) within \(connectTimeout) — is the gateway running and reachable?"
-                )
-            }
+        // AsyncHTTPClient already owns the response-head deadline. Racing its
+        // request against a second sleeping task duplicated that machinery and
+        // made every request cross a structured-concurrency stack boundary. In
+        // optimized Swift 6.3 builds that boundary can trigger the runtime's
+        // stack-allocation assertion before the gateway sees the request. Keep
+        // the shorter of the caller's overall deadline and our connect budget;
+        // the body still gets its own idle/overall guard after the head arrives.
+        let headDeadline = min(deadline, connectTimeout)
+        do {
+            return try await client.execute(
+                request,
+                timeout: .nanoseconds(Self.nanoseconds(headDeadline))
+            )
+        } catch let error as HTTPClientError where error == .deadlineExceeded {
+            let where_ = host.map { " from \($0)" } ?? ""
+            throw DoMoError(
+                .transport,
+                "No response\(where_) within \(headDeadline) — is the gateway running and reachable?"
+            )
         }
     }
-
-    /// Sentinel thrown by the connect-deadline child so the group can tell a
-    /// timeout apart from a real transport failure the request itself produced.
-    private struct ConnectDeadlineReached: Error {}
 
     /// Bridges the NIO body sequence into the currency stream, wiring
     /// cancellation through so that dropping the consumer aborts the request.
