@@ -182,7 +182,7 @@ final class MockGateway: @unchecked Sendable {
             // The listener is non-blocking, so the accept loop can observe the
             // stop flag even on Darwin, where closing a socket from another
             // thread does not reliably wake a blocking accept immediately.
-            _ = shutdown(listenFD, SHUT_RDWR)
+            _ = shutdown(listenFD, Int32(SHUT_RDWR))
             close(listenFD)
         }
 
