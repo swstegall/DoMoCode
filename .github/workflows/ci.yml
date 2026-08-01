@@ -49,5 +49,16 @@ jobs:
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 
+      # `--no-parallel` because this suite contends with ITSELF. swift-testing
+      # runs suites concurrently, and a large fraction of these spawn processes,
+      # open sockets, drive ptys or assert on wall-clock intervals. On a small,
+      # oversubscribed runner they starve each other: successive runs failed
+      # DIFFERENT suites (bash, Shell termination, FileLock, the idle guard, the
+      # MCP fixture) while the same jobs passed in between, and one 40ms sleep
+      # inside a 2s window overran by more than fiftyfold.
+      #
+      # Serial execution trades wall-clock for a signal that means something. The
+      # alternative — widening every timing bound until nothing can fail — is how
+      # a suite stops detecting the regressions it exists to catch.
       - name: Test
-        run: swift test --configuration ${{ matrix.configuration }}
+        run: swift test --configuration ${{ matrix.configuration }} --no-parallel
