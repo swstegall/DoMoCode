@@ -175,56 +175,80 @@ actor PersistentProcess {
                 // Record the pid (== pgid, since createSession made the child a group
                 // leader) so shutdown can signal the whole group and reap descendants.
                 childPID.set(execution.processIdentifier.value)
-                await withTaskGroup(of: Void.self) { group in
-                    // Writer: drain outgoing lines to stdin, newline-framed.
-                    group.addTask {
-                        let writer = execution.standardInputWriter
-                        writing: for await line in outgoing {
-                            var frame = line
-                            frame.append(0x0A)
-                            var offset = 0
-                            while offset < frame.count {
-                                let written = (try? await writer.write(Array(frame[offset...]))) ?? 0
-                                // A write that makes no progress means the pipe is gone
-                                // (child exited/EPIPE). Stop the whole writer rather than
-                                // starting the next frame — otherwise a half-written frame
-                                // would be spliced onto the next one as corrupt JSON.
-                                if written <= 0 { break writing }
-                                offset += written
-                            }
-                        }
-                        try? await writer.finish()   // stdin EOF — most stdio servers exit
-                    }
+                // Keep the three pumps concurrent, but coordinate them with an
+                // AsyncStream rather than a task group. On optimized Swift 6.3
+                // runtimes, tearing down a task group while Subprocess is unwinding
+                // its execution closure can trip the runtime's stack-allocation
+                // assertion. These are deliberately unstructured tasks so the
+                // cancellation handler below can retire them explicitly.
+                let (completions, completionContinuation) = AsyncStream.makeStream(of: Void.self)
 
+                let writerTask = Task {
+                    defer { completionContinuation.yield(()) }
+                    let writer = execution.standardInputWriter
+                    writing: for await line in outgoing {
+                        var frame = line
+                        frame.append(0x0A)
+                        var offset = 0
+                        while offset < frame.count {
+                            let written = (try? await writer.write(Array(frame[offset...]))) ?? 0
+                            // A write that makes no progress means the pipe is gone
+                            // (child exited/EPIPE). Stop the whole writer rather than
+                            // starting the next frame — otherwise a half-written frame
+                            // would be spliced onto the next one as corrupt JSON.
+                            if written <= 0 { break writing }
+                            offset += written
+                        }
+                    }
+                    try? await writer.finish()   // stdin EOF — most stdio servers exit
+                }
+
+                let stdoutTask = Task {
+                    defer { completionContinuation.yield(()) }
                     // Reader: frame stdout into lines (see LineFramer). A line past the cap
                     // is a protocol violation — stop framing so a flood can't exhaust memory.
-                    group.addTask {
-                        var framer = LineFramer(maxLineBytes: maxLineBytes)
-                        do {
-                            reading: for try await chunk in execution.standardOutput {
-                                let bytes: [UInt8] = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
-                                for line in framer.feed(bytes) { linesContinuation.yield(line) }
-                                if framer.overflowed { break reading }
-                            }
-                        } catch {
-                            // The pipe closed on teardown; treat as end-of-stream.
+                    var framer = LineFramer(maxLineBytes: maxLineBytes)
+                    do {
+                        reading: for try await chunk in execution.standardOutput {
+                            let bytes: [UInt8] = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
+                            for line in framer.feed(bytes) { linesContinuation.yield(line) }
+                            if framer.overflowed { break reading }
                         }
-                        if let last = framer.finish() { linesContinuation.yield(last) }
-                        linesContinuation.finish()
+                    } catch {
+                        // The pipe closed on teardown; treat as end-of-stream.
                     }
+                    if let last = framer.finish() { linesContinuation.yield(last) }
+                    linesContinuation.finish()
+                }
 
+                let stderrTask = Task {
+                    defer { completionContinuation.yield(()) }
                     // Stderr: drain and discard so a chatty server's pipe never fills
                     // (an undrained stderr pipe eventually blocks the child).
-                    group.addTask {
-                        do {
-                            for try await chunk in execution.standardError {
-                                _ = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
-                            }
-                        } catch {}
-                    }
-
-                    await group.waitForAll()
+                    do {
+                        for try await chunk in execution.standardError {
+                            _ = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
+                        }
+                    } catch {}
                 }
+
+                await withTaskCancellationHandler(operation: {
+                    var iterator = completions.makeAsyncIterator()
+                    for _ in 0..<3 { _ = await iterator.next() }
+                }, onCancel: {
+                    writerTask.cancel()
+                    stdoutTask.cancel()
+                    stderrTask.cancel()
+                    completionContinuation.finish()
+                })
+
+                // The completion markers are emitted before each task returns. Awaiting
+                // the task values closes that small gap and makes the execution closure
+                // deterministic on both normal exit and cancellation.
+                await writerTask.value
+                await stdoutTask.value
+                await stderrTask.value
+                completionContinuation.finish()
             }
             // The child has exited (and swift-subprocess has reaped it): forget its pid so a
             // later shutdown can't signal a reaped/reused pgid.

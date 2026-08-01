@@ -349,8 +349,8 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
     /// the moment the head lands.
     ///
     /// A connection the OS refuses outright still errors on its own, faster than
-    /// this deadline; the race only covers the case that actually hangs — a host
-    /// that accepts the SYN, or silently drops it, and then never answers.
+    /// this deadline; the same bound covers a host that accepts the SYN, or
+    /// silently drops it, and then never answers.
     private func headWithinConnectDeadline(
         _ request: HTTPClientRequest,
         deadline: Duration,
