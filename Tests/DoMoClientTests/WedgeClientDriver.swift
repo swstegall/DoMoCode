@@ -104,11 +104,10 @@ final class WedgeClient {
         oracleRows: Int? = nil,
         watching: [String] = [],
         ownsFullScreenGate: Bool = true
-    ) async -> WedgeClient {
+    ) async throws -> WedgeClient {
         let gateLease: FullScreenClientGateLease?
         if ownsFullScreenGate {
-            await FullScreenClientGate.shared.enter()
-            gateLease = FullScreenClientGateLease(gate: FullScreenClientGate.shared)
+            gateLease = try await FullScreenClientGate.shared.acquire()
         } else {
             gateLease = nil
         }

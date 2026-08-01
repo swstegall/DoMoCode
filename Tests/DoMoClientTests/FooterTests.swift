@@ -699,9 +699,10 @@ struct FooterScreenTests {
         // One whole-client run at a time — see FullScreenClientGate. These tests
         // watch for a value that is on screen only between two network answers,
         // and a second client on the same main actor spends that window.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else { return }
+        defer { Task { await gateLease.release() } }
 
-        let client = await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
         // ONE row must hold all four. Scattered across the screen proves nothing:
         // the cwd is also in the sidebar, and every number would still "appear"
         // if the footer row itself were deleted and the values logged elsewhere.
@@ -710,7 +711,7 @@ struct FooterScreenTests {
         )
         #expect(shown, "no single row carried the footer:\n\(client.joined())")
         await client.quit()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
     }
 
     @Test("A session that spent nothing shows $0.00 on the footer, not a blank")
@@ -724,13 +725,14 @@ struct FooterScreenTests {
         // One whole-client run at a time — see FullScreenClientGate. These tests
         // watch for a value that is on screen only between two network answers,
         // and a second client on the same main actor spends that window.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else { return }
+        defer { Task { await gateLease.release() } }
 
-        let client = await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
         let shown = await client.waitForRow(with: ["/home/me/proj", "tok 0", "$0.00", "ctx 0 (0%)"])
         #expect(shown, "a spent-nothing session drew no footer numbers:\n\(client.joined())")
         await client.quit()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
     }
 
     @Test("An unknown context window puts ? on the screen, never a percentage")
@@ -747,15 +749,16 @@ struct FooterScreenTests {
         // One whole-client run at a time — see FullScreenClientGate. These tests
         // watch for a value that is on screen only between two network answers,
         // and a second client on the same main actor spends that window.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else { return }
+        defer { Task { await gateLease.release() } }
 
-        let client = await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
         let shown = await client.waitForRow(with: ["/home/me/proj", "ctx 50.0k (?)"])
         #expect(shown, "the unknown-window meter never drew:\n\(client.joined())")
         // The compaction fallback is 200_000, which would have rendered 25%.
         #expect(!client.showing("25%"), "a percentage of the fallback window reached the screen")
         await client.quit()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
     }
 
     @Test("A narrow terminal sheds segments instead of overflowing the row")
@@ -769,11 +772,12 @@ struct FooterScreenTests {
         ])
         stub.start()
         defer { stub.stop() }
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else { return }
+        defer { Task { await gateLease.release() } }
 
         // 40 columns leaves the main column 24 wide once the sidebar takes its
         // minimum 16 — room for the cost and the context meter and nothing else.
-        let client = await WedgeClient.make(
+        let client = try await WedgeClient.make(
             baseURL: stub.baseURL, token: Self.token, columns: 40, rows: 24,
             ownsFullScreenGate: false
         )
@@ -781,7 +785,7 @@ struct FooterScreenTests {
         #expect(shown, "the footer lost its last two segments on a narrow screen:\n\(client.joined())")
         #expect(!client.showing("tok 7.0k"), "the token count should have been shed first")
         await client.quit()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
     }
 
     @Test("A status poll corrects a live fold instead of stacking on top of it")
@@ -823,9 +827,10 @@ struct FooterScreenTests {
         // One whole-client run at a time — see FullScreenClientGate. These tests
         // watch for a value that is on screen only between two network answers,
         // and a second client on the same main actor spends that window.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else { return }
+        defer { Task { await gateLease.release() } }
 
-        let client = await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, ownsFullScreenGate: false)
         #expect(await client.wait(for: "tok 8.2k"),
                 "the streamed turn never moved the footer:\n\(client.joined())")
         #expect(await client.waitForRow(with: ["tok 90.0k"], timeout: .seconds(40)),
@@ -833,7 +838,7 @@ struct FooterScreenTests {
         #expect(!client.showing("tok 91.2k"),
                 "the polled total was added to the fold instead of replacing it")
         await client.quit()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
     }
 }
 

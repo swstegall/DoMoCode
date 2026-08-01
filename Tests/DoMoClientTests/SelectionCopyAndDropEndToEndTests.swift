@@ -302,7 +302,10 @@ struct SelectionCopyAndDropEndToEndTests {
     ) async -> CaptureTarget {
         // One end-to-end client at a time across the whole binary — see
         // FullScreenClientGate.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else {
+            return CaptureTarget(columns: Self.columns, rows: Self.rows)
+        }
+        defer { Task { await gateLease.release() } }
         let target = CaptureTarget(columns: Self.columns, rows: Self.rows)
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
@@ -326,7 +329,7 @@ struct SelectionCopyAndDropEndToEndTests {
         // graceful shutdown suspended, so do not let one completed case hold the
         // cross-suite gate while its owned client is trying to close.
         clientTask.cancel()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
         _ = await clientTask.result
         return target
     }
@@ -871,7 +874,8 @@ struct SelectionCopyAndDropEndToEndTests {
 
         // One end-to-end client at a time across the whole binary — see
         // FullScreenClientGate.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else { return }
+        defer { Task { await gateLease.release() } }
         let target = CaptureTarget(columns: Self.columns, rows: Self.rows)
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
@@ -902,7 +906,7 @@ struct SelectionCopyAndDropEndToEndTests {
         inputCont.finish()
         resizeCont.finish()
         clientTask.cancel()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
         _ = await clientTask.result
 
         // Asserted on the PERSISTENT row, not on the transient notice. `post(notice:)`

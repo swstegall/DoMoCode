@@ -16,6 +16,8 @@
 // an actor gives mutual exclusion for free, and FIFO ordering keeps a waiting
 // test from being starved by a stream of new arrivals.
 
+import Foundation
+
 /// A one-at-a-time gate for tests that run the whole full-screen client.
 ///
 /// `WedgeClient.make` acquires the gate before returning a client; tests that
@@ -24,16 +26,50 @@
 actor FullScreenClientGate {
     static let shared = FullScreenClientGate()
 
-    private var busy = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<FullScreenClientGateLease, Error>
+    }
 
-    /// Wait until no other end-to-end client test is running.
-    func enter() async {
-        guard busy else {
-            busy = true
-            return
+    private var busy = false
+    private var waiters: [Waiter] = []
+
+    /// Wait until no other end-to-end client test is running, or throw if the
+    /// waiting test is cancelled. A raw continuation cannot observe
+    /// cancellation: leaving one in `waiters` strands every test behind it.
+    func acquire() async throws -> FullScreenClientGateLease {
+        let id = UUID()
+        let lease = try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<FullScreenClientGateLease, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else if !busy {
+                    busy = true
+                    continuation.resume(returning: FullScreenClientGateLease(gate: self))
+                } else {
+                    waiters.append(Waiter(id: id, continuation: continuation))
+                }
+            }
+        }, onCancel: {
+            Task { await self.cancel(id: id) }
+        })
+
+        // Cancellation can race with `leave()` granting this waiter. In that
+        // case the waiter is no longer in the queue, so the cancellation
+        // callback cannot remove it; give the permit back before propagating
+        // cancellation instead.
+        if Task.isCancelled {
+            await lease.release()
+            throw CancellationError()
         }
-        await withCheckedContinuation { waiters.append($0) }
+        return lease
+    }
+
+    private func cancel(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
     /// Hand the gate to the next waiter, or open it.
@@ -42,7 +78,8 @@ actor FullScreenClientGate {
             busy = false
             return
         }
-        waiters.removeFirst().resume()
+        let waiter = waiters.removeFirst()
+        waiter.continuation.resume(returning: FullScreenClientGateLease(gate: self))
     }
 }
 

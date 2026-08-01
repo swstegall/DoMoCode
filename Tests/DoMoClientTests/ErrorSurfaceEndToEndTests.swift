@@ -132,7 +132,10 @@ struct ErrorSurfaceEndToEndTests {
         // One end-to-end client at a time across the whole binary — see
         // FullScreenClientGate. This suite's `type` helper has a wall-clock
         // budget, and a second client running on the same main actor spends it.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else {
+            return CaptureTarget(columns: Self.columns, rows: Self.rows)
+        }
+        defer { Task { await gateLease.release() } }
         let target = CaptureTarget(columns: Self.columns, rows: Self.rows)
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
@@ -164,7 +167,7 @@ struct ErrorSurfaceEndToEndTests {
         // Keep a stalled HTTP body from making the next full-screen case wait on
         // this client's graceful shutdown forever on Linux.
         clientTask.cancel()
-        await FullScreenClientGate.shared.leave()
+        await gateLease.release()
         _ = await clientTask.result
         return target
     }
