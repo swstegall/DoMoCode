@@ -30,7 +30,10 @@ final class HangingGateway: @unchecked Sendable {
     private let listenFD: Int32
     private let firstDelta: String
     private let lock = NSLock()
+    private let lifecycleLock = NSLock()
     private var stopped = false
+    private var activeClientFDs: Set<Int32> = []
+    private var acceptLoopFinished = false
     private var thread: Thread?
 
     /// - Parameter firstDelta: the assistant text sent in the single streamed
@@ -61,6 +64,11 @@ final class HangingGateway: @unchecked Sendable {
         guard listen(fd, 16) == 0 else {
             close(fd)
             throw HangingGatewayError("listen() failed: \(errno)")
+        }
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            close(fd)
+            throw HangingGatewayError("fcntl() failed: \(errno)")
         }
 
         var bound = sockaddr_in()
@@ -93,12 +101,31 @@ final class HangingGateway: @unchecked Sendable {
         lock.lock()
         let alreadyStopped = stopped
         stopped = true
+        let activeClients = activeClientFDs
         lock.unlock()
-        guard !alreadyStopped else { return }
-        close(listenFD)
+        if !alreadyStopped {
+            _ = shutdown(listenFD, Int32(SHUT_RDWR))
+            close(listenFD)
+        }
+        for client in activeClients {
+            _ = shutdown(client, Int32(SHUT_RDWR))
+        }
+        while true {
+            lifecycleLock.lock()
+            let finished = acceptLoopFinished
+            lifecycleLock.unlock()
+            if finished { return }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
     }
 
     private func acceptLoop() {
+        defer {
+            lifecycleLock.lock()
+            acceptLoopFinished = true
+            lifecycleLock.unlock()
+        }
+
         while true {
             lock.lock()
             let done = stopped
@@ -108,9 +135,27 @@ final class HangingGateway: @unchecked Sendable {
             let client = accept(listenFD, nil, nil)
             if client < 0 {
                 if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    usleep(1_000)
+                    continue
+                }
                 return
             }
+
+            lock.lock()
+            let stopping = stopped
+            if !stopping { activeClientFDs.insert(client) }
+            lock.unlock()
+            if stopping {
+                _ = shutdown(client, Int32(SHUT_RDWR))
+                close(client)
+                return
+            }
+
             handleConnection(client)
+            lock.lock()
+            activeClientFDs.remove(client)
+            lock.unlock()
             close(client)
         }
     }
