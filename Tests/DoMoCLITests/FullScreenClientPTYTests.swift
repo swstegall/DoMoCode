@@ -28,14 +28,12 @@ private final class PseudoTerminal {
     let slavePath: String
 
     init() throws {
-        let fd = posix_openpt(O_RDWR | O_NOCTTY)
-        guard fd >= 0 else { throw MockGatewayError("posix_openpt failed: \(errno)") }
-        guard grantpt(fd) == 0, unlockpt(fd) == 0, let name = ptsname(fd) else {
-            closeDescriptor(fd)
+        guard let opened = openPTYMaster() else {
             throw MockGatewayError("pty setup failed: \(errno)")
         }
+        let fd = opened.master
         master = fd
-        slavePath = String(cString: name)
+        slavePath = opened.slaveName
         // Non-blocking, so draining never parks the test on a child that has
         // simply stopped painting.
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)

@@ -31,6 +31,11 @@ import Glibc
 #endif
 import DoMoCore
 import Foundation
+// `URLSession`, `URLRequest` and `HTTPURLResponse` live in FoundationNetworking
+// on Linux and in Foundation on Darwin, so the import is conditional.
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import Testing
 
 @Suite(.serialized)

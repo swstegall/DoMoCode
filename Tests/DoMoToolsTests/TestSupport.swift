@@ -44,7 +44,11 @@ struct ToolFixture {
         let full = path(relative)
         let parent = (full as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: full, contents: data)
+        // `_ =` for a platform discrepancy: `createFile` is `@discardableResult`
+        // in Darwin's Foundation and is not in swift-corelibs-Foundation, so
+        // ignoring the `Bool` is silent on macOS and an unused-result warning on
+        // Linux — which this package builds with `treatAllWarnings(as: .error)`.
+        _ = FileManager.default.createFile(atPath: full, contents: data)
         return full
     }
 

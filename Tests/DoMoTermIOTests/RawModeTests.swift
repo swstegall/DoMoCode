@@ -23,17 +23,9 @@ struct PTYPair {
     let slave: Int32
 
     init?() {
-        let master = posix_openpt(O_RDWR | O_NOCTTY)
-        guard master >= 0 else { return nil }
-        guard grantpt(master) == 0, unlockpt(master) == 0 else {
-            _ = close(master)
-            return nil
-        }
-        guard let name = ptsname(master) else {
-            _ = close(master)
-            return nil
-        }
-        let slave = open(name, O_RDWR | O_NOCTTY)
+        guard let opened = openPTYMaster() else { return nil }
+        let master = opened.master
+        let slave = open(opened.slaveName, O_RDWR | O_NOCTTY)
         guard slave >= 0 else {
             _ = close(master)
             return nil

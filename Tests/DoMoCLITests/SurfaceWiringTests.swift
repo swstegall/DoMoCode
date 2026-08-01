@@ -47,6 +47,11 @@ import Glibc
 import DoMoCore
 import DoMoHarness
 import Foundation
+// `URLSession`, `URLRequest` and `HTTPURLResponse` live in FoundationNetworking
+// on Linux and in Foundation on Darwin, so the import is conditional.
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import SystemPackage
 import Testing
 
@@ -726,18 +731,17 @@ private final class InlineTerminal {
     static let promptHint = "enter to send"
 
     init() throws {
-        let descriptor = posix_openpt(O_RDWR | O_NOCTTY)
-        guard descriptor >= 0 else { throw MockGatewayError("posix_openpt failed: \(errno)") }
-        guard grantpt(descriptor) == 0, unlockpt(descriptor) == 0, let name = ptsname(descriptor) else {
-            _ = close(descriptor)
+        guard let opened = openPTYMaster() else {
             throw MockGatewayError("pty setup failed: \(errno)")
         }
+        let descriptor = opened.master
+        let name = opened.slaveName
         // Non-blocking, so draining never parks the test on a child that has
         // simply stopped painting.
         _ = fcntl(descriptor, F_SETFL, fcntl(descriptor, F_GETFL, 0) | O_NONBLOCK)
-        guard let handle = FileHandle(forUpdatingAtPath: String(cString: name)) else {
+        guard let handle = FileHandle(forUpdatingAtPath: name) else {
             _ = close(descriptor)
-            throw MockGatewayError("could not open pty slave \(String(cString: name))")
+            throw MockGatewayError("could not open pty slave \(name)")
         }
         master = descriptor
         slave = handle
