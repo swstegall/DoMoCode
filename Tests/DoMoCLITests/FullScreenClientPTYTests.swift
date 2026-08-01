@@ -336,7 +336,10 @@ struct FullScreenClientPTYTests {
         process.environment = environment
         process.standardInput = slave
         process.standardOutput = slave
-        process.standardError = Pipe()
+        // Keep child diagnostics out of the pty transcript, but surface them in
+        // the test runner. A release-only child crash otherwise looks exactly
+        // like an input or gateway hang because the error pipe is never read.
+        process.standardError = FileHandle.standardError
         try process.run()
         return process
     }
