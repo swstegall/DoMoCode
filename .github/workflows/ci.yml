@@ -50,11 +50,37 @@ jobs:
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 
-      # Run the cases one at a time. Several suites drive a real full-screen
-      # client on the main actor; `--parallel --num-workers 1` still permits
-      # cases from different suites to overlap in the same process, so an
-      # optimized Linux run can starve a render loop and turn a short wait into
-      # a job-wide hang. The end-to-end cases already provide the concurrency
-      # coverage; CI needs deterministic teardown.
+      # Run each test target in its own process. A package-wide Swift Testing
+      # process lets unrelated suites overlap even when its worker count is
+      # one; that is enough for a full-screen @MainActor client to starve on
+      # Linux. Keep those process/PTY targets serial, while ordinary targets
+      # retain limited case-level parallelism.
       - name: Test
-        run: swift test --configuration ${{ matrix.configuration }} --no-parallel
+        run: |
+          serial_targets=(
+            DoMoLLMTests
+            DoMoMCPTests
+            DoMoTermIOTests
+            DoMoCLITests
+            DoMoServerTests
+            DoMoClientTests
+          )
+          parallel_targets=(
+            DoMoCoreTests
+            DoMoTermGraphicsTests
+            DoMoExecTests
+            DoMoToolsTests
+            DoMoAgentTests
+            DoMoPermissionsTests
+            DoMoHarnessTests
+            DoMoTUITests
+            DoMoToolsUITests
+          )
+
+          for target in "${serial_targets[@]}"; do
+            swift test --configuration ${{ matrix.configuration }} --no-parallel --filter "^${target}\."
+          done
+
+          for target in "${parallel_targets[@]}"; do
+            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 2 --filter "^${target}\."
+          done
