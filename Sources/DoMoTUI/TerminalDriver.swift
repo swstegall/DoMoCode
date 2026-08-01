@@ -142,7 +142,15 @@ public nonisolated final class QuitSignal: Sendable {
 
     /// Suspend until ``quit()`` fires or the awaiting task is cancelled.
     func wait() async {
-        for await _ in stream { break }
+        await withTaskCancellationHandler(operation: {
+            for await _ in stream { break }
+        }, onCancel: {
+            // `AsyncStream` normally observes task cancellation at its next
+            // suspension point. Finishing here makes the wake-up explicit for
+            // the task-group teardown path, including Linux's Swift Testing
+            // runner where the next test may be waiting on the same actor.
+            continuation.finish()
+        })
     }
 }
 
@@ -188,6 +196,9 @@ public final class TerminalDriver {
     private var framer = StdinFramer()
     /// The armed ESC-disambiguation flush, cancelled the instant more bytes land.
     private var flushTask: Task<Void, Never>?
+    /// Background agent work is intentionally not a child of the shutdown
+    /// group. A body that ignores cancellation must not delay terminal restore.
+    private var backgroundTask: Task<Void, Never>?
 
     /// The session's app and quit handle, held for the duration of `run` so
     /// ``render()`` and the render-error path can reach them without threading
@@ -219,7 +230,6 @@ public final class TerminalDriver {
         case quit
         case inputEnded
         case resizeEnded
-        case backgroundEnded
     }
 
     /// Run the interactive session until quit, input EOF, or cancellation.
@@ -253,6 +263,8 @@ public final class TerminalDriver {
         defer {
             flushTask?.cancel()
             flushTask = nil
+            backgroundTask?.cancel()
+            backgroundTask = nil
             app.stop()
             lifecycle.stop()
             activeApp = nil
@@ -273,6 +285,14 @@ public final class TerminalDriver {
         // same reason: the screen should show the UI, not a blank line, at t=0.
         render()
 
+        // Keep optional work alive alongside the input pumps, but outside the
+        // structured shutdown group. The group is responsible for deciding when
+        // the session ends; it must not wait for arbitrary agent/network work to
+        // acknowledge cancellation before the terminal can be restored.
+        if let background {
+            backgroundTask = Task { await background() }
+        }
+
         await withTaskGroup(of: RunOutcome.self) { group in
             group.addTask { [input] in
                 for await chunk in input {
@@ -290,22 +310,15 @@ public final class TerminalDriver {
                 await quit.wait()
                 return .quit
             }
-            if let background {
-                group.addTask {
-                    await background()
-                    return .backgroundEnded
-                }
-            }
-
             for await outcome in group {
                 switch outcome {
                 case .quit, .inputEnded:
                     // Session over. Cancelling the group unblocks the remaining
-                    // stream iterators (they return nil on cancel) and the
-                    // background job; the group then drains and returns.
+                    // stream iterators (they return nil on cancel), and the
+                    // background task is canceled by the outer defer.
                     group.cancelAll()
                     return
-                case .resizeEnded, .backgroundEnded:
+                case .resizeEnded:
                     continue
                 }
             }
