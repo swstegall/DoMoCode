@@ -294,21 +294,25 @@ public final class TerminalDriver {
         // quit key; resize EOF is not, because a resize source may be closed
         // while the UI itself remains live. Avoiding a nested task-group teardown
         // keeps optimized Swift runtimes from tripping their stack assertion.
-        // The stream readers are unstructured main-actor tasks. Iterating an
-        // AsyncStream suspends without blocking the actor, while keeping the
-        // reader and the injected app on one isolation domain avoids the
-        // platform-dependent scheduling gap that detached readers exposed on
-        // Linux. The live stream's descriptor callback still runs on its own
-        // Dispatch queue; only the UI handoff is main-actor isolated here.
-        let inputTask = Task { @MainActor [input, quit] in
+        // The stream readers are detached so waiting for input or resize never
+        // competes with the UI task for main-actor scheduling. Each event then
+        // crosses back explicitly for the small stateful UI handoff. The live
+        // stream's descriptor callback already runs on its own Dispatch queue;
+        // keeping the AsyncStream wait detached makes that boundary explicit on
+        // both Darwin and Linux.
+        let inputTask = Task.detached { [input, quit] in
             for await chunk in input {
-                self.ingest(chunk, app: app)
+                await MainActor.run {
+                    self.ingest(chunk, app: app)
+                }
             }
             quit.quit()
         }
-        let resizeTask = Task { @MainActor [resize] in
+        let resizeTask = Task.detached { [resize] in
             for await size in resize {
-                self.handleResize(size, app: app)
+                await MainActor.run {
+                    self.handleResize(size, app: app)
+                }
             }
         }
 
