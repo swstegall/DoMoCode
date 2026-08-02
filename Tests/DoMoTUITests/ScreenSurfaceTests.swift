@@ -315,7 +315,7 @@ struct ScreenSurfaceTests {
     @Test("The same driver runs a ScreenSurface end-to-end")
     func driverRunsScreenSurface() async {
         let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
         let target = CaptureTarget(columns: 20, rows: 6)
 
         let alpha = FocusableProbe("alpha")
@@ -332,6 +332,7 @@ struct ScreenSurfaceTests {
         inputCont.yield([0x09])          // Tab -> focus bravo
         inputCont.yield(bytes("z"))      // 'z' -> bravo
         inputCont.finish()
+        resizeCont.finish()
 
         await driver.run(surface, quit: QuitSignal())
 

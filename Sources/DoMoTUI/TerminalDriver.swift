@@ -446,11 +446,13 @@ extension TerminalDriver {
     /// watcher yields whatever the descriptor makes available, so the read never
     /// blocks the main actor and the driver's input pump is oblivious to whether
     /// its bytes come from a keyboard or a script. Reading goes through
-    /// `FileHandle.availableData` (the source guarantees data is ready) rather than
-    /// a raw `read(2)`, keeping this file inside strict memory safety. The source
-    /// is cancelled when the stream's consumer stops, and an empty read (EOF, e.g.
-    /// stdin closed) finishes the stream — which the run loop treats as
-    /// end-of-session.
+    /// ``NonblockingFileDescriptor/read(_:maximumBytes:)`` rather than a raw
+    /// `read(2)`, keeping this file inside strict memory safety. The source is
+    /// cancelled when the stream's consumer stops, and EOF finishes the stream —
+    /// which the run loop treats as end-of-session. The POSIX seam also drains
+    /// every currently available chunk: Linux dispatch read sources do not
+    /// reliably issue a separate callback for a pipe's EOF unless the handler
+    /// observes it while draining a nonblocking descriptor.
     // `nonisolated` is load-bearing: under DoMoTUI's `.defaultIsolation(MainActor.self)`
     // this factory — and, crucially, the `setEventHandler` closure it builds —
     // would otherwise be `@MainActor`. The `DispatchSource` runs that handler on
@@ -463,21 +465,33 @@ extension TerminalDriver {
         queue: DispatchQueue = DispatchQueue(label: "domo.tui.stdin")
     ) -> AsyncStream<[UInt8]> {
         AsyncStream { continuation in
-            let handle = FileHandle(fileDescriptor: fileDescriptor, closeOnDealloc: false)
+            guard let flags = NonblockingFileDescriptor.makeNonblocking(fileDescriptor) else {
+                continuation.finish()
+                return
+            }
             let source = DispatchSource.makeReadSource(fileDescriptor: fileDescriptor, queue: queue)
+            let box = DispatchSourceBox(source)
             source.setEventHandler {
-                let data = handle.availableData
-                if data.isEmpty {
-                    continuation.finish()
-                    return
+                while true {
+                    switch NonblockingFileDescriptor.read(fileDescriptor) {
+                    case .bytes(let bytes):
+                        continuation.yield(bytes)
+                    case .wouldBlock:
+                        return
+                    case .endOfFile, .error:
+                        continuation.finish()
+                        box.cancel()
+                        return
+                    }
                 }
-                continuation.yield([UInt8](data))
             }
             source.setCancelHandler {}
             // Boxed for the same Linux-only reason as the signal sources; see
             // `DoMoTermIO.DispatchSourceBox`.
-            let box = DispatchSourceBox(source)
-            continuation.onTermination = { _ in box.cancel() }
+            continuation.onTermination = { _ in
+                box.cancel()
+                flags.restore()
+            }
             source.resume()
         }
     }
