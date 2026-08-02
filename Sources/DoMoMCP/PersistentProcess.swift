@@ -9,6 +9,11 @@
 // `\n` and delivered as `lines`. Teardown closes stdin then cancels the Task, whose
 // teardown sequence sends SIGTERM (grace) then SIGKILL to the child's process group.
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Subprocess
 
@@ -126,6 +131,12 @@ actor PersistentProcess {
     /// in a retained Task. `lines` begins yielding as the child writes.
     func start(_ spawn: Spawn) {
         guard runTask == nil else { return }
+
+        // A server is allowed to exit at any point, including between spawn and
+        // the first JSON-RPC frame. On Linux, writing to its closed stdin would
+        // otherwise deliver SIGPIPE before `writer.write` can report EPIPE and
+        // let the manager isolate the failed server.
+        signal(SIGPIPE, SIG_IGN)
 
         var platformOptions = PlatformOptions()
         // The child (and its descendants, e.g. `npx` -> node) get their own session, so
