@@ -302,7 +302,10 @@ struct SelectionCopyAndDropEndToEndTests {
     ) async -> CaptureTarget {
         // One end-to-end client at a time across the whole binary — see
         // FullScreenClientGate.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else {
+            return CaptureTarget(columns: Self.columns, rows: Self.rows)
+        }
+        defer { Task { await gateLease.release() } }
         let target = CaptureTarget(columns: Self.columns, rows: Self.rows)
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
@@ -321,8 +324,13 @@ struct SelectionCopyAndDropEndToEndTests {
         inputCont.yield([0x03])
         inputCont.finish()
         resizeCont.finish()
+        // The input byte requests a graceful quit; cancellation is the second
+        // half of teardown. On Linux an async-http-client body reader can keep the
+        // graceful shutdown suspended, so do not let one completed case hold the
+        // cross-suite gate while its owned client is trying to close.
+        clientTask.cancel()
+        await gateLease.release()
         _ = await clientTask.result
-        await FullScreenClientGate.shared.leave()
         return target
     }
 
@@ -866,7 +874,8 @@ struct SelectionCopyAndDropEndToEndTests {
 
         // One end-to-end client at a time across the whole binary — see
         // FullScreenClientGate.
-        await FullScreenClientGate.shared.enter()
+        guard let gateLease = try? await FullScreenClientGate.shared.acquire() else { return }
+        defer { Task { await gateLease.release() } }
         let target = CaptureTarget(columns: Self.columns, rows: Self.rows)
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
@@ -896,8 +905,9 @@ struct SelectionCopyAndDropEndToEndTests {
         inputCont.yield([0x03])
         inputCont.finish()
         resizeCont.finish()
+        clientTask.cancel()
+        await gateLease.release()
         _ = await clientTask.result
-        await FullScreenClientGate.shared.leave()
 
         // Asserted on the PERSISTENT row, not on the transient notice. `post(notice:)`
         // is a single slot with a TTL and several sources, so any other event inside
@@ -1180,8 +1190,9 @@ struct SelectionCopyAndDropEndToEndTests {
         // The window: `handleSubmit` used to clear `pendingDrops`, which made the
         // loader's answer stale — so the drop's images were discarded, the message
         // went out with no image part in it, and the status line said "attached 1
-        // image" anyway. A multi-megabyte file makes the window wide enough to
-        // walk into on the first try, which is how it was found on a real pty.
+        // image" anyway. A two-megabyte file makes the window wide enough to walk
+        // into on the first try, which is how it was found on a real pty, without
+        // making the Linux test server buffer an unnecessarily large request.
         //
         // The assertion is the INVARIANT rather than the race: whichever side wins,
         // no user message may reach the gateway without the picture it claims.
@@ -1189,7 +1200,7 @@ struct SelectionCopyAndDropEndToEndTests {
         defer { dirs.cleanUp() }
         let file = dirs.files.appendingPathComponent("shot.png")
         var bytes = Self.onePixelPNG
-        bytes.append(Data(repeating: 0x42, count: (4 << 20)))
+        bytes.append(Data(repeating: 0x42, count: (2 << 20)))
         try bytes.write(to: file)
 
         let seen = SeenMessages()

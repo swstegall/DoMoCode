@@ -172,8 +172,9 @@ extension TerminalSize {
             source.setEventHandler {
                 continuation.yield(TerminalSize.current(fileDescriptor: fileDescriptor))
             }
+            let box = DispatchSourceBox(source)
             continuation.onTermination = { _ in
-                source.cancel()
+                box.source.cancel()
             }
 
             continuation.yield(TerminalSize.current(fileDescriptor: fileDescriptor))

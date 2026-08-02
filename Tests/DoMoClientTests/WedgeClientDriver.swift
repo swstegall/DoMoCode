@@ -81,6 +81,7 @@ final class WedgeClient {
     private let inputCont: AsyncStream<[UInt8]>.Continuation
     private let resizeCont: AsyncStream<TerminalSize>.Continuation
     private let task: Task<Void, Never>
+    private let gateLease: FullScreenClientGateLease?
     private var stopped = false
 
     /// Needles that have been on screen at least once since the run started.
@@ -89,7 +90,40 @@ final class WedgeClient {
     /// against the CURRENT screen.
     private var watching: Set<String> = []
 
-    init(
+    /// Acquire the cross-suite full-screen permit before handing the client to a
+    /// test. Starting a task that waits for the permit is not enough: the test
+    /// would begin polling an empty screen, time out, and then wait forever in
+    /// `quit()` for that queued task while the current permit holder waits behind
+    /// it.
+    static func make(
+        baseURL: String,
+        token: String,
+        columns: Int = 220,
+        rows: Int = 34,
+        oracleColumns: Int? = nil,
+        oracleRows: Int? = nil,
+        watching: [String] = [],
+        ownsFullScreenGate: Bool = true
+    ) async throws -> WedgeClient {
+        let gateLease: FullScreenClientGateLease?
+        if ownsFullScreenGate {
+            gateLease = try await FullScreenClientGate.shared.acquire()
+        } else {
+            gateLease = nil
+        }
+        return WedgeClient(
+            baseURL: baseURL,
+            token: token,
+            columns: columns,
+            rows: rows,
+            oracleColumns: oracleColumns,
+            oracleRows: oracleRows,
+            watching: watching,
+            gateLease: gateLease
+        )
+    }
+
+    private init(
         baseURL: String,
         token: String,
         // Wide on purpose. The status line composes a disconnect reason, a run
@@ -106,17 +140,20 @@ final class WedgeClient {
         // ``WedgeCaptureTarget/oracleColumns``.
         oracleColumns: Int? = nil,
         oracleRows: Int? = nil,
-        watching: [String] = []
+        watching: [String] = [],
+        gateLease: FullScreenClientGateLease? = nil
     ) {
         self.target = WedgeCaptureTarget(
             columns: columns, rows: rows, oracleColumns: oracleColumns, oracleRows: oracleRows
         )
         self.watching = Set(watching)
+        self.gateLease = gateLease
         let (input, inputCont) = AsyncStream<[UInt8]>.makeStream()
         let (resize, resizeCont) = AsyncStream<TerminalSize>.makeStream()
         self.inputCont = inputCont
         self.resizeCont = resizeCont
         let target = self.target
+        let gateLease = self.gateLease
         self.task = Task { @MainActor in
             try? await runFullScreenClient(
                 baseURL: baseURL,
@@ -126,6 +163,7 @@ final class WedgeClient {
                 resize: resize,
                 lifecycle: WedgeNoopLifecycle()
             )
+            await gateLease?.release()
         }
     }
 
@@ -154,6 +192,12 @@ final class WedgeClient {
         inputCont.yield([0x03])
         inputCont.finish()
         resizeCont.finish()
+        task.cancel()
+        // Release before waiting for the cancelled HTTP body reader. If that
+        // reader is parked in async-http-client shutdown on Linux, a later test
+        // must still be able to start; the lease makes the task's eventual
+        // cleanup release a harmless no-op.
+        await gateLease?.release()
         _ = await task.result
     }
 

@@ -108,6 +108,40 @@ final class SteeringBox: Sendable {
     }
 }
 
+// MARK: - Response metadata relay
+
+/// A late-bound sink for the response headers of every LLM request this session
+/// makes.
+///
+/// It exists for the same reason ``DoMoPermissions/PrompterBox`` does: the harness
+/// — and therefore the stream function whose `onResponse` fires — is built by
+/// `InteractiveMode.make`, long before `InteractiveMode.run` builds the coordinator
+/// that can draw anything. Until a handler is installed the metadata is dropped,
+/// which is correct: there is no transcript to write it to.
+///
+/// The inline REPL previously passed `onResponse: { _ in }`, so the "a fallback
+/// fired and a different model answered" warning — which the README states the UI
+/// must give "rather than lie" — existed on `-p` and nowhere else.
+///
+/// `Sendable` around a ``Mutex``: the handler is installed from the main actor and
+/// invoked from the streaming client's task. The stored closure is read out of the
+/// lock before it is called, so a handler that hops to the main actor never runs
+/// with the lock held.
+final class ResponseMetadataRelay: Sendable {
+    private let handler = Mutex<(@Sendable (ResponseMetadata) -> Void)?>(nil)
+
+    /// Install the sink (called once, when the surface's UI is ready).
+    func set(_ sink: @escaping @Sendable (ResponseMetadata) -> Void) {
+        handler.withLock { $0 = sink }
+    }
+
+    /// Forward one response head, or drop it when nothing is listening yet.
+    func deliver(_ metadata: ResponseMetadata) {
+        let sink = handler.withLock { $0 }
+        sink?(metadata)
+    }
+}
+
 // MARK: - Mutable transcript block
 
 /// A transcript entry whose rendered content can be swapped in place.
@@ -138,13 +172,124 @@ final class MutableBlock: @MainActor Component {
 /// It answers "what can I do right now": the idle affordances, or — while the
 /// agent runs — that Escape interrupts. Always exactly one line, always clipped to
 /// width, so it can never be the over-wide line the renderer treats as fatal.
+///
+/// ``trailing`` is the session's accounting, right-aligned against the same row.
+/// It is dropped WHOLE when it does not fit rather than truncated with the left
+/// side, because half of `$0.0312` is `$0.03` — a smaller number that still looks
+/// like a number, which is exactly the class of quiet lie Phase 5a exists to
+/// remove. Nothing on this strip is load-bearing enough to be worth showing
+/// wrongly.
 @MainActor
 final class StatusLine: @MainActor Component {
     var text: String = ""
+    /// The right-aligned accounting strip. Empty renders the row exactly as it
+    /// rendered before there was one.
+    var trailing: String = ""
+
+    /// Columns of clear space kept between the hints and the accounting, so the
+    /// two never read as one sentence.
+    private static let gap = 2
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [""] }
-        return [truncateToWidth(text, width, ellipsis: "")]
+        let left = truncateToWidth(text, width, ellipsis: "")
+        guard !trailing.isEmpty else { return [left] }
+        let leftWidth = visibleWidth(left)
+        let trailingWidth = visibleWidth(trailing)
+        let padding = width - leftWidth - trailingWidth
+        guard padding >= Self.gap else { return [left] }
+        return [left + String(repeating: " ", count: padding) + trailing]
+    }
+}
+
+// MARK: - Inline accounting strip
+
+/// The three numbers the inline REPL reports about the session it is driving:
+/// tokens used, money spent, and how full the context is.
+///
+/// Pure, and public, rather than a method on the coordinator: it can then be
+/// exercised without a terminal, a harness or a gateway, which the `@MainActor`
+/// coordinator needs all three of. That is how a formatter like this otherwise
+/// ends up with no test at all.
+///
+/// Every number here comes from ``DoMoHarness/SessionAccounting``, which the
+/// harness produces from the ONE running total it keeps. There is deliberately no
+/// accumulator on this side: a second one is how `--inline` and `--serve` came to
+/// be able to report different figures for the same session file.
+///
+/// The segment vocabulary — `tok`, `$`, `ctx N (P%)`, and `?` for "unknown" —
+/// deliberately matches the full-screen client's footer, so a user who moves
+/// between the two surfaces reads the same row. It is a SECOND implementation of
+/// that vocabulary only because DoMoCLI does not depend on DoMoClient; if a third
+/// surface ever needs it, the formatting belongs in a module both can import
+/// rather than a third copy.
+public enum InlineAccountingSummary {
+
+    /// `"tok 12.3k · $0.0031 · ctx 4.2k (2%)"`, or `""` when nothing is known yet.
+    public static func text(_ accounting: SessionAccounting?) -> String {
+        guard let accounting else { return "" }
+        return [
+            "tok " + compact(accounting.usage.totalTokens),
+            cost(accounting),
+            context(accounting),
+        ].joined(separator: " · ")
+    }
+
+    /// What the session has spent.
+    ///
+    /// The exact decimal digits, not a fixed number of places: a turn that cost a
+    /// third of a cent rounds to `$0.00` at two places, and "the meter reads zero"
+    /// is the falsehood this phase exists to remove. Rendering the `Decimal`'s own
+    /// description also keeps the number off `Double` entirely.
+    ///
+    /// A zero total on a session that demonstrably ran gets a trailing `?`. Two
+    /// different situations produce that zero — a model nobody configured a price
+    /// for, and a session file written before this phase recorded any cost at all
+    /// — and neither is "it was free", so the strip marks it unknown with the same
+    /// glyph the context meter uses rather than asserting either.
+    static func cost(_ accounting: SessionAccounting) -> String {
+        guard accounting.costTotal > 0 else {
+            return accounting.turns > 0 && accounting.usage.totalTokens > 0 ? "$0.00?" : "$0.00"
+        }
+        return "$" + accounting.costTotal.description
+    }
+
+    /// How big the context is, and how much of the window it fills.
+    ///
+    /// An unknown ``DoMoHarness/SessionAccounting/contextWindow`` renders `(?)`
+    /// and **never** a percentage. Compaction falls back to a 200K guess so that a
+    /// session against an unrecognised model still compacts rather than growing
+    /// into a provider overflow, but a percentage computed against that guess is
+    /// indistinguishable on screen from one computed against the model's real
+    /// window — which would replace the old lie with a new one.
+    ///
+    /// A context past its window reports the real figure rather than clamping at
+    /// 100: it is a true state (the next turn is what compacts), and a meter
+    /// pinned at 100% hides how far past it has gone. The 9999 ceiling is only so
+    /// a nonsense window cannot widen the row without bound.
+    static func context(_ accounting: SessionAccounting) -> String {
+        let tokens = compact(accounting.contextTokens)
+        guard let window = accounting.contextWindow, window > 0 else { return "ctx \(tokens) (?)" }
+        return "ctx \(tokens) (\(min(9_999, accounting.contextTokens * 100 / window))%)"
+    }
+
+    /// A token count as `842`, `12.3k` or `1.4M`.
+    ///
+    /// The strip has to stay a roughly fixed handful of columns as a session
+    /// grows — ``StatusLine`` drops it entirely once it stops fitting, so a count
+    /// that widens by a digit every ten turns would eventually take the cost and
+    /// the context meter off the screen with it.
+    public static func compact(_ value: Int) -> String {
+        if value < 1000 { return "\(value)" }
+        // 999_950 and not 1_000_000: one decimal place already rounds to
+        // "1000.0k" at that point, which is a unit nobody uses.
+        if value < 999_950 { return tenths((value + 50) / 100, suffix: "k") }
+        return tenths((value + 50_000) / 100_000, suffix: "M")
+    }
+
+    /// `count` is the value in TENTHS of the unit, so 123 renders `12.3k`.
+    private static func tenths(_ count: Int, suffix: String) -> String {
+        "\(count / 10).\(count % 10)\(suffix)"
     }
 }
 
@@ -259,6 +404,11 @@ final class InteractiveCoordinator {
     // Run state.
     private var running = false
     private var currentRunTask: Task<RunStopReason, Never>?
+    /// Escape is a user-visible action even if an upstream transport is slow to
+    /// acknowledge cancellation. The marker is emitted once at the action site;
+    /// the run still owns cleanup and settles normally in ``runOne(_:)``.
+    private var abortRequested = false
+    private var interruptedShown = false
 
     // Streaming assistant turn.
     private var currentAssistant: Markdown?
@@ -429,6 +579,17 @@ final class InteractiveCoordinator {
         }
 
         if popupList != nil {
+            // A completion overlay is non-capturing: it must not steal the
+            // interrupt gesture from a live agent. An asynchronous completion
+            // result can arrive after submit and briefly recreate the overlay,
+            // so check the running state before treating Escape as merely
+            // "close popup".
+            if running, matchesKey(data, Key.escape) {
+                closePopup()
+                abortRun()
+                render()
+                return
+            }
             if kb.matches(data, .selectUp) || kb.matches(data, .selectDown) {
                 popupList?.handleInput(data)
                 render()
@@ -494,7 +655,14 @@ final class InteractiveCoordinator {
     /// and returns a clean transcript — no throw — so ``runOne(_:)`` simply resumes
     /// past its `await` and marks the turn interrupted.
     private func abortRun() {
+        guard running else { return }
+        abortRequested = true
         currentRunTask?.cancel()
+        if !interruptedShown {
+            interruptedShown = true
+            appendInterrupted()
+            render()
+        }
     }
 
     // MARK: Submit + slash commands
@@ -882,11 +1050,56 @@ final class InteractiveCoordinator {
     /// run's last steering poll is still sitting in the box, so it is re-queued as
     /// the next run's prompt rather than being left to wait for an unrelated submit.
     func agentLoop() async {
+        // Before parking on the first submission: a RESUMED session already has
+        // tokens and a bill behind it, and a strip that only appears after the
+        // first new turn would make a resumed session look free until it was
+        // spent again.
+        await refreshAccounting()
+        render()
         var iterator = submissions.makeAsyncIterator()
         while !Task.isCancelled {
             guard let submission = await iterator.next() else { break }
             await runOne(submission)
             drainLeftoverSteering()
+        }
+    }
+
+    // MARK: Accounting strip
+
+    /// Re-read the session's totals and put them on the status line.
+    ///
+    /// The harness owns the only accumulator, so this is a READ — nothing here
+    /// adds anything up. It is cached onto ``StatusLine/trailing`` rather than
+    /// recomputed per repaint because ``AgentHarness/accounting()`` rebuilds the
+    /// context to measure it and the status row repaints about ten times a second
+    /// while a turn is in flight.
+    ///
+    /// A failure leaves the previous figures in place rather than blanking them:
+    /// the numbers are a display, and a session whose path momentarily cannot be
+    /// resolved still has a REPL to run. It does not silently show zeros — the
+    /// last figures it actually read are the last true ones it had.
+    private func refreshAccounting() async {
+        guard let latest = try? await harness.accounting() else { return }
+        statusLine.trailing = InlineAccountingSummary.text(latest)
+    }
+
+    /// The in-flight refresh, so a run that finishes several turns quickly queues
+    /// one catch-up rather than one task per turn.
+    private var accountingRefreshTask: Task<Void, Never>?
+
+    /// Ask for a refresh from a synchronous context.
+    ///
+    /// ``handle(_:)`` is deliberately synchronous — it mutates the transcript and
+    /// repaints in one uninterrupted main-actor step, and adding an `await` inside
+    /// it would let another main-actor task interleave between the mutation and
+    /// the frame. So the refresh is hopped onto its own main-actor task: the strip
+    /// catches up a frame later, which is invisible beside a 10 Hz spinner.
+    private func scheduleAccountingRefresh() {
+        guard accountingRefreshTask == nil else { return }
+        accountingRefreshTask = Task { @MainActor [weak self] in
+            await self?.refreshAccounting()
+            self?.accountingRefreshTask = nil
+            self?.render()
         }
     }
 
@@ -921,6 +1134,8 @@ final class InteractiveCoordinator {
     private func runOne(_ submission: PendingSubmission) async {
         let prompt = submission.text
         running = true
+        abortRequested = false
+        interruptedShown = false
         currentAssistant = nil
         assistantBuffer = ""
         statusLine.text = runningStatus
@@ -948,6 +1163,9 @@ final class InteractiveCoordinator {
             } catch is CancellationError {
                 return .aborted
             } catch {
+                if Task.isCancelled || DoMoError.isCancellation(error) {
+                    return .aborted
+                }
                 self.appendError(error)
                 return .errored
             }
@@ -971,8 +1189,13 @@ final class InteractiveCoordinator {
         running = false
         stopProgressClock()
         statusLine.text = idleStatus
-        if reason == .aborted {
-            appendInterrupted()
+        // The settled run is the moment the totals are final for this turn set —
+        // and the one refresh that is guaranteed to happen even if every mid-run
+        // one was coalesced away.
+        await refreshAccounting()
+        let wasAborted = abortRequested || reason == .aborted
+        if wasAborted {
+            if !interruptedShown { appendInterrupted() }
         } else if let notice = Self.stopNotice(for: reason) {
             // A run that stopped WITHOUT finishing has to say so. Before this,
             // `.maxTurnsReached` produced no output whatsoever here — the REPL
@@ -980,6 +1203,8 @@ final class InteractiveCoordinator {
             // deciding it was done.
             appendStopNotice(notice)
         }
+        abortRequested = false
+        interruptedShown = false
         render()
     }
 
@@ -1049,7 +1274,13 @@ final class InteractiveCoordinator {
         case .messageUpdate(_, let assembly):
             if case .textDelta(_, let delta) = assembly { appendAssistantText(delta) }
         case .messageEnd(let message):
-            if case .assistant(let assistant) = message { finalizeAssistant(assistant) }
+            if case .assistant(let assistant) = message {
+                finalizeAssistant(assistant)
+                // A turn just billed. Without this the strip would only move when
+                // a whole run settled, so a long agentic run — the one where the
+                // spend actually matters — would sit on stale numbers for minutes.
+                scheduleAccountingRefresh()
+            }
         case .toolExecutionStart(let id, let name, let arguments):
             startTool(id: id, name: name, arguments: arguments.value)
         case .toolExecutionEnd(let id, let name, let result, let isError):
@@ -1138,6 +1369,30 @@ final class InteractiveCoordinator {
     /// A run that stopped without finishing, said out loud.
     private func appendStopNotice(_ text: String) {
         transcript.addChild(Text("  \u{1b}[33m⚠ " + text + Self.sgrReset))
+    }
+
+    /// Say out loud that a LiteLLM fallback fired and a different model answered.
+    ///
+    /// The README is explicit that a surface must report this "rather than lie",
+    /// and until the stream function's `onResponse` was routed here the inline REPL
+    /// had no way to know it had happened: it passed `onResponse: { _ in }`, so
+    /// ``ResponseMetadata/attemptedFallbacks`` — the only signal there is — was
+    /// discarded at the seam.
+    ///
+    /// Both names are gateway-controlled strings arriving in a response header, so
+    /// both are collapsed to one line and stripped of anything a terminal would act
+    /// on before they reach the screen.
+    ///
+    /// Said once per request that fell back, not once per session: which turn was
+    /// answered by a substitute is exactly the thing a reader needs to know.
+    func noteFallback(served: String, requested: String) {
+        appendStopNotice(
+            "request fell back — answered by "
+                + sanitizeUntrustedText(collapseToOneLine(served))
+                + ", not the requested model "
+                + sanitizeUntrustedText(collapseToOneLine(requested))
+        )
+        render()
     }
 
     /// A drop's outcome — what attached, what did not.
@@ -1270,6 +1525,13 @@ public struct InteractiveMode: Sendable {
     /// can tear them down on exit — they spawn in their own process group and would
     /// otherwise be orphaned. `nil` when no MCP servers are configured.
     private let mcpManager: MCPManager?
+    /// The response-header relay the session's stream function reports to. Built in
+    /// ``make`` alongside that stream function, pointed at the coordinator's
+    /// transcript by ``run`` once there is a transcript to write to.
+    private let metadataRelay: ResponseMetadataRelay
+    /// The alias this session asked for, kept so the fallback warning can name what
+    /// was requested next to what actually answered.
+    private let requestedModel: String
 
     private init(
         harness: AgentHarness,
@@ -1280,6 +1542,8 @@ public struct InteractiveMode: Sendable {
         toolTheme: ToolRenderTheme,
         steering: SteeringBox,
         prompterBox: PrompterBox,
+        metadataRelay: ResponseMetadataRelay,
+        requestedModel: String,
         fileSystem: SandboxedFileSystem? = nil,
         mcpManager: MCPManager? = nil
     ) {
@@ -1291,6 +1555,8 @@ public struct InteractiveMode: Sendable {
         self.toolTheme = toolTheme
         self.steering = steering
         self.prompterBox = prompterBox
+        self.metadataRelay = metadataRelay
+        self.requestedModel = requestedModel
         self.fileSystem = fileSystem
         self.mcpManager = mcpManager
     }
@@ -1329,14 +1595,42 @@ public struct InteractiveMode: Sendable {
         sessionSource: SessionSource = .new,
         toolTheme: ToolRenderTheme = .ansi,
         mcpServers: [String: MCPServerConfig] = [:],
-        mcpLog: (@Sendable (String) -> Void)? = nil
+        mcpLog: (@Sendable (String) -> Void)? = nil,
+        // The resolved model, when the caller has one. Added ALONGSIDE
+        // `model`/`reasoningEffort` rather than replacing them, because those two
+        // are what every existing caller passes; a runtime supersedes both when
+        // given, and also carries the cost rates and the context window a bare alias
+        // cannot express. `nil` builds one from `model`/`reasoningEffort`, which is
+        // exactly the request this surface made before.
+        modelRuntime: ModelRuntime? = nil,
+        compaction: CompactionSettings = .default,
+        // The compaction summarizer, when a distinct small model was configured.
+        // Decided by the caller (`DoMoCodeCommand.compactionSummarizer`), because
+        // that is the layer that knows both aliases; `nil` keeps the harness's own.
+        summarizer: Summarizer? = nil,
+        // The environment variable names holding this run's gateway credential —
+        // the three built-in spellings plus whatever `apiKeyEnv` named. They are
+        // unset for every MCP child and every tool subprocess, so a model cannot
+        // read the key back with a one-word `bash` command. Empty leaves only
+        // `ToolContext`'s own built-in scrub, which is what a test that never
+        // configured a credential wants.
+        credentialEnvNames: Set<String> = []
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
+        // One resolved model for the whole session. A caller that supplied a runtime
+        // has already applied its own precedence (an alias-level `reasoningEffort`
+        // outranks the global one), so it wins outright rather than being merged
+        // with the loose parameters here.
+        let runtime = modelRuntime ?? ModelRuntime(model: model, reasoningEffort: reasoningEffort)
 
         let client = LiteLLMClient(configuration: clientConfiguration)
         let shell = try SubprocessShell()
-        let toolContext = try await ToolContext.rooted(at: workDirectory, shell: shell)
+        let toolContext = try await ToolContext.rooted(
+            at: workDirectory,
+            shell: shell,
+            environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+        )
         let registry = ToolRegistry.builtin
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools to the built-ins. The manager is held on the session and torn down in
@@ -1349,8 +1643,10 @@ public struct InteractiveMode: Sendable {
             mcpTools = await manager.connect(
                 servers: mcpServers,
                 workspaceDirectory: workingDirectory,
-                // Scrub the LLM-gateway credential variables from each MCP child's env.
-                sensitiveEnvKeys: Set(EnvName.apiKeyFallbacks),
+                // Scrub the LLM-gateway credential variables from each MCP child's
+                // env — including the one a user named through `apiKeyEnv`, which
+                // the old hardcoded three-name list handed to every server.
+                sensitiveEnvKeys: Redaction.secretEnvironmentNames.union(credentialEnvNames),
                 // Reserve the built-in tool names so an MCP tool can't shadow one.
                 reservedNames: Set(ToolRegistry.builtin.names),
                 log: mcpLog ?? { _ in }
@@ -1373,14 +1669,15 @@ public struct InteractiveMode: Sendable {
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
         let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
 
-        let streamFn: AgentStreamFn = { context in
-            client.streamCompletion(
-                model: model,
-                context: context,
-                reasoningEffort: reasoningEffort,
-                onResponse: { _ in }
-            )
-        }
+        // The shared factory, so this surface gets the per-alias cost rates and the
+        // response-head callback that `-p` already had. The relay is the seam: the
+        // coordinator that can draw a warning does not exist yet.
+        let metadataRelay = ResponseMetadataRelay()
+        let streamFn = makeStreamFn(
+            client: client,
+            runtime: runtime,
+            onResponse: { metadataRelay.deliver($0) }
+        )
 
         // The steering seam: the loop drains this box for mid-run submissions at
         // each turn boundary, and the coordinator appends to it. Built here so the
@@ -1401,12 +1698,21 @@ public struct InteractiveMode: Sendable {
                 toolNames: registry.names + visibleMcp.map(\.definition.name)
             ),
             tools: tools,
-            model: model,
+            model: runtime.model,
             streamFn: streamFn,
+            // A distinct small model compacts on its own request rather than through
+            // `streamFn`; with none configured this is `nil` and the harness keeps
+            // its built-in summarizer, unchanged.
+            summarizer: summarizer,
             // Sequential keeps tool-start/tool-result transcript order equal to the
             // model's own call order, which is what a reader expects to watch.
             toolExecution: .sequential,
             maxTurns: maxTurns,
+            // Neither was forwarded before, so the REPL compacted on the built-in
+            // defaults against the 200K fallback window whatever the user configured
+            // and whatever model was answering.
+            compaction: compaction,
+            contextWindow: runtime.contextWindow,
             getSteeringMessages: { steering.drain() },
             beforeToolCall: gate
         )
@@ -1439,6 +1745,8 @@ public struct InteractiveMode: Sendable {
             toolTheme: toolTheme,
             steering: steering,
             prompterBox: prompterBox,
+            metadataRelay: metadataRelay,
+            requestedModel: runtime.model,
             fileSystem: toolContext.fileSystem,
             mcpManager: mcpManager
         )
@@ -1531,6 +1839,17 @@ public struct InteractiveMode: Sendable {
         // Now that the approval UI exists, point the engine's prompter at it. Until
         // this runs (it cannot fire before the first frame), the box refuses.
         prompterBox.set { await coordinator.showPermissionPrompt($0) }
+        // And point the response-header relay at the transcript, so a fallback the
+        // gateway performed is reported instead of swallowed. The head arrives on
+        // the streaming client's task, off the main actor, so the hop is explicit.
+        // Only a fallback is surfaced: the rest of the head is diagnostic noise the
+        // inline surface has no room for and the JSON stream already carries.
+        let requested = requestedModel
+        metadataRelay.set { metadata in
+            guard metadata.fellBack else { return }
+            let served = metadata.modelID ?? "an unknown model"
+            Task { @MainActor in coordinator.noteFallback(served: served, requested: requested) }
+        }
 
         await driver.run(tui, quit: quit, background: {
             await coordinator.agentLoop()

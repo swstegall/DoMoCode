@@ -9,6 +9,14 @@ import DoMoCore
 import Foundation
 import SystemPackage
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 // MARK: - Trust-requiring project resources
 
 /// Whether `directory` carries project-local resources that must be gated behind
@@ -66,6 +74,11 @@ public struct TrustStore: Sendable {
     /// `nil` is distinct from `false`: `nil` means "never asked" (a caller may
     /// prompt, or in non-interactive mode refuse-with-instructions), while
     /// `false` means "explicitly distrusted" and a caller should honor it.
+    ///
+    /// Deliberately unlocked. The file is only ever replaced by `rename(2)`, so a
+    /// reader sees either the whole old document or the whole new one; taking the
+    /// write lock to read would make every launch wait on any launch that happened to
+    /// be recording a decision.
     public func decision(for directory: FilePath) throws(DoMoError) -> Bool? {
         let table = try load()
         var current = Self.canonical(directory)
@@ -80,10 +93,141 @@ public struct TrustStore: Sendable {
     /// Records `trusted` for `directory` (canonicalized), creating `trust.json`
     /// and its parent directory if needed. A prior decision for the exact path is
     /// overwritten; ancestor decisions are left untouched.
+    ///
+    /// The read, the edit and the write are one locked step. Without the lock, two
+    /// `domo` processes trusting two different directories at once each read the same
+    /// table, each add their own key and each write the whole document back — and one
+    /// of the two decisions is gone, with the only symptom being that the user is
+    /// asked to trust a directory they already trusted. A lock timeout is a real
+    /// error here rather than best-effort silence, because every caller of this
+    /// already handles a throw and a lost trust decision is a security-relevant
+    /// surprise.
     public func setDecision(_ trusted: Bool, for directory: FilePath) throws(DoMoError) {
-        var table = try load()
-        table[Self.canonical(directory)] = trusted
-        try save(table)
+        // Before the lock, because on a first run the config directory does not exist
+        // yet and both the lock file and trust.json need it. (For a symlinked store the
+        // lock is a sibling of the link's *target* instead; ``withLock(_:)`` creates
+        // that directory itself.)
+        let parent = Self.parent(of: path.string)
+        do {
+            try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+        } catch {
+            throw DoMoError(.file(path: FilePath(parent), errno: nil), "Could not create config directory", cause: error)
+        }
+
+        try withLock { () throws(DoMoError) in
+            var table = try load()
+            table[Self.canonical(directory)] = trusted
+            try save(table)
+        }
+    }
+
+    // MARK: - Locking
+
+    /// How long to keep trying for the lock before calling it contention.
+    ///
+    /// A trust decision is written at most twice in a process, at startup, and the
+    /// critical section is one small read and one small write — so anything past a
+    /// couple of seconds is a stuck or dead peer, not a queue.
+    private static let lockTimeout: Duration = .seconds(2)
+
+    /// The sidecar lock file guarding a write.
+    ///
+    /// Derived with ``FileLock/lockPath(forDocumentAt:)``, which follows a symlinked
+    /// leaf exactly the way ``AtomicFileWrite`` follows it when it writes — so a
+    /// dotfiles-symlinked trust.json is locked where it is written. Processes that
+    /// spell the *parent* differently (`/tmp` versus `/private/tmp`, `$HOME` versus
+    /// its real location) need no help: `flock(2)` locks an inode, and both spellings
+    /// name the same one.
+    ///
+    /// It used to be `URL.resolvingSymlinksInPath()`, which resolves a symlink only
+    /// once the target exists. For a trust.json symlinked at a file no decision had
+    /// created yet, the lock therefore lived on `.trust.json.lock` before the first
+    /// write and on `.real.json.lock` after it — and this is the store where that is
+    /// worst, because ``setDecision(_:for:)`` then *succeeds* under a lock somebody
+    /// else is holding rather than throwing, silently bypassing the guarantee its own
+    /// documentation makes.
+    ///
+    /// Internal rather than private so a test can hold it and check that a write
+    /// respects it; there is no other way to assert the lock exists.
+    var lockPath: String {
+        FileLock.lockPath(forDocumentAt: path.string)
+    }
+
+    /// Runs `body` holding an exclusive `flock(2)` on `.trust.json.lock`.
+    ///
+    /// This is ``FileLock`` open-coded, and only because it must be **synchronous**:
+    /// `setDecision(_:for:)` is sync, its caller `ensureProjectTrust` is sync, and
+    /// making either `async` would ripple through command entry points this file has
+    /// no business changing. The cost is a `Thread.sleep` on a contended acquire
+    /// instead of a suspension — acceptable exactly here, where the call happens once
+    /// at startup before the harness or any concurrency exists, and nowhere else.
+    /// When `ensureProjectTrust` can be async, delete this and call
+    /// `FileLock.withLock`.
+    ///
+    /// A sidecar (``lockPath``), never trust.json itself: `O_CREAT` on the document
+    /// would leave a 0-byte trust.json, which ``load()`` — strict on purpose — turns
+    /// into a hard error on every later launch.
+    private func withLock(_ body: () throws(DoMoError) -> Void) throws(DoMoError) {
+        let lockPath = FilePath(self.lockPath)
+
+        // The lock is a sibling of the *resolved* trust.json, which for a symlinked
+        // store is a directory `setDecision(_:for:)` never created — it created the
+        // config directory the link lives in. `FileLock.withLock` creates its own
+        // parent for the same reason; this is the open-coded copy of that, and without
+        // it a store symlinked into a not-yet-created dotfiles directory fails to lock
+        // a write that would otherwise have succeeded.
+        let lockDirectory = lockPath.removingLastComponent().string
+        if !lockDirectory.isEmpty {
+            try? FileManager.default.createDirectory(
+                atPath: lockDirectory,
+                withIntermediateDirectories: true
+            )
+        }
+
+        let descriptor: FileDescriptor
+        do {
+            descriptor = try FileDescriptor.open(
+                lockPath,
+                .writeOnly,
+                options: [.create],
+                permissions: .ownerReadWrite
+            )
+        } catch {
+            throw DoMoError(
+                .file(path: lockPath, errno: error as? Errno),
+                "Could not open the trust store lock \(lockPath.string)",
+                cause: error
+            )
+        }
+        defer { try? descriptor.close() }
+
+        guard Self.acquire(descriptor.rawValue) else {
+            throw DoMoError(
+                .file(path: path, errno: nil),
+                "Another DoMoCode process is updating \(path.string). Try again in a moment."
+            )
+        }
+        // Redundant with the close above — `close(2)` drops an `flock` — but stated
+        // rather than left as an inference about `defer` ordering.
+        defer { _ = flock(descriptor.rawValue, LOCK_UN) }
+
+        try body()
+    }
+
+    /// Polls `LOCK_EX|LOCK_NB` until it succeeds or ``lockTimeout`` elapses.
+    ///
+    /// Never a blocking `LOCK_EX`: a peer that took the lock and then stopped (a
+    /// suspended process, a debugger) would hang the CLI at startup with no way out
+    /// but a signal. The deadline is on `ContinuousClock`, so an NTP step cannot
+    /// extend or truncate the wait.
+    private static func acquire(_ descriptor: CInt) -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: lockTimeout)
+        while true {
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { return true }
+            if clock.now >= deadline { return false }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
     }
 
     // MARK: - File I/O
@@ -112,24 +256,30 @@ public struct TrustStore: Sendable {
         }
     }
 
+    /// Writes the whole table. Called only from ``setDecision(_:for:)``, which has
+    /// already created the directory and taken the lock.
     private func save(_ table: [String: Bool]) throws(DoMoError) {
-        let directory = Self.parent(of: path.string)
-        do {
-            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        } catch {
-            throw DoMoError(.file(path: FilePath(directory), errno: nil), "Could not create config directory", cause: error)
-        }
-
         let encoder = JSONEncoder()
         // Sorted keys so the file is stable across writes and reviewable in a
         // diff — the same reason the session wire sorts its keys.
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        let data: Data
         do {
-            let data = try encoder.encode(table)
-            try data.write(to: URL(fileURLWithPath: path.string), options: .atomic)
+            data = try encoder.encode(table)
         } catch {
-            throw DoMoError(.file(path: path, errno: nil), "Could not write trust store", cause: error)
+            throw DoMoError(.file(path: path, errno: nil), "Could not encode trust store", cause: error)
         }
+        // `AtomicFileWrite` rather than `Data.write(options: .atomic)`. Measured on
+        // Darwin 27 under umask 022: Foundation creates the file at 0644 — so a
+        // brand-new trust.json is world-readable — and replaces a symlink with a
+        // regular file, detaching a dotfiles-managed store from its repository. It
+        // does carry an existing file's mode across on this platform, so that half is
+        // belt and braces here rather than a fix.
+        //
+        // `String(decoding:as:)` rather than `String(data:encoding:)` because
+        // `JSONEncoder` output is UTF-8 by construction, so there is no failure case
+        // to invent a message for.
+        try AtomicFileWrite.replace(at: path.string, with: String(decoding: data, as: UTF8.self))
     }
 
     // MARK: - Path normalization

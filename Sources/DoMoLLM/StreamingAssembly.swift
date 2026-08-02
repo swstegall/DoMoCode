@@ -262,6 +262,13 @@ public final class StreamingAssembly: Sendable {
         var reasoningSlot: Int?
 
         var usage: Usage = .zero
+
+        /// Held apart from ``usage`` on purpose. The trailing usage frame
+        /// replaces `usage` wholesale, so a reported cost written into it when
+        /// the response head arrived would be destroyed by the last frame of
+        /// every well-behaved stream. It is stamped on at snapshot time instead.
+        var reportedCost: Decimal?
+
         var finishReason: FinishReason?
         var stopReason: StopReason?
         var errorMessage: String?
@@ -315,6 +322,22 @@ public final class StreamingAssembly: Sendable {
     }
 
     // MARK: Feeding
+
+    /// Records a cost the gateway billed for this request, read off the response
+    /// head before any body byte.
+    ///
+    /// Separate from ``ingest(_:)`` because it arrives from a different place at
+    /// a different time — the HTTP header block, not an SSE frame — and because
+    /// it must survive the trailing usage frame, which assigns a whole fresh
+    /// ``Usage``. Every snapshot taken from here on carries it, including the
+    /// one behind a `.failed` terminal message, so a turn that dies mid-stream
+    /// still reports what it was charged.
+    ///
+    /// Passing `nil` clears it, which is what the far more common
+    /// header-absent case does.
+    public func setReportedCost(_ value: Decimal?) {
+        state.withLock { $0.reportedCost = value }
+    }
 
     /// Folds one chunk in and reports what changed.
     ///
@@ -569,12 +592,19 @@ public final class StreamingAssembly: Sendable {
                 blocks.append(.toolCall(partialToolCall(streamIndex: streamIndex, state: call)))
             }
         }
+        // Stamped here rather than at ``setReportedCost(_:)`` time: `ingest`
+        // assigns a whole fresh `Usage` on the trailing usage frame, so a value
+        // written into `current.usage` earlier would be silently dropped by the
+        // last frame of every stream that reports usage at all.
+        var usage = current.usage
+        usage.reportedCost = current.reportedCost
+
         return AssistantSnapshot(
             model: current.model,
             responseModel: current.responseModel,
             responseID: current.responseID,
             blocks: blocks,
-            usage: current.usage,
+            usage: usage,
             stopReason: current.stopReason,
             errorMessage: current.errorMessage,
             isFinished: current.terminated
@@ -592,7 +622,16 @@ extension AssistantMessage {
     /// tool call whose `arguments` will not parse strictly is repaired rather
     /// than dropped — the model asked for something, and refusing to say what
     /// helps nobody.
-    public init(response: ChatCompletionResponse, model: String, rates: ModelCostRates? = nil) {
+    ///
+    /// `reportedCost` is what the gateway said this request cost, if its header
+    /// block carried a price. It goes last and is defaulted because this init
+    /// has positional callers.
+    public init(
+        response: ChatCompletionResponse,
+        model: String,
+        rates: ModelCostRates? = nil,
+        reportedCost: Decimal? = nil
+    ) {
         var content: [ContentBlock] = []
         let choice = response.choices.first
 
@@ -632,12 +671,18 @@ extension AssistantMessage {
             errorMessage = "Response contained no finish_reason"
         }
 
+        // A priced request with no `usage` object still records the price: the
+        // gateway's number is a claim in its own right, not an annotation on a
+        // token count that may never have arrived.
+        var usage = response.usage.map { Usage(wire: $0).costed(at: rates) } ?? .zero
+        usage.reportedCost = reportedCost
+
         self.init(
             content: content,
             model: model,
             responseModel: responseModel,
             responseID: response.id,
-            usage: response.usage.map { Usage(wire: $0).costed(at: rates) } ?? .zero,
+            usage: usage,
             stopReason: stopReason,
             errorMessage: errorMessage
         )

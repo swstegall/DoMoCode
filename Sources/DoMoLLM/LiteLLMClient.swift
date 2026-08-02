@@ -45,13 +45,28 @@ public struct ResponseMetadata: Sendable, Hashable {
     /// A server-requested retry delay, if the head carried one.
     public var retryAfter: Duration?
 
+    /// `x-litellm-response-cost`, in USD, when the gateway priced the request in
+    /// its header block.
+    ///
+    /// Usually `nil`, and that is expected rather than a bug: LiteLLM works out
+    /// a request's cost once the response is complete, which on a *streamed*
+    /// request is long after the head was flushed. The header is read here
+    /// because doing so is nearly free and because a non-streaming call can
+    /// legitimately carry it; the primary source of cost in this harness remains
+    /// the per-alias ``ModelCostRates``.
+    ///
+    /// Last in the initializer below, and defaulted, because that initializer
+    /// has positional callers.
+    public var responseCost: Decimal?
+
     public init(
         status: Int,
         headers: [String: String] = [:],
         callID: String? = nil,
         modelID: String? = nil,
         attemptedFallbacks: Int? = nil,
-        retryAfter: Duration? = nil
+        retryAfter: Duration? = nil,
+        responseCost: Decimal? = nil
     ) {
         self.status = status
         self.headers = headers
@@ -59,6 +74,7 @@ public struct ResponseMetadata: Sendable, Hashable {
         self.modelID = modelID
         self.attemptedFallbacks = attemptedFallbacks
         self.retryAfter = retryAfter
+        self.responseCost = responseCost
     }
 
     /// True when a fallback fired and a different model answered.
@@ -75,7 +91,8 @@ public struct ResponseMetadata: Sendable, Hashable {
             callID: head.headerValue("x-litellm-call-id"),
             modelID: head.headerValue("x-litellm-model-id"),
             attemptedFallbacks: head.headerValue("x-litellm-attempted-fallbacks").flatMap(Int.init),
-            retryAfter: LiteLLMClient.retryAfter(from: head)
+            retryAfter: LiteLLMClient.retryAfter(from: head),
+            responseCost: LiteLLMClient.parseResponseCost(head.headerValue("x-litellm-response-cost"))
         )
     }
 }
@@ -454,7 +471,7 @@ public struct LiteLLMClient: Sendable {
                                 maxAttempts: cap,
                                 delay: delay,
                                 reason: RetryNotice.reason(for: classified),
-                                message: DoMoError.truncating(classified.message, to: Self.retryNoticeMessageCap)
+                                message: Self.retryNoticeMessage(classified)
                             )))
                     guard await sleepForRetry(delay) else {
                         finishAborted(assembly, continuation)
@@ -487,7 +504,7 @@ public struct LiteLLMClient: Sendable {
                                 maxAttempts: configuration.maxRetries,
                                 delay: delay,
                                 reason: RetryNotice.reason(for: error),
-                                message: DoMoError.truncating(error.message, to: Self.retryNoticeMessageCap)
+                                message: Self.retryNoticeMessage(error)
                             )))
                     guard await sleepForRetry(delay) else {
                         finishAborted(assembly, continuation)
@@ -501,14 +518,26 @@ public struct LiteLLMClient: Sendable {
 
             // A 2xx commits us to a stream: no more retries. A failure now keeps
             // whatever content arrived rather than replaying it.
-            onResponse?(ResponseMetadata(head: response.head))
+            let metadata = ResponseMetadata(head: response.head)
+            // Stamped into the assembler *before* the callback fires, and before
+            // a single body byte is read. Two things fall out of that ordering.
+            // A turn that dies mid-stream still reports what it was billed,
+            // because the `.failed` message is built from this same assembler.
+            // And the cost reaches every caller: only one of the three
+            // production call sites passes `onResponse` at all, so a cost routed
+            // solely through `ResponseMetadata` would reach `-p` and neither the
+            // TUI nor the server.
+            assembly.setReportedCost(metadata.responseCost)
+            onResponse?(metadata)
             do {
                 try await consumeSSE(response.body, into: assembly, continuation: continuation)
                 continuation.finish()
             } catch let error where DoMoError.isCancellation(error) {
                 finishAborted(assembly, continuation)
             } catch {
-                for event in assembly.fail(Self.classifyTransport(error)) { continuation.yield(event) }
+                for event in assembly.fail(Self.streamFailure(Self.classifyTransport(error))) {
+                    continuation.yield(event)
+                }
                 continuation.finish()
             }
             return
@@ -533,14 +562,31 @@ public struct LiteLLMClient: Sendable {
                 case .done:
                     sawDone = true
                 case .data(let payload):
-                    if let wireError = WireErrorEnvelope.sniff(sseData: payload) {
+                    if var wireError = WireErrorEnvelope.sniff(sseData: payload) {
+                        // A mid-stream error frame under a committed 200 is the
+                        // second way a gateway's prose becomes
+                        // `AssistantMessage.errorMessage` — and therefore a
+                        // permanent line in the session JSONL. It quotes the
+                        // credential back at us for exactly the same reasons a
+                        // 401 body does, so it is scrubbed here, where the frame
+                        // is still ours, rather than in the assembler.
+                        //
+                        // Only `message` is touched. `type` and `code` are the
+                        // classifier tokens `LiteLLMErrorPatterns` reads and a
+                        // reader diagnoses by; they are vocabulary, not payload.
+                        wireError.message = wireError.message.map { Redaction.diagnostic($0) }
                         for event in assembly.fail(wireError) { continuation.yield(event) }
                     } else {
                         do {
                             let chunk = try ChatCompletionChunk.decode(sseData: payload)
                             for event in assembly.ingest(chunk) { continuation.yield(event) }
                         } catch {
-                            for event in assembly.fail(error) { continuation.yield(event) }
+                            // `decode` quotes the raw SSE payload back verbatim,
+                            // so an undecodable frame carries whatever the
+                            // gateway put in it straight into `errorMessage`.
+                            for event in assembly.fail(Self.streamFailure(error)) {
+                                continuation.yield(event)
+                            }
                         }
                     }
                 }
@@ -634,7 +680,7 @@ public struct LiteLLMClient: Sendable {
                             maxAttempts: cap,
                             delay: delay,
                             reason: RetryNotice.reason(for: classified),
-                            message: DoMoError.truncating(classified.message, to: Self.retryNoticeMessageCap)
+                            message: Self.retryNoticeMessage(classified)
                         ))
                     guard await sleepForRetry(delay) else {
                         throw DoMoError(.cancelled, "Request was aborted")
@@ -660,7 +706,7 @@ public struct LiteLLMClient: Sendable {
                             maxAttempts: configuration.maxRetries,
                             delay: delay,
                             reason: RetryNotice.reason(for: error),
-                            message: DoMoError.truncating(error.message, to: Self.retryNoticeMessageCap)
+                            message: Self.retryNoticeMessage(error)
                         ))
                     guard await sleepForRetry(delay) else {
                         // Cancellation mid-backoff leaves as `.cancelled`, not as
@@ -673,18 +719,30 @@ public struct LiteLLMClient: Sendable {
                 throw error
             }
 
-            onResponse?(ResponseMetadata(head: response.head))
+            let metadata = ResponseMetadata(head: response.head)
+            onResponse?(metadata)
             let decoded: ChatCompletionResponse
             do {
                 decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: Data(bodyText.utf8))
             } catch {
                 throw DoMoError(
                     .malformedResponse,
-                    "Could not decode completion response: \(DoMoError.truncating(bodyText, to: 512))",
+                    // Redacted before the cap, for the reason spelled out on
+                    // ``retryNoticeMessage(_:)``: cutting first can split a
+                    // registered literal, and half a key matches nothing.
+                    "Could not decode completion response: "
+                        + DoMoError.truncating(Redaction.diagnostic(bodyText), to: 512),
                     cause: error
                 )
             }
-            return AssistantMessage(response: decoded, model: model, rates: rates)
+            // The billed cost rides on the message's usage rather than only on
+            // `onResponse`, so a caller that passed no callback still gets it.
+            return AssistantMessage(
+                response: decoded,
+                model: model,
+                rates: rates,
+                reportedCost: metadata.responseCost
+            )
         }
     }
 
@@ -762,7 +820,15 @@ public struct LiteLLMClient: Sendable {
         var base = configuration.baseURL
         while base.hasSuffix("/") { base.removeLast() }
         guard let url = URL(string: "\(base)/\(path)") else {
-            throw DoMoError(.configuration, "Invalid base URL: \(configuration.baseURL)")
+            // A base URL is one of the few configuration values that can carry a
+            // credential inline — `https://user:token@proxy/v1` — and this
+            // message becomes a `DoMoError` that the loop persists as
+            // `errorMessage`. The pattern rule keeps the host readable, which is
+            // the half of the URL that makes the diagnostic useful.
+            throw DoMoError(
+                .configuration,
+                "Invalid base URL: \(Redaction.diagnostic(configuration.baseURL))"
+            )
         }
         return url
     }
@@ -826,6 +892,43 @@ public struct LiteLLMClient: Sendable {
     /// status line, not a log: one line's worth.
     static let retryNoticeMessageCap = 200
 
+    /// The provider's own words, made safe for a status line.
+    ///
+    /// Redaction runs BEFORE the cap. Truncating first can cut a registered
+    /// literal in half, and half a secret matches neither the literal registry
+    /// nor a prefix rule — it simply survives into the notice.
+    ///
+    /// This is not the redaction site for a classified HTTP failure:
+    /// ``classify(status:head:body:)`` already scrubbed that message, and this
+    /// is a no-op over it. It is the only site for a ``DoMoError`` the
+    /// *transport* threw, which ``classifyTransport(_:)`` deliberately returns
+    /// unchanged so its kind and cause chain survive — and a transport failure's
+    /// message is precisely where a base URL spelled `user:password@host` shows
+    /// up.
+    static func retryNoticeMessage(_ error: DoMoError) -> String {
+        DoMoError.truncating(Redaction.diagnostic(error.message), to: retryNoticeMessageCap)
+    }
+
+    /// A classified failure flattened and scrubbed for
+    /// ``StreamingAssembly/fail(_:)``.
+    ///
+    /// That method writes `error.description` — the whole cause chain — into
+    /// `AssistantMessage.errorMessage`, and the resulting `.failed` terminal is
+    /// handed to the agent loop AS IS; the loop only redacts the message it
+    /// synthesizes for a stream that *threw*. So this is the last place a
+    /// mid-stream failure can be scrubbed before it is persisted, and both of
+    /// its producers need it: a transport error carrying the request URL, and
+    /// ``ChatCompletionChunk/decode(sseData:)``, whose message quotes the raw
+    /// SSE payload back verbatim.
+    ///
+    /// Rebuilding drops the `cause` chain, which is safe HERE and nowhere else:
+    /// `fail(_:)` reads exactly two things — the kind, to tell a cancellation
+    /// from a failure, and the description — and the description *is* the
+    /// flattened chain, carried over as the new message.
+    static func streamFailure(_ error: DoMoError) -> DoMoError {
+        DoMoError(error.kind, Redaction.diagnostic(error.description))
+    }
+
     // MARK: Body collection
 
     /// The cap on a non-2xx error body, in bytes. Provider error pages can be an
@@ -878,14 +981,31 @@ extension LiteLLMClient {
     /// may be a context overflow that compaction fixes rather than a generic
     /// refusal. Overflow is checked first because it can arrive under several
     /// statuses and overrides them.
+    ///
+    /// ## The body is redacted here, and only here
+    ///
+    /// This is the sharpest credential leak in the harness. LiteLLM's 401 body
+    /// echoes back the API key it was handed; that body becomes this error's
+    /// message, which the agent loop assigns to
+    /// `AssistantMessage.errorMessage`, which is appended to the session JSONL
+    /// **permanently** and re-emitted over SSE, printed by `-p --json` and
+    /// drawn by both interactive surfaces. Scrubbing at the root means none of
+    /// those five consumers has to remember to.
+    ///
+    /// `matchText` is deliberately the RAW text: every classification decision
+    /// below reads it, and a `[redacted]` sitting where a provider's wording
+    /// used to be would change which ``DoMoError/Kind`` an error gets. Only the
+    /// human-facing `message` is scrubbed.
     static func classify(status: Int, head: HTTPResponse, body: String) -> DoMoError {
         let wireError = extractWireError(from: body)
         let matchText = wireError?.summary ?? body
         let message: String
         if let wireError {
-            message = wireError.summary
+            message = Redaction.diagnostic(wireError.summary)
         } else if !body.isEmpty {
-            message = DoMoError.truncating(body)
+            // Redacted before the cap: truncating first can split a registered
+            // literal, and half a key matches nothing.
+            message = DoMoError.truncating(Redaction.diagnostic(body))
         } else {
             message = "HTTP \(status)"
         }
@@ -916,6 +1036,15 @@ extension LiteLLMClient {
 
     /// Classifies a thrown transport error. Cancellation wins; a `DoMoError`
     /// keeps its kind; anything else is transport (and therefore retryable).
+    ///
+    /// A `DoMoError` is passed through by VALUE, unredacted, on purpose: its
+    /// kind and its whole `cause` chain are the evidence every caller above
+    /// reads, and rebuilding it here to scrub one string would scrub only the
+    /// outermost link while claiming to have cleaned the chain. The two places
+    /// that turn such an error into text a human keeps —
+    /// ``retryNoticeMessage(_:)`` and the agent loop's `errorMessage`
+    /// assignment — redact there instead, where the whole chain has already been
+    /// flattened.
     static func classifyTransport(_ error: any Error) -> DoMoError {
         if DoMoError.isCancellation(error) {
             return DoMoError(.cancelled, "Request was aborted", cause: error)
@@ -941,7 +1070,15 @@ extension LiteLLMClient {
                 cause: error
             )
         }
-        return DoMoError(.transport, DoMoError.truncating(String(describing: error)), cause: error)
+        // A foreign transport error stringifies whatever the client library put
+        // in it, and AsyncHTTPClient's failures routinely carry the request URL
+        // — which is where a `user:password@` base URL lives. Redacted before
+        // the cap, for the reason on ``retryNoticeMessage(_:)``.
+        return DoMoError(
+            .transport,
+            DoMoError.truncating(Redaction.diagnostic(String(describing: error))),
+            cause: error
+        )
     }
 
     /// Parses the two retry-after headers LiteLLM may send, millisecond spelling
@@ -951,6 +1088,30 @@ extension LiteLLMClient {
             retryAfter: head.headerValue("retry-after") ?? head.headerValue("llm_provider-retry-after"),
             retryAfterMilliseconds: head.headerValue("retry-after-ms")
         )
+    }
+
+    /// Parses `x-litellm-response-cost` — a USD amount the gateway billed for
+    /// this request — or `nil` if the header is absent or is anything other than
+    /// a plain non-negative number.
+    ///
+    /// Every rejection here is a case that would otherwise put a fabricated
+    /// price in front of the user:
+    ///
+    /// - `Decimal(string:)` prefix-parses, so `"1.5x"` would silently become
+    ///   `1.5`. The whole string must match the grammar.
+    /// - A header sent twice comes back from `HTTPField` subscripting
+    ///   comma-joined as `"0.001, 0.001"`. That is two claims, not one, and
+    ///   taking the prefix would under-report the request; it is rejected.
+    /// - `Decimal(string:)` is locale-sensitive, so the same header would read
+    ///   differently on a Linux host under a comma-decimal locale.
+    /// - A negative price is not a price.
+    ///
+    /// Exponent notation is accepted deliberately: LiteLLM stringifies a Python
+    /// float, so a small per-request cost genuinely arrives as `1e-05`, and
+    /// rejecting that would throw away most of the values this can ever see.
+    public static func parseResponseCost(_ raw: String?) -> Decimal? {
+        guard let raw, let value = DecimalText.strict(raw), value >= 0 else { return nil }
+        return value
     }
 
     /// Pulls a ``WireError`` out of an error body, trying the shapes LiteLLM uses:

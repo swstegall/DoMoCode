@@ -234,7 +234,14 @@ public struct DoMoServer: Sendable {
         }
 
         // The server's authoritative view of a session. A client whose run state is
-        // pinned by a missed edge polls this rather than guessing.
+        // pinned by a missed edge polls this rather than guessing, and reads the
+        // session's cumulative accounting off the same payload — the totals cannot
+        // be folded from the SSE stream by a client that attached halfway through.
+        //
+        // This route answers even for a session whose accounting cannot be
+        // computed: `ServerRuntime.status(sessionID:)` degrades that to
+        // `accounting: nil` rather than throwing, precisely so a damaged session is
+        // still diagnosable here. Only an unknown id is an error, and it is a 404.
         router.get("/session/:id/status") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")

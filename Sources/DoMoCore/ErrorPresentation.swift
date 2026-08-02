@@ -131,16 +131,30 @@ public enum ErrorPresentation: Sendable {
 
     /// The three parts of an error row, from what a wire frame carries.
     ///
-    /// `message` is provider- or gateway-controlled text, so it is truncated
-    /// here with the same budget the provider-body cap uses. Sanitizing it is
-    /// the *renderer's* job — a `DoMoCore` type cannot reach `DoMoTUI`'s
-    /// `sanitizeUntrustedText`, and the truncation has to happen before the
-    /// string is measured either way.
+    /// `message` is provider- or gateway-controlled text, so it is redacted and
+    /// truncated here — the latter with the same budget the provider-body cap
+    /// uses. Escaping it for a terminal is still the *renderer's* job: a
+    /// `DoMoCore` type cannot reach `DoMoTUI`'s `sanitizeUntrustedText`, and the
+    /// truncation has to happen before the string is measured either way.
+    ///
+    /// Redaction is repeated here rather than trusted from upstream because this
+    /// is the display edge that consumes a *wire* frame: a `ServerNotice` from
+    /// another process, whose producer's version of this harness is not
+    /// something a renderer can check. Over an already-scrubbed message it costs
+    /// one `isEmpty` and one substring scan.
+    ///
+    /// Redacting before truncating is load-bearing: cutting first can split a
+    /// registered literal in half, and half a secret matches neither the
+    /// registry nor a prefix rule.
     public static func rows(
         label: String?,
         message: String
     ) -> (headline: String, message: String, hint: String?) {
         let kind = label.flatMap(DoMoError.Kind.labeled)
-        return (headline(for: kind), DoMoError.truncating(message), hint(for: kind))
+        return (
+            headline(for: kind),
+            DoMoError.truncating(Redaction.diagnostic(message)),
+            hint(for: kind)
+        )
     }
 }

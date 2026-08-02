@@ -87,14 +87,14 @@ private func settle(_ milliseconds: Int = 30) async {
 // MARK: - Tests
 
 @MainActor
-@Suite("Live terminal driver")
+@Suite("Live terminal driver", .serialized)
 struct TerminalDriverTests {
     /// Scripted keystrokes reach the focused component, in order, and the loop
     /// tears the terminal back down when the input stream ends.
     @Test("Scripted keystrokes reach the focused component")
     func keystrokesReachFocus() async {
         let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
         let target = CaptureTarget(columns: 20, rows: 6)
         let tui = TUI(target: target)
         let probe = FocusableProbe("probe")
@@ -110,6 +110,7 @@ struct TerminalDriverTests {
         inputCont.yield(bytes("b"))
         inputCont.yield(bytes("c"))
         inputCont.finish()
+        resizeCont.finish()
 
         await driver.run(tui, quit: QuitSignal())
 
@@ -123,7 +124,7 @@ struct TerminalDriverTests {
     @Test("Keystrokes render through to the screen grid")
     func keystrokesRenderToGrid() async {
         let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
         let target = CaptureTarget(columns: 20, rows: 4)
         let tui = TUI(target: target)
         let probe = EchoProbe()
@@ -135,6 +136,7 @@ struct TerminalDriverTests {
         inputCont.yield(bytes("h"))
         inputCont.yield(bytes("i"))
         inputCont.finish()
+        resizeCont.finish()
 
         await driver.run(tui, quit: QuitSignal())
 
@@ -152,7 +154,7 @@ struct TerminalDriverTests {
     @Test("A bracketed paste arrives re-wrapped")
     func pasteReWrapped() async {
         let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
         let tui = TUI(target: CaptureTarget(columns: 40, rows: 6))
         let probe = FocusableProbe("probe")
         tui.addChild(probe)
@@ -162,6 +164,7 @@ struct TerminalDriverTests {
 
         inputCont.yield(bytes("\u{1b}[200~pasted\u{1b}[201~"))
         inputCont.finish()
+        resizeCont.finish()
 
         await driver.run(tui, quit: QuitSignal())
 
@@ -174,7 +177,7 @@ struct TerminalDriverTests {
     func keyReleaseFiltering() async {
         // Ordinary component: release swallowed, press delivered.
         let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
         let tui = TUI(target: CaptureTarget(columns: 20, rows: 6))
         let probe = FocusableProbe("probe")
         tui.addChild(probe)
@@ -184,12 +187,13 @@ struct TerminalDriverTests {
         inputCont.yield(bytes("\u{1b}[97;1:3u")) // Kitty 'a' RELEASE
         inputCont.yield(bytes("a")) // plain press
         inputCont.finish()
+        resizeCont.finish()
         await driver.run(tui, quit: QuitSignal())
         #expect(probe.received == [bytes("a")])
 
         // Opt-in component: the same release is delivered.
         let (input2, input2Cont) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize2, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (resize2, resize2Cont) = AsyncStream.makeStream(of: TerminalSize.self)
         let tui2 = TUI(target: CaptureTarget(columns: 20, rows: 6))
         let probe2 = FocusableProbe("probe")
         probe2.wantsKeyRelease = true
@@ -199,6 +203,7 @@ struct TerminalDriverTests {
 
         input2Cont.yield(bytes("\u{1b}[97;1:3u"))
         input2Cont.finish()
+        resize2Cont.finish()
         await driver2.run(tui2, quit: QuitSignal())
         #expect(probe2.received == [bytes("\u{1b}[97;1:3u")])
     }
@@ -264,8 +269,8 @@ struct TerminalDriverTests {
     /// guarantee that a crash-adjacent shutdown never leaves the tty in raw mode.
     @Test("Cancellation exits and restores")
     func cancellationRestores() async {
-        let (input, _) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
         let tui = TUI(target: CaptureTarget(columns: 20, rows: 6))
         let lifecycle = RecordingLifecycle()
         let driver = TerminalDriver(input: input, resize: resize, lifecycle: lifecycle)
@@ -274,6 +279,8 @@ struct TerminalDriverTests {
         let runTask = Task { await driver.run(tui, quit: QuitSignal()) }
         await settle()
         runTask.cancel()
+        inputCont.finish()
+        resizeCont.finish()
         await runTask.value
 
         #expect(lifecycle.enterCount == 1)
@@ -284,8 +291,8 @@ struct TerminalDriverTests {
     /// component updates through the driver's synchronous render seam.
     @Test("Background work renders concurrently, then quits")
     func backgroundWorkRenders() async {
-        let (input, _) = AsyncStream.makeStream(of: [UInt8].self)
-        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
         let target = CaptureTarget(columns: 20, rows: 6)
         let tui = TUI(target: target)
         let content = LinesComponent(["start"])
@@ -300,6 +307,8 @@ struct TerminalDriverTests {
             await MainActor.run { content.lines = ["start", "bg"] }
             await driver.render()
             ran.withLock { $0 = true }
+            inputCont.finish()
+            resizeCont.finish()
             quit.quit()
         })
 

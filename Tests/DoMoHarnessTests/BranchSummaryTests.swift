@@ -117,13 +117,61 @@ struct BranchSummaryTests {
             parentId: "leaf",
             timestamp: "t"
         ) { messages in
-            "summarized \(messages.count) messages"
+            SummarizerResult(text: "summarized \(messages.count) messages")
         }
         guard case .branchSummary(let branch) = built.payload else {
             Issue.record("expected a branch-summary payload")
             return
         }
         #expect(branch.summary.contains("summarized 2 messages"))
+    }
+
+    /// ``BranchSummary/usage`` carries the same doc claim ``Compaction/usage`` does
+    /// — "folded into totals" — and had the same problem: no caller could supply it,
+    /// because the summarizer returned only prose.
+    @Test("summarizeBranch carries the summarizer's reported usage onto the entry")
+    func summarizerUsageReachesTheEntry() async throws {
+        let prep = prepareBranchEntries(messagePath([user(chars: 40)]))
+        let built = try await summarizeBranch(prep, fromId: "l", id: "bs", parentId: nil, timestamp: "t") { _ in
+            SummarizerResult(text: "S", usage: Usage(input: 64, output: 8))
+        }
+        guard case .branchSummary(let branch) = built.payload else {
+            Issue.record("expected a branch-summary payload")
+            return
+        }
+        #expect(branch.usage?.input == 64)
+        #expect(branch.usage?.output == 8)
+    }
+
+    @Test("an explicit usage argument wins over the summarizer's own report")
+    func explicitUsageOverridesTheSummarizer() async throws {
+        let prep = prepareBranchEntries(messagePath([user(chars: 40)]))
+        let built = try await summarizeBranch(
+            prep,
+            fromId: "l",
+            id: "bs",
+            parentId: nil,
+            timestamp: "t",
+            usage: Usage(input: 999)
+        ) { _ in SummarizerResult(text: "S", usage: Usage(input: 64)) }
+        guard case .branchSummary(let branch) = built.payload else {
+            Issue.record("expected a branch-summary payload")
+            return
+        }
+        #expect(branch.usage?.input == 999)
+    }
+
+    @Test("a summarizer that reports nothing leaves usage nil rather than zero")
+    func unmeasuredSummarizerLeavesUsageNil() async throws {
+        let prep = prepareBranchEntries(messagePath([user(chars: 40)]))
+        let built = try await summarizeBranch(prep, fromId: "l", id: "bs", parentId: nil, timestamp: "t") { _ in
+            SummarizerResult(text: "S")
+        }
+        guard case .branchSummary(let branch) = built.payload else {
+            Issue.record("expected a branch-summary payload")
+            return
+        }
+        #expect(branch.usage == nil, "\"not measured\" was recorded as a measurement of zero")
     }
 
     @Test("summarizeBranch on an empty branch writes a fixed note without calling the summarizer")
@@ -137,7 +185,7 @@ struct BranchSummaryTests {
             timestamp: "t"
         ) { _ in
             Issue.record("summarizer must not run for an empty branch")
-            return "unexpected"
+            return SummarizerResult(text: "unexpected")
         }
         guard case .branchSummary(let branch) = built.payload else {
             Issue.record("expected a branch-summary payload")

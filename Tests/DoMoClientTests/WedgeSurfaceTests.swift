@@ -87,7 +87,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, watching: [
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, watching: [
             "could not create a session — retrying",
             "Could not create a session",
             "the session directory is not writable",
@@ -120,7 +120,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, watching: [
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, watching: [
             "Retrying in 8s (attempt 4/10) — provider busy"
         ])
         _ = await client.waitForAll()
@@ -157,7 +157,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, watching: [
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, watching: [
             "Retrying in 60s (attempt 7/10) — rate limited"
         ])
         // It must be shown at all — otherwise the clearing assertion below is
@@ -209,7 +209,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "the session list did not refresh"), "screen:\n\(client.joined())")
         await client.quit()
     }
@@ -235,7 +235,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "history refresh failed"), "screen:\n\(client.joined())")
         await client.quit()
     }
@@ -262,7 +262,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         // ONE row, carrying all three parts. Asserted as a row and not as three
         // separate needles because the transcript row below reports the same words:
         // a whole-screen search would stay green with the status line's reason
@@ -304,7 +304,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         try? await Task.sleep(for: .milliseconds(600))
         client.type("are you there")
         try? await Task.sleep(for: .milliseconds(300))
@@ -342,7 +342,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         try? await Task.sleep(for: .milliseconds(800))
         client.send([0x1b])   // Escape
 
@@ -370,7 +370,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "could not check for pending approvals"), "screen:\n\(client.joined())")
         await client.quit()
     }
@@ -402,7 +402,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "Permission required"), "screen:\n\(client.joined())")
         client.press()   // Enter answers "Allow once"
         #expect(await client.wait(for: "the approval did not reach the server"), "screen:\n\(client.joined())")
@@ -425,7 +425,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         // The key is advertised exactly where it is useful: something is wrong.
         #expect(await client.wait(for: "^G: diagnostics"), "screen:\n\(client.joined())")
 
@@ -484,14 +484,14 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "Permission required"), "screen:\n\(client.joined())")
 
         client.send([0x07])
         #expect(await client.wait(for: "Connection & run state"), "screen:\n\(client.joined())")
         // The modal is still there underneath — the panel is a second overlay, not
         // a replacement, and answering the prompt is still what the user must do.
-        #expect(client.showing("client prompt"), "screen:\n\(client.joined())")
+        #expect(await client.wait(for: "client prompt"), "screen:\n\(client.joined())")
 
         // And ^C still quits, over BOTH of them. If it does not, the suite's time
         // limit fails this test rather than hanging the run.
@@ -528,7 +528,7 @@ struct WedgeSurfaceTests {
         // Opened on a narrow window, watched on a wide emulator: the app lays out to
         // 40 columns and paints into the left of a 220-column grid, so the replay
         // never wraps a line the real screen did not wrap.
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, columns: 40, oracleColumns: 220)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, columns: 40, oracleColumns: 220)
         // No hint to wait for: on a 40-column window the status line's key hints are
         // the first thing truncated away, which is part of what makes this window
         // worth testing on.
@@ -579,7 +579,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, columns: 40, oracleColumns: 220)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, columns: 40, oracleColumns: 220)
         try? await Task.sleep(for: .milliseconds(800))
         client.send([0x07])
         #expect(await client.wait(for: "Connection & run state"), "screen:\n\(client.joined())")
@@ -647,7 +647,7 @@ struct WedgeSurfaceTests {
         var portIterator = ports.makeAsyncIterator()
         let port = await portIterator.next() ?? 0
 
-        let client = WedgeClient(baseURL: "http://127.0.0.1:\(port)", token: Self.token)
+        let client = try await WedgeClient.make(baseURL: "http://127.0.0.1:\(port)", token: Self.token)
         try? await Task.sleep(for: .milliseconds(800))
         client.type("park forever")
         try? await Task.sleep(for: .milliseconds(200))
@@ -770,7 +770,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "thinking…", timeout: .seconds(10)), "screen:\n\(client.joined())")
         // The ask exists only on the server at this point; nothing has drawn a modal,
         // and on the stream alone nothing ever would.
@@ -821,7 +821,7 @@ struct WedgeSurfaceTests {
         // The refusal is a four-second notice and every other notice in this file
         // replaces it, so it is watched from the first frame rather than only while
         // a `wait` for it happens to be running.
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token, watching: ["Esc aborts it"])
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, watching: ["Esc aborts it"])
         try? await Task.sleep(for: .milliseconds(800))
         // The premise: the client believes nothing is running, which is what makes
         // the periodic poll unreachable.
@@ -889,7 +889,7 @@ struct WedgeSurfaceTests {
         // while a `wait` is running is a needle that can be stepped on before it is
         // seen. What this test is measuring is the SECOND one; the first is proven
         // on its own in "A refused prompt names both ways out".
-        let client = WedgeClient(
+        let client = try await WedgeClient.make(
             baseURL: stub.baseURL, token: Self.token,
             watching: ["the server says nothing is running"]
         )
@@ -949,7 +949,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "thinking…", timeout: .seconds(10)), "screen:\n\(client.joined())")
         // No reconnect ever succeeds here; the ONLY thing that can move this is the
         // poll asking the server what it actually believes.
@@ -981,7 +981,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         #expect(await client.wait(for: "the session is live again", timeout: .seconds(15)), "screen:\n\(client.joined())")
         await client.quit()
     }
@@ -1010,7 +1010,7 @@ struct WedgeSurfaceTests {
         stub.start()
         defer { stub.stop() }
 
-        let client = WedgeClient(baseURL: stub.baseURL, token: Self.token)
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
         // Nothing is claimed before the threshold: a status line that cried wolf at
         // two seconds would be turned off by everyone within a day.
         #expect(await client.wait(for: "thinking…", timeout: .seconds(10)), "screen:\n\(client.joined())")

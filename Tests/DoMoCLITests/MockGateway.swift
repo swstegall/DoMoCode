@@ -24,6 +24,15 @@ private let streamSocketType = Int32(SOCK_STREAM.rawValue)
 private let streamSocketType = SOCK_STREAM
 #endif
 
+/// The listener is nonblocking so its accept loop can observe `stop()` without
+/// a cross-thread close. On Darwin, an accepted descriptor can retain that
+/// flag; request parsing expects the client socket itself to block until the
+/// request bytes arrive, so normalize it immediately after `accept(2)`.
+func makeBlockingSocket(_ fd: Int32) -> Bool {
+    let flags = fcntl(fd, F_GETFL, 0)
+    return flags >= 0 && fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0
+}
+
 /// One parsed HTTP request the gateway received. Enough to route on and to let a
 /// test assert what the binary actually sent.
 struct RecordedRequest: Sendable {
@@ -48,9 +57,12 @@ final class MockGateway: @unchecked Sendable {
     private let listenFD: Int32
     private let chatBodies: [String]
     private let lock = NSLock()
+    private let lifecycleLock = NSLock()
     private var served = 0
     private var recorded: [RecordedRequest] = []
     private var stopped = false
+    private var activeClientFDs: Set<Int32> = []
+    private var acceptLoopFinished = false
     private var thread: Thread?
 
     /// A status and JSON body to answer every `chat/completions` request with,
@@ -118,6 +130,11 @@ final class MockGateway: @unchecked Sendable {
             close(fd)
             throw MockGatewayError("listen() failed: \(errno)")
         }
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            close(fd)
+            throw MockGatewayError("fcntl() failed: \(errno)")
+        }
 
         var bound = sockaddr_in()
         var boundSize = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -170,16 +187,49 @@ final class MockGateway: @unchecked Sendable {
         lock.lock()
         let alreadyStopped = stopped
         stopped = true
+        let activeClients = activeClientFDs
         lock.unlock()
-        guard !alreadyStopped else { return }
-        // Closing the listening fd makes the blocking `accept` return with an
-        // error, which ends the loop.
-        close(listenFD)
+        if !alreadyStopped {
+            // The listener is non-blocking, so the accept loop can observe the
+            // stop flag even on Darwin, where closing a socket from another
+            // thread does not reliably wake a blocking accept immediately. Keep
+            // the descriptor open until the loop has exited: closing it first
+            // lets another parallel test reuse the number while this thread can
+            // still call accept(2) on it.
+            _ = shutdown(listenFD, Int32(SHUT_RDWR))
+        }
+
+        // Interrupt any connection the serial accept loop is currently reading
+        // or writing before waiting for that loop to finish.
+        for client in activeClients {
+            _ = shutdown(client, Int32(SHUT_RDWR))
+        }
+
+        // Do not let the OS reuse this descriptor while the old accept loop can
+        // still touch it. This is especially important when the next test starts
+        // another ephemeral loopback gateway immediately after this one stops.
+        while true {
+            lifecycleLock.lock()
+            let finished = acceptLoopFinished
+            lifecycleLock.unlock()
+            if finished { break }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+
+        // No thread can touch the listener now, so its descriptor number is safe
+        // to release for the next fixture.
+        if !alreadyStopped { close(listenFD) }
     }
 
     // MARK: Accept loop
 
     private func acceptLoop() {
+        defer {
+            lifecycleLock.lock()
+            acceptLoopFinished = true
+            lifecycleLock.unlock()
+        }
+
         while true {
             lock.lock()
             let done = stopped
@@ -189,9 +239,31 @@ final class MockGateway: @unchecked Sendable {
             let client = accept(listenFD, nil, nil)
             if client < 0 {
                 if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    usleep(1_000)
+                    continue
+                }
                 return  // listen fd closed by stop()
             }
+            guard makeBlockingSocket(client) else {
+                close(client)
+                continue
+            }
+
+            lock.lock()
+            let stopping = stopped
+            if !stopping { activeClientFDs.insert(client) }
+            lock.unlock()
+            if stopping {
+                _ = shutdown(client, Int32(SHUT_RDWR))
+                close(client)
+                return
+            }
+
             handleConnection(client)
+            lock.lock()
+            activeClientFDs.remove(client)
+            lock.unlock()
             close(client)
         }
     }
@@ -325,17 +397,19 @@ final class MockGateway: @unchecked Sendable {
     // MARK: Response building
 
     private static func sseResponse(callID: String, body: String) -> [UInt8] {
+        let bodyBytes = Array(body.utf8)
         let headers = [
             "HTTP/1.1 200 OK",
             "Content-Type: text/event-stream",
             "Cache-Control: no-cache",
             "x-litellm-call-id: \(callID)",
             "x-litellm-model-id: mock-deployment",
+            "Content-Length: \(bodyBytes.count)",
             "Connection: close",
             "",
             "",
         ].joined(separator: "\r\n")
-        return Array(headers.utf8) + Array(body.utf8)
+        return Array(headers.utf8) + bodyBytes
     }
 
     /// A non-2xx JSON answer, the shape LiteLLM returns when it refuses outright.

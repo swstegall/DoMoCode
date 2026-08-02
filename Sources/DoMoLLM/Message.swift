@@ -492,13 +492,36 @@ public struct Usage: Sendable, Hashable, Codable {
     public var reasoning: Int?
     public var cost: Cost
 
+    /// A total the gateway itself billed, when it said one.
+    ///
+    /// Kept beside ``cost`` rather than folded into it, because it is a single
+    /// number and ``cost`` is a four-way breakdown: splitting one total across
+    /// four buckets would require inventing a division nobody reported. When
+    /// both exist the gateway's number is the one to believe — it knows the
+    /// deployment that answered, and the local ``ModelCostRates`` are a
+    /// per-alias approximation of it — so readers ask ``effectiveCostTotal``
+    /// rather than `cost.total`.
+    ///
+    /// `nil` is the overwhelmingly common case. LiteLLM computes a request's
+    /// cost after the response is complete, and on a streamed request the header
+    /// block has already been flushed by then, so `x-litellm-response-cost` is
+    /// normally absent on exactly the path this harness uses. Per-alias rates
+    /// are the primary source; this is the free win when it happens to be there.
+    ///
+    /// Optional with the synthesized `Codable`, which means `encodeIfPresent`:
+    /// a turn without a reported cost writes no key at all, so every session
+    /// file already on disk still decodes and every new line written for such a
+    /// turn is byte-identical to what the previous version wrote.
+    public var reportedCost: Decimal?
+
     public init(
         input: Int = 0,
         output: Int = 0,
         cacheRead: Int = 0,
         cacheWrite: Int = 0,
         reasoning: Int? = nil,
-        cost: Cost = .zero
+        cost: Cost = .zero,
+        reportedCost: Decimal? = nil
     ) {
         self.input = input
         self.output = output
@@ -506,20 +529,54 @@ public struct Usage: Sendable, Hashable, Codable {
         self.cacheWrite = cacheWrite
         self.reasoning = reasoning
         self.cost = cost
+        self.reportedCost = reportedCost
     }
 
     public static let zero = Usage()
 
-    public var totalTokens: Int { input + output + cacheRead + cacheWrite }
+    /// The four token buckets summed, **saturating** at the ends of `Int` rather
+    /// than trapping.
+    ///
+    /// Not arithmetic paranoia. `SessionAccounting` — which owns a `Usage` — is
+    /// decoded straight off the `/status` socket by the
+    /// full-screen client, with no bounds applied anywhere on the way in, and the
+    /// footer reads this property every frame. A plain `+` on a buggy, older or
+    /// hostile snapshot is therefore a trap that kills the whole TUI session
+    /// mid-frame, with the alternate screen still on. A clamped total is wrong in
+    /// the same direction its input was already wrong; a trap loses the session.
+    ///
+    /// This property is one stop on that path and never the whole of it: the same
+    /// unbounded number reaches the harness's context estimate and its running
+    /// fold, where the server process — not merely a client — would take the trap.
+    /// See ``Int/saturatingAdding(_:)``, which every one of those folds now uses.
+    public var totalTokens: Int {
+        input.saturatingAdding(output).saturatingAdding(cacheRead).saturatingAdding(cacheWrite)
+    }
+
+    /// What this turn actually cost: the gateway's number when it gave one,
+    /// otherwise the rate-derived total.
+    ///
+    /// Every accumulator and every display reads this. Reading `cost.total`
+    /// instead silently discards a gateway-reported price whenever one arrives.
+    public var effectiveCostTotal: Decimal { reportedCost ?? cost.total }
 
     /// This usage with ``cost`` recomputed from `rates`.
     ///
     /// A copy rather than a mutation: upstream mutates the usage object in place
     /// from inside the stream loop, which means every snapshot taken before the
     /// final chunk silently changes underneath its holder.
+    ///
+    /// The tier lookup sums three token counts the provider chose, so it sums them
+    /// **saturating**: this runs on the client's stream path, on the same
+    /// unbounded `usage` frame ``totalTokens`` guards against, and a plain `+`
+    /// here trapped on any turn whose reported prompt tokens were near `Int.max`.
+    /// A clamped tier input picks the top tier, which is the same answer an
+    /// absurd-but-representable count would have picked.
     public func costed(at rates: ModelCostRates?) -> Usage {
         guard let rates else { return self }
-        let applicable = rates.rates(forInputTokens: input + cacheRead + cacheWrite)
+        let applicable = rates.rates(
+            forInputTokens: input.saturatingAdding(cacheRead).saturatingAdding(cacheWrite)
+        )
         let million: Decimal = 1_000_000
         var copy = self
         copy.cost = Cost(
@@ -531,16 +588,64 @@ public struct Usage: Sendable, Hashable, Codable {
         return copy
     }
 
+    /// Sums two turns.
+    ///
+    /// ``reportedCost`` folds the same way ``reasoning`` does — `nil` only when
+    /// *neither* side said anything — but with one difference that matters: the
+    /// side that said nothing contributes its own `cost.total` rather than zero.
+    /// A session that mixes a turn the gateway priced with a turn it did not
+    /// would otherwise report a running total that is missing the unpriced
+    /// turns entirely, which reads as the session getting cheaper the longer it
+    /// runs. In other words the sum is always the sum of both sides'
+    /// ``effectiveCostTotal``, and it only becomes visible as a reported cost
+    /// once at least one side had one.
+    ///
+    /// Every token sum here saturates, for the reason ``totalTokens`` gives: the
+    /// client folds this operator over `usage` values that arrived on the SSE
+    /// `message_end` frame, which is the same unbounded door the `/status`
+    /// snapshot comes through.
     public static func + (lhs: Usage, rhs: Usage) -> Usage {
         Usage(
-            input: lhs.input + rhs.input,
-            output: lhs.output + rhs.output,
-            cacheRead: lhs.cacheRead + rhs.cacheRead,
-            cacheWrite: lhs.cacheWrite + rhs.cacheWrite,
+            input: lhs.input.saturatingAdding(rhs.input),
+            output: lhs.output.saturatingAdding(rhs.output),
+            cacheRead: lhs.cacheRead.saturatingAdding(rhs.cacheRead),
+            cacheWrite: lhs.cacheWrite.saturatingAdding(rhs.cacheWrite),
             reasoning: lhs.reasoning == nil && rhs.reasoning == nil
-                ? nil : (lhs.reasoning ?? 0) + (rhs.reasoning ?? 0),
-            cost: lhs.cost + rhs.cost
+                ? nil : (lhs.reasoning ?? 0).saturatingAdding(rhs.reasoning ?? 0),
+            cost: lhs.cost + rhs.cost,
+            reportedCost: lhs.reportedCost == nil && rhs.reportedCost == nil
+                ? nil : lhs.effectiveCostTotal + rhs.effectiveCostTotal
         )
+    }
+}
+
+// MARK: - Saturating token arithmetic
+
+extension Int {
+    /// `self + other`, clamped to the ends of `Int` instead of trapping on
+    /// overflow.
+    ///
+    /// Two operands can only overflow when they share a sign, so the sign of
+    /// `other` names which end it ran off.
+    ///
+    /// Public, and **not** a general licence to stop checking sums. It exists for
+    /// one path and is spelled loudly so a reader can tell when they are on it: a
+    /// token count that arrived from outside this process — a provider's `usage`
+    /// frame, a `/status` snapshot decoded by the client, a session line written
+    /// by an older build — being folded on its way to a footer or to the harness's
+    /// session accounting. Nothing bounds those numbers on the way in, so a plain
+    /// `+` anywhere along that path is a SIGTRAP on a value somebody else chose,
+    /// in release as much as in debug.
+    ///
+    /// Saturating ``Usage/totalTokens`` alone did not close that path — it moved
+    /// the trap one frame down, into the context estimate the harness runs over
+    /// the same numbers — which is why the clamp is a shared operation now rather
+    /// than a private detail of ``Usage``. Arithmetic on numbers this process
+    /// computed itself still uses `+` and still traps, which is what it should do.
+    public func saturatingAdding(_ other: Int) -> Int {
+        let (sum, overflow) = addingReportingOverflow(other)
+        guard overflow else { return sum }
+        return other > 0 ? Int.max : Int.min
     }
 }
 

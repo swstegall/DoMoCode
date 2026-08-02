@@ -11,6 +11,7 @@
 // here to mutate it, so a frame never observes a half-applied event.
 
 import DoMoCore
+import DoMoHarness
 import DoMoLLM
 import Foundation
 import DoMoPermissions
@@ -134,6 +135,12 @@ public final class EventStore {
         // not forget where that session lives. Selecting a different one must.
         sessionPath = nil
         lastNotice = nil
+        // Same rule, same reason. A re-seed after a stream outage replaces the
+        // transcript of the SAME session; the turns it already folded still
+        // happened and are still missing from the server total it last adopted,
+        // so resetting there would blank the footer on every reconnect. A
+        // different session is a different bill.
+        resetAccounting()
         onChange?()
     }
 
@@ -335,6 +342,12 @@ public final class EventStore {
             if let reasoning, !reasoning.isEmpty { appendReasoningDelta(sanitizeUntrustedText(reasoning)) }
 
         case .messageEnd(let message):
+            // Outside the display switch below, and deliberately BEFORE it: that
+            // switch matches `.assistant(let a) where !a.text.isEmpty`, and a
+            // tool-call-only turn has no text at all. Folding inside it would
+            // have billed a session for the turns that talked and not for the
+            // turns that worked.
+            if case .assistant(let assistant) = message { foldTurn(assistant.usage) }
             switch message {
             case .assistant(let assistant) where !assistant.text.isEmpty:
                 // Replace the streamed buffer with the authoritative final text when
@@ -434,7 +447,181 @@ public final class EventStore {
             pendingPermission = nil
             markPendingToolAwaitingApproval()
         }
+        adoptAccounting(status)
         onChange?()
+    }
+
+    /// Adopt only the accounting half of a status snapshot, leaving run state,
+    /// the pending permission and the tool rows alone.
+    ///
+    /// This exists because seeding the footer must not be a back door into run
+    /// state. Phase 8.5 made the SSE `connected(running:)` frame authoritative
+    /// both ways, and an extra `/status` adoption on session open quietly took
+    /// that over — enough to break the wedge repair path's premise, where the
+    /// client believes it is idle until a 409 corrects it. Filling in a resumed
+    /// session's totals is a strictly smaller question than "is a turn running",
+    /// and it now asks only that.
+    public func adoptAccounting(_ status: SessionStatus) {
+        guard status.sessionID == selectedSessionID else { return }
+        guard let reported = status.accounting else {
+            // The server answered, so stop asking — even though it had no totals
+            // to give. An older runtime sends no `accounting` at all, and
+            // re-asking it every five seconds forever would be a poll loop with
+            // no possible answer.
+            accountingPolled = true
+            return
+        }
+        // A snapshot that knows about FEWER turns than this client has already
+        // folded on top of the current baseline was computed before those turns
+        // were persisted, and is arriving after them. Adopting it would re-base
+        // onto the older total, discard the local delta AND disarm the poll — so
+        // the turn's tokens and its cost would simply vanish from the footer
+        // until the next prompt. Keep the fold and leave the poll armed instead;
+        // the next answer, five seconds later, has the turn in it.
+        //
+        // Bounded, and deliberately: if the client's own count is what is wrong
+        // (a turn folded twice), refusing forever would weld the self-correcting
+        // path shut on exactly the session that needs it. The server is
+        // authoritative; after `staleSnapshotLimit` consecutive refusals this
+        // believes it over its own arithmetic.
+        if let baseline = accountingBaseline, pendingTurns > 0,
+           reported.turns < Self.saturatingAdd(baseline.turns, pendingTurns),
+           staleSnapshots < Self.staleSnapshotLimit {
+            staleSnapshots += 1
+            return
+        }
+        staleSnapshots = 0
+        accountingPolled = true
+        // The polled total WINS. It is the one that counted the turns this
+        // client never saw: everything before it attached, every compaction
+        // and branch summary, and any turn a dropped frame cost it. Re-basing
+        // on it and discarding the local delta is what makes the footer
+        // self-correcting instead of a number that drifts for the life of a
+        // session.
+        accountingBaseline = reported
+        pendingUsage = .zero
+        pendingTurns = 0
+        pendingContextTokens = nil
+    }
+
+    // MARK: Accounting
+
+    /// The server's last authoritative snapshot for the selected session.
+    private var accountingBaseline: SessionAccounting?
+    /// Assistant turns folded off THIS stream since that snapshot was taken.
+    private var pendingUsage: Usage = .zero
+    private var pendingTurns = 0
+    /// The context size implied by the newest locally-folded turn, or `nil` when
+    /// no turn has landed since the last poll.
+    private var pendingContextTokens: Int?
+    /// Whether the server has been asked since the last locally-folded turn.
+    private var accountingPolled = true
+    /// Consecutive `/status` snapshots refused as stale since the last one that
+    /// was adopted. Bounds the refusal, so a client whose own turn count is wrong
+    /// still gets back in sync — see ``adoptAccounting(_:)``.
+    private var staleSnapshots = 0
+    /// How many polls in a row may be refused before the server is believed
+    /// anyway. Two, because the race being defended against is one snapshot
+    /// computed a few milliseconds before a persist; the poll runs every five
+    /// seconds, so the next answer is already fresh.
+    private static let staleSnapshotLimit = 2
+
+    /// `lhs + rhs`, clamped instead of trapping. The baseline is decoded straight
+    /// off the `/status` socket, so `baseline.turns + pendingTurns` is the same
+    /// unbounded door ``DoMoLLM/Usage/totalTokens`` saturates for.
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        guard overflow else { return sum }
+        return rhs > 0 ? Int.max : Int.min
+    }
+
+    /// What this session has spent and how full its context is, or `nil` when
+    /// nothing has said.
+    ///
+    /// The polled snapshot is the baseline and the locally-folded turns are a
+    /// delta on top of it, so the number moves the instant a turn ends and is
+    /// re-based — delta discarded — the next time ``adopt(_:)`` runs with a
+    /// snapshot that is not older than the fold (see ``adoptAccounting(_:)``).
+    /// `nil` means "not reported": no poll has landed and no turn has streamed. A
+    /// renderer must not read that as zero.
+    ///
+    /// ``SessionAccounting/contextWindow`` comes only from the server, because
+    /// only the server knows the model's window; until a poll lands it is `nil`
+    /// and a meter must show `?` rather than a percentage of a guess.
+    public var accounting: SessionAccounting? {
+        guard let baseline = accountingBaseline else {
+            guard pendingTurns > 0 else { return nil }
+            return SessionAccounting(
+                usage: pendingUsage,
+                costTotal: pendingUsage.effectiveCostTotal,
+                contextTokens: pendingContextTokens ?? 0,
+                contextWindow: nil,
+                turns: pendingTurns
+            )
+        }
+        guard pendingTurns > 0 else { return baseline }
+        return SessionAccounting(
+            usage: baseline.usage + pendingUsage,
+            costTotal: baseline.costTotal + pendingUsage.effectiveCostTotal,
+            contextTokens: pendingContextTokens ?? baseline.contextTokens,
+            contextWindow: baseline.contextWindow,
+            turns: Self.saturatingAdd(baseline.turns, pendingTurns)
+        )
+    }
+
+    /// Whether a turn has been folded that no `/status` answer has yet corrected.
+    ///
+    /// The status poll otherwise only runs while a turn is in flight, so the LAST
+    /// turn of a run would be shown from the local fold alone until the next
+    /// prompt — and the local fold cannot see a compaction's own usage, which is
+    /// billed to the session but never streamed as an assistant turn. Self-
+    /// limiting: one poll answers it, and only a new turn re-arms it — with one
+    /// bounded exception, a snapshot ``adoptAccounting(_:)`` refuses as older
+    /// than the fold, which leaves the flag set so the next poll can bring the
+    /// answer that includes the turn.
+    public var wantsAccountingPoll: Bool { !accountingPolled }
+
+    /// Record that the server could not be asked, so the client stops asking
+    /// until something changes.
+    ///
+    /// Without this a runtime that is gone (or predates `/status`) is polled
+    /// every five seconds for the life of an idle session.
+    public func noteAccountingPollFailed() {
+        accountingPolled = true
+    }
+
+    /// Fold one assistant turn's usage into the running delta.
+    private func foldTurn(_ usage: Usage) {
+        pendingUsage = pendingUsage + usage
+        pendingTurns += 1
+        // The context this turn ran against, as the provider itself reported it:
+        // the prompt it was given (billed, cached and cache-written alike) plus
+        // the completion it produced — which is exactly ``Usage/totalTokens``,
+        // spelled that way so this shares its saturation rather than trapping on
+        // a hostile frame. It is an estimate of what the NEXT turn starts from —
+        // it cannot see a tool result appended afterwards — which is exactly why
+        // a polled `contextTokens` supersedes it.
+        //
+        // A turn that reported NO usage at all leaves the estimate alone. An
+        // aborted turn is the case: `AgentLoop` emits `message_end` with
+        // `usage: .zero` when the user presses Esc, and taking that literally
+        // re-based a 60k context onto `ctx 0 (0%)` and left it there until the
+        // next poll. A turn that told us nothing has not told us the context
+        // shrank. The zero still counts as a turn and still folds into the
+        // totals; it is only the context ESTIMATE that needs a number to be an
+        // estimate of.
+        let context = usage.totalTokens
+        if context > 0 { pendingContextTokens = context }
+        accountingPolled = false
+    }
+
+    private func resetAccounting() {
+        accountingBaseline = nil
+        pendingUsage = .zero
+        pendingTurns = 0
+        pendingContextTokens = nil
+        accountingPolled = true
+        staleSnapshots = 0
     }
 
     /// Whether any of `ids` names a prompt this store has neither parked nor

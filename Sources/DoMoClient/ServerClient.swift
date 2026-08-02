@@ -296,65 +296,85 @@ public struct ServerClient: Sendable {
                 // an actor because the watchdog reads it once a second and must not
                 // be able to queue behind the reader's own hop.
                 let lastActivityAt = ActivityStamp(clock.now)
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask {
-                        do {
-                            var request = HTTPClientRequest(url: baseURL + path)
-                            request.method = .GET
-                            request.headers.add(name: "authorization", value: "Bearer \(token)")
-                            // A long deadline for a long-lived stream; heartbeats keep it
-                            // active, and the consumer cancels on teardown / session switch.
-                            let response = try await http.execute(request, timeout: .hours(24))
-                            // The head arriving is activity: a slow connect must not
-                            // be charged against the idle budget. Stamped BEFORE the
-                            // status check, so the error-body read below is itself
-                            // covered by the watchdog rather than being a second
-                            // unbounded read on the failure path.
+                // The reader and watchdog are independent pumps. Coordinate their
+                // first completion with an AsyncStream instead of a task group: this
+                // stream is commonly cancelled while the HTTP response is unwinding,
+                // which is the optimized-runtime stack boundary that used to abort
+                // the full-screen client.
+                let (completions, completionContinuation) = AsyncStream.makeStream(of: Void.self)
+                let readerTask = Task {
+                    defer { completionContinuation.yield(()) }
+                    do {
+                        var request = HTTPClientRequest(url: baseURL + path)
+                        request.method = .GET
+                        request.headers.add(name: "authorization", value: "Bearer \(token)")
+                        // A long deadline for a long-lived stream; heartbeats keep it
+                        // active, and the consumer cancels on teardown / session switch.
+                        let response = try await http.execute(request, timeout: .hours(24))
+                        // The head arriving is activity: a slow connect must not
+                        // be charged against the idle budget. Stamped BEFORE the
+                        // status check, so the error-body read below is itself
+                        // covered by the watchdog rather than being a second
+                        // unbounded read on the failure path.
+                        lastActivityAt.touch(clock.now)
+                        guard response.status.code == 200 else {
+                            // Carry what the server said. This throw site used to
+                            // pass `body: nil`, so the ONE place the client tells
+                            // the user why the stream is down — the status line's
+                            // disconnect reason — could only ever say a number.
+                            // A reverse proxy in front of the runtime is exactly
+                            // the thing that answers 503 with a sentence.
+                            throw ServerClientError.unexpectedStatus(
+                                response.status.code,
+                                path: path,
+                                body: await Self.readErrorBody(response.body)
+                            )
+                        }
+                        var decoder = SSEFrameDecoder()
+                        for try await chunk in response.body {
                             lastActivityAt.touch(clock.now)
-                            guard response.status.code == 200 else {
-                                // Carry what the server said. This throw site used to
-                                // pass `body: nil`, so the ONE place the client tells
-                                // the user why the stream is down — the status line's
-                                // disconnect reason — could only ever say a number.
-                                // A reverse proxy in front of the runtime is exactly
-                                // the thing that answers 503 with a sentence.
-                                throw ServerClientError.unexpectedStatus(
-                                    response.status.code,
-                                    path: path,
-                                    body: await Self.readErrorBody(response.body)
-                                )
-                            }
-                            var decoder = SSEFrameDecoder()
-                            for try await chunk in response.body {
-                                lastActivityAt.touch(clock.now)
-                                var chunk = chunk
-                                let bytes = chunk.readBytes(length: chunk.readableBytes) ?? []
-                                for event in decoder.push(bytes) { continuation.yield(event) }
-                                try Task.checkCancellation()
-                            }
-                            continuation.finish()
-                        } catch {
-                            continuation.finish(throwing: error)
+                            var chunk = chunk
+                            let bytes = chunk.readBytes(length: chunk.readableBytes) ?? []
+                            for event in decoder.push(bytes) { continuation.yield(event) }
+                            try Task.checkCancellation()
                         }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
                     }
-                    group.addTask {
-                        // Poll rather than schedule a one-shot: every chunk would
-                        // otherwise have to cancel and re-arm a timer, on a path that
-                        // runs for every delta of every turn.
-                        let tick = min(idle, .seconds(1))
-                        while !Task.isCancelled {
-                            try? await Task.sleep(for: tick)
-                            if Task.isCancelled { return }
-                            if lastActivityAt.silence(at: clock.now) >= idle {
-                                continuation.finish(throwing: ServerClientError.streamIdle(path: path))
-                                return
-                            }
-                        }
-                    }
-                    // Whichever finishes first ends the stream; the other is torn down.
-                    _ = await group.next()
-                    group.cancelAll()
                 }
+                let watchdogTask = Task {
+                    defer { completionContinuation.yield(()) }
+                    // Poll rather than schedule a one-shot: every chunk would
+                    // otherwise have to cancel and re-arm a timer, on a path that
+                    // runs for every delta of every turn.
+                    let tick = min(idle, .seconds(1))
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: tick)
+                        if Task.isCancelled { return }
+                        if lastActivityAt.silence(at: clock.now) >= idle {
+                            continuation.finish(throwing: ServerClientError.streamIdle(path: path))
+                            return
+                        }
+                    }
+                }
+
+                await withTaskCancellationHandler(operation: {
+                    var iterator = completions.makeAsyncIterator()
+                    _ = await iterator.next()
+                }, onCancel: {
+                    readerTask.cancel()
+                    watchdogTask.cancel()
+                    completionContinuation.finish()
+                })
+                // Whichever finishes first ends the stream. Explicitly retire the
+                // other task, but do not await canceled task values here: on Linux,
+                // an async-http-client body reader can be parked on its connection
+                // until the owning HTTPClient shuts down. The caller performs that
+                // shutdown immediately after its canceled client task returns.
+                readerTask.cancel()
+                watchdogTask.cancel()
+                completionContinuation.finish()
             }
             continuation.onTermination = { _ in task.cancel() }
         }
@@ -432,19 +452,38 @@ public struct ServerClient: Sendable {
         path: String,
         _ body: HTTPClientResponse.Body
     ) async throws -> Data {
-        try await withThrowingTaskGroup(of: Data.self) { group in
-            group.addTask {
+        let (results, resultContinuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+        let bodyTask = Task {
+            do {
                 var buffer = try await body.collect(upTo: 4 << 20)
-                return Data(buffer.readBytes(length: buffer.readableBytes) ?? [])
+                resultContinuation.yield(Data(buffer.readBytes(length: buffer.readableBytes) ?? []))
+                resultContinuation.finish()
+            } catch {
+                resultContinuation.finish(throwing: error)
             }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw ServerClientError.timedOut(path: path)
-            }
-            defer { group.cancelAll() }
-            // Non-nil: the group has two tasks and neither returns without a value.
-            return try await group.next()!
         }
+        let timeoutTask = Task {
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
+            }
+            resultContinuation.finish(throwing: ServerClientError.timedOut(path: path))
+        }
+        defer {
+            bodyTask.cancel()
+            timeoutTask.cancel()
+            resultContinuation.finish()
+        }
+
+        return try await withTaskCancellationHandler(operation: {
+            for try await data in results { return data }
+            throw ServerClientError.timedOut(path: path)
+        }, onCancel: {
+            bodyTask.cancel()
+            timeoutTask.cancel()
+            resultContinuation.finish(throwing: CancellationError())
+        })
     }
 
     /// How much of an error body is carried into the thrown error.

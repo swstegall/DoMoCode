@@ -46,18 +46,44 @@ public struct SessionStatus: Sendable, Codable, Hashable {
     /// 14m" instead of an undifferentiated spinner.
     public var runStartedAt: String?
 
+    /// What this session has spent and how full its context is, or `nil` when the
+    /// server could not work it out.
+    ///
+    /// Cumulative totals only. Per-*turn* numbers already reach a client without
+    /// this: ``ServerEvent/messageEnd(_:)`` carries the whole ``DoMoLLM/Message``,
+    /// and ``DoMoLLM/AssistantMessage`` encodes its `usage`, so a subscriber can
+    /// fold turns itself. What it cannot do is recover the totals of a session it
+    /// attached to halfway through — the turns it missed were never on its stream —
+    /// which is why the running total is level-triggered and lives here.
+    ///
+    /// Optional for two independent reasons, both load-bearing. On the wire it is
+    /// an **additive** field and `ServerClient.status` decodes with a plain
+    /// `JSONDecoder`, so a payload from a server that predates it must still decode:
+    /// an absent key means "not reported", never a decode failure that turns the
+    /// diagnostic route into one more thing that is broken. In the server it is what
+    /// ``ServerRuntime/status(sessionID:)`` degrades to when the session's harness
+    /// cannot answer; see there for why that is deliberately not an error.
+    ///
+    /// A reader must not treat `nil` as zero. Zero is a claim about a session that
+    /// spent nothing; `nil` says the server did not know.
+    public var accounting: SessionAccounting?
+
+    /// - Parameter accounting: Defaulted and **last**, so every existing
+    ///   construction of this type keeps compiling untouched.
     public init(
         sessionID: String,
         running: Bool,
         pendingPermissionIDs: [String],
         subscribers: Int,
-        runStartedAt: String?
+        runStartedAt: String?,
+        accounting: SessionAccounting? = nil
     ) {
         self.sessionID = sessionID
         self.running = running
         self.pendingPermissionIDs = pendingPermissionIDs
         self.subscribers = subscribers
         self.runStartedAt = runStartedAt
+        self.accounting = accounting
     }
 }
 
@@ -132,6 +158,37 @@ public actor ServerRuntime {
         public var cwd: String
         public var permissions: PermissionRuntime?
 
+        /// The model's context window in tokens, or `nil` when it is genuinely
+        /// unknown — which is the default, because behind a gateway it usually is.
+        ///
+        /// Forwarded verbatim to ``DoMoHarness/AgentHarness/Configuration/contextWindow``
+        /// and from there onto ``SessionStatus/accounting``, so a client's meter
+        /// renders the server's actual answer. `nil` must reach the client as `nil`:
+        /// a percentage computed against the compaction fallback would be
+        /// indistinguishable on screen from one computed against a real window.
+        public var contextWindow: Int?
+
+        /// When and how aggressively the server's sessions compact.
+        ///
+        /// Defaulted rather than required because every existing construction of
+        /// this type predates it, and because ``CompactionSettings/default`` is
+        /// exactly what the harness used to apply on its own.
+        public var compaction: CompactionSettings
+
+        /// The summarization call compaction uses. `nil` keeps the harness's own
+        /// default — a one-shot request through ``streamFn`` — so a server that
+        /// configures nothing behaves byte-for-byte as it did.
+        public var summarizer: Summarizer?
+
+        /// - Parameters:
+        ///   - contextWindow: See ``Config/contextWindow``.
+        ///   - compaction: See ``Config/compaction``.
+        ///   - summarizer: See ``Config/summarizer``.
+        ///
+        /// The three above are defaulted and **last**. A dozen files across the CLI
+        /// and the test suites construct this initializer, so a non-defaulted
+        /// parameter — or a new one inserted in the middle — is a build failure in
+        /// every one of them.
         public init(
             systemPrompt: String,
             tools: [any AgentTool],
@@ -141,7 +198,10 @@ public actor ServerRuntime {
             maxTurns: Int? = nil,
             sessionDirectory: FilePath,
             cwd: String,
-            permissions: PermissionRuntime? = nil
+            permissions: PermissionRuntime? = nil,
+            contextWindow: Int? = nil,
+            compaction: CompactionSettings = .default,
+            summarizer: Summarizer? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.tools = tools
@@ -152,6 +212,9 @@ public actor ServerRuntime {
             self.sessionDirectory = sessionDirectory
             self.cwd = cwd
             self.permissions = permissions
+            self.contextWindow = contextWindow
+            self.compaction = compaction
+            self.summarizer = summarizer
         }
     }
 
@@ -277,8 +340,15 @@ public actor ServerRuntime {
             tools: config.tools,
             model: config.model,
             streamFn: config.streamFn,
+            // The three below are the whole reason `Config` carries them: a value
+            // that stops here is a knob a user can set and nothing reads. The
+            // harness clamps `compaction` against `contextWindow` in its own
+            // initializer, so nothing is decided here beyond forwarding.
+            summarizer: config.summarizer,
             toolExecution: config.toolExecution,
             maxTurns: config.maxTurns,
+            compaction: config.compaction,
+            contextWindow: config.contextWindow,
             beforeToolCall: beforeToolCall
         )
     }
@@ -708,16 +778,53 @@ public actor ServerRuntime {
     private static let clearedReason = "The run was cleared at the client's request."
 
     /// The server's authoritative view of one session — see ``SessionStatus``.
-    public func status(sessionID: String) throws -> SessionStatus {
+    ///
+    /// **Accounting failures degrade; they do not propagate.**
+    /// ``DoMoHarness/AgentHarness/accounting()`` throws exactly when the session's
+    /// active path cannot be resolved — a structural hole in the branch it is
+    /// standing on — which is to say, on precisely the damaged session a client
+    /// reaches for this route to diagnose. Letting that throw out would 500 the one
+    /// endpoint whose job is to answer "is a turn still running, and what is it
+    /// waiting on"; the run state would be lost along with the numbers, and a client
+    /// whose spinner is pinned by a missed SSE edge would have nothing left to ask.
+    /// The totals are the *addition* to this payload. Run state is the reason it
+    /// exists, and it must survive the addition failing. So a failure becomes
+    /// `accounting: nil`, which ``SessionStatus/accounting`` already has to mean
+    /// "not reported" for the older-server case.
+    ///
+    /// **The run-state half is snapshotted before the hop below.** Awaiting the
+    /// harness suspends, and this actor is reentrant, so reading `session` again
+    /// afterwards could pair a `running` from one moment with a pending set from
+    /// another — and this value's whole purpose is to be a self-consistent answer a
+    /// client adopts wholesale.
+    ///
+    /// **Two things this does not insulate against**, stated because the degradation
+    /// above could be read as covering more than it does:
+    ///
+    /// 1. A harness that cannot be *reached*, as opposed to one that cannot answer.
+    ///    This awaits it, so a session whose harness actor is blocked leaves the
+    ///    request waiting rather than answering with `nil`. That is the same
+    ///    exposure ``messages(sessionID:)`` and ``forceClearRun(sessionID:)`` already
+    ///    carry — both read from the harness too — and closing it would need a
+    ///    supervision layer this server does not have.
+    /// 2. Cost. `accounting()` re-parses the whole session file to measure the
+    ///    current context, so polling this route on a long transcript is not free
+    ///    and serializes against the harness's own work.
+    public func status(sessionID: String) async throws -> SessionStatus {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        let running = session.runTask != nil
+        // Sorted so the projection is stable across calls; the pending map is
+        // a dictionary and its iteration order is not.
+        let pendingPermissionIDs = session.pending.keys.sorted()
+        let subscribers = session.sink.subscriberCount
+        let runStartedAt = session.runStartedAt.map(Self.iso8601)
         return SessionStatus(
             sessionID: sessionID,
-            running: session.runTask != nil,
-            // Sorted so the projection is stable across calls; the pending map is
-            // a dictionary and its iteration order is not.
-            pendingPermissionIDs: session.pending.keys.sorted(),
-            subscribers: session.sink.subscriberCount,
-            runStartedAt: session.runStartedAt.map(Self.iso8601)
+            running: running,
+            pendingPermissionIDs: pendingPermissionIDs,
+            subscribers: subscribers,
+            runStartedAt: runStartedAt,
+            accounting: try? await session.harness.accounting()
         )
     }
 

@@ -8,9 +8,10 @@
 // pump stdin through the framer into the focused component, repaint on resize,
 // and always restore the terminal on the way out. pi wires input and resize as
 // Node event-emitter callbacks; Swift structured concurrency lets the same three
-// sources (keystrokes, `SIGWINCH`, a quit signal) meet under one task group, so
-// the "always restore" guarantee is a `defer` around the group rather than pi's
-// scattered `stop()` calls in signal/exit/error handlers.
+// sources (keystrokes, `SIGWINCH`, a quit signal) meet under one cancellation-safe
+// coordinator, so the "always restore" guarantee is a `defer` around the
+// coordinator rather than pi's scattered `stop()` calls in signal/exit/error
+// handlers.
 
 import Dispatch
 import DoMoCore
@@ -142,7 +143,15 @@ public nonisolated final class QuitSignal: Sendable {
 
     /// Suspend until ``quit()`` fires or the awaiting task is cancelled.
     func wait() async {
-        for await _ in stream { break }
+        await withTaskCancellationHandler(operation: {
+            for await _ in stream { break }
+        }, onCancel: {
+            // `AsyncStream` normally observes task cancellation at its next
+            // suspension point. Finishing here makes the wake-up explicit for
+            // the task-group teardown path, including Linux's Swift Testing
+            // runner where the next test may be waiting on the same actor.
+            continuation.finish()
+        })
     }
 }
 
@@ -188,6 +197,9 @@ public final class TerminalDriver {
     private var framer = StdinFramer()
     /// The armed ESC-disambiguation flush, cancelled the instant more bytes land.
     private var flushTask: Task<Void, Never>?
+    /// Background agent work is intentionally not a child of the shutdown
+    /// group. A body that ignores cancellation must not delay terminal restore.
+    private var backgroundTask: Task<Void, Never>?
 
     /// The session's app and quit handle, held for the duration of `run` so
     /// ``render()`` and the render-error path can reach them without threading
@@ -215,13 +227,6 @@ public final class TerminalDriver {
     /// The exit reasons a child of the run group can report. `quit` and
     /// `inputEnded` end the session; a finished resize stream or completed
     /// background job do not (the user is still typing).
-    private enum RunOutcome: Sendable {
-        case quit
-        case inputEnded
-        case resizeEnded
-        case backgroundEnded
-    }
-
     /// Run the interactive session until quit, input EOF, or cancellation.
     ///
     /// - Parameters:
@@ -253,6 +258,8 @@ public final class TerminalDriver {
         defer {
             flushTask?.cancel()
             flushTask = nil
+            backgroundTask?.cancel()
+            backgroundTask = nil
             app.stop()
             lifecycle.stop()
             activeApp = nil
@@ -273,43 +280,51 @@ public final class TerminalDriver {
         // same reason: the screen should show the UI, not a blank line, at t=0.
         render()
 
-        await withTaskGroup(of: RunOutcome.self) { group in
-            group.addTask { [input] in
-                for await chunk in input {
-                    await self.ingest(chunk, app: app)
-                }
-                return .inputEnded
-            }
-            group.addTask { [resize] in
-                for await size in resize {
-                    await self.handleResize(size, app: app)
-                }
-                return .resizeEnded
-            }
-            group.addTask {
-                await quit.wait()
-                return .quit
-            }
-            if let background {
-                group.addTask {
-                    await background()
-                    return .backgroundEnded
-                }
-            }
+        // Keep optional work alive alongside the input pumps, but outside the
+        // shutdown coordinator. The coordinator is responsible for deciding when
+        // the session ends; it must not wait for arbitrary agent/network work to
+        // acknowledge cancellation before the terminal can be restored.
+        if let background {
+            backgroundTask = Task { await background() }
+        }
 
-            for await outcome in group {
-                switch outcome {
-                case .quit, .inputEnded:
-                    // Session over. Cancelling the group unblocks the remaining
-                    // stream iterators (they return nil on cancel) and the
-                    // background job; the group then drains and returns.
-                    group.cancelAll()
-                    return
-                case .resizeEnded, .backgroundEnded:
-                    continue
+        // Keep the pumps concurrent, but use the existing quit signal as their
+        // one completion channel rather than nesting another AsyncStream
+        // coordinator. Input EOF is a normal session-ending event, just like a
+        // quit key; resize EOF is not, because a resize source may be closed
+        // while the UI itself remains live. Avoiding a nested task-group teardown
+        // keeps optimized Swift runtimes from tripping their stack assertion.
+        // The stream readers are detached so waiting for input or resize never
+        // competes with the UI task for main-actor scheduling. Each event then
+        // crosses back explicitly for the small stateful UI handoff. The live
+        // stream's descriptor callback already runs on its own Dispatch queue;
+        // keeping the AsyncStream wait detached makes that boundary explicit on
+        // both Darwin and Linux.
+        let inputTask = Task.detached { [input, quit] in
+            for await chunk in input {
+                await MainActor.run {
+                    self.ingest(chunk, app: app)
+                }
+            }
+            quit.quit()
+        }
+        let resizeTask = Task.detached { [resize] in
+            for await size in resize {
+                await MainActor.run {
+                    self.handleResize(size, app: app)
                 }
             }
         }
+
+        await withTaskCancellationHandler(operation: {
+            await quit.wait()
+        }, onCancel: {
+            inputTask.cancel()
+            resizeTask.cancel()
+        })
+
+        inputTask.cancel()
+        resizeTask.cancel()
     }
 
     // MARK: Input
@@ -431,11 +446,13 @@ extension TerminalDriver {
     /// watcher yields whatever the descriptor makes available, so the read never
     /// blocks the main actor and the driver's input pump is oblivious to whether
     /// its bytes come from a keyboard or a script. Reading goes through
-    /// `FileHandle.availableData` (the source guarantees data is ready) rather than
-    /// a raw `read(2)`, keeping this file inside strict memory safety. The source
-    /// is cancelled when the stream's consumer stops, and an empty read (EOF, e.g.
-    /// stdin closed) finishes the stream — which the run loop treats as
-    /// end-of-session.
+    /// ``NonblockingFileDescriptor/read(_:maximumBytes:)`` rather than a raw
+    /// `read(2)`, keeping this file inside strict memory safety. The source is
+    /// cancelled when the stream's consumer stops, and EOF finishes the stream —
+    /// which the run loop treats as end-of-session. The POSIX seam also drains
+    /// every currently available chunk: Linux dispatch read sources do not
+    /// reliably issue a separate callback for a pipe's EOF unless the handler
+    /// observes it while draining a nonblocking descriptor.
     // `nonisolated` is load-bearing: under DoMoTUI's `.defaultIsolation(MainActor.self)`
     // this factory — and, crucially, the `setEventHandler` closure it builds —
     // would otherwise be `@MainActor`. The `DispatchSource` runs that handler on
@@ -448,18 +465,33 @@ extension TerminalDriver {
         queue: DispatchQueue = DispatchQueue(label: "domo.tui.stdin")
     ) -> AsyncStream<[UInt8]> {
         AsyncStream { continuation in
-            let handle = FileHandle(fileDescriptor: fileDescriptor, closeOnDealloc: false)
+            guard let flags = NonblockingFileDescriptor.makeNonblocking(fileDescriptor) else {
+                continuation.finish()
+                return
+            }
             let source = DispatchSource.makeReadSource(fileDescriptor: fileDescriptor, queue: queue)
+            let box = DispatchSourceBox(source)
             source.setEventHandler {
-                let data = handle.availableData
-                if data.isEmpty {
-                    continuation.finish()
-                    return
+                while true {
+                    switch NonblockingFileDescriptor.read(fileDescriptor) {
+                    case .bytes(let bytes):
+                        continuation.yield(bytes)
+                    case .wouldBlock:
+                        return
+                    case .endOfFile, .error:
+                        continuation.finish()
+                        box.cancel()
+                        return
+                    }
                 }
-                continuation.yield([UInt8](data))
             }
             source.setCancelHandler {}
-            continuation.onTermination = { _ in source.cancel() }
+            // Boxed for the same Linux-only reason as the signal sources; see
+            // `DoMoTermIO.DispatchSourceBox`.
+            continuation.onTermination = { _ in
+                box.cancel()
+                flags.restore()
+            }
             source.resume()
         }
     }

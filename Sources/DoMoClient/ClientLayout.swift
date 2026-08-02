@@ -33,11 +33,37 @@ struct ClientLayout {
     /// The status line is still exactly one row.
     static let statusRows = 1
 
-    init(width: Int, height: Int, promptRows: Int = 1) {
+    /// The rows the accounting footer occupies: 1 when the app is painting it,
+    /// 0 when it is not.
+    ///
+    /// A parameter rather than a constant because the app decides — see
+    /// ``footerRows(for:)`` — and because a geometry asked about for its own sake
+    /// (a pane hit test in a unit test, say) should describe the layout it was
+    /// asked about rather than assume one.
+    let footerRows: Int
+
+    /// The shortest terminal that still gets an accounting footer.
+    ///
+    /// A second `Fixed` row is not free: `Fixed.measure` returns its basis
+    /// unconditionally and `distributeMainAxis` hands the flexible transcript
+    /// only `max(0, mainExtent - fixedTotal)`, so the footer's row comes straight
+    /// out of the transcript. At 10 rows the split is status 1 + footer 1 +
+    /// prompt 3 + transcript 5, which is the point below which the conversation
+    /// stops being readable — so below it the footer, not the transcript, is what
+    /// gives way.
+    static let minimumFooterHeight = 10
+
+    /// Whether a terminal this tall can afford the footer.
+    static func footerRows(for height: Int) -> Int {
+        height >= minimumFooterHeight ? 1 : 0
+    }
+
+    init(width: Int, height: Int, promptRows: Int = 1, footerRows: Int = 0) {
         self.width = max(0, width)
         self.height = max(0, height)
         self.sidebarWidth = Self.sidebarWidth(for: self.width)
         self.promptRows = max(1, promptRows)
+        self.footerRows = max(0, min(1, footerRows))
     }
 
     /// A quarter of the terminal, bounded to something usable — the rule the tree
@@ -56,15 +82,23 @@ struct ClientLayout {
     /// an uncapped prompt first starves the transcript to zero rows and then
     /// overruns the rect, where it is silently clipped. This cap is the only thing
     /// standing between a long paste and that.
-    static func promptRowCap(for height: Int) -> Int {
+    /// - Parameter footerRows: the accounting footer's rows, so the cap accounts
+    ///   for the row it takes too. Defaulted to 0 — the geometry without a
+    ///   footer — so every caller that does not paint one is unchanged. At the
+    ///   heights the app actually asks for a footer (``minimumFooterHeight`` and
+    ///   up) the `height / 3` ceiling is always the binding constraint, so this
+    ///   term changes nothing TODAY; it is here so that lowering that threshold
+    ///   cannot silently start starving the transcript again.
+    static func promptRowCap(for height: Int, footerRows: Int = 0) -> Int {
         let ceiling = Swift.max(3, height / 3)
-        let roomLeavingOneTranscriptRow = height - statusRows - 1
+        let roomLeavingOneTranscriptRow = height - statusRows - Swift.max(0, footerRows) - 1
         return Swift.max(1, Swift.min(ceiling, roomLeavingOneTranscriptRow))
     }
 
-    /// The rows the main column spends below the transcript: the status line plus
-    /// however tall the prompt currently is.
-    var mainFooterRows: Int { Self.statusRows + promptRows }
+    /// The rows the main column spends below the transcript: the status line, the
+    /// accounting footer when there is one, and however tall the prompt currently
+    /// is.
+    var mainFooterRows: Int { Self.statusRows + footerRows + promptRows }
 
     /// The transcript viewport's height, once the status line and prompt are taken.
     var transcriptHeight: Int {
@@ -75,7 +109,8 @@ struct ClientLayout {
     enum Pane {
         case sidebar
         case transcript
-        /// The status line or the prompt — the bottom rows of the main column.
+        /// The status line, the accounting footer and the prompt — the bottom
+        /// rows of the main column.
         case mainFooter
     }
 
@@ -104,8 +139,8 @@ struct ClientLayout {
     /// into every copied line.
     ///
     /// `.sidebar` spans the full height because the sidebar is one column with no
-    /// footer of its own — the status line and prompt live only in the main
-    /// column.
+    /// footer of its own — the status line, the accounting footer and the prompt
+    /// live only in the main column.
     func bounds(of pane: Pane) -> PaneBounds {
         switch pane {
         case .sidebar:

@@ -99,6 +99,94 @@ struct EventLog: Sendable {
     }
 }
 
+// MARK: - Usage encoding
+
+/// The `usage` object carried by the JSON stream's `assistant` and `result`
+/// events.
+///
+/// One encoder for both, so the per-turn numbers and the session totals cannot
+/// come to describe the same quantities under different key names — the JSON
+/// stream is a published contract, and two spellings of "cache reads" is a
+/// contract nobody can write one parser for.
+enum PrintUsageEncoding {
+
+    /// - Parameters:
+    ///   - usage: the token counts to report.
+    ///   - cost: the total to report alongside them, or `nil` when nobody ever
+    ///     stated one — see ``reportableCost(_:ratesConfigured:reportedCost:)``,
+    ///     which is how callers decide. A non-`nil` caller passes
+    ///     ``DoMoLLM/Usage/effectiveCostTotal`` or
+    ///     ``DoMoHarness/SessionAccounting/costTotal`` — never `cost.total`,
+    ///     which silently discards a price the gateway itself reported.
+    static func object(_ usage: Usage, cost: Decimal?) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "input": .int(usage.input),
+            "output": .int(usage.output),
+            "cacheRead": .int(usage.cacheRead),
+            "cacheWrite": .int(usage.cacheWrite),
+        ]
+        // ABSENT, not `"0"`, when nothing priced the model — the same rule
+        // `reasoning` follows one line below, and for the same reason: an
+        // unpriced run that emits `"cost":"0"` is not reporting a fact, it is
+        // claiming the run was free.
+        if let cost {
+            fields["cost"] = .string(decimalString(cost))
+        }
+        // ABSENT, not `0`, when the provider said nothing about reasoning.
+        // ``DoMoLLM/Usage/reasoning`` is Optional for exactly this reason: a
+        // provider that reports no reasoning tokens and one that never mentions
+        // them are different facts, and `0` asserts the first about the second.
+        if let reasoning = usage.reasoning {
+            fields["reasoning"] = .int(reasoning)
+        }
+        return .object(fields)
+    }
+
+    /// The cost to report, or `nil` when nothing in this run can state one.
+    ///
+    /// Three independent things can make a cost real, and any one of them is
+    /// enough:
+    ///
+    /// - `ratesConfigured`: the alias has a ``DoMoLLM/ModelCostRates`` table, so
+    ///   the number is derived from prices the operator wrote down. **Rates that
+    ///   happen to price a model at zero still count** — "this model is free" is
+    ///   a statement, and reporting it as unknown would throw away the one thing
+    ///   the operator took the trouble to say.
+    /// - `reportedCost`: the gateway itself billed a number
+    ///   (`x-litellm-response-cost`), which outranks any local table.
+    /// - A non-zero `total`: whatever produced it, a number that is not zero is
+    ///   plainly known. This is what keeps a `--resume`d session honest — the
+    ///   totals are seeded by walking the whole file, so a session priced by an
+    ///   earlier invocation must not be re-reported as unknown just because this
+    ///   invocation was started without a rate table.
+    ///
+    /// Only the run where all three are absent is genuinely unpriced, and that
+    /// is the one this returns `nil` for.
+    static func reportableCost(
+        _ total: Decimal,
+        ratesConfigured: Bool,
+        reportedCost: Decimal?
+    ) -> Decimal? {
+        guard ratesConfigured || reportedCost != nil || total != 0 else { return nil }
+        return total
+    }
+
+    /// A `Decimal` as its exact decimal digits, in a JSON **string**.
+    ///
+    /// A string because ``DoMoCore/JSONValue`` has no decimal case: its only
+    /// fractional number is `.double`, and a per-turn cost like `0.000003`
+    /// summed over a few hundred turns is precisely the binary-floating-point
+    /// drift ``DoMoLLM/Cost`` chose `Decimal` to avoid. Emitting the number
+    /// through `.double` would round-trip every cost this phase exists to make
+    /// honest through the type it was chosen to escape.
+    ///
+    /// `Decimal.description` writes the base-10 significand and exponent it
+    /// actually holds, so nothing is rounded, and it is locale-independent
+    /// (`NSDecimalString` with no locale always writes `.`), so the same run
+    /// produces the same bytes on a machine set to `de_DE`.
+    static func decimalString(_ value: Decimal) -> String { value.description }
+}
+
 // MARK: - Tool adapter
 
 /// Wraps a ``DoMoTools/Tool`` and its bound ``ToolContext`` as an ``AgentTool``.
@@ -161,6 +249,13 @@ struct PrintEventSink: AgentEventSink {
     /// one when this turn failed. See ``RunGuard`` and this file's header note on
     /// the harness gap.
     let runGuard: RunGuard
+    /// Whether this run's alias has a price table at all.
+    ///
+    /// The sink sees only ``DoMoLLM/Usage``, whose zero `cost` is the same value
+    /// for a model priced at zero and a model nobody priced. That distinction is
+    /// the run's, not the turn's, so it is carried in from ``PrintMode`` — see
+    /// ``PrintUsageEncoding/reportableCost(_:ratesConfigured:reportedCost:)``.
+    let ratesConfigured: Bool
 
     /// The tty's inline-image capability, cell pixel size, and column budget, for
     /// text mode. Detected only when stdout is a terminal (else `images` is `nil`),
@@ -289,6 +384,13 @@ struct PrintEventSink: AgentEventSink {
         }
     }
 
+    /// The `assistant` event for one finished turn.
+    ///
+    /// Its `usage` object reports what THAT turn used and cost. Two of the six
+    /// numbers were missing until Phase 5a: `reasoning`, which is emitted only
+    /// when the provider reported it, and `cost`, without which a `-p` run could
+    /// not tell a caller what it had just spent even though the harness knew.
+    /// `cost` is likewise omitted — never `"0"` — on a run nothing priced.
     private func emitAssistant(_ assistant: AssistantMessage) {
         log.emit(
             "assistant",
@@ -302,12 +404,14 @@ struct PrintEventSink: AgentEventSink {
                         .object(["id": .string(call.id), "name": .string(call.name), "arguments": call.arguments])
                     }
                 ),
-                "usage": .object([
-                    "input": .int(assistant.usage.input),
-                    "output": .int(assistant.usage.output),
-                    "cacheRead": .int(assistant.usage.cacheRead),
-                    "cacheWrite": .int(assistant.usage.cacheWrite),
-                ]),
+                "usage": PrintUsageEncoding.object(
+                    assistant.usage,
+                    cost: PrintUsageEncoding.reportableCost(
+                        assistant.usage.effectiveCostTotal,
+                        ratesConfigured: ratesConfigured,
+                        reportedCost: assistant.usage.reportedCost
+                    )
+                ),
             ]
         )
     }
@@ -399,8 +503,16 @@ public enum SessionSource: Sendable {
 public struct PrintMode: Sendable {
 
     let client: LiteLLMClient
-    let model: String
-    let reasoningEffort: ReasoningEffort?
+    /// The resolved model this run talks to: the alias, its reasoning effort, its
+    /// cost rates, and its context window. One value rather than four loose
+    /// parameters, so a surface cannot forward three of them and quietly drop the
+    /// fourth — which is how every `-p` run came to bill at zero and compact
+    /// against a hardcoded 200K guess regardless of the model it was using.
+    let modelRuntime: ModelRuntime
+    /// The alias this session is labelled with, for the `session_start` event, the
+    /// `assistant` events' `model` field, and the fallback warning. Computed off
+    /// ``modelRuntime`` so there is exactly one place the answer lives.
+    var model: String { modelRuntime.model }
     let registry: ToolRegistry
     let toolContext: ToolContext
     let workingDirectory: FilePath
@@ -419,6 +531,19 @@ public struct PrintMode: Sendable {
     /// Tools discovered from configured MCP servers (Phase 8c), appended after the
     /// built-ins. Already connected by the caller, which owns their teardown.
     let mcpTools: [any AgentTool]
+    /// When and how aggressively automatic pre-turn compaction fires. Forwarded to
+    /// the harness, which clamps it against the window; before it was plumbed, a
+    /// `-p` run ignored the user's `compaction` settings entirely.
+    let compaction: CompactionSettings
+    /// The compaction summarizer, when a distinct small model was configured.
+    ///
+    /// `nil` leaves the harness on its built-in one, which is the unchanged
+    /// behaviour for anyone who configured nothing — and, deliberately, keeps the
+    /// spurious-turn defect for them: the built-in summarizer re-enters
+    /// ``streamFunction(counter:runGuard:)``, so a compaction emits a `turn_start`
+    /// and advances the counter the terminal `result` event reports as `turns`.
+    /// Installing a real summarizer is what removes that turn from the count.
+    let summarizer: Summarizer?
 
     /// How often text mode says it is still alive, in turns. Rare enough that a
     /// short run prints nothing extra (the two-turn end-to-end runs are untouched),
@@ -427,8 +552,6 @@ public struct PrintMode: Sendable {
 
     public init(
         client: LiteLLMClient,
-        model: String,
-        reasoningEffort: ReasoningEffort?,
         registry: ToolRegistry,
         toolContext: ToolContext,
         workingDirectory: FilePath,
@@ -438,11 +561,13 @@ public struct PrintMode: Sendable {
         sessionSource: SessionSource,
         sessionDirectory: FilePath,
         beforeToolCall: BeforeToolCallHook? = nil,
-        mcpTools: [any AgentTool] = []
+        mcpTools: [any AgentTool] = [],
+        modelRuntime: ModelRuntime,
+        compaction: CompactionSettings = .default,
+        summarizer: Summarizer? = nil
     ) {
         self.client = client
-        self.model = model
-        self.reasoningEffort = reasoningEffort
+        self.modelRuntime = modelRuntime
         self.registry = registry
         self.toolContext = toolContext
         self.workingDirectory = workingDirectory
@@ -453,6 +578,8 @@ public struct PrintMode: Sendable {
         self.sessionDirectory = sessionDirectory
         self.beforeToolCall = beforeToolCall
         self.mcpTools = mcpTools
+        self.compaction = compaction
+        self.summarizer = summarizer
     }
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
@@ -494,12 +621,25 @@ public struct PrintMode: Sendable {
             tools: tools,
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
+            // Installing one is not only about spending less on compaction. The
+            // harness's built-in fallback summarizer runs its request through
+            // `configuration.streamFn` — which here is the seam below — so a
+            // compaction fires `turn_start` on the JSON stream and advances
+            // ``TurnCounter``, inflating the `turns` field of the terminal `result`
+            // event by one per compaction. A real summarizer bypasses that seam
+            // entirely.
+            summarizer: summarizer,
             // Sequential to preserve Phase 1's strictly source-ordered tool
             // dispatch: `tool_use`/`tool_result` events, and the tool-result
             // messages fed back to the model, appear in the model's own call
             // order. Parallel would reorder the completion-order `tool_result`s.
             toolExecution: .sequential,
             maxTurns: maxTurns,
+            // Both were previously omitted, which meant every `-p` run compacted on
+            // the default settings against the 200K fallback window no matter what
+            // model it was talking to or what the user configured.
+            compaction: compaction,
+            contextWindow: modelRuntime.contextWindow,
             beforeToolCall: beforeToolCall
         )
 
@@ -513,13 +653,25 @@ public struct PrintMode: Sendable {
             workingDirectory: workingDirectory,
             toolNames: tools.map(\.definition.name),
             runGuard: runGuard,
+            ratesConfigured: modelRuntime.rates != nil,
             imageCapabilities: graphics.capabilities,
             cell: graphics.cell,
             imageMaxWidth: graphics.maxWidth
         )
 
         let result = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
-        return finish(result: result, turns: turnCounter.value)
+        // The totals come off the harness's own accumulator rather than a second
+        // sum kept here: one accumulator per session is the whole reason
+        // ``AgentHarness/accounting()`` exists, and a private one in this file
+        // would make `-p` and `--serve` report different numbers for the same
+        // session file.
+        //
+        // `try?` on purpose. `accounting()` resolves the session path to measure
+        // the context, and a run that produced a perfectly good answer must still
+        // print it and exit 0 if that resolution fails. The totals are then
+        // OMITTED from the `result` event rather than reported as zeros.
+        let accounting = try? await harness.accounting()
+        return finish(result: result, turns: turnCounter.value, accounting: accounting)
     }
 
     /// Builds the harness for this run's ``SessionSource``: a new file, an opened
@@ -576,7 +728,16 @@ public struct PrintMode: Sendable {
     /// failing turn (exit 1) without a further provider call — the effect Phase 1
     /// got from `shouldStopAfterTurn`.
     private func streamFunction(counter: TurnCounter, runGuard: RunGuard) -> AgentStreamFn {
-        { context in
+        // The request itself is ``makeStreamFn``'s, shared with the inline REPL and
+        // the embedded server, so an argument added there (per-alias `rates`, say)
+        // cannot reach two surfaces and miss the third. Only the guard, the counter
+        // and the heartbeat are print mode's own.
+        let request = makeStreamFn(
+            client: client,
+            runtime: modelRuntime,
+            onResponse: { metadata in onMetadata(metadata) }
+        )
+        return { context in
             if let blocking = runGuard.blockingError {
                 return AsyncThrowingStream { $0.finish(throwing: blocking) }
             }
@@ -591,12 +752,7 @@ public struct PrintMode: Sendable {
             if mode == .text, turn % Self.progressHeartbeatTurns == 0 {
                 channel.writeErr("… still working — turn \(turn)\n")
             }
-            return client.streamCompletion(
-                model: model,
-                context: context,
-                reasoningEffort: reasoningEffort,
-                onResponse: { metadata in onMetadata(metadata) }
-            )
+            return request(context)
         }
     }
 
@@ -638,7 +794,12 @@ public struct PrintMode: Sendable {
     /// occur — every other code keeps its exact meaning, and `--max-turns N` brings
     /// `2` back unchanged. The one code that gained reachability is `3`: the
     /// runaway guard is the bound an unbounded run still has.
-    private func finish(result: AgentRunResult, turns: Int) -> Int32 {
+    ///
+    /// - Parameter accounting: the session's running totals, or `nil` when they
+    ///   could not be read. `nil` omits them from the `result` event; it never
+    ///   substitutes zeros, which would be a confident claim that the run was
+    ///   free.
+    private func finish(result: AgentRunResult, turns: Int, accounting: SessionAccounting?) -> Int32 {
         let lastAssistant = Self.lastAssistant(in: result.messages)
 
         switch result.stopReason {
@@ -652,7 +813,23 @@ public struct PrintMode: Sendable {
                 return fail(lastAssistant)
             }
             if let lastAssistant { finishText(lastAssistant) }
-            log.emit("result", ["text": .string(lastAssistant?.text ?? ""), "turns": .int(turns)])
+            // `text` and `turns` keep their existing names and meanings; the
+            // `usage` object is ADDED beside them, and the event keeps its place
+            // as the last line of the stream. Adding a key cannot break a reader
+            // that ignores unknown ones, which is the only compatibility promise
+            // a newline-delimited JSON stream can offer.
+            var fields: [String: JSONValue] = [
+                "text": .string(lastAssistant?.text ?? ""),
+                "turns": .int(turns),
+            ]
+            if let accounting {
+                fields["usage"] = PrintUsageEncoding.object(
+                    accounting.usage,
+                    cost: sessionCost(accounting)
+                )
+            }
+            log.emit("result", fields)
+            reportSessionTotal(accounting)
             return 0
 
         case .errored, .aborted:
@@ -700,6 +877,49 @@ public struct PrintMode: Sendable {
         log.emit("error", ["message": .string(message), "stopReason": .string(stopReason)])
         channel.writeErr(message + "\n")
         return 1
+    }
+
+    /// Tells a human what the session has spent, on **stderr**, in text mode.
+    ///
+    /// stdout stays exactly what it was — the final answer and nothing else — for
+    /// the reason `-p` exists at all: it is piped into other programs, and a
+    /// summary line appended to the text they are parsing is a breaking change to
+    /// every one of them. stderr is where this file already puts the retry notice
+    /// and the turn heartbeat, and `--help` promises diagnostics land there.
+    ///
+    /// JSON mode says nothing here: the `result` event's `usage` object carries
+    /// the same numbers, and a second copy on stderr would only be a second thing
+    /// to keep in step.
+    ///
+    /// "Session", not "run": the harness seeds its totals by walking the file it
+    /// opened, so a `--resume`d run reports what the whole session has spent, not
+    /// only what this invocation added. For a fresh `-p` run the two are the same
+    /// number. Nothing is printed when there is nothing to report — a run that
+    /// used no tokens has no total worth a line.
+    ///
+    /// A run nothing priced says `cost unknown` rather than `$0`. `$0` is a
+    /// claim — "this cost you nothing" — and it is the wrong one to make about a
+    /// model whose price nobody ever stated; the same phase renders an unknown
+    /// context window as `?` for exactly this reason. A model configured at a
+    /// price of zero still prints `$0`, because that IS a statement.
+    private func reportSessionTotal(_ accounting: SessionAccounting?) {
+        guard mode == .text, let accounting, accounting.usage.totalTokens > 0 else { return }
+        let cost =
+            sessionCost(accounting)
+            .map { "$" + PrintUsageEncoding.decimalString($0) } ?? "cost unknown"
+        channel.writeErr("… session total: \(accounting.usage.totalTokens) tokens · \(cost)\n")
+    }
+
+    /// The session total to report, or `nil` when nothing priced this session.
+    /// One decision, read by both the `result` event and the stderr line, so the
+    /// JSON stream and the human line can never disagree about whether the run
+    /// was priced.
+    private func sessionCost(_ accounting: SessionAccounting) -> Decimal? {
+        PrintUsageEncoding.reportableCost(
+            accounting.costTotal,
+            ratesConfigured: modelRuntime.rates != nil,
+            reportedCost: accounting.usage.reportedCost
+        )
     }
 
     /// Prints the final assistant text in text mode, one text block per line to

@@ -17,6 +17,14 @@ import DoMoHarness
 import Foundation
 import SystemPackage
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
 /// Per-workspace prompt history on disk.
 ///
 /// It lives beside the workspace's sessions — `<sessionDirectory>/--<cwd>--/` —
@@ -175,37 +183,27 @@ public actor PromptHistoryStore {
             try? FileManager.default.removeItem(atPath: temporary.string)
             return
         }
-        let destination = URL(fileURLWithPath: path.string)
-        let source = URL(fileURLWithPath: temporary.string)
-        do {
-            if FileManager.default.fileExists(atPath: path.string) {
-                _ = try FileManager.default.replaceItemAt(
-                    destination,
-                    withItemAt: source,
-                    backupItemName: nil,
-                    options: [.usingNewMetadataOnly]
-                )
-            } else {
-                try FileManager.default.moveItem(at: source, to: destination)
-            }
-        } catch {
+        guard rename(temporary, to: path) else {
             try? FileManager.default.removeItem(atPath: temporary.string)
-            // `replaceItemAt` refuses destinations `rename(2)` accepts — notably a
-            // SYMLINK, which it does not follow even though the `fileExists` probe
-            // above does, and a file whose mode denies writing. Without this fallback
-            // a symlinked history file (an ordinary dotfiles arrangement) silently
-            // stopped recording forever: every append failed into this catch, and
-            // because the whole path is best-effort, nothing said so.
-            //
-            // The fallback costs a brief 0644 window before the chmod, which is
-            // strictly better than losing every prompt the user types. The normal
-            // path never reaches it.
-            guard (try? data.write(to: destination, options: .atomic)) != nil else { return }
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: path.string
-            )
+            // This is deliberately best-effort: a failed rename loses this append,
+            // but never interrupts the interactive client or replaces a symlink with
+            // a less secure fallback write.
+            return
         }
+    }
+
+    /// The same atomic move used by `AtomicFileWrite`, kept best-effort here so a
+    /// prompt-history save can never interrupt the interactive client.
+    private func rename(_ source: FilePath, to destination: FilePath) -> Bool {
+        #if canImport(Darwin)
+        return unsafe Darwin.rename(source.string, destination.string) == 0
+        #elseif canImport(Glibc)
+        return unsafe Glibc.rename(source.string, destination.string) == 0
+        #elseif canImport(Musl)
+        return unsafe Musl.rename(source.string, destination.string) == 0
+        #else
+        return false
+        #endif
     }
 
     /// `path` with a final symlink component followed to its target, or `path`

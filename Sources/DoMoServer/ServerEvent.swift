@@ -21,6 +21,18 @@ import DoMoLLM
 /// connection down. Bumping this number instead would make every older client
 /// refuse the whole session over a frame it never needed. Bump it when an
 /// EXISTING frame's shape changes, which is the case `parseFrame` cannot absorb.
+///
+/// The same rule governs the REST payloads, for the same reason one level down.
+/// A new **optional** field on a response body — ``DoMoServer/SessionStatus/accounting``
+/// is the latest, `SessionStatus.runStartedAt` was an earlier one — is absorbed in
+/// both directions by the plain `JSONDecoder` both sides use: a decoder ignores keys
+/// it does not know, and the synthesized decoder reads an `Optional` property with
+/// `decodeIfPresent`, so an absent key is `nil`. A new client reading an old server
+/// sees `nil`; an old client reading a new server ignores the key; neither fails.
+/// What is NOT covered, and what does require a bump: removing a field, renaming
+/// one, changing a field's type, or adding a **non**-optional one — each of those
+/// makes the older side's decode throw, and a throw on a REST payload is not a
+/// dropped frame, it is a route that stopped working.
 public let serverProtocolVersion = 1
 
 // MARK: - ServerEvent
@@ -62,6 +74,14 @@ public enum ServerEvent: Sendable, Hashable {
     /// A streaming assistant delta — text or reasoning, whichever this frame
     /// carried. The snapshot-bearing assembly cases are intentionally dropped.
     case messageDelta(text: String?, reasoning: String?)
+    /// A completed message. For an assistant turn this is where **per-turn
+    /// accounting** crosses the wire, and why there is no usage frame of its own:
+    /// the whole ``DoMoLLM/Message`` is encoded, ``DoMoLLM/AssistantMessage``'s
+    /// `CodingKeys` include `usage`, and that property is non-optional, so every
+    /// assistant `message_end` carries the turn's ``DoMoLLM/Usage`` whether or not a
+    /// consumer wants it. What a subscriber cannot reconstruct from these is the
+    /// session's *cumulative* total — the turns before it attached were never on its
+    /// stream — which is what ``DoMoServer/SessionStatus/accounting`` is for.
     case messageEnd(Message)
     case toolStart(id: String, name: String, arguments: JSONValue)
     case toolEnd(id: String, name: String, output: String, isError: Bool, imageCount: Int)

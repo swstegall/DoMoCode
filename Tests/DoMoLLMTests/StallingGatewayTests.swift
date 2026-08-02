@@ -27,6 +27,16 @@ import Glibc
 
 import DoMoLLM
 
+/// `SOCK_STREAM` is an `Int32` on Darwin and an enum on Glibc; normalize it.
+/// The same shim already exists in five other test files — `MockGateway.swift`
+/// documents it — and this was the one socket that never got it, because the
+/// Linux build has not compiled the test targets since 2026-07-25.
+#if canImport(Glibc)
+private let stallingStreamSocketType = Int32(SOCK_STREAM.rawValue)
+#else
+private let stallingStreamSocketType = SOCK_STREAM
+#endif
+
 /// A listener that writes an HTTP/1.1 head plus two SSE chunks and then goes
 /// silent, keeping the connection open until it is torn down.
 ///
@@ -61,7 +71,7 @@ private final class StallingGateway: @unchecked Sendable {
     /// Bind an ephemeral loopback port and start listening. Split out of `init`
     /// so the accept thread can capture a plain fd rather than a half-built self.
     private static func bindLoopback() throws -> (fd: Int32, port: Int) {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        let fd = socket(AF_INET, stallingStreamSocketType, 0)
         guard fd >= 0 else { throw GatewayError.setup("socket") }
 
         var yes: Int32 = 1

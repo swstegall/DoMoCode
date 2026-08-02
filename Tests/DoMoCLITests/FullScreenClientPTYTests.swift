@@ -28,14 +28,12 @@ private final class PseudoTerminal {
     let slavePath: String
 
     init() throws {
-        let fd = posix_openpt(O_RDWR | O_NOCTTY)
-        guard fd >= 0 else { throw MockGatewayError("posix_openpt failed: \(errno)") }
-        guard grantpt(fd) == 0, unlockpt(fd) == 0, let name = ptsname(fd) else {
-            closeDescriptor(fd)
+        guard let opened = openPTYMaster() else {
             throw MockGatewayError("pty setup failed: \(errno)")
         }
+        let fd = opened.master
         master = fd
-        slavePath = String(cString: name)
+        slavePath = opened.slaveName
         // Non-blocking, so draining never parks the test on a child that has
         // simply stopped painting.
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
@@ -118,6 +116,10 @@ struct FullScreenClientPTYTests {
             "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
             // Live since the stream idle bound was wired.
             "DOMOCODE_STREAM_TIMEOUT_MS",
+            // CI enables this for the test runner, but the macOS release
+            // runtime rejects the inherited crash-backtrace hook in this
+            // spawned PTY client and aborts before it can accept input.
+            "SWIFT_BACKTRACE",
         ] {
             environment.removeValue(forKey: key)
         }
@@ -332,13 +334,19 @@ struct FullScreenClientPTYTests {
             "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
             // Live since the stream idle bound was wired.
             "DOMOCODE_STREAM_TIMEOUT_MS",
+            // Keep test-runner diagnostics out of the optimized application
+            // child; see the matching environment cleanup above.
+            "SWIFT_BACKTRACE",
         ] {
             environment.removeValue(forKey: key)
         }
         process.environment = environment
         process.standardInput = slave
         process.standardOutput = slave
-        process.standardError = Pipe()
+        // Keep child diagnostics out of the pty transcript, but surface them in
+        // the test runner. A release-only child crash otherwise looks exactly
+        // like an input or gateway hang because the error pipe is never read.
+        process.standardError = FileHandle.standardError
         try process.run()
         return process
     }

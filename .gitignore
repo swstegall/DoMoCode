@@ -67,3 +67,9 @@ fastlane/test_output
 # specific toolchain, and a checked-in .swift-version would switch every
 # contributor to whatever release the file names. CI enforces the floor.
 .swift-version
+
+# Ephemeral git worktrees created by review agents.
+.claude/worktrees/
+
+# Scratch path for cross-checking the Linux build in Docker.
+.build-linux/

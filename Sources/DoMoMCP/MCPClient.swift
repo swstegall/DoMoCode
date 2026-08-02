@@ -106,7 +106,17 @@ public actor MCPClient {
         // known versions, so proceeding is more compatible than disconnecting. But an
         // UNKNOWN version is worth a warning — it may mean tools behave unexpectedly.
         if let version = initResult["protocolVersion"]?.stringValue, !knownProtocolVersions.contains(version) {
-            log?("MCP server '\(serverName)' negotiated an unrecognized protocol version '\(version)'; proceeding anyway.")
+            // Redacted because BOTH interpolations are attacker-influenced: the
+            // version is whatever an untrusted subprocess chose to send, and the
+            // server name comes from a settings.json that may itself have been
+            // written by a project. `log` is wired to stderr, which is what a
+            // user pastes into a bug report.
+            log?(
+                Redaction.diagnostic(
+                    "MCP server '\(serverName)' negotiated an unrecognized protocol version "
+                        + "'\(version)'; proceeding anyway."
+                )
+            )
         }
 
         try await notify("notifications/initialized", params: nil)

@@ -274,4 +274,161 @@ struct SessionEntryTests {
             _ = try decoder.decode(SessionTreeEntry.self, from: json)
         }
     }
+
+    // MARK: - seq / elapsedMs backward compatibility
+
+    // The compatibility proof for the two envelope fields added after the format
+    // shipped. The expected JSON is written out as a literal rather than
+    // compared against this encoder's own output: comparing an encoder to itself
+    // would still pass if `seq` were emitted unconditionally as `null`, which is
+    // precisely the regression these tests exist to catch.
+
+    @Test("an entry with neither seq nor elapsedMs encodes byte-identically to the pre-field format")
+    func omittedWhenNilSessionInfo() throws {
+        let entry = SessionTreeEntry(
+            id: "a1",
+            parentId: nil,
+            timestamp: "2026-07-23T12:00:01.000Z",
+            payload: .sessionInfo(name: "root")
+        )
+        let json = String(decoding: try encoder.encode(entry), as: UTF8.self)
+        #expect(
+            json == #"{"id":"a1","name":"root","parentId":null,"timestamp":"2026-07-23T12:00:01.000Z","type":"session_info"}"#
+        )
+    }
+
+    @Test("a leaf entry with neither field keeps its explicit null targetId and gains nothing else")
+    func omittedWhenNilLeaf() throws {
+        let entry = SessionTreeEntry(
+            id: "lf",
+            parentId: "p",
+            timestamp: "t",
+            payload: .leaf(targetId: nil)
+        )
+        let json = String(decoding: try encoder.encode(entry), as: UTF8.self)
+        #expect(json == #"{"id":"lf","parentId":"p","targetId":null,"timestamp":"t","type":"leaf"}"#)
+    }
+
+    @Test("a model_change entry with neither field encodes byte-identically")
+    func omittedWhenNilModelChange() throws {
+        let entry = SessionTreeEntry(
+            id: "mc",
+            parentId: "p",
+            timestamp: "t",
+            payload: .modelChange(provider: "openai", modelId: "gpt-4o")
+        )
+        let json = String(decoding: try encoder.encode(entry), as: UTF8.self)
+        #expect(
+            json == #"{"id":"mc","modelId":"gpt-4o","parentId":"p","provider":"openai","timestamp":"t","type":"model_change"}"#
+        )
+    }
+
+    @Test("seq and elapsedMs are emitted when set and round-trip")
+    func seqAndElapsedRoundTrip() throws {
+        let entry = SessionTreeEntry(
+            id: "a1",
+            parentId: nil,
+            timestamp: "t",
+            payload: .sessionInfo(name: "root"),
+            seq: 7,
+            elapsedMs: 1234
+        )
+        let json = String(decoding: try encoder.encode(entry), as: UTF8.self)
+        #expect(
+            json == #"{"elapsedMs":1234,"id":"a1","name":"root","parentId":null,"seq":7,"timestamp":"t","type":"session_info"}"#
+        )
+        let decoded = try roundTrip(entry)
+        #expect(decoded == entry)
+        #expect(decoded.seq == 7)
+        #expect(decoded.elapsedMs == 1234)
+    }
+
+    @Test("seq 0 and elapsedMs 0 survive the round trip as values, not as absence")
+    func zeroIsNotAbsence() throws {
+        let entry = SessionTreeEntry(
+            id: "z",
+            parentId: nil,
+            timestamp: "t",
+            payload: .message(.user("hi")),
+            seq: 0,
+            elapsedMs: 0
+        )
+        let json = String(decoding: try encoder.encode(entry), as: UTF8.self)
+        #expect(json.contains(#""seq":0"#))
+        #expect(json.contains(#""elapsedMs":0"#))
+        let decoded = try roundTrip(entry)
+        #expect(decoded.seq == 0)
+        #expect(decoded.elapsedMs == 0)
+    }
+
+    @Test("a hand-written line from before the fields existed decodes with both nil")
+    func legacyLineDecodesWithNilFields() throws {
+        let json = Data(
+            #"{"type":"message","id":"m1","parentId":null,"timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#
+                .utf8
+        )
+        let decoded = try decoder.decode(SessionTreeEntry.self, from: json)
+        #expect(decoded.seq == nil)
+        #expect(decoded.elapsedMs == nil)
+        #expect(decoded.id == "m1")
+        #expect(decoded.payload == .message(.user("hello")))
+    }
+
+    @Test("only one of the two fields present decodes independently")
+    func partiallyPopulatedLineDecodes() throws {
+        let seqOnly = Data(
+            #"{"type":"session_info","id":"s1","parentId":null,"timestamp":"t","name":"n","seq":3}"#.utf8
+        )
+        let decodedSeq = try decoder.decode(SessionTreeEntry.self, from: seqOnly)
+        #expect(decodedSeq.seq == 3)
+        #expect(decodedSeq.elapsedMs == nil)
+
+        let elapsedOnly = Data(
+            #"{"type":"session_info","id":"s2","parentId":null,"timestamp":"t","name":"n","elapsedMs":42}"#.utf8
+        )
+        let decodedElapsed = try decoder.decode(SessionTreeEntry.self, from: elapsedOnly)
+        #expect(decodedElapsed.seq == nil)
+        #expect(decodedElapsed.elapsedMs == 42)
+    }
+
+    @Test("an unknown extra field is ignored, so forward compatibility is field-additive")
+    func unknownFieldIsIgnored() throws {
+        // Complements `unknownTypeThrows`: an unknown entry TYPE is fatal, an
+        // unknown FIELD is not. That asymmetry is the whole forward-compatibility
+        // story for this format and nothing pinned it before.
+        let json = Data(
+            #"{"type":"session_info","id":"f1","parentId":null,"timestamp":"t","name":"n","seq":2,"thinkingLevel":"high","extra":{"nested":[1,2]}}"#
+                .utf8
+        )
+        let decoded = try decoder.decode(SessionTreeEntry.self, from: json)
+        #expect(decoded.id == "f1")
+        #expect(decoded.seq == 2)
+        if case .sessionInfo(let name) = decoded.payload {
+            #expect(name == "n")
+        } else {
+            Issue.record("expected sessionInfo payload")
+        }
+    }
+
+    @Test("seq and elapsedMs participate in equality, so a mismatch is not silently equal")
+    func fieldsAffectEquality() {
+        let base = SessionTreeEntry(id: "e", parentId: nil, timestamp: "t", payload: .sessionInfo(name: nil))
+        let withSeq = SessionTreeEntry(
+            id: "e",
+            parentId: nil,
+            timestamp: "t",
+            payload: .sessionInfo(name: nil),
+            seq: 0
+        )
+        let withElapsed = SessionTreeEntry(
+            id: "e",
+            parentId: nil,
+            timestamp: "t",
+            payload: .sessionInfo(name: nil),
+            elapsedMs: 0
+        )
+        #expect(base != withSeq)
+        #expect(base != withElapsed)
+        #expect(withSeq != withElapsed)
+    }
 }

@@ -237,6 +237,10 @@ public struct ToolContext: Sendable {
     public let toolLocator: ExternalToolLocator
 
     /// The environment `bash` runs under.
+    ///
+    /// Defaults to ``scrubbedEnvironment(alsoUnsetting:)``, not
+    /// `ShellEnvironment.inherit`. See that method for why the default is where
+    /// the fix has to live.
     public let environment: ShellEnvironment
 
     public init(
@@ -244,7 +248,7 @@ public struct ToolContext: Sendable {
         shell: any Shell,
         mutations: FileMutationCoordinator? = nil,
         toolLocator: ExternalToolLocator = .pathSearch,
-        environment: ShellEnvironment = .inherit
+        environment: ShellEnvironment = ToolContext.scrubbedEnvironment()
     ) {
         self.fileSystem = fileSystem
         self.shell = shell
@@ -261,7 +265,7 @@ public struct ToolContext: Sendable {
         shell: any Shell,
         base: some FileSystem = POSIXFileSystem(),
         toolLocator: ExternalToolLocator = .pathSearch,
-        environment: ShellEnvironment = .inherit
+        environment: ShellEnvironment = ToolContext.scrubbedEnvironment()
     ) async throws(DoMoError) -> ToolContext {
         let sandboxed = try await SandboxedFileSystem.rooted(at: root, using: base)
         return ToolContext(
@@ -275,6 +279,44 @@ public struct ToolContext: Sendable {
     public var sandbox: PathSandbox { fileSystem.sandbox }
     public var base: any FileSystem { fileSystem.base }
     public var workingDirectory: FilePath { fileSystem.workingDirectory }
+
+    /// This process's environment with the LLM gateway credential variables
+    /// unset — the environment every tool subprocess gets unless a caller says
+    /// otherwise.
+    ///
+    /// `bash` is a tool the MODEL drives. With a plain inherited environment,
+    /// `env` — or `printenv DOMOCODE_API_KEY`, or a `curl` the model writes —
+    /// reads the gateway credential straight out of the child and returns it as
+    /// tool OUTPUT, which is persisted to the session JSONL and replayed
+    /// verbatim into the context of every subsequent request. Tool output is
+    /// deliberately never redacted (it is conversation state; rewriting it
+    /// corrupts a resume), so the only place to stop this is before the
+    /// subprocess can see the variable at all.
+    ///
+    /// This is the DEFAULT rather than a helper a caller opts into, and that is
+    /// the substance of the fix: a helper is something a new construction site
+    /// forgets, and nothing fails when it does.
+    ///
+    /// Only the credential names are removed. Everything else is inherited on
+    /// purpose — a `bash` with no `PATH`, no `HOME` and no `LANG` cannot run the
+    /// build the user asked about, and a tool that cannot do its job is not a
+    /// security win.
+    ///
+    /// - Parameter extraNames: further names to unset, for a deployment whose
+    ///   key lives outside ``DoMoCore/Redaction/secretEnvironmentNames`` — the
+    ///   CLI passes its configured `apiKeyEnv` here. Passed in rather than read
+    ///   from configuration because this module has none.
+    public static func scrubbedEnvironment(alsoUnsetting extraNames: Set<String> = []) -> ShellEnvironment {
+        var overrides: [String: String?] = [:]
+        // `updateValue(nil, forKey:)`, not `overrides[name] = nil`. The
+        // dictionary's value type is `String?`, so the subscript form REMOVES
+        // the entry — leaving an empty override map that scrubs nothing, with
+        // no compiler complaint. `updateValue` stores a present key whose value
+        // is nil, which is what `ShellEnvironment` reads as "unset this".
+        for name in Redaction.secretEnvironmentNames { overrides.updateValue(nil, forKey: name) }
+        for name in extraNames { overrides.updateValue(nil, forKey: name) }
+        return .inherit(overrides)
+    }
 }
 
 // MARK: - External tool location

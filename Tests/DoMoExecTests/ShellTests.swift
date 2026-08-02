@@ -61,7 +61,7 @@ private func readPID(_ path: FilePath) -> Int32? {
 
 // MARK: - Basics
 
-@Suite("Shell", .timeLimit(.minutes(2)))
+@Suite("Shell", .serialized, .timeLimit(.minutes(2)))
 struct ShellBasicsTests {
     @Test("runs a command and captures stdout")
     func capturesStandardOutput() async throws {
@@ -152,7 +152,7 @@ struct ShellBasicsTests {
 
 // MARK: - Environment
 
-@Suite("Shell environment", .timeLimit(.minutes(2)))
+@Suite("Shell environment", .serialized, .timeLimit(.minutes(2)))
 struct ShellEnvironmentTests {
     @Test("overrides an inherited variable")
     func overridesInheritedVariable() async throws {
@@ -184,7 +184,7 @@ struct ShellEnvironmentTests {
 
 // MARK: - Output bounding
 
-@Suite("Shell output bounding", .timeLimit(.minutes(2)))
+@Suite("Shell output bounding", .serialized, .timeLimit(.minutes(2)))
 struct ShellOutputTests {
     @Test("bounds gigabyte-scale output to head and tail")
     func boundsHugeOutput() async throws {
@@ -250,7 +250,7 @@ struct ShellOutputTests {
 
 // MARK: - Timeouts, cancellation, process groups
 
-@Suite("Shell termination", .timeLimit(.minutes(2)))
+@Suite("Shell termination", .serialized, .timeLimit(.minutes(2)))
 struct ShellTerminationTests {
     @Test("a timeout kills a sleeping process")
     func timeoutKillsSleep() async throws {
@@ -358,7 +358,7 @@ struct ShellTerminationTests {
 
 // MARK: - Rejected requests
 
-@Suite("Shell validation", .timeLimit(.minutes(2)))
+@Suite("Shell validation", .serialized, .timeLimit(.minutes(2)))
 struct ShellValidationTests {
     @Test("rejects a non-positive timeout")
     func rejectsNonPositiveTimeout() async throws {

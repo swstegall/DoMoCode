@@ -9,6 +9,11 @@
 // `\n` and delivered as `lines`. Teardown closes stdin then cancels the Task, whose
 // teardown sequence sends SIGTERM (grace) then SIGKILL to the child's process group.
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Subprocess
 
@@ -83,9 +88,20 @@ actor PersistentProcess {
         /// Working directory for the child, or nil to inherit.
         var workingDirectory: String?
         /// Environment variable names to REMOVE from the inherited environment before
-        /// spawning (overlaid `environment` still wins if it re-provides one). The MCP
-        /// subprocess is untrusted code; scrubbing the harness's LLM-gateway credential
-        /// names keeps a compromised server from reading them out of its own environment.
+        /// spawning. The MCP subprocess is untrusted code; scrubbing the harness's
+        /// LLM-gateway credential names keeps a compromised server from reading them out
+        /// of its own environment.
+        ///
+        /// The overlaid `environment` is applied AFTER these removals, so a server that
+        /// legitimately re-provides one of these names still gets it — see `start`. That
+        /// ordering is deliberate and it is only safe in company: it means a settings.json
+        /// can hand an MCP server any value it can *write*, so the thing that must hold
+        /// the line is config interpolation refusing to *resolve* a credential name.
+        /// `DoMoCore.InterpolationPolicy.deniedEnvironmentNames` — seeded from
+        /// `Redaction.secretEnvironmentNames` on both the trusted and the untrusted
+        /// policy — is what makes `{"env": {"X": "{env:DOMOCODE_API_KEY}"}}` a hard
+        /// config diagnostic rather than a laundering route straight back through this
+        /// overlay. Change either mechanism and the other stops being sufficient.
         var sensitiveEnvKeys: Set<String> = []
         /// Grace between SIGTERM and SIGKILL on teardown.
         var terminationGrace: Duration = .seconds(2)
@@ -116,6 +132,12 @@ actor PersistentProcess {
     func start(_ spawn: Spawn) {
         guard runTask == nil else { return }
 
+        // A server is allowed to exit at any point, including between spawn and
+        // the first JSON-RPC frame. On Linux, writing to its closed stdin would
+        // otherwise deliver SIGPIPE before `writer.write` can report EPIPE and
+        // let the manager isolate the failed server.
+        signal(SIGPIPE, SIG_IGN)
+
         var platformOptions = PlatformOptions()
         // The child (and its descendants, e.g. `npx` -> node) get their own session, so
         // the group-targeted teardown signals never reach this harness.
@@ -126,7 +148,10 @@ actor PersistentProcess {
 
         // Build the environment overlay: first mark each sensitive key for REMOVAL (a
         // `nil` value in `updating` unsets an inherited variable), then apply the config
-        // overlay so a server that legitimately re-provides one still gets it.
+        // overlay so a server that legitimately re-provides one still gets it. The order
+        // is the documented contract on `Spawn.sensitiveEnvKeys`, and it is what config
+        // interpolation's env denylist is protecting — do not reverse it without reading
+        // that note.
         var overrides: [Subprocess.Environment.Key: String?] = [:]
         for key in spawn.sensitiveEnvKeys {
             overrides.updateValue(nil, forKey: Subprocess.Environment.Key(stringLiteral: key))
@@ -161,56 +186,80 @@ actor PersistentProcess {
                 // Record the pid (== pgid, since createSession made the child a group
                 // leader) so shutdown can signal the whole group and reap descendants.
                 childPID.set(execution.processIdentifier.value)
-                await withTaskGroup(of: Void.self) { group in
-                    // Writer: drain outgoing lines to stdin, newline-framed.
-                    group.addTask {
-                        let writer = execution.standardInputWriter
-                        writing: for await line in outgoing {
-                            var frame = line
-                            frame.append(0x0A)
-                            var offset = 0
-                            while offset < frame.count {
-                                let written = (try? await writer.write(Array(frame[offset...]))) ?? 0
-                                // A write that makes no progress means the pipe is gone
-                                // (child exited/EPIPE). Stop the whole writer rather than
-                                // starting the next frame — otherwise a half-written frame
-                                // would be spliced onto the next one as corrupt JSON.
-                                if written <= 0 { break writing }
-                                offset += written
-                            }
-                        }
-                        try? await writer.finish()   // stdin EOF — most stdio servers exit
-                    }
+                // Keep the three pumps concurrent, but coordinate them with an
+                // AsyncStream rather than a task group. On optimized Swift 6.3
+                // runtimes, tearing down a task group while Subprocess is unwinding
+                // its execution closure can trip the runtime's stack-allocation
+                // assertion. These are deliberately unstructured tasks so the
+                // cancellation handler below can retire them explicitly.
+                let (completions, completionContinuation) = AsyncStream.makeStream(of: Void.self)
 
+                let writerTask = Task {
+                    defer { completionContinuation.yield(()) }
+                    let writer = execution.standardInputWriter
+                    writing: for await line in outgoing {
+                        var frame = line
+                        frame.append(0x0A)
+                        var offset = 0
+                        while offset < frame.count {
+                            let written = (try? await writer.write(Array(frame[offset...]))) ?? 0
+                            // A write that makes no progress means the pipe is gone
+                            // (child exited/EPIPE). Stop the whole writer rather than
+                            // starting the next frame — otherwise a half-written frame
+                            // would be spliced onto the next one as corrupt JSON.
+                            if written <= 0 { break writing }
+                            offset += written
+                        }
+                    }
+                    try? await writer.finish()   // stdin EOF — most stdio servers exit
+                }
+
+                let stdoutTask = Task {
+                    defer { completionContinuation.yield(()) }
                     // Reader: frame stdout into lines (see LineFramer). A line past the cap
                     // is a protocol violation — stop framing so a flood can't exhaust memory.
-                    group.addTask {
-                        var framer = LineFramer(maxLineBytes: maxLineBytes)
-                        do {
-                            reading: for try await chunk in execution.standardOutput {
-                                let bytes: [UInt8] = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
-                                for line in framer.feed(bytes) { linesContinuation.yield(line) }
-                                if framer.overflowed { break reading }
-                            }
-                        } catch {
-                            // The pipe closed on teardown; treat as end-of-stream.
+                    var framer = LineFramer(maxLineBytes: maxLineBytes)
+                    do {
+                        reading: for try await chunk in execution.standardOutput {
+                            let bytes: [UInt8] = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
+                            for line in framer.feed(bytes) { linesContinuation.yield(line) }
+                            if framer.overflowed { break reading }
                         }
-                        if let last = framer.finish() { linesContinuation.yield(last) }
-                        linesContinuation.finish()
+                    } catch {
+                        // The pipe closed on teardown; treat as end-of-stream.
                     }
+                    if let last = framer.finish() { linesContinuation.yield(last) }
+                    linesContinuation.finish()
+                }
 
+                let stderrTask = Task {
+                    defer { completionContinuation.yield(()) }
                     // Stderr: drain and discard so a chatty server's pipe never fills
                     // (an undrained stderr pipe eventually blocks the child).
-                    group.addTask {
-                        do {
-                            for try await chunk in execution.standardError {
-                                _ = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
-                            }
-                        } catch {}
-                    }
-
-                    await group.waitForAll()
+                    do {
+                        for try await chunk in execution.standardError {
+                            _ = unsafe chunk.withUnsafeBytes { unsafe Array($0) }
+                        }
+                    } catch {}
                 }
+
+                await withTaskCancellationHandler(operation: {
+                    var iterator = completions.makeAsyncIterator()
+                    for _ in 0..<3 { _ = await iterator.next() }
+                }, onCancel: {
+                    writerTask.cancel()
+                    stdoutTask.cancel()
+                    stderrTask.cancel()
+                    completionContinuation.finish()
+                })
+
+                // The completion markers are emitted before each task returns. Awaiting
+                // the task values closes that small gap and makes the execution closure
+                // deterministic on both normal exit and cancellation.
+                await writerTask.value
+                await stdoutTask.value
+                await stderrTask.value
+                completionContinuation.finish()
             }
             // The child has exited (and swift-subprocess has reaped it): forget its pid so a
             // later shutdown can't signal a reaped/reused pgid.
