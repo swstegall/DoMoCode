@@ -214,17 +214,6 @@ public final class TerminalDriver {
     /// A failure entering raw mode (the descriptor was not a terminal), if any.
     public private(set) var startupError: DoMoError?
 
-    /// Events read off the terminal's non-actor sources and applied by the one
-    /// main-actor loop below. Keeping the handoff as data avoids scheduling one
-    /// actor hop per input chunk, which is especially important when a scripted
-    /// stream is already buffered before the driver starts waiting.
-    private enum DriverEvent: Sendable {
-        case input([UInt8])
-        case resize(TerminalSize)
-        case inputEnded
-        case quit
-    }
-
     public init(
         input: AsyncStream<[UInt8]>,
         resize: AsyncStream<TerminalSize>,
@@ -235,6 +224,9 @@ public final class TerminalDriver {
         self.lifecycle = lifecycle
     }
 
+    /// The exit reasons a child of the run group can report. `quit` and
+    /// `inputEnded` end the session; a finished resize stream or completed
+    /// background job do not (the user is still typing).
     /// Run the interactive session until quit, input EOF, or cancellation.
     ///
     /// - Parameters:
@@ -296,53 +288,43 @@ public final class TerminalDriver {
             backgroundTask = Task { await background() }
         }
 
-        // Keep the source readers detached, but apply their events in one
-        // main-actor loop. The readers never schedule UI work themselves: they
-        // only enqueue values, so a buffered script cannot strand a per-chunk
-        // MainActor.run hop behind the run loop's own wait. Input EOF is a normal
-        // session-ending event; resize EOF is not. Avoiding a task-group teardown
+        // Keep the pumps concurrent, but use the existing quit signal as their
+        // one completion channel rather than nesting another AsyncStream
+        // coordinator. Input EOF is a normal session-ending event, just like a
+        // quit key; resize EOF is not, because a resize source may be closed
+        // while the UI itself remains live. Avoiding a nested task-group teardown
         // keeps optimized Swift runtimes from tripping their stack assertion.
-        let (events, eventContinuation) = AsyncStream.makeStream(of: DriverEvent.self)
-        let inputTask = Task.detached { [input, eventContinuation] in
+        // The stream readers are detached so waiting for input or resize never
+        // competes with the UI task for main-actor scheduling. Each event then
+        // crosses back explicitly for the small stateful UI handoff. The live
+        // stream's descriptor callback already runs on its own Dispatch queue;
+        // keeping the AsyncStream wait detached makes that boundary explicit on
+        // both Darwin and Linux.
+        let inputTask = Task.detached { [input, quit] in
             for await chunk in input {
-                guard !Task.isCancelled else { return }
-                eventContinuation.yield(.input(chunk))
+                await MainActor.run {
+                    self.ingest(chunk, app: app)
+                }
             }
-            if !Task.isCancelled { eventContinuation.yield(.inputEnded) }
+            quit.quit()
         }
-        let resizeTask = Task.detached { [resize, eventContinuation] in
+        let resizeTask = Task.detached { [resize] in
             for await size in resize {
-                guard !Task.isCancelled else { return }
-                eventContinuation.yield(.resize(size))
+                await MainActor.run {
+                    self.handleResize(size, app: app)
+                }
             }
-        }
-        let quitTask = Task.detached { [quit, eventContinuation] in
-            await quit.wait()
-            if !Task.isCancelled { eventContinuation.yield(.quit) }
         }
 
         await withTaskCancellationHandler(operation: {
-            for await event in events {
-                switch event {
-                case .input(let chunk):
-                    self.ingest(chunk, app: app)
-                case .resize(let size):
-                    self.handleResize(size, app: app)
-                case .inputEnded, .quit:
-                    return
-                }
-            }
+            await quit.wait()
         }, onCancel: {
             inputTask.cancel()
             resizeTask.cancel()
-            quitTask.cancel()
-            eventContinuation.finish()
         })
 
         inputTask.cancel()
         resizeTask.cancel()
-        quitTask.cancel()
-        eventContinuation.finish()
     }
 
     // MARK: Input
