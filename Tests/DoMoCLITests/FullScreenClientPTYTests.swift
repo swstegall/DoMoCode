@@ -116,6 +116,10 @@ struct FullScreenClientPTYTests {
             "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
             // Live since the stream idle bound was wired.
             "DOMOCODE_STREAM_TIMEOUT_MS",
+            // CI enables this for the test runner, but the macOS release
+            // runtime rejects the inherited crash-backtrace hook in this
+            // spawned PTY client and aborts before it can accept input.
+            "SWIFT_BACKTRACE",
         ] {
             environment.removeValue(forKey: key)
         }
@@ -330,6 +334,9 @@ struct FullScreenClientPTYTests {
             "OPENAI_API_KEY", "LITELLM_API_KEY", "DOMOCODE_MODEL", "DOMOCODE_BASE_URL",
             // Live since the stream idle bound was wired.
             "DOMOCODE_STREAM_TIMEOUT_MS",
+            // Keep test-runner diagnostics out of the optimized application
+            // child; see the matching environment cleanup above.
+            "SWIFT_BACKTRACE",
         ] {
             environment.removeValue(forKey: key)
         }
