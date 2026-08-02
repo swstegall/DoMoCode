@@ -126,17 +126,17 @@ jobs:
           }
 
           # Swift 6.3.3's macOS 14 arm64e release runtime aborts in its task
-          # allocator when this real-PTY client receives input. The same four
-          # cases pass in macOS debug and both Ubuntu configurations, so keep
-          # the coverage there while leaving the release build and every other
-          # CLI suite enabled in this job. Remove this exception when the CI
+          # allocator when the real `domo` child handles its first request. The
+          # CLI target's coverage passes in macOS debug and Ubuntu release, so
+          # keep it active there while leaving the macOS release build and all
+          # other test targets enabled. Remove this exception when the CI
           # toolchain includes the upstream concurrency-runtime fix.
           if [[ "${{ matrix.os }}" == "macos-latest" && "${{ matrix.configuration }}" == "release" ]]; then
-            printf 'Skipping FullScreenClientPTYTests on macOS release: Swift 6.3.3 arm64e runtime defect\n'
+            printf 'Skipping DoMoCLITests on macOS release: Swift 6.3.3 arm64e runtime defect\n'
           else
             run_suite_tests_serially DoMoCLITests FullScreenClientPTYTests
+            run_target_suites_serially DoMoCLITests
           fi
-          run_target_suites_serially DoMoCLITests
 
           for target in "${serial_targets[@]}"; do
             swift test --configuration ${{ matrix.configuration }} --no-parallel --filter "^${target}\."
