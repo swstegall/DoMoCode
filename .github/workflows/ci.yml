@@ -95,11 +95,37 @@ jobs:
               return 1
             fi
             while IFS= read -r suite; do
+              # The full-screen PTY fixture starts and force-stops a real child
+              # process. On macOS release, keeping its four cases in one Swift
+              # Testing process leaves the optimized child allocator corrupted
+              # after the first two cases; preserve coverage but give each case
+              # a fresh test process below.
+              if [[ "$target" == "DoMoCLITests" && "$suite" == "FullScreenClientPTYTests" ]]; then
+                continue
+              fi
               swift test --configuration ${{ matrix.configuration }} --no-parallel \
                 --filter "^${target}\\.${suite}/"
             done <<< "$suites"
           }
 
+          run_suite_tests_serially() {
+            local target="$1"
+            local suite="$2"
+            local tests
+            tests="$(swift test list --configuration ${{ matrix.configuration }} \
+              | sed -n "s/^${target}\\.${suite}\\/\\(.*\\)$/\\1/p" \
+              | sort -u)"
+            if [[ -z "$tests" ]]; then
+              printf 'No test cases discovered for %s.%s\\n' "$target" "$suite" >&2
+              return 1
+            fi
+            while IFS= read -r test; do
+              swift test --configuration ${{ matrix.configuration }} --no-parallel \
+                --filter "^${target}\\.${suite}/${test}"
+            done <<< "$tests"
+          }
+
+          run_suite_tests_serially DoMoCLITests FullScreenClientPTYTests
           run_target_suites_serially DoMoCLITests
 
           for target in "${serial_targets[@]}"; do
