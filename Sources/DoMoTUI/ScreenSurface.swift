@@ -307,6 +307,22 @@ public final class ScreenSurface: TerminalApp {
         requestRender()
     }
 
+    /// Move an existing overlay above every other overlay without rebuilding it.
+    ///
+    /// Some full-screen clients deliberately stack a diagnostic view over a modal:
+    /// the modal still owns the underlying action, while the diagnostic view is the
+    /// explanation for why that action is parked. Keeping the z-order explicit is
+    /// important when the modal is reconciled after the diagnostic view was opened.
+    func bringOverlayToFront(_ entry: OverlayStackEntry) {
+        guard let index = overlayStack.firstIndex(where: { $0 === entry }) else { return }
+        guard index != overlayStack.index(before: overlayStack.endIndex) else { return }
+        overlayStack.remove(at: index)
+        overlayCounter += 1
+        entry.focusOrder = overlayCounter
+        overlayStack.append(entry)
+        requestRender()
+    }
+
     /// Toggle an overlay's hidden flag (backs ``ScreenOverlayHandle/setHidden(_:)``).
     ///
     /// Hiding is a soft remove: if the entry owned the caret it is dimmed and focus
@@ -410,6 +426,11 @@ public final class ScreenOverlayHandle {
     /// Hide or re-show this overlay without removing it from the stack.
     public func setHidden(_ hidden: Bool) {
         surface?.setOverlayHidden(entry, hidden)
+    }
+
+    /// Raise this overlay above the other visible overlays.
+    public func bringToFront() {
+        surface?.bringOverlayToFront(entry)
     }
 
     /// Whether this overlay is currently painted.

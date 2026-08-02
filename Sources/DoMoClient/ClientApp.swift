@@ -1853,6 +1853,10 @@ public final class ClientApp {
         } else if permissionHandle != nil {
             dismissPermissionOverlay()
         }
+        // A permission event may be reconciled after ^G opened diagnostics. The
+        // modal belongs underneath that panel: it explains the parked action, but
+        // must not hide the panel's client/server state rows.
+        diagnosticsHandle?.bringToFront()
     }
 
     /// The modal's outer width. The content is framed in a ``Box``, whose rows are
