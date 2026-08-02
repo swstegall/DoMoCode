@@ -61,6 +61,12 @@ public actor AgentHarness {
     private var leaf: String? { leafChain.last }
 
     private let configuration: Configuration
+    /// The model and stream selected for the current branch. The configuration
+    /// remains the immutable set of tools and defaults; these values are the
+    /// persisted, user-facing model choice.
+    private var activeModel: String
+    private var activeStreamFn: AgentStreamFn
+    private var activeContextWindow: Int?
 
     /// Guards against a second concurrent ``run(prompt:sink:)``. Set and read only
     /// in the synchronous prologue of an actor method, so a re-entrant call sees it
@@ -91,6 +97,10 @@ public actor AgentHarness {
         self.store = store
         self.leafChain = leaf.map { [$0] } ?? []
         self.configuration = configuration
+        self.activeModel = seed.model ?? configuration.model
+        self.activeStreamFn = configuration.streamFnForModel?(seed.model ?? configuration.model) ?? configuration.streamFn
+        self.activeContextWindow = configuration.contextWindowForModel?(seed.model ?? configuration.model)
+            ?? configuration.contextWindow
         self.nextSeq = seed.nextSeq
         self.accumulatedUsage = seed.usage
         self.recordedTurns = seed.turns
@@ -103,9 +113,10 @@ public actor AgentHarness {
         var nextSeq: Int
         var usage: Usage
         var turns: Int
+        var model: String?
 
         /// A brand-new file: numbering starts at zero and nothing has been spent.
-        static let fresh = Seed(nextSeq: 0, usage: .zero, turns: 0)
+        static let fresh = Seed(nextSeq: 0, usage: .zero, turns: 0, model: nil)
     }
 
     /// Everything a harness resumes with: the file's running totals, plus the
@@ -117,9 +128,30 @@ public actor AgentHarness {
     /// crash-truncated line is missing from it, and a file written before ordering
     /// keys existed has no `seq` to take a maximum of at all. The store counts raw
     /// lines for those, which over-counts — the safe direction.
-    private static func seed(store: JSONLSessionStore, entries: [SessionTreeEntry]) throws -> Seed {
+    private static func seed(
+        store: JSONLSessionStore,
+        entries: [SessionTreeEntry],
+        defaultModel: String,
+        leafID: String?
+    ) throws -> Seed {
         let recovered = totals(from: entries)
-        return Seed(nextSeq: try store.nextSequenceNumber(), usage: recovered.usage, turns: recovered.turns)
+        // Model metadata follows the same active context path as a resumed turn.
+        // A compacted checkpoint makes the path below it optional: the file may
+        // have lost an old ancestor while the checkpoint still contains the
+        // complete context the active branch needs. Requiring the full root path
+        // here would reject the same usable branch that `open(preferring:)` just
+        // selected.
+        let activeEntries = try SessionTree(entries: entries).pathToRootOrCompaction(from: leafID)
+        let model = activeEntries.reversed().compactMap { entry -> String? in
+            if case .modelChange(_, let modelID) = entry.payload { return modelID }
+            return nil
+        }.first ?? defaultModel
+        return Seed(
+            nextSeq: try store.nextSequenceNumber(),
+            usage: recovered.usage,
+            turns: recovered.turns,
+            model: model
+        )
     }
 
     /// Walk the file's entries once and recover what the session has spent.
@@ -142,7 +174,10 @@ public actor AgentHarness {
                 if let compactionUsage = compaction.usage { usage = usage + compactionUsage }
             case .branchSummary(let branch):
                 if let branchUsage = branch.usage { usage = usage + branchUsage }
-            case .message, .modelChange, .label, .sessionInfo, .leaf:
+            case .message, .modelChange, .label, .leaf:
+                break
+            case .sessionInfo:
+                if let metadataUsage = entry.metadataUsage { usage = usage + metadataUsage }
                 break
             }
         }
@@ -161,6 +196,11 @@ public actor AgentHarness {
         /// The system prompt sent with every request.
         public var systemPrompt: String?
 
+        /// Builds a prompt-aware system prompt for each turn. This is the seam
+        /// used by keyword-triggered skills; the static `systemPrompt` remains the
+        /// fallback for callers that do not load project resources.
+        public var systemPromptForPrompt: (@Sendable (String) -> String)?
+
         /// The tools available to a run, already wrapped as ``AgentTool``s. The
         /// harness never imports `DoMoTools`; the caller crosses that seam and
         /// hands the bound tools in.
@@ -173,6 +213,13 @@ public actor AgentHarness {
 
         /// The one dependency on the outside world for an assistant turn.
         public var streamFn: AgentStreamFn
+
+        /// Resolves a persisted model selection when a session is reopened. The
+        /// default keeps every existing caller byte-for-byte unchanged.
+        public var streamFnForModel: (@Sendable (String) -> AgentStreamFn)?
+
+        /// Supplies the measured context window for a selected model alias.
+        public var contextWindowForModel: (@Sendable (String) -> Int?)?
 
         /// The summarization LLM call. `nil` means "reuse the same client the run
         /// uses", realized as a one-shot request through ``streamFn`` — so the
@@ -246,9 +293,12 @@ public actor AgentHarness {
 
         public init(
             systemPrompt: String? = nil,
+            systemPromptForPrompt: (@Sendable (String) -> String)? = nil,
             tools: [any AgentTool] = [],
             model: String,
             streamFn: @escaping AgentStreamFn,
+            streamFnForModel: (@Sendable (String) -> AgentStreamFn)? = nil,
+            contextWindowForModel: (@Sendable (String) -> Int?)? = nil,
             summarizer: Summarizer? = nil,
             toolExecution: ToolExecutionMode = .parallel,
             maxTurns: Int? = nil,
@@ -263,9 +313,12 @@ public actor AgentHarness {
             beforeToolCall: BeforeToolCallHook? = nil
         ) {
             self.systemPrompt = systemPrompt
+            self.systemPromptForPrompt = systemPromptForPrompt
             self.tools = tools
             self.model = model
             self.streamFn = streamFn
+            self.streamFnForModel = streamFnForModel
+            self.contextWindowForModel = contextWindowForModel
             self.summarizer = summarizer
             self.toolExecution = toolExecution
             self.maxTurns = maxTurns
@@ -294,6 +347,26 @@ public actor AgentHarness {
         /// `nil` as unknown, because a percentage computed against this number
         /// would look exactly like a real one.
         public static let fallbackContextWindow = 200_000
+    }
+
+    /// Per-command settings for one turn. A command can select a model and
+    /// reasoning effort through the surface's stream factory, and can provide the
+    /// original prompt's skill-expanded system prompt while the persisted user
+    /// message contains the rendered template.
+    public struct RunOverride: Sendable {
+        public var model: String?
+        public var streamFn: AgentStreamFn?
+        public var systemPrompt: String?
+
+        public init(
+            model: String? = nil,
+            streamFn: AgentStreamFn? = nil,
+            systemPrompt: String? = nil
+        ) {
+            self.model = model
+            self.streamFn = streamFn
+            self.systemPrompt = systemPrompt
+        }
     }
 
     // MARK: - Lifecycle
@@ -335,7 +408,12 @@ public actor AgentHarness {
             entryIDFactory: configuration.entryIDFactory
         )
         let tree = try SessionTree.load(from: store)
-        let seed = try Self.seed(store: store, entries: tree.entries)
+        let seed = try Self.seed(
+            store: store,
+            entries: tree.entries,
+            defaultModel: configuration.model,
+            leafID: tree.leafID
+        )
         return AgentHarness(store: store, leaf: tree.leafID, configuration: configuration, seed: seed)
     }
 
@@ -394,7 +472,12 @@ public actor AgentHarness {
                 )
             }
         }
-        let seed = try Self.seed(store: store, entries: tree.entries)
+        let seed = try Self.seed(
+            store: store,
+            entries: tree.entries,
+            defaultModel: configuration.model,
+            leafID: leaf
+        )
         return AgentHarness(store: store, leaf: leaf, configuration: configuration, seed: seed)
     }
 
@@ -459,7 +542,12 @@ public actor AgentHarness {
         // chosen leaf is on the live branch and can never be another harness's.
         let pinned = preferredLeaves.first { (try? tree.branch(from: $0)) != nil }
             ?? preferredLeaves.first { (try? tree.pathToRootOrCompaction(from: $0)) != nil }
-        let seed = try Self.seed(store: store, entries: tree.entries)
+        let seed = try Self.seed(
+            store: store,
+            entries: tree.entries,
+            defaultModel: configuration.model,
+            leafID: pinned
+        )
         return AgentHarness(store: store, leaf: pinned, configuration: configuration, seed: seed)
     }
 
@@ -485,7 +573,12 @@ public actor AgentHarness {
         // in, so what it already contains is the only authority on where its
         // numbering and its totals stand.
         let forkedTree = try SessionTree.load(from: forked)
-        let seed = try Self.seed(store: forked, entries: forkedTree.entries)
+        let seed = try Self.seed(
+            store: forked,
+            entries: forkedTree.entries,
+            defaultModel: configuration.model,
+            leafID: forkedTree.leafID
+        )
         return AgentHarness(store: forked, leaf: forkedTree.leafID, configuration: configuration, seed: seed)
     }
 
@@ -496,6 +589,15 @@ public actor AgentHarness {
 
     /// The current tip.
     public var currentLeafID: String? { leaf }
+
+    /// The model selected for the active branch. This is recovered from the last
+    /// `model_change` entry when a session is reopened.
+    public var currentModel: String { activeModel }
+
+    /// The most recent user-visible session name, if one was recorded.
+    public func sessionName() throws -> String? {
+        try SessionTree.latestSessionName(in: SessionTree.load(from: store).branch(from: leaf))
+    }
 
     /// The current tip followed by the ancestors of it this harness itself knows,
     /// most recent first — see ``leafChain``.
@@ -541,9 +643,162 @@ public actor AgentHarness {
             // price the gateway itself reported.
             costTotal: accumulatedUsage.effectiveCostTotal,
             contextTokens: contextTokens,
-            contextWindow: configuration.contextWindow,
+            contextWindow: activeContextWindow,
             turns: recordedTurns
         )
+    }
+
+    // MARK: - Session metadata and tree navigation
+
+    /// Persist a model selection and make it the default for subsequent turns.
+    public func selectModel(
+        provider: String,
+        modelId: String,
+        streamFn: AgentStreamFn? = nil,
+        contextWindow: Int? = nil
+    ) throws {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot change models while a turn is running")
+        }
+        try appendMetadata(.modelChange(provider: provider, modelId: modelId))
+        activeModel = modelId
+        activeStreamFn = streamFn
+            ?? configuration.streamFnForModel?(modelId)
+            ?? configuration.streamFn
+        activeContextWindow = contextWindow
+            ?? configuration.contextWindowForModel?(modelId)
+            ?? configuration.contextWindow
+    }
+
+    /// Persist a display name. Passing `nil` clears it.
+    public func rename(_ name: String?) throws {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot rename a session while a turn is running")
+        }
+        let clean = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        try appendMetadata(.sessionInfo(name: clean?.isEmpty == true ? nil : clean))
+    }
+
+    /// Ask the active model for a short display title when the session has no
+    /// explicit name yet. The title request is metadata, not a conversation turn,
+    /// so it is persisted on the `session_info` entry with its usage and never
+    /// appears in the transcript context.
+    public func autoTitle() async throws -> String? {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot title a session while a turn is running")
+        }
+        guard try sessionName() == nil else { return nil }
+        let messages = try buildContextMessages()
+        guard !messages.isEmpty else { return nil }
+        let request = Context(
+            systemPrompt: "You create concise session titles. Reply with only a descriptive title of at most six words. Do not use quotes, markdown, or punctuation at the end.",
+            messages: Array(messages.suffix(12)) + [
+                .user(UserMessage(content: [.text("Give this coding session a useful short title.")]))
+            ],
+            tools: []
+        )
+        var terminal: AssistantMessage?
+        for try await event in activeStreamFn(request) {
+            if let message = event.terminalMessage { terminal = message }
+        }
+        guard let terminal else {
+            throw DoMoError(.provider(status: nil, isRetryable: false), "Title generation produced no response")
+        }
+        if let failure = terminal.failure { throw failure }
+        let title = Self.cleanGeneratedTitle(terminal.text)
+        guard !title.isEmpty else { return nil }
+        try appendMetadata(.sessionInfo(name: title), usage: terminal.usage)
+        return title
+    }
+
+    /// Persist a bookmark on an entry. A nil label clears the bookmark.
+    public func setLabel(targetID: String, label: String?) throws {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot label a session while a turn is running")
+        }
+        guard try SessionTree.load(from: store).entry(withID: targetID) != nil else {
+            throw DoMoError(.file(path: store.path, errno: nil), "Session entry not found: \(targetID)")
+        }
+        try appendMetadata(.label(targetId: targetID, label: label))
+    }
+
+    /// Move the active leaf to another node, recording a summary of the abandoned
+    /// suffix before the navigation entry.
+    public func moveLeaf(to targetID: String?) async throws {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot navigate the tree while a turn is running")
+        }
+        let tree = try SessionTree.load(from: store)
+        if let targetID, tree.entry(withID: targetID) == nil {
+            throw DoMoError(.file(path: store.path, errno: nil), "Session entry not found: \(targetID)")
+        }
+        guard targetID != leaf else { return }
+
+        let currentPath = try leaf.map { try tree.branch(from: $0) } ?? []
+        let targetPath = try targetID.map { try tree.branch(from: $0) } ?? []
+        var commonCount = 0
+        while commonCount < currentPath.count,
+              commonCount < targetPath.count,
+              currentPath[commonCount].id == targetPath[commonCount].id {
+            commonCount += 1
+        }
+        let abandoned = Array(currentPath.dropFirst(commonCount))
+        if !abandoned.isEmpty, let fromID = leaf {
+            let preparation = prepareBranchEntries(abandoned)
+            var summary = try await summarizeBranch(
+                preparation,
+                fromId: fromID,
+                id: store.createEntryID(),
+                parentId: leaf,
+                timestamp: timestamp(),
+                summarize: effectiveSummarizer
+            )
+            summary.seq = nextSeq
+            try store.appendEntry(summary)
+            nextSeq += 1
+            leafChain.append(summary.id)
+            if case .branchSummary(let branch) = summary.payload, let usage = branch.usage {
+                accumulatedUsage = accumulatedUsage + usage
+            }
+        }
+
+        _ = try store.moveLeaf(to: targetID, timestamp: timestamp(), seq: nextSeq)
+        nextSeq += 1
+        let movedTree = try SessionTree.load(from: store)
+        let movedPath = try targetID.map { try movedTree.branch(from: $0) } ?? []
+        leafChain = movedPath.map(\.id)
+        let model = movedPath.reversed().compactMap { entry -> String? in
+            if case .modelChange(_, let modelID) = entry.payload { return modelID }
+            return nil
+        }.first ?? configuration.model
+        activeModel = model
+        activeStreamFn = configuration.streamFnForModel?(model) ?? configuration.streamFn
+        activeContextWindow = configuration.contextWindowForModel?(model) ?? configuration.contextWindow
+    }
+
+    private func appendMetadata(_ payload: SessionTreeEntry.Payload, usage: Usage? = nil) throws {
+        let entry = SessionTreeEntry(
+            id: store.createEntryID(),
+            parentId: leaf,
+            timestamp: timestamp(),
+            payload: payload,
+            seq: nextSeq,
+            metadataUsage: usage
+        )
+        try store.appendEntry(entry)
+        nextSeq += 1
+        leafChain.append(entry.id)
+        if let usage { accumulatedUsage = accumulatedUsage + usage }
+    }
+
+    private static func cleanGeneratedTitle(_ text: String) -> String {
+        let firstLine = text.split(whereSeparator: { $0.isNewline }).first.map(String.init) ?? text
+        let trimmed = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "`*_\"'#"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let folded = trimmed.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard folded.count > 80 else { return folded }
+        return String(folded.prefix(77)) + "…"
     }
 
     // MARK: - Sealing an interrupted branch
@@ -647,7 +902,8 @@ public actor AgentHarness {
     public func run(
         prompt: String,
         attachments: [ImageBlock] = [],
-        sink: (any AgentEventSink)? = nil
+        sink: (any AgentEventSink)? = nil,
+        runOverride: RunOverride? = nil
     ) async throws -> AgentRunResult {
         guard !isRunning else {
             throw DoMoError(.configuration, "AgentHarness is already running a turn")
@@ -658,12 +914,14 @@ public actor AgentHarness {
         try await compactIfNeeded()
 
         let context = AgentContext(
-            systemPrompt: configuration.systemPrompt,
+            systemPrompt: runOverride?.systemPrompt
+                ?? configuration.systemPromptForPrompt?(prompt)
+                ?? configuration.systemPrompt,
             messages: try buildContextMessages(),
             tools: configuration.tools
         )
         let config = AgentLoopConfig(
-            model: configuration.model,
+            model: runOverride?.model ?? activeModel,
             toolExecution: configuration.toolExecution,
             maxTurns: configuration.maxTurns,
             beforeToolCall: configuration.beforeToolCall,
@@ -689,7 +947,7 @@ public actor AgentHarness {
             context: context,
             config: config,
             sink: persistenceSink,
-            streamFn: configuration.streamFn
+            streamFn: runOverride?.streamFn ?? activeStreamFn
         )
 
         if let error = errorBox.first {
@@ -733,7 +991,7 @@ public actor AgentHarness {
     /// no entry — the correct outcome for a context that cannot be bounded.
     private var effectiveSummarizer: Summarizer {
         if let summarizer = configuration.summarizer { return summarizer }
-        let streamFn = configuration.streamFn
+        let streamFn = activeStreamFn
         return { messages in
             let request = Context(
                 systemPrompt: CompactionPrompts.system,
@@ -771,7 +1029,7 @@ public actor AgentHarness {
         // and `compaction` are both `var`s on a struct the caller keeps, so the
         // pairing can be broken after construction. Idempotent when it already
         // holds.
-        let window = configuration.contextWindow ?? Configuration.fallbackContextWindow
+        let window = activeContextWindow ?? Configuration.fallbackContextWindow
         let settings = configuration.compaction.clamped(toContextWindow: window)
         guard settings.enabled else { return }
         // Same reason as ``buildContextMessages()``: an empty tip is an empty branch,

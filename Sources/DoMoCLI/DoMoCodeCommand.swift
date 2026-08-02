@@ -361,6 +361,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     // `InteractiveMode` with arguments of their own, so nothing but a
                     // run of the real binary observes what this line hands it.
                     modelRuntime: configuration.modelRuntime(for: model),
+                    modelRuntimeFor: { configuration.modelRuntime(for: $0) },
                     compaction: configuration.compaction,
                     summarizer: Self.compactionSummarizer(configuration, model: model),
                     credentialEnvNames: Self.gatewayCredentialEnvNames(configuration)
@@ -422,6 +423,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 homeDirectory: homeDirectory
             )
         )
+        let promptWorkspace = try SystemPromptBuilder(
+            workingDirectory: workingDirectory,
+            configDirectory: configuration.configDirectory,
+            toolNames: registry.names + visibleMcp.map(\.definition.name),
+            projectTrusted: true
+        ).build()
+        let commandProcessor = PromptCommandProcessor(
+            workspace: promptWorkspace,
+            workingDirectory: workingDirectory,
+            shell: shell,
+            allowInlineShell: true
+        )
 
         let printMode = PrintMode(
             client: client,
@@ -437,7 +450,14 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             mcpTools: visibleMcp,
             modelRuntime: configuration.modelRuntime(for: model),
             compaction: configuration.compaction,
-            summarizer: Self.compactionSummarizer(configuration, model: model, client: client)
+            summarizer: Self.compactionSummarizer(configuration, model: model, client: client),
+            promptWorkspace: promptWorkspace,
+            commandProcessor: commandProcessor,
+            commandRuntimeFactory: { commandModel, effort in
+                var selected = configuration.modelRuntime(for: commandModel ?? model)
+                if let effort { selected.reasoningEffort = effort }
+                return selected
+            }
         )
 
         let code: Int32
@@ -719,17 +739,32 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
         let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
-        let systemPrompt = PrintMode.systemPrompt(
+        let promptWorkspace = try SystemPromptBuilder(
             workingDirectory: workingDirectory,
-            toolNames: registry.names + visibleMcp.map(\.definition.name)
+            configDirectory: configuration.configDirectory,
+            toolNames: registry.names + visibleMcp.map(\.definition.name),
+            projectTrusted: true
+        ).build()
+        let commandProcessor = PromptCommandProcessor(
+            workspace: promptWorkspace,
+            workingDirectory: workingDirectory,
+            shell: shell,
+            allowInlineShell: true
         )
         // One resolved runtime for the alias — reasoning effort, per-alias rates and
         // the declared context window — built once and shared by the stream function
         // and the accounting the client's footer reads.
         let modelRuntime = configuration.modelRuntime(for: model)
         let streamFn = makeStreamFn(client: client, runtime: modelRuntime)
+        var modelAliases = Set(configuration.modelOverrides.keys)
+        modelAliases.insert(model)
+        if let small = configuration.smallModel { modelAliases.insert(small) }
+        let modelOptions = modelAliases.sorted().map { alias in
+            let runtime = configuration.modelRuntime(for: alias)
+            return ModelOption(id: alias, contextWindow: runtime.contextWindow)
+        }
         let runtime = ServerRuntime(config: ServerRuntime.Config(
-            systemPrompt: systemPrompt,
+            systemPrompt: promptWorkspace.baseSystemPrompt,
             tools: tools,
             model: model,
             streamFn: streamFn,
@@ -747,7 +782,19 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // percentage of a guess.
             contextWindow: modelRuntime.contextWindow,
             compaction: configuration.compaction,
-            summarizer: Self.compactionSummarizer(configuration, model: model, client: client)
+            summarizer: Self.compactionSummarizer(configuration, model: model, client: client),
+            promptWorkspace: promptWorkspace,
+            commandProcessor: commandProcessor,
+            commandStreamFactory: { commandModel, effort in
+                var selected = configuration.modelRuntime(for: commandModel ?? model)
+                if let effort { selected.reasoningEffort = effort }
+                return makeStreamFn(client: client, runtime: selected)
+            },
+            modelOptions: modelOptions,
+            modelStreamFactory: { alias in
+                makeStreamFn(client: client, runtime: configuration.modelRuntime(for: alias))
+            },
+            modelContextWindow: { alias in configuration.modelRuntime(for: alias).contextWindow }
         ))
         return (runtime, mcpManager)
     }
@@ -924,12 +971,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             throw DoMoError(
                 .configuration,
                 "Project \(workingDirectory.string) is marked untrusted in \(store.path.string), so its "
-                    + ".domocode/settings.json will not be used. Pass --trust to override and re-trust it."
+                    + "local prompt resources will not be used. Pass --trust to override and re-trust it."
             )
         case .none:
             // Ask, when there is a human on a terminal to ask. Refusing outright made
-            // every interactive session in any project holding a
-            // .domocode/settings.json a hard stop that could only be cleared by
+            // every interactive session in any project holding local resources a
+            // hard stop that could only be cleared by
             // re-running with a flag — for a question the user is standing right there
             // to answer. This is before raw mode and before any TUI, so a plain
             // line-read is the whole mechanism.
@@ -941,9 +988,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // lock the directory out permanently.
             throw DoMoError(
                 .configuration,
-                "Project \(workingDirectory.string) has a .domocode/settings.json, which can change how tools "
-                    + "and permissions behave, and this directory is not trusted. Re-run with --trust to "
-                    + "trust it (recorded in \(store.path.string)), or remove the file to run without it."
+                "Project \(workingDirectory.string) has local prompt resources that can change agent behavior, "
+                    + "and this directory is not trusted. Re-run with --trust to trust it (recorded in "
+                    + "\(store.path.string)), or remove the resources to run without them."
             )
         }
     }
@@ -952,8 +999,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     /// yes is a no, and EOF (stdin closed under us) is a no.
     private static func askToTrust(_ workingDirectory: FilePath, store: TrustStore) throws(DoMoError) -> Bool {
         writeStderr(
-            "\nProject \(workingDirectory.string) has a .domocode/settings.json.\n"
-                + "It can change how tools and permissions behave, so it is only used in directories you trust.\n"
+            "\nProject \(workingDirectory.string) has local prompt resources.\n"
+                + "They can change agent behavior, so they are only used in directories you trust.\n"
                 + "Trust this directory? [y/N] "
         )
         guard let answer = readLine(strippingNewline: true)?

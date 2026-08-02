@@ -26,10 +26,16 @@ import Foundation
 @MainActor
 final class StatusBar: Component {
     var text = ""
+    private var style: (String) -> String = dim
+
+    func applyTheme(_ theme: Theme, appearance: ThemeAppearance, trueColor: Bool = true) {
+        let color = theme.palette(for: appearance).muted.foreground(trueColor: trueColor)
+        style = color.isEmpty ? { $0 } : { color + $0 + sgrReset }
+    }
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [] }
-        return [truncateToWidth(dim(text), width)]
+        return [truncateToWidth(style(text), width)]
     }
 }
 
@@ -296,9 +302,15 @@ enum FooterRow {
 @MainActor
 final class FooterBar: Component {
     var model = FooterModel()
+    private var style: (String) -> String = dim
+
+    func applyTheme(_ theme: Theme, appearance: ThemeAppearance, trueColor: Bool = true) {
+        let color = theme.palette(for: appearance).muted.foreground(trueColor: trueColor)
+        style = color.isEmpty ? { $0 } : { color + $0 + sgrReset }
+    }
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [] }
-        return [dim(FooterRow.compose(model, width: width))]
+        return [style(FooterRow.compose(model, width: width))]
     }
 }

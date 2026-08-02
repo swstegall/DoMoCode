@@ -93,11 +93,27 @@ public struct SessionSummary: Sendable, Codable, Hashable {
     public let path: String
     public let cwd: String
     public let timestamp: String
-    public init(id: String, path: String, cwd: String, timestamp: String) {
+    public let name: String?
+    public init(id: String, path: String, cwd: String, timestamp: String, name: String? = nil) {
         self.id = id
         self.path = path
         self.cwd = cwd
         self.timestamp = timestamp
+        self.name = name
+    }
+}
+
+/// A model alias the client may select. The runtime remains the authority for
+/// the stream factory; the client only needs a stable id and honest meter data.
+public struct ModelOption: Sendable, Codable, Hashable {
+    public let id: String
+    public let provider: String
+    public let contextWindow: Int?
+
+    public init(id: String, provider: String = "litellm", contextWindow: Int? = nil) {
+        self.id = id
+        self.provider = provider
+        self.contextWindow = contextWindow
     }
 }
 
@@ -149,6 +165,20 @@ public actor ServerRuntime {
 
     public struct Config: Sendable {
         public var systemPrompt: String
+        /// The loaded prompt resources. When present, the server adds matching
+        /// skills to each turn and expands command templates before dispatch.
+        public var promptWorkspace: PromptWorkspace?
+        public var commandProcessor: PromptCommandProcessor?
+        /// Resolves a command's optional model/reasoning override into the stream
+        /// function that owns the concrete LLM client.
+        public var commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?
+        /// The aliases exposed by the model picker. An empty list is replaced by
+        /// the configured default model at runtime.
+        public var modelOptions: [ModelOption]
+        /// Resolves a selected alias to the concrete stream function owned by the
+        /// CLI's LLM client.
+        public var modelStreamFactory: (@Sendable (String) -> AgentStreamFn)?
+        public var modelContextWindow: (@Sendable (String) -> Int?)?
         public var tools: [any AgentTool]
         public var model: String
         public var streamFn: AgentStreamFn
@@ -201,9 +231,21 @@ public actor ServerRuntime {
             permissions: PermissionRuntime? = nil,
             contextWindow: Int? = nil,
             compaction: CompactionSettings = .default,
-            summarizer: Summarizer? = nil
+            summarizer: Summarizer? = nil,
+            promptWorkspace: PromptWorkspace? = nil,
+            commandProcessor: PromptCommandProcessor? = nil,
+            commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)? = nil,
+            modelOptions: [ModelOption] = [],
+            modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
+            modelContextWindow: (@Sendable (String) -> Int?)? = nil
         ) {
             self.systemPrompt = systemPrompt
+            self.promptWorkspace = promptWorkspace
+            self.commandProcessor = commandProcessor
+            self.commandStreamFactory = commandStreamFactory
+            self.modelOptions = modelOptions
+            self.modelStreamFactory = modelStreamFactory
+            self.modelContextWindow = modelContextWindow
             self.tools = tools
             self.model = model
             self.streamFn = streamFn
@@ -312,6 +354,20 @@ public actor ServerRuntime {
         self.config = config
     }
 
+    /// The one command registry shared by every client surface. Templates are
+    /// intentionally absent from the descriptor wire value; the server remains
+    /// the authority that expands them.
+    public func commands() -> CommandRegistry {
+        config.promptWorkspace?.commands ?? .builtIn
+    }
+
+    public func models() -> [ModelOption] {
+        if config.modelOptions.isEmpty {
+            return [ModelOption(id: config.model, contextWindow: config.contextWindow)]
+        }
+        return config.modelOptions
+    }
+
     private func makeState(harness: AgentHarness, sink: BroadcastEventSink) -> SessionState {
         let token = nextToken
         nextToken += 1
@@ -335,11 +391,18 @@ public actor ServerRuntime {
             )
             beforeToolCall = permissionHook(engine: engine, factory: permissions.factory, sessionID: sessionID)
         }
+        var systemPromptForPrompt: (@Sendable (String) -> String)?
+        if let workspace = config.promptWorkspace {
+            systemPromptForPrompt = { prompt in workspace.systemPrompt(for: prompt) }
+        }
         return AgentHarness.Configuration(
-            systemPrompt: config.systemPrompt,
+            systemPrompt: config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
+            systemPromptForPrompt: systemPromptForPrompt,
             tools: config.tools,
             model: config.model,
             streamFn: config.streamFn,
+            streamFnForModel: config.modelStreamFactory,
+            contextWindowForModel: config.modelContextWindow,
             // The three below are the whole reason `Config` carries them: a value
             // that stops here is a knob a user can set and nothing reads. The
             // harness clamps `compaction` against `contextWindow` in its own
@@ -478,6 +541,9 @@ public actor ServerRuntime {
         // ``RunSink``.
         let sink = RunSink(session.sink)
         let token = session.token
+        let commandProcessor = config.commandProcessor
+        let commandStreamFactory = config.commandStreamFactory
+        let baseSystemPrompt = config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt
         session.runSink = sink
         session.runStartedAt = Date()
         session.runTask = Task { [weak self] in
@@ -489,7 +555,41 @@ public actor ServerRuntime {
                 // `result.failure` here would put the identical row on the screen
                 // twice — the frame is not missing, only the frames for the failures
                 // the loop never saw are, and those all arrive as a throw.
-                _ = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
+                let resolution: PromptCommandResolution
+                if let processor = commandProcessor {
+                    resolution = try await processor.resolve(prompt)
+                } else {
+                    resolution = .prompt(
+                        text: prompt,
+                        model: nil,
+                        reasoningEffort: nil,
+                        systemPrompt: baseSystemPrompt
+                    )
+                }
+                switch resolution {
+                case .local(let action):
+                    throw DoMoError(.configuration, "/\(action.rawValue) is a client-local command")
+                case .unknown(let name):
+                    throw DoMoError(.configuration, "Unknown command /\(name)")
+                case .prompt(let rendered, let commandModel, let reasoningEffort, let systemPrompt):
+                    var runOverride: AgentHarness.RunOverride?
+                    if commandModel != nil || reasoningEffort != nil || commandStreamFactory != nil {
+                        let stream = commandStreamFactory?(commandModel, reasoningEffort)
+                        runOverride = AgentHarness.RunOverride(
+                            model: commandModel,
+                            streamFn: stream,
+                            systemPrompt: systemPrompt
+                        )
+                    } else {
+                        runOverride = AgentHarness.RunOverride(systemPrompt: systemPrompt)
+                    }
+                    _ = try await harness.run(
+                        prompt: rendered,
+                        attachments: attachments,
+                        sink: sink,
+                        runOverride: runOverride
+                    )
+                }
             } catch is CancellationError {
                 // Aborted before the loop emitted its own close.
                 sink.broadcast(.agentEnd(reason: "aborted"))
@@ -879,6 +979,56 @@ public actor ServerRuntime {
         try await Self.loadListing(cwd: config.cwd, sessionDirectory: config.sessionDirectory)
     }
 
+    /// The full tree snapshot used by the client's `/tree` picker. Metadata stays
+    /// in the existing session-entry vocabulary, so labels and branch summaries
+    /// are visible without inventing a second wire representation.
+    public func tree(sessionID: String) async throws -> [SessionTreeEntry] {
+        try await Self.loadTree(at: try await sessionPath(sessionID))
+    }
+
+    /// Persist a model selection for a session and make it the stream used by its
+    /// next turn.
+    public func changeModel(sessionID: String, modelID: String) async throws {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard let option = models().first(where: { $0.id == modelID }) else {
+            throw DoMoError(.configuration, "Unknown model: \(modelID)")
+        }
+        try await session.harness.selectModel(
+            provider: option.provider,
+            modelId: option.id,
+            streamFn: config.modelStreamFactory?(option.id),
+            contextWindow: option.contextWindow ?? config.modelContextWindow?(option.id) ?? config.contextWindow
+        )
+    }
+
+    public func renameSession(sessionID: String, name: String?) async throws {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        try await session.harness.rename(name)
+    }
+
+    /// Generate and persist a display title through the session's active model.
+    /// A live session is required because the selected model and stream factory
+    /// belong to its harness; the client revives disk-only sessions before calling.
+    public func autoTitle(sessionID: String) async throws -> String? {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        return try await session.harness.autoTitle()
+    }
+
+    public func label(sessionID: String, targetID: String, label: String?) async throws {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        try await session.harness.setLabel(targetID: targetID, label: label)
+    }
+
+    public func moveLeaf(sessionID: String, targetID: String?) async throws {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        try await session.harness.moveLeaf(to: targetID)
+    }
+
     /// The linear root-to-leaf message path of a session — what a client renders
     /// as the transcript. Reads from disk, so it works for a session that is live
     /// or one that only exists as a file.
@@ -997,9 +1147,26 @@ public actor ServerRuntime {
     }
 
     @concurrent
+    private static func loadTree(at path: FilePath) async throws -> [SessionTreeEntry] {
+        try SessionTree.load(from: JSONLSessionStore(path: path)).entries
+    }
+
+    @concurrent
     private static func loadListing(cwd: String, sessionDirectory: FilePath) async throws -> [SessionSummary] {
         try JSONLSessionStore.list(cwd: cwd, sessionDirectory: sessionDirectory).map {
-            SessionSummary(id: $0.header.id, path: $0.path.string, cwd: $0.header.cwd, timestamp: $0.header.timestamp)
+            let name: String?
+            if let branch = try? SessionTree.load(from: JSONLSessionStore(path: $0.path)).branch() {
+                name = SessionTree.latestSessionName(in: branch)
+            } else {
+                name = nil
+            }
+            return SessionSummary(
+                id: $0.header.id,
+                path: $0.path.string,
+                cwd: $0.header.cwd,
+                timestamp: $0.header.timestamp,
+                name: name
+            )
         }
     }
 

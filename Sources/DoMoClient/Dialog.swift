@@ -1,0 +1,510 @@
+// Copyright (c) 2026 Sam Stegall. MIT license.
+// SPDX-License-Identifier: MIT
+
+import DoMoTUI
+import DoMoTermIO
+
+/// The full-screen client's reusable overlay owner. `ScreenSurface` already
+/// saves and restores focus for every overlay; this small stack adds the missing
+/// application-level rule that dialogs are dismissed in LIFO order and that a
+/// caller never has to reach into the surface to present one.
+@MainActor
+final class DialogStack {
+    private weak var surface: ScreenSurface?
+    private var handles: [ScreenOverlayHandle] = []
+
+    init(surface: ScreenSurface) { self.surface = surface }
+
+    var isEmpty: Bool { handles.isEmpty }
+
+    @discardableResult
+    func present(_ component: Component, options: OverlayOptions? = nil) -> ScreenOverlayHandle? {
+        guard let surface else { return nil }
+        let handle = surface.showOverlay(component, options: options)
+        handles.append(handle)
+        return handle
+    }
+
+    func dismiss(_ handle: ScreenOverlayHandle?) {
+        guard let handle else { return }
+        handle.hide()
+        handles.removeAll { $0 === handle }
+    }
+
+    func dismissTop() {
+        guard let handle = handles.last else { return }
+        dismiss(handle)
+    }
+
+    func dismissAll() {
+        while let handle = handles.popLast() { handle.hide() }
+    }
+}
+
+/// A compact searchable list dialog. Printable input changes the prefix filter,
+/// while the underlying `SelectList` retains all of the shared wrap/navigation
+/// and width-safe rendering behavior.
+@MainActor
+final class SearchableSelectDialog: Component {
+    private let title: String
+    private var items: [SelectItem]
+    private var list: SelectList
+    private var query = ""
+    private let keybindings: Keybindings
+
+    var onSelect: ((SelectItem) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(title: String, items: [SelectItem], keybindings: Keybindings = Keybindings()) {
+        self.title = title
+        self.keybindings = keybindings
+        self.items = items
+        self.list = SelectList(items: [], maxVisible: 12, keybindings: keybindings)
+        rebuildList()
+    }
+
+    /// Replace the source rows without losing the current search query or, when
+    /// possible, the selected value. Session names can change while this picker is
+    /// open (for example when automatic titling finishes), so a snapshot-only list
+    /// makes the dialog visibly stale until it is dismissed and reopened.
+    func updateItems(_ items: [SelectItem]) {
+        let selectedValue = list.getSelectedItem()?.value
+        self.items = items
+        rebuildList(preferredValue: selectedValue)
+    }
+
+    func render(width: Int) -> [String] {
+        let heading = truncateToWidth("\u{1b}[1m\(title)\u{1b}[0m  \(query.isEmpty ? "" : "[\(query)]")", width, ellipsis: "")
+        return [heading] + list.render(width: width)
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if isKeyRelease(data) { return }
+        if keybindings.matches(data, .selectUp)
+            || keybindings.matches(data, .selectDown)
+            || keybindings.matches(data, .selectConfirm) {
+            list.handleInput(data)
+            return
+        }
+        if keybindings.matches(data, .selectCancel) {
+            onCancel?()
+            return
+        }
+        if data == [0x7f] || data == [0x08] {
+            guard !query.isEmpty else { return }
+            query.removeLast()
+            rebuildList()
+            return
+        }
+        guard let scalar = data.first, data.count == 1, scalar >= 0x20, scalar != 0x7f else { return }
+        let character = String(decoding: data, as: UTF8.self)
+        guard !character.isEmpty, !character.contains("\u{1b}") else { return }
+        query += character
+        rebuildList()
+    }
+
+    private func rebuildList(preferredValue: String? = nil) {
+        let needle = query.lowercased()
+        let filtered = needle.isEmpty
+            ? items
+            : items.filter { item in
+                let primary = item.label.isEmpty ? item.value : item.label
+                let haystack = "\(primary) \(item.value) \(item.description ?? "")".lowercased()
+                return haystack.contains(needle)
+            }
+        let replacement = SelectList(
+            items: filtered,
+            maxVisible: max(1, min(filtered.count, 12)),
+            keybindings: keybindings
+        )
+        replacement.onSelect = { [weak self] item in self?.onSelect?(item) }
+        replacement.onCancel = { [weak self] in self?.onCancel?() }
+        if let preferredValue,
+           let index = filtered.firstIndex(where: { $0.value == preferredValue }) {
+            replacement.setSelectedIndex(index)
+        }
+        list = replacement
+    }
+}
+
+/// A one-line input dialog used for session names and other small metadata.
+@MainActor
+final class DialogTextInput: @MainActor Focusable {
+    private let title: String
+    private let editor: Editor
+
+    var focused = false { didSet { editor.focused = focused } }
+    var wantsKeyRelease: Bool { false }
+    var onSubmit: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(title: String, initial: String = "") {
+        self.title = title
+        self.editor = Editor(paddingX: 0, rows: { 4 })
+        self.editor.setText(initial)
+        self.editor.showBorders = false
+        self.editor.maxVisibleLines = 1
+        self.editor.onSubmit = { [weak self] text in self?.onSubmit?(text) }
+    }
+
+    func render(width: Int) -> [String] {
+        let titleLine = truncateToWidth("\u{1b}[1m\(title)\u{1b}[0m", width, ellipsis: "")
+        return [titleLine] + editor.render(width: width) + [truncateToWidth(dim("Enter confirm · Esc cancel"), width, ellipsis: "")]
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if isKeyRelease(data) { return }
+        if data == [0x1b] {
+            onCancel?()
+            return
+        }
+        editor.handleInput(data)
+    }
+
+    func invalidate() { editor.invalidate() }
+}
+
+/// A two-choice confirmation dialog. Keeping the answer as a value rather than
+/// making callers inspect a selected row lets the same overlay work for destructive
+/// actions and simple yes/no questions.
+@MainActor
+final class DialogConfirm: Component {
+    private let title: String
+    private let message: String
+    private let list: SelectList
+
+    var onResult: ((Bool) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(
+        title: String,
+        message: String,
+        confirmLabel: String = "Confirm",
+        cancelLabel: String = "Cancel",
+        keybindings: Keybindings = Keybindings()
+    ) {
+        self.title = title
+        self.message = message
+        self.list = SelectList(
+            items: [
+                SelectItem(value: "confirm", label: confirmLabel),
+                SelectItem(value: "cancel", label: cancelLabel),
+            ],
+            maxVisible: 2,
+            keybindings: keybindings
+        )
+        self.list.onSelect = { [weak self] item in
+            self?.onResult?(item.value == "confirm")
+        }
+        self.list.onCancel = { [weak self] in self?.onCancel?() }
+    }
+
+    func render(width: Int) -> [String] {
+        [truncateToWidth("\u{1b}[1m\(title)\u{1b}[0m", width, ellipsis: ""),
+         truncateToWidth(message, width, ellipsis: "")] + list.render(width: width)
+    }
+
+    func handleInput(_ data: [UInt8]) { list.handleInput(data) }
+}
+
+/// A small, keyboard-first form. Each field owns a normal `Editor`, so paste,
+/// undo, Unicode cursor movement, and validation hooks remain the same as the
+/// prompt input rather than being reimplemented for metadata dialogs.
+struct DialogFormField: Sendable, Hashable {
+    var label: String
+    var value: String
+
+    init(label: String, value: String = "") {
+        self.label = label
+        self.value = value
+    }
+}
+
+@MainActor
+final class DialogForm: @MainActor Focusable {
+    private let title: String
+    private let keybindings: Keybindings
+    private let labels: [String]
+    private let editors: [Editor]
+    private var selectedIndex = 0
+
+    var focused = false { didSet { updateFocus() } }
+    var wantsKeyRelease: Bool { false }
+    var onSubmit: (([String]) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(title: String, fields: [DialogFormField], keybindings: Keybindings = Keybindings()) {
+        self.title = title
+        self.keybindings = keybindings
+        self.labels = fields.map { $0.label }
+        self.editors = fields.map { field in
+            let editor = Editor(paddingX: 0, rows: { 1 })
+            editor.setText(field.value)
+            editor.showBorders = false
+            editor.maxVisibleLines = 1
+            return editor
+        }
+        updateFocus()
+    }
+
+    func render(width: Int) -> [String] {
+        var lines = [truncateToWidth("\u{1b}[1m\(title)\u{1b}[0m", width, ellipsis: "")]
+        for (index, editor) in editors.enumerated() {
+            let prefix = (index == selectedIndex ? "> " : "  ") + labels[index] + ": "
+            let value = editor.render(width: max(0, width - prefix.count)).joined(separator: " ")
+            lines.append(truncateToWidth(prefix + value, width, ellipsis: ""))
+        }
+        lines.append(truncateToWidth(dim("↑/↓ field · Enter next/submit · Esc cancel"), width, ellipsis: ""))
+        return lines
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if isKeyRelease(data) || editors.isEmpty { return }
+        if keybindings.matches(data, .selectCancel) {
+            onCancel?()
+            return
+        }
+        if keybindings.matches(data, .selectUp) {
+            selectedIndex = max(0, selectedIndex - 1)
+            updateFocus()
+            return
+        }
+        if keybindings.matches(data, .selectDown) {
+            selectedIndex = min(editors.count - 1, selectedIndex + 1)
+            updateFocus()
+            return
+        }
+        if keybindings.matches(data, .selectConfirm) {
+            if selectedIndex < editors.count - 1 {
+                selectedIndex += 1
+                updateFocus()
+            } else {
+                onSubmit?(editors.map { $0.getText() })
+            }
+            return
+        }
+        editors[selectedIndex].handleInput(data)
+    }
+
+    func invalidate() { editors.forEach { $0.invalidate() } }
+
+    private func updateFocus() {
+        for (index, editor) in editors.enumerated() {
+            editor.focused = focused && index == selectedIndex
+        }
+    }
+}
+
+/// A multiline editor dialog used by callers that need a real text body rather
+/// than the one-line metadata input. It deliberately exposes the same submit and
+/// cancel callbacks as the other dialog shapes.
+@MainActor
+final class DialogEditor: @MainActor Focusable {
+    private let title: String
+    private let editor: Editor
+
+    var focused = false { didSet { editor.focused = focused } }
+    var wantsKeyRelease: Bool { false }
+    var onSubmit: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(title: String, initial: String = "", rows: @escaping () -> Int = { 12 }) {
+        self.title = title
+        self.editor = Editor(paddingX: 0, rows: rows)
+        self.editor.setText(initial)
+        self.editor.onSubmit = { [weak self] text in self?.onSubmit?(text) }
+    }
+
+    var text: String { editor.getText() }
+
+    func render(width: Int) -> [String] {
+        [truncateToWidth("\u{1b}[1m\(title)\u{1b}[0m", width, ellipsis: "")]
+            + editor.render(width: width)
+            + [truncateToWidth(dim("Enter submit · Esc cancel"), width, ellipsis: "")]
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if isKeyRelease(data) { return }
+        if data == [0x1b] {
+            onCancel?()
+            return
+        }
+        editor.handleInput(data)
+    }
+
+    func invalidate() { editor.invalidate() }
+}
+
+/// The row model for the conversation-tree dialog. It deliberately does not
+/// depend on the session file type: the client can decorate entries with labels
+/// and depths while the dialog only owns filtering, folding, and selection.
+struct TreeDialogItem: Sendable, Hashable {
+    enum Kind: String, Sendable, Hashable {
+        case message
+        case metadata
+        case label
+        case branch
+    }
+
+    let value: String
+    let label: String
+    let description: String?
+    let parentID: String?
+    let depth: Int
+    let kind: Kind
+    let hasChildren: Bool
+    let currentLabel: String?
+}
+
+enum TreeFilterMode: String, CaseIterable, Equatable, Sendable {
+    case all
+    case messages
+    case metadata
+    case labels
+    case branches
+
+    var next: TreeFilterMode {
+        let modes = Self.allCases
+        guard let index = modes.firstIndex(of: self) else { return .all }
+        return modes[(index + 1) % modes.count]
+    }
+
+    func includes(_ item: TreeDialogItem) -> Bool {
+        switch self {
+        case .all: return true
+        case .messages: return item.kind == .message
+        case .metadata: return item.kind == .metadata
+        case .labels: return item.kind == .label
+        case .branches: return item.kind == .branch || item.hasChildren
+        }
+    }
+}
+
+/// A tree-aware select dialog. `f` cycles semantic filters, Space folds the
+/// selected subtree, and `l` hands a selected node to the caller's label form.
+/// Search is a case-insensitive substring match, which is more useful for long
+/// assistant messages than the prefix filter used by ordinary pickers.
+@MainActor
+final class TreeDialog: Component {
+    private let title: String
+    private let items: [TreeDialogItem]
+    private let keybindings: Keybindings
+    private var list: SelectList
+    private var query = ""
+    private var filterMode: TreeFilterMode = .all
+    private var folded: Set<String> = []
+
+    var onSelect: ((TreeDialogItem) -> Void)?
+    var onLabel: ((TreeDialogItem) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(title: String, items: [TreeDialogItem], keybindings: Keybindings = Keybindings()) {
+        self.title = title
+        self.items = items
+        self.keybindings = keybindings
+        self.list = SelectList(items: [], maxVisible: 16, keybindings: keybindings)
+        rebuildList()
+    }
+
+    func render(width: Int) -> [String] {
+        let filter = "filter: \(filterMode.rawValue)"
+        let search = query.isEmpty ? "" : "  [\(query)]"
+        let heading = truncateToWidth(
+            "\u{1b}[1m\(title)\u{1b}[0m  \(filter)\(search)",
+            width,
+            ellipsis: ""
+        )
+        return [heading] + list.render(width: width)
+            + [truncateToWidth(dim("f filter · Space fold · l label · Enter branch"), width, ellipsis: "")]
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if isKeyRelease(data) { return }
+        if keybindings.matches(data, .selectUp)
+            || keybindings.matches(data, .selectDown)
+            || keybindings.matches(data, .selectConfirm) {
+            list.handleInput(data)
+            return
+        }
+        if keybindings.matches(data, .selectCancel) {
+            onCancel?()
+            return
+        }
+        if data == [0x66] { // f
+            filterMode = filterMode.next
+            rebuildList(preferredID: selectedID())
+            return
+        }
+        if data == [0x20] { // Space
+            guard let item = selectedItem(), item.hasChildren else { return }
+            if folded.contains(item.value) {
+                folded.remove(item.value)
+            } else {
+                folded.insert(item.value)
+            }
+            rebuildList(preferredID: item.value)
+            return
+        }
+        if data == [0x6c] { // l
+            if let item = selectedItem() { onLabel?(item) }
+            return
+        }
+        if data == [0x7f] || data == [0x08] {
+            guard !query.isEmpty else { return }
+            query.removeLast()
+            rebuildList(preferredID: nil)
+            return
+        }
+        guard data.count == 1, let scalar = data.first, scalar >= 0x20, scalar != 0x7f else { return }
+        let character = String(decoding: data, as: UTF8.self)
+        guard !character.isEmpty, !character.contains("\u{1b}") else { return }
+        query += character
+        rebuildList(preferredID: nil)
+    }
+
+    private func selectedID() -> String? { list.getSelectedItem()?.value }
+
+    private func selectedItem() -> TreeDialogItem? {
+        guard let id = selectedID() else { return nil }
+        return items.first { $0.value == id }
+    }
+
+    private func rebuildList(preferredID: String? = nil) {
+        let visible = items.filter { item in
+            guard filterMode.includes(item), isVisible(item) else { return false }
+            guard !query.isEmpty else { return true }
+            let haystack = "\(item.label) \(item.description ?? "")".lowercased()
+            return haystack.contains(query.lowercased())
+        }
+        let rows = visible.map { item in
+            let marker = item.hasChildren && folded.contains(item.value) ? "▸ " : "  "
+            let indent = String(repeating: "  ", count: item.depth)
+            return SelectItem(
+                value: item.value,
+                label: indent + marker + item.label,
+                description: item.description
+            )
+        }
+        let replacement = SelectList(items: rows, maxVisible: 16, keybindings: keybindings)
+        replacement.onSelect = { [weak self] row in
+            guard let self, let item = self.items.first(where: { $0.value == row.value }) else { return }
+            self.onSelect?(item)
+        }
+        replacement.onCancel = { [weak self] in self?.onCancel?() }
+        if let preferredID,
+           let index = rows.firstIndex(where: { $0.value == preferredID }) {
+            replacement.setSelectedIndex(index)
+        }
+        list = replacement
+    }
+
+    private func isVisible(_ item: TreeDialogItem) -> Bool {
+        var parent = item.parentID
+        var seen: Set<String> = []
+        while let parentID = parent, seen.insert(parentID).inserted {
+            if folded.contains(parentID) { return false }
+            parent = items.first(where: { $0.value == parentID })?.parentID
+        }
+        return true
+    }
+}

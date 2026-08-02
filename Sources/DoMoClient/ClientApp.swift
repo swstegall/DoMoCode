@@ -48,6 +48,10 @@ public final class ClientApp {
     private let footerBar = FooterBar()
     private let focus = FocusRing()
     private let quit = QuitSignal()
+    /// Command metadata is fetched from the runtime at bootstrap. The client
+    /// uses local actions immediately and forwards prompt commands unchanged so
+    /// the server remains the authority for template expansion.
+    private var commandRegistry = CommandRegistry.builtIn
 
     /// The terminal's inline-image capability and cell pixel size, detected once at
     /// startup (the client owns the tty; the remote runtime has none).
@@ -55,11 +59,39 @@ public final class ClientApp {
     private var cellSize: CellDimensions = .default
 
     private var surface: ScreenSurface?
+    private var dialogs: DialogStack?
+    private var paletteHandle: ScreenOverlayHandle?
+    private var sessionPickerHandle: ScreenOverlayHandle?
+    private var modelPickerHandle: ScreenOverlayHandle?
+    private var treePickerHandle: ScreenOverlayHandle?
+    private var renameHandle: ScreenOverlayHandle?
+    private var labelHandle: ScreenOverlayHandle?
+    private var autocompleteHandle: ScreenOverlayHandle?
+    private var autocompleteDialog: SearchableSelectDialog?
+    private var paletteDialog: SearchableSelectDialog?
+    private var sessionPickerDialog: SearchableSelectDialog?
+    private var modelPickerDialog: SearchableSelectDialog?
+    private var treePickerDialog: TreeDialog?
+    private var renameDialog: DialogForm?
+    private var labelDialog: DialogTextInput?
+    private var forceClearHandle: ScreenOverlayHandle?
+    private var forceClearDialog: DialogConfirm?
+    private var draftEditorHandle: ScreenOverlayHandle?
+    private var draftEditorDialog: DialogEditor?
+    private var theme = Theme.standard
+    private var appearance: ThemeAppearance = .dark
     private var eventTask: Task<Void, Never>?
     /// User actions can outlive the input event that started them. Keep them under
     /// the app's lifetime so shutdown cancels and drains in-flight HTTP requests
     /// before `runFullScreenClient` shuts down its shared client.
     private var actionTasks: [Task<Void, Never>] = []
+    /// The one background title request allowed for the selected session. It is
+    /// kicked off after the first normal turn, not while the agent is still holding
+    /// the server's run slot.
+    private var autoTitleTask: Task<Void, Never>?
+    private var observedRunSessionID: String?
+    private var observedRunState: EventStore.RunState = .idle
+    private var automaticTitleAttemptedSessionIDs: Set<String> = []
     /// Drives the in-flight animation. The transcript's spinner is a pure function
     /// of a frame index, so something has to advance it; this is that clock, and it
     /// only runs while there is something in flight. Its second job is diagnostic: a
@@ -212,6 +244,13 @@ public final class ClientApp {
     /// free on this path: it is in no `Keybindings.defaults`, `PromptInput` only
     /// accepts scalars ≥ 0x20, and the sidebar ignores it.
     private static let ctrlG: [UInt8] = [0x07]
+    /// The command palette and the three pickers are intentionally on free
+    /// control bytes so they remain available while the prompt is focused.
+    private static let ctrlP: [UInt8] = [0x10]
+    private static let ctrlS: [UInt8] = [0x13]
+    private static let ctrlM: [UInt8] = [0x0c]
+    private static let ctrlT: [UInt8] = [0x14]
+    private static let ctrlE: [UInt8] = [0x05]
 
     public init(
         client: ServerClient,
@@ -252,6 +291,7 @@ public final class ClientApp {
             self?.buildTree(width: target.columns, height: target.rows) ?? Column([])
         }
         self.surface = surface
+        self.dialogs = DialogStack(surface: surface)
         // Held for F8. The app can flip its own `mouseOwned` flag all it likes;
         // only the lifecycle can actually write `?1000l` at the terminal.
         self.lifecycle = lifecycle
@@ -267,6 +307,8 @@ public final class ClientApp {
         }
 
         store.onChange = { [weak self] in
+            self?.refreshSessionPicker()
+            self?.observeRunStateChange()
             self?.clearNoticeIfRunSettled()
             self?.reconcilePermissionOverlay()
             self?.surface?.requestRender()
@@ -300,6 +342,13 @@ public final class ClientApp {
         promptInput.onSubmitDeferredForDrop = { [weak self] in
             self?.post(notice: "still reading the dropped file — Enter again once the 📎 chip appears")
         }
+        promptInput.onAutocomplete = { [weak self] suggestions in
+            self?.reconcileAutocomplete(suggestions)
+        }
+        promptInput.setAutocompleteProvider(makeAutocompleteProvider(commands: commandRegistry))
+        promptInput.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
+        statusBar.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
+        footerBar.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
         sidebar.onSelect = { [weak self] id in self?.openSession(id) }
         sidebar.onNew = { [weak self] in self?.newSession() }
 
@@ -340,6 +389,34 @@ public final class ClientApp {
         graphicsCapabilities = detectCapabilities()
         if let pixel = TerminalSize.cellPixelSize() {
             cellSize = CellDimensions(widthPx: pixel.widthPx, heightPx: pixel.heightPx)
+        }
+    }
+
+    /// Build the shared slash/`@` provider. Completion is local to the client
+    /// terminal, which is the useful behavior for a remote runtime: the file the
+    /// user is dragging or naming is on the machine where they are typing.
+    private func makeAutocompleteProvider(commands: CommandRegistry) -> AutocompleteProvider {
+        let slash = commands.commands.map {
+            SlashCommand(name: $0.name, description: $0.description, argumentHint: $0.argumentHint)
+        }
+        let cwd = FileManager.default.currentDirectoryPath
+        return CombinedAutocompleteProvider(commands: slash) { directory in
+            let home = NSHomeDirectory()
+            let expanded: String
+            if directory == "~" || directory.hasPrefix("~/") {
+                expanded = home + String(directory.dropFirst())
+            } else if directory.hasPrefix("/") {
+                expanded = directory
+            } else {
+                expanded = URL(fileURLWithPath: cwd).appendingPathComponent(directory).path
+            }
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: expanded) else { return [] }
+            return names.sorted().map { name in
+                let path = URL(fileURLWithPath: expanded).appendingPathComponent(name).path
+                let isDirectory = try? URL(fileURLWithPath: path)
+                    .resourceValues(forKeys: [.isDirectoryKey]).isDirectory
+                return DirectoryEntry(name: name, isDirectory: isDirectory == true)
+            }
         }
     }
 
@@ -453,6 +530,17 @@ public final class ClientApp {
             let quiet = Int(Date().timeIntervalSince(store.lastEventAt))
             if quiet >= Int(Self.silenceThreshold) { parts.append("(no data for \(quiet)s)") }
         }
+        // Contextual controls come before transient notices. The status row is
+        // truncated from the right, and a long disconnect or refusal notice can
+        // otherwise hide the diagnostic key at exactly the moment it explains the
+        // problem. The notice remains useful when it follows the key, while the
+        // key remains discoverable throughout the notice's lifetime.
+        if !streamConnected || store.runState == .running {
+            parts.append("^G: diagnostics")
+        }
+        if store.hasExpandableDetail {
+            parts.append(transcriptView.expandErrors ? "^O: collapse" : "^O: expand")
+        }
         if let notice {
             parts.append("\u{1b}[33m\(notice)\u{1b}[0m")
         }
@@ -510,23 +598,16 @@ public final class ClientApp {
             // the transient F8 notice, which has the room and is on screen at
             // exactly the moment the user needs them.
             if !mouseOwned { parts.append("mouse: released") }
-            // CONTEXTUAL HINTS FIRST, then the constants.
-            //
-            // The line is truncated from the RIGHT, and four separate waves each
-            // appended their own hint to the end of it — enough that on a 220-column
-            // terminal the tail was being cut off. What got cut was exactly the wrong
-            // half: `^G` and `^O` appear only when there is something wrong to
-            // diagnose or something capped to expand, i.e. only at the moment they
-            // matter, whereas `Tab: pane` is true forever and is the first thing a
-            // user learns. A hint that is only ever shown in an emergency has to
-            // outrank one that is always true.
-            if !streamConnected || store.runState == .running {
-                parts.append("^G: diagnostics")
-            }
-            if store.hasExpandableDetail {
-                parts.append(transcriptView.expandErrors ? "^O: collapse" : "^O: expand")
-            }
+            // The current mouse contract is more important than the static
+            // navigation hints below, and the notice above can consume most of
+            // the row on a narrow terminal. Keep the escape hatch beside the
+            // persistent mode marker so it remains visible in both directions.
             parts.append(mouseOwned ? "F8: release mouse" : "F8: capture mouse")
+            // Keep the abort contract near the contextual controls. The status
+            // row is truncated from the right, and on a narrow full-screen client
+            // the always-available tail would otherwise disappear before the
+            // user can see how to stop a run.
+            parts.append("Esc: abort")
             parts.append("Tab: pane")
             parts.append("Enter: send")
             // The working newline bindings, not the one a user will reach for first.
@@ -536,7 +617,6 @@ public final class ClientApp {
             // advertising a key that submits.
             parts.append("Alt+↵/^J: newline")
             parts.append("↑/↓: history")
-            parts.append("Esc: abort")
             parts.append("^C: quit")
         }
         return parts.joined(separator: "   ")
@@ -563,6 +643,68 @@ public final class ClientApp {
         noticeIsRunScoped = false
         notice = nil
         noticeExpiry = nil
+    }
+
+    /// Start the optional display-title request at the lifecycle boundary where it
+    /// is safe: after a normal first turn has emitted `agent_end`. Starting it when
+    /// the frame arrives races the server's final `finishRun` hop and produces a
+    /// spurious 409; starting it from the prompt path can also title an aborted or
+    /// errored session. The observed session id prevents a late end from one session
+    /// from titling the session the user just selected.
+    private func observeRunStateChange() {
+        let sessionID = store.selectedSessionID
+        guard observedRunSessionID == sessionID else {
+            observedRunSessionID = sessionID
+            observedRunState = store.runState
+            return
+        }
+        let previous = observedRunState
+        observedRunState = store.runState
+        guard previous == .running,
+              store.runState == .idle,
+              store.lastStopReason == "completed",
+              let sessionID,
+              !automaticTitleAttemptedSessionIDs.contains(sessionID),
+              autoTitleTask == nil,
+              store.sessions.first(where: { $0.id == sessionID })?.name == nil
+        else { return }
+
+        automaticTitleAttemptedSessionIDs.insert(sessionID)
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.autoTitleTask = nil }
+            let retryCount = 4
+            for attempt in 0..<retryCount {
+                guard !Task.isCancelled else { return }
+                do {
+                    guard let title = try await self.client.autoTitle(sessionID: sessionID) else { return }
+                    guard self.store.selectedSessionID == sessionID else { return }
+                    do {
+                        self.store.setSessions(try await self.client.listSessions())
+                    } catch {
+                        // The title is already durable; the next sidebar refresh
+                        // will pick it up. Avoid turning optional presentation
+                        // metadata into a transcript error row.
+                        self.post(notice: "session titled: " + sanitizeUntrustedText(title))
+                        return
+                    }
+                    self.post(notice: "session titled: " + sanitizeUntrustedText(title))
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    if case ServerClientError.unexpectedStatus(409, _, _) = error,
+                       attempt + 1 < retryCount {
+                        try? await Task.sleep(for: .milliseconds(100))
+                        continue
+                    }
+                    guard self.store.selectedSessionID == sessionID else { return }
+                    self.post(notice: "automatic title unavailable — use ^P to retry")
+                    return
+                }
+            }
+        }
+        autoTitleTask = task
+        actionTasks.append(task)
     }
 
     /// Show a non-error runtime notice on the status line.
@@ -1222,6 +1364,15 @@ public final class ClientApp {
         if let historyStore {
             promptInput.seedHistory(await historyStore.load())
         }
+        do {
+            commandRegistry = try await client.commands()
+            promptInput.setAutocompleteProvider(makeAutocompleteProvider(commands: commandRegistry))
+        } catch {
+            // Older runtimes do not have the additive route yet. Keep the built-in
+            // local actions usable and let the prompt request surface any unknown
+            // remote command normally.
+            post(notice: "command list unavailable — using built-ins")
+        }
         let sessions: [SessionSummary]
         do {
             sessions = try await client.listSessions()
@@ -1540,6 +1691,491 @@ public final class ClientApp {
         for event in pending { store.apply(event) }
     }
 
+    // MARK: Dialogs and pickers
+
+    /// Remove an application dialog through the shared stack so focus ownership
+    /// and the stack's LIFO bookkeeping stay in sync. The fallback keeps the
+    /// helper safe during teardown, when the surface may already be gone.
+    private func dismissDialog(_ handle: ScreenOverlayHandle?) {
+        guard let handle else { return }
+        if let dialogs {
+            dialogs.dismiss(handle)
+        } else {
+            handle.hide()
+        }
+    }
+
+    private func overlayOptions(width: Int = 70, height: Int? = nil) -> OverlayOptions {
+        OverlayOptions(
+            width: .absolute(min(width, max(30, surface?.target.columns ?? width))),
+            minWidth: 20,
+            maxHeight: height.map { .absolute($0) },
+            anchor: .center
+        )
+    }
+
+    private func reconcileAutocomplete(_ suggestions: AutocompleteSuggestions?) {
+        dismissDialog(autocompleteHandle)
+        autocompleteHandle = nil
+        autocompleteDialog = nil
+        guard let suggestions, !suggestions.items.isEmpty else { return }
+        let items = suggestions.items.map {
+            SelectItem(value: $0.value, label: $0.label, description: $0.description)
+        }
+        let dialog = SearchableSelectDialog(title: "Complete", items: items, keybindings: keybindings)
+        dialog.onCancel = { [weak self] in self?.dismissAutocomplete() }
+        dialog.onSelect = { [weak self] item in
+            guard let self,
+                  let selected = suggestions.items.first(where: { $0.value == item.value })
+            else { return }
+            self.promptInput.applyAutocomplete(selected, prefix: suggestions.prefix)
+            self.dismissAutocomplete()
+        }
+        autocompleteDialog = dialog
+        autocompleteHandle = dialogs?.present(dialog, options: overlayOptions(width: 76, height: 16))
+    }
+
+    private func dismissAutocomplete() {
+        dismissDialog(autocompleteHandle)
+        autocompleteHandle = nil
+        autocompleteDialog = nil
+        promptInput.dismissAutocomplete()
+    }
+
+    private func openPalette() {
+        if paletteHandle != nil { dismissPalette(); return }
+        let items = [
+            SelectItem(value: "session", label: "Open session", description: "Search and switch sessions"),
+            SelectItem(value: "rename", label: "Rename session", description: "Persist a display name"),
+            SelectItem(value: "title", label: "Auto-title session", description: "Ask the active model for a short name"),
+            SelectItem(value: "model", label: "Switch model", description: "Write a model_change entry"),
+            SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
+            SelectItem(value: "theme-dark", label: "Theme: dark", description: "Use the dark palette"),
+            SelectItem(value: "theme-light", label: "Theme: light", description: "Use the light palette"),
+            SelectItem(value: "edit-dialog", label: "Edit prompt in dialog", description: "Edit the draft inside the client"),
+            SelectItem(value: "edit", label: "Edit prompt in $EDITOR", description: "Hand the draft to the external editor"),
+        ]
+        let dialog = SearchableSelectDialog(title: "Command palette", items: items, keybindings: keybindings)
+        dialog.onCancel = { [weak self] in self?.dismissPalette() }
+        dialog.onSelect = { [weak self] item in
+            guard let self else { return }
+            self.dismissPalette()
+            self.activatePalette(item.value)
+        }
+        paletteDialog = dialog
+        paletteHandle = dialogs?.present(dialog, options: overlayOptions(width: 82, height: 15))
+    }
+
+    private func dismissPalette() {
+        dismissDialog(paletteHandle)
+        paletteHandle = nil
+        paletteDialog = nil
+    }
+
+    private func activatePalette(_ value: String) {
+        switch value {
+        case "session": openSessionPicker()
+        case "rename": openRenameDialog()
+        case "title": autoTitleSession()
+        case "model": openModelPicker()
+        case "tree": openTreePicker()
+        case "theme-dark": setAppearance(.dark)
+        case "theme-light": setAppearance(.light)
+        case "edit-dialog": openPromptEditorDialog()
+        case "edit": editPromptInEditor()
+        default: break
+        }
+    }
+
+    private func openSessionPicker() {
+        if sessionPickerHandle != nil { dismissSessionPicker(); return }
+        let items = sessionPickerItems()
+        guard !items.isEmpty else { post(notice: "no sessions to open"); return }
+        let dialog = SearchableSelectDialog(title: "Open session", items: items, keybindings: keybindings)
+        dialog.onCancel = { [weak self] in self?.dismissSessionPicker() }
+        dialog.onSelect = { [weak self] item in
+            self?.dismissSessionPicker()
+            self?.openSession(item.value)
+        }
+        sessionPickerDialog = dialog
+        sessionPickerHandle = dialogs?.present(dialog, options: overlayOptions(width: 82, height: 18))
+    }
+
+    private func sessionPickerItems() -> [SelectItem] {
+        store.sessions.map { session in
+            let title = session.name ?? session.cwd.split(separator: "/").last.map(String.init) ?? session.cwd
+            return SelectItem(
+                value: session.id,
+                label: sanitizeUntrustedText(title),
+                description: sanitizeUntrustedText(session.cwd)
+            )
+        }
+    }
+
+    private func refreshSessionPicker() {
+        guard let sessionPickerDialog else { return }
+        sessionPickerDialog.updateItems(sessionPickerItems())
+    }
+
+    private func dismissSessionPicker() {
+        dismissDialog(sessionPickerHandle)
+        sessionPickerHandle = nil
+        sessionPickerDialog = nil
+    }
+
+    private func openModelPicker() {
+        guard store.selectedSessionID != nil else { post(notice: "no session is open"); return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let models = try await self.client.models()
+                guard !models.isEmpty else { self.post(notice: "the runtime has no model aliases"); return }
+                let items = models.map {
+                    SelectItem(value: $0.id, label: $0.id, description: $0.contextWindow.map { "window \($0) tokens" })
+                }
+                let dialog = SearchableSelectDialog(title: "Switch model", items: items, keybindings: self.keybindings)
+                dialog.onCancel = { [weak self] in self?.dismissModelPicker() }
+                dialog.onSelect = { [weak self] item in
+                    self?.dismissModelPicker()
+                    self?.selectModel(item.value)
+                }
+                self.modelPickerDialog = dialog
+                self.modelPickerHandle = self.dialogs?.present(dialog, options: self.overlayOptions(width: 82, height: 18))
+            } catch {
+                self.postError("Could not load models", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func dismissModelPicker() {
+        dismissDialog(modelPickerHandle)
+        modelPickerHandle = nil
+        modelPickerDialog = nil
+    }
+
+    private func selectModel(_ model: String) {
+        guard let id = store.selectedSessionID else { return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.changeModel(sessionID: id, modelID: model)
+                self.post(notice: "model selected: \(sanitizeUntrustedText(model))")
+                self.store.markAccountingStale()
+            } catch {
+                self.postError("Could not change model", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func openTreePicker() {
+        guard let id = store.selectedSessionID else { post(notice: "no session is open"); return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let entries = try await self.client.tree(sessionID: id)
+                let items = self.treeDialogItems(entries)
+                guard !items.isEmpty else { self.post(notice: "the conversation tree is empty"); return }
+                let dialog = TreeDialog(title: "Conversation tree", items: items, keybindings: self.keybindings)
+                dialog.onCancel = { [weak self] in self?.dismissTreePicker() }
+                dialog.onSelect = { [weak self] item in
+                    self?.dismissTreePicker()
+                    self?.moveToTreeEntry(item.value)
+                }
+                dialog.onLabel = { [weak self] item in self?.openLabelDialog(for: item) }
+                self.treePickerDialog = dialog
+                self.treePickerHandle = self.dialogs?.present(dialog, options: self.overlayOptions(width: 92, height: 20))
+            } catch {
+                self.postError("Could not load the conversation tree", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func dismissTreePicker() {
+        dismissDialog(treePickerHandle)
+        treePickerHandle = nil
+        treePickerDialog = nil
+    }
+
+    private func treeDialogItems(_ entries: [SessionTreeEntry]) -> [TreeDialogItem] {
+        let byID = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        let children = Dictionary(grouping: entries, by: { $0.parentId })
+        var labelsByTarget: [String: String] = [:]
+        for entry in entries {
+            guard case .label(let targetID, let value) = entry.payload else { continue }
+            let clean = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if clean.isEmpty {
+                labelsByTarget.removeValue(forKey: targetID)
+            } else {
+                labelsByTarget[targetID] = clean
+            }
+        }
+
+        func depth(of entry: SessionTreeEntry) -> Int {
+            var depth = 0
+            var parent = entry.parentId
+            var seen: Set<String> = []
+            while let parentID = parent, seen.insert(parentID).inserted {
+                depth += 1
+                parent = byID[parentID]?.parentId
+            }
+            return min(depth, 32)
+        }
+
+        return entries.map { entry in
+            let label: String
+            let description: String
+            let kind: TreeDialogItem.Kind
+            switch entry.payload {
+            case .message(let message):
+                kind = .message
+                switch message {
+                case .user(let user): label = "user  \(collapseToOneLine(user.text))"
+                case .assistant(let assistant): label = "assistant  \(collapseToOneLine(assistant.text))"
+                case .tool(let tool): label = "tool  \(tool.toolName)"
+                case .system: label = "system"
+                }
+                description = entry.id
+            case .modelChange(let provider, let modelId):
+                kind = .metadata
+                label = "model  \(modelId)"
+                description = provider
+            case .branchSummary(let summary):
+                kind = .branch
+                label = "branch summary  \(collapseToOneLine(summary.summary))"
+                description = entry.id
+            case .compaction(let compaction):
+                kind = .metadata
+                label = "compaction  \(collapseToOneLine(compaction.summary))"
+                description = entry.id
+            case .label(let targetID, let value):
+                kind = .label
+                label = "label  \(value ?? "(cleared)")"
+                description = targetID
+            case .sessionInfo(let name):
+                kind = .metadata
+                label = "session  \(name ?? "(unnamed)")"
+                description = entry.id
+            case .leaf(let targetID):
+                kind = .branch
+                label = "branch  \(targetID ?? "root")"
+                description = entry.id
+            }
+            let currentLabel = labelsByTarget[entry.id]
+            let decoratedLabel = currentLabel.map { label + "  [" + $0 + "]" } ?? label
+            return TreeDialogItem(
+                value: entry.id,
+                label: sanitizeUntrustedText(collapseToOneLine(decoratedLabel)),
+                description: sanitizeUntrustedText(collapseToOneLine(description)),
+                parentID: entry.parentId,
+                depth: depth(of: entry),
+                kind: kind,
+                hasChildren: !(children[entry.id] ?? []).isEmpty,
+                currentLabel: currentLabel.map(sanitizeUntrustedText)
+            )
+        }
+    }
+
+    private func openLabelDialog(for item: TreeDialogItem) {
+        let dialog = DialogTextInput(title: "Label tree entry", initial: item.currentLabel ?? "")
+        dialog.onCancel = { [weak self] in self?.dismissLabelDialog() }
+        dialog.onSubmit = { [weak self] label in
+            self?.dismissLabelDialog()
+            self?.setLabel(label, targetID: item.value)
+        }
+        labelDialog = dialog
+        labelHandle = dialogs?.present(dialog, options: overlayOptions(width: 72, height: 7))
+    }
+
+    private func dismissLabelDialog() {
+        dismissDialog(labelHandle)
+        labelHandle = nil
+        labelDialog = nil
+    }
+
+    private func setLabel(_ label: String, targetID: String) {
+        guard let id = store.selectedSessionID else { return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                try await self.client.label(
+                    sessionID: id,
+                    targetID: targetID,
+                    label: clean.isEmpty ? nil : clean
+                )
+                self.post(notice: clean.isEmpty ? "label cleared" : "label saved")
+                if self.treePickerHandle != nil {
+                    self.dismissTreePicker()
+                    self.openTreePicker()
+                }
+            } catch {
+                self.postError("Could not save the label", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func moveToTreeEntry(_ entryID: String) {
+        guard let id = store.selectedSessionID else { return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.moveLeaf(sessionID: id, targetID: entryID)
+                await self.open(id)
+                self.post(notice: "moved to the selected branch")
+            } catch {
+                self.postError("Could not move to that branch", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func openRenameDialog() {
+        guard let current = store.sessions.first(where: { $0.id == store.selectedSessionID }) else {
+            post(notice: "no session is open")
+            return
+        }
+        let dialog = DialogForm(
+            title: "Rename session",
+            fields: [DialogFormField(label: "Name", value: current.name ?? "")],
+            keybindings: keybindings
+        )
+        dialog.onCancel = { [weak self] in self?.dismissRenameDialog() }
+        dialog.onSubmit = { [weak self] values in
+            self?.dismissRenameDialog()
+            self?.renameSession(values.first ?? "")
+        }
+        renameDialog = dialog
+        renameHandle = dialogs?.present(dialog, options: overlayOptions(width: 72, height: 8))
+    }
+
+    private func dismissRenameDialog() {
+        dismissDialog(renameHandle)
+        renameHandle = nil
+        renameDialog = nil
+    }
+
+    private func renameSession(_ name: String) {
+        guard let id = store.selectedSessionID else { return }
+        // An explicit rename, including an intentional clear, is the user's
+        // decision about this session's title. Do not immediately replace it with
+        // an automatic title after the next completed turn.
+        automaticTitleAttemptedSessionIDs.insert(id)
+        autoTitleTask?.cancel()
+        autoTitleTask = nil
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.renameSession(sessionID: id, name: name)
+                self.store.setSessions(try await self.client.listSessions())
+                self.post(notice: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "session name cleared" : "session renamed")
+            } catch {
+                self.postError("Could not rename the session", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func autoTitleSession() {
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        guard autoTitleTask == nil else {
+            post(notice: "automatic title is still being generated")
+            return
+        }
+        automaticTitleAttemptedSessionIDs.insert(id)
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                guard let title = try await self.client.autoTitle(sessionID: id) else {
+                    self.post(notice: "session already has a name or no messages")
+                    return
+                }
+                self.store.setSessions(try await self.client.listSessions())
+                self.post(notice: "session titled: \(sanitizeUntrustedText(title))")
+            } catch {
+                self.postError("Could not auto-title the session", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func openPromptEditorDialog() {
+        if draftEditorHandle != nil {
+            dismissPromptEditorDialog()
+            return
+        }
+        let dialog = DialogEditor(
+            title: "Edit prompt",
+            initial: promptInput.text,
+            rows: { [weak self] in
+                max(4, min(14, (self?.surface?.target.rows ?? 24) - 8))
+            }
+        )
+        dialog.onCancel = { [weak self] in self?.dismissPromptEditorDialog() }
+        dialog.onSubmit = { [weak self] text in
+            guard let self else { return }
+            self.dismissPromptEditorDialog()
+            self.promptInput.setText(text)
+            self.post(notice: "draft updated")
+        }
+        draftEditorDialog = dialog
+        draftEditorHandle = dialogs?.present(dialog, options: overlayOptions(width: 92, height: 18))
+    }
+
+    private func dismissPromptEditorDialog() {
+        dismissDialog(draftEditorHandle)
+        draftEditorHandle = nil
+        draftEditorDialog = nil
+    }
+
+    private func setAppearance(_ value: ThemeAppearance) {
+        appearance = value
+        promptInput.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
+        statusBar.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
+        footerBar.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
+        surface?.requestFullRedraw()
+        post(notice: "theme: \(value.rawValue)")
+    }
+
+    /// Hand the current draft to `$VISUAL`/`$EDITOR` while restoring the terminal
+    /// first. Re-entering the lifecycle and forcing a redraw makes this safe for
+    /// both the alternate screen and terminals whose raw-mode state is strict.
+    private func editPromptInEditor() {
+        let editorName = ProcessInfo.processInfo.environment["VISUAL"]
+            ?? ProcessInfo.processInfo.environment["EDITOR"]
+            ?? "vi"
+        let parts = editorName.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard let executable = parts.first, !executable.isEmpty else { return }
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("domocode-prompt-\(UUID().uuidString).txt")
+        do {
+            try Data(promptInput.text.utf8).write(to: temporary)
+            lifecycle?.stop()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = Array(parts.dropFirst()) + [temporary.path]
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0,
+               let updated = try? String(contentsOf: temporary, encoding: .utf8) {
+                promptInput.setText(updated)
+            }
+            try? FileManager.default.removeItem(at: temporary)
+            try lifecycle?.enter()
+            surface?.requestFullRedraw()
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            try? lifecycle?.enter()
+            post(notice: "could not launch \(executable)")
+        }
+    }
+
     // MARK: Actions (called from the render actor via component callbacks)
 
     private func openSession(_ id: String) {
@@ -1568,6 +2204,30 @@ public final class ClientApp {
     /// main-actor turn as the keystroke; and a `catch` for every remaining race, which
     /// restores it too.
     private func submit(_ text: String, _ attachments: [PromptAttachment]) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let commandName = Self.commandName(in: trimmed),
+           let descriptor = commandRegistry.command(named: commandName),
+           let action = descriptor.action {
+            switch action {
+            case .clear:
+                guard store.runState != .running else {
+                    promptInput.restore(text, attachments: attachments)
+                    refuseAsBusy()
+                    return
+                }
+                store.seed([])
+                transcriptView.scrollToBottom()
+                post(notice: "transcript cleared")
+            case .exit:
+                quit.quit()
+            case .help:
+                let names = commandRegistry.commands.map { "/\($0.name)" }.joined(separator: " · ")
+                post(notice: names, seconds: 8)
+            case .tree:
+                openTreePicker()
+            }
+            return
+        }
         guard let id = store.selectedSessionID else {
             promptInput.restore(text, attachments: attachments)
             post(notice: "no session is open")
@@ -1628,6 +2288,15 @@ public final class ClientApp {
             }
         }
         actionTasks.append(task)
+    }
+
+    private static func commandName(in input: String) -> String? {
+        guard input.first == "/" else { return nil }
+        let rest = input.dropFirst()
+        guard let first = rest.first, !first.isWhitespace else { return nil }
+        let end = rest.firstIndex(where: { $0.isWhitespace }) ?? rest.endIndex
+        let name = String(rest[..<end])
+        return name.isEmpty ? nil : name
     }
 
     /// Refuse a prompt because a turn is already in flight — and make the refusal
@@ -1725,7 +2394,7 @@ public final class ClientApp {
         // keys off the handle. The other order is a whole-keyboard trap: a nil
         // surface would leave a list with no overlay, and the input branch would
         // then swallow every key forever with nothing on screen to dismiss.
-        diagnosticsHandle = surface?.showOverlay(
+        diagnosticsHandle = dialogs?.present(
             Box(inner, paddingX: 1),
             options: OverlayOptions(
                 width: .absolute(width),
@@ -1815,7 +2484,7 @@ public final class ClientApp {
     }
 
     private func dismissDiagnosticsOverlay() {
-        diagnosticsHandle?.hide()
+        dismissDialog(diagnosticsHandle)
         diagnosticsHandle = nil
         diagnosticsList = nil
         diagnosticsOverlaySize = nil
@@ -1826,6 +2495,38 @@ public final class ClientApp {
         let value = diagnosticsList?.getSelectedItem()?.value
         dismissDiagnosticsOverlay()
         guard value == "force-clear", let id = store.selectedSessionID else { return }
+        presentForceClearConfirmation(sessionID: id)
+    }
+
+    private func presentForceClearConfirmation(sessionID: String) {
+        let dialog = DialogConfirm(
+            title: "Force-clear run?",
+            message: "This abandons the stuck turn and reopens the session.",
+            confirmLabel: "Clear run",
+            cancelLabel: "Keep running",
+            keybindings: keybindings
+        )
+        dialog.onCancel = { [weak self] in self?.dismissForceClearConfirmation() }
+        dialog.onResult = { [weak self] confirmed in
+            guard let self else { return }
+            self.dismissForceClearConfirmation()
+            guard confirmed else {
+                self.post(notice: "run was not cleared")
+                return
+            }
+            self.forceClearRun(sessionID: sessionID)
+        }
+        forceClearDialog = dialog
+        forceClearHandle = dialogs?.present(dialog, options: overlayOptions(width: 72, height: 7))
+    }
+
+    private func dismissForceClearConfirmation() {
+        dismissDialog(forceClearHandle)
+        forceClearHandle = nil
+        forceClearDialog = nil
+    }
+
+    private func forceClearRun(sessionID id: String) {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
@@ -1945,7 +2646,7 @@ public final class ClientApp {
         // and the input branch would then swallow the entire keyboard forever with
         // nothing visible and no path to dismissal (`reconcilePermissionOverlay`
         // keys off the handle, so it would never take it down either).
-        permissionHandle = surface?.showOverlay(
+        permissionHandle = dialogs?.present(
             Box(inner, paddingX: 1),
             options: OverlayOptions(
                 width: .absolute(min(Self.permissionOverlayWidth, max(30, surface?.target.columns ?? Self.permissionOverlayWidth))),
@@ -1990,7 +2691,7 @@ public final class ClientApp {
     }
 
     private func dismissPermissionOverlay() {
-        permissionHandle?.hide()
+        dismissDialog(permissionHandle)
         permissionHandle = nil
         permissionList = nil
         permissionOverlaySize = nil
@@ -2113,6 +2814,21 @@ extension ClientApp: TerminalApp {
         if data == Self.ctrlO {
             transcriptView.expandErrors.toggle()
             surface?.requestRender()
+            return
+        }
+        if data == Self.ctrlP { openPalette(); return }
+        if data == Self.ctrlS { openSessionPicker(); return }
+        if data == Self.ctrlM { openModelPicker(); return }
+        if data == Self.ctrlT { openTreePicker(); return }
+        if data == Self.ctrlE { editPromptInEditor(); return }
+        // The reusable client dialogs capture ordinary keyboard input. This
+        // branch must precede the global Escape/abort interpretation below:
+        // Escape dismisses a palette, picker, or rename form, while it still
+        // aborts a turn when no dialog owns the surface.
+        if autocompleteHandle != nil || paletteHandle != nil || sessionPickerHandle != nil
+            || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
+            || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil {
+            surface?.handleInput(data)
             return
         }
         // The diagnostics panel owns the keyboard while it is up — including over a

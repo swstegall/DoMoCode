@@ -365,6 +365,8 @@ final class InteractiveCoordinator {
     private let quit: QuitSignal
     private let harness: AgentHarness
     private let provider: any AutocompleteProvider
+    private let commandProcessor: PromptCommandProcessor
+    private let commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?
     private let toolRendererRegistry: ToolRendererRegistry
     private let toolTheme: ToolRenderTheme
     private let homeDirectory: String?
@@ -472,6 +474,8 @@ final class InteractiveCoordinator {
         quit: QuitSignal,
         harness: AgentHarness,
         provider: any AutocompleteProvider,
+        commandProcessor: PromptCommandProcessor,
+        commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?,
         toolRendererRegistry: ToolRendererRegistry,
         toolTheme: ToolRenderTheme,
         homeDirectory: String?,
@@ -489,6 +493,8 @@ final class InteractiveCoordinator {
         self.steering = steering
         self.fileSystem = fileSystem
         self.provider = provider
+        self.commandProcessor = commandProcessor
+        self.commandStreamFactory = commandStreamFactory
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
         self.homeDirectory = homeDirectory
@@ -677,11 +683,11 @@ final class InteractiveCoordinator {
         guard !trimmed.isEmpty || !staged.isEmpty else { return }
         if !trimmed.isEmpty { editor.addToHistory(trimmed) }
 
-        switch trimmed {
-        case "/exit", "/quit":
+        switch commandProcessor.localAction(for: trimmed) {
+        case .some(.exit):
             quit.quit()
             return
-        case "/clear":
+        case .some(.clear):
             transcript.clear()
             currentAssistant = nil
             assistantBuffer = ""
@@ -691,6 +697,17 @@ final class InteractiveCoordinator {
             // carrying them into the next message would send bytes the user has
             // no way to see are still staged.
             stagedImages = []
+            render()
+            return
+        case .some(.help):
+            let names = commandProcessor.workspace.commands.commands
+                .map { "/\($0.name)" }
+                .joined(separator: " · ")
+            appendStopNotice("commands: \(names)")
+            render()
+            return
+        case .some(.tree):
+            appendStopNotice("/tree is available in the full-screen client")
             render()
             return
         default:
@@ -703,6 +720,28 @@ final class InteractiveCoordinator {
 
         let images = staged.map { ImageBlock(mediaType: $0.mediaType, data: $0.data) }
         if running {
+            if commandProcessor.isCommand(trimmed) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        switch try await commandProcessor.resolve(trimmed) {
+                        case .prompt(let rendered, _, _, _):
+                            self.steering.append(
+                                .user(UserMessage(content: [.text(rendered)] + images.map(ContentBlock.image)))
+                            )
+                        case .local:
+                            break
+                        case .unknown(let name):
+                            self.appendError(DoMoError(.configuration, "Unknown command /\(name)"))
+                            self.render()
+                        }
+                    } catch {
+                        self.appendError(error)
+                        self.render()
+                    }
+                }
+                return
+            }
             // Steer the in-flight run: the harness's `getSteeringMessages` hook
             // drains this box at the current run's next turn boundary, so the text
             // joins the running agent rather than waiting for a fresh run. The user
@@ -1158,7 +1197,29 @@ final class InteractiveCoordinator {
         let sink = InteractiveEventSink(coordinator: self)
         let task = Task { @MainActor () -> RunStopReason in
             do {
-                let result = try await self.harness.run(prompt: prompt, attachments: attachments, sink: sink)
+                let resolution = try await self.commandProcessor.resolve(prompt)
+                let renderedPrompt: String
+                let runOverride: AgentHarness.RunOverride?
+                switch resolution {
+                case .local(let action):
+                    throw DoMoError(.configuration, "/\(action.rawValue) is a client-local command")
+                case .unknown(let name):
+                    throw DoMoError(.configuration, "Unknown command /\(name)")
+                case .prompt(let rendered, let commandModel, let reasoningEffort, let systemPrompt):
+                    renderedPrompt = rendered
+                    let stream = self.commandStreamFactory?(commandModel, reasoningEffort)
+                    runOverride = AgentHarness.RunOverride(
+                        model: commandModel,
+                        streamFn: stream,
+                        systemPrompt: systemPrompt
+                    )
+                }
+                let result = try await self.harness.run(
+                    prompt: renderedPrompt,
+                    attachments: attachments,
+                    sink: sink,
+                    runOverride: runOverride
+                )
                 return result.stopReason
             } catch is CancellationError {
                 return .aborted
@@ -1507,6 +1568,8 @@ public struct InteractiveMode: Sendable {
     private let harness: AgentHarness
     private let directoryLister: DirectoryLister
     private let slashCommands: [SlashCommand]
+    private let commandProcessor: PromptCommandProcessor
+    private let commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?
     private let homeDirectory: String?
     private let toolRendererRegistry: ToolRendererRegistry
     private let toolTheme: ToolRenderTheme
@@ -1537,6 +1600,8 @@ public struct InteractiveMode: Sendable {
         harness: AgentHarness,
         directoryLister: @escaping DirectoryLister,
         slashCommands: [SlashCommand],
+        commandProcessor: PromptCommandProcessor,
+        commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?,
         homeDirectory: String?,
         toolRendererRegistry: ToolRendererRegistry,
         toolTheme: ToolRenderTheme,
@@ -1550,6 +1615,8 @@ public struct InteractiveMode: Sendable {
         self.harness = harness
         self.directoryLister = directoryLister
         self.slashCommands = slashCommands
+        self.commandProcessor = commandProcessor
+        self.commandStreamFactory = commandStreamFactory
         self.homeDirectory = homeDirectory
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
@@ -1603,6 +1670,7 @@ public struct InteractiveMode: Sendable {
         // cannot express. `nil` builds one from `model`/`reasoningEffort`, which is
         // exactly the request this surface made before.
         modelRuntime: ModelRuntime? = nil,
+        modelRuntimeFor: (@Sendable (String) -> ModelRuntime)? = nil,
         compaction: CompactionSettings = .default,
         // The compaction summarizer, when a distinct small model was configured.
         // Decided by the caller (`DoMoCodeCommand.compactionSummarizer`), because
@@ -1669,6 +1737,19 @@ public struct InteractiveMode: Sendable {
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
         let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
 
+        let promptWorkspace = try SystemPromptBuilder(
+            workingDirectory: workDirectory,
+            configDirectory: FilePath(configDirectory),
+            toolNames: registry.names + visibleMcp.map(\.definition.name),
+            projectTrusted: true
+        ).build()
+        let commandProcessor = PromptCommandProcessor(
+            workspace: promptWorkspace,
+            workingDirectory: workDirectory,
+            shell: shell,
+            allowInlineShell: true
+        )
+
         // The shared factory, so this surface gets the per-alias cost rates and the
         // response-head callback that `-p` already had. The relay is the seam: the
         // coordinator that can draw a warning does not exist yet.
@@ -1692,11 +1773,11 @@ public struct InteractiveMode: Sendable {
         )
         let gate = permissionHook(engine: engine, factory: permission.factory, sessionID: "interactive")
 
+        var systemPromptForPrompt: (@Sendable (String) -> String)?
+        systemPromptForPrompt = { prompt in promptWorkspace.systemPrompt(for: prompt) }
         let configuration = AgentHarness.Configuration(
-            systemPrompt: PrintMode.systemPrompt(
-                workingDirectory: workDirectory,
-                toolNames: registry.names + visibleMcp.map(\.definition.name)
-            ),
+            systemPrompt: promptWorkspace.baseSystemPrompt,
+            systemPromptForPrompt: systemPromptForPrompt,
             tools: tools,
             model: runtime.model,
             streamFn: streamFn,
@@ -1739,7 +1820,20 @@ public struct InteractiveMode: Sendable {
         return InteractiveMode(
             harness: harness,
             directoryLister: lister,
-            slashCommands: defaultSlashCommands,
+            slashCommands: promptWorkspace.commands.commands.map {
+                SlashCommand(name: $0.name, description: $0.description, argumentHint: $0.argumentHint)
+            },
+            commandProcessor: commandProcessor,
+            commandStreamFactory: { commandModel, effort in
+                var selected = (modelRuntimeFor?(commandModel ?? runtime.model))
+                    ?? ModelRuntime(model: commandModel ?? runtime.model)
+                if let effort { selected.reasoningEffort = effort }
+                return makeStreamFn(
+                    client: client,
+                    runtime: selected,
+                    onResponse: { metadataRelay.deliver($0) }
+                )
+            },
             homeDirectory: homeDirectory,
             toolRendererRegistry: .builtin,
             toolTheme: toolTheme,
@@ -1826,6 +1920,8 @@ public struct InteractiveMode: Sendable {
             quit: quit,
             harness: harness,
             provider: provider,
+            commandProcessor: commandProcessor,
+            commandStreamFactory: commandStreamFactory,
             toolRendererRegistry: toolRendererRegistry,
             toolTheme: toolTheme,
             homeDirectory: homeDirectory,

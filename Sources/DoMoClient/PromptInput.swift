@@ -30,6 +30,9 @@ import DoMoTermIO
 final class PromptInput: @MainActor Focusable {
     private let editor: Editor
     private let keybindings: Keybindings
+    private var autocompleteTask: Task<Void, Never>?
+    private var autocompleteProvider: AutocompleteProvider?
+    private var autocompleteSuggestions: AutocompleteSuggestions?
 
     var focused = false {
         didSet { editor.focused = focused }
@@ -64,6 +67,11 @@ final class PromptInput: @MainActor Focusable {
     /// a keypress that visibly does nothing — which is exactly how a user concludes
     /// the client has frozen and hammers the key.
     var onSubmitDeferredForDrop: (() -> Void)?
+
+    /// Fired after an explicit Tab lookup. The client presents the returned
+    /// suggestions as an overlay; keeping the provider and editor here means the
+    /// same completion cursor arithmetic is used by every client surface.
+    var onAutocomplete: ((AutocompleteSuggestions?) -> Void)?
 
     private(set) var attachments: [PromptAttachment] = []
 
@@ -103,7 +111,48 @@ final class PromptInput: @MainActor Focusable {
     /// expands it again on submit, so this is the display text, not the payload.
     var text: String { editor.getText() }
 
+    func setText(_ text: String) { editor.setText(text) }
+
+    func applyTheme(_ theme: Theme, appearance: ThemeAppearance, trueColor: Bool = true) {
+        let palette = theme.palette(for: appearance)
+        editor.borderColor = { value in
+            let color = palette.accent.foreground(trueColor: trueColor)
+            return color.isEmpty ? value : color + value + sgrReset
+        }
+    }
+
+    func setAutocompleteProvider(_ provider: AutocompleteProvider?) {
+        autocompleteTask?.cancel()
+        autocompleteTask = nil
+        autocompleteProvider = provider
+        autocompleteSuggestions = nil
+        onAutocomplete?(nil)
+    }
+
+    func applyAutocomplete(_ item: AutocompleteItem, prefix: String) {
+        guard let provider = autocompleteProvider,
+              let result = provider.applyCompletion(
+                lines: editor.getLines(),
+                cursorLine: editor.getCursor().line,
+                cursorCol: editor.getCursor().col,
+                item: item,
+                prefix: prefix
+              )
+        else { return }
+        editor.applyAutocomplete(result)
+        autocompleteSuggestions = nil
+        onAutocomplete?(nil)
+    }
+
+    func dismissAutocomplete() {
+        autocompleteTask?.cancel()
+        autocompleteTask = nil
+        autocompleteSuggestions = nil
+        onAutocomplete?(nil)
+    }
+
     func clear() {
+        dismissAutocomplete()
         editor.setText("")
         attachments = []
         pendingDrops = [:]
@@ -381,10 +430,36 @@ final class PromptInput: @MainActor Focusable {
             attachments.removeLast()
             return
         }
+        // Editor deliberately treats Tab as a no-op. It is the explicit,
+        // unambiguous request to consult the async provider in the full-screen
+        // client, so do this before handing the sequence to the editor.
+        if keybindings.matches(data, .inputTab) {
+            requestAutocomplete(force: true)
+            return
+        }
         editor.handleInput(data)
     }
 
     func invalidate() { editor.invalidate() }
+
+    private func requestAutocomplete(force: Bool) {
+        guard let provider = autocompleteProvider else { return }
+        autocompleteTask?.cancel()
+        let lines = editor.getLines()
+        let cursor = editor.getCursor()
+        autocompleteTask = Task { @MainActor [weak self] in
+            let suggestions = await provider.getSuggestions(
+                lines: lines,
+                cursorLine: cursor.line,
+                cursorCol: cursor.col,
+                force: force,
+                signal: CancellationSignal { Task.isCancelled }
+            )
+            guard let self, !Task.isCancelled else { return }
+            self.autocompleteSuggestions = suggestions
+            self.onAutocomplete?(suggestions)
+        }
+    }
 
     // MARK: Paste
 

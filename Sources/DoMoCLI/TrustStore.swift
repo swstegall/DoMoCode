@@ -22,21 +22,47 @@ import Musl
 /// Whether `directory` carries project-local resources that must be gated behind
 /// project trust before a run may act on them.
 ///
-/// This is pi's `hasTrustRequiringProjectResources`, narrowed to the one project
-/// resource DoMoCode actually loads today: `<cwd>/.domocode/settings.json`. That
-/// file can silently change the model, the proxy base URL, the API-key env name,
-/// and the session directory — i.e. it can redirect where the agent talks and
-/// where it writes — so a repository must not get to supply it without the user
-/// having said "I trust this directory".
+/// This is pi's `hasTrustRequiringProjectResources`, covering project settings and
+/// every prompt resource the Phase 5b loader can inject: system files, ancestor
+/// instructions, commands, and skills. These files can change what the agent is
+/// told to do or cause a trusted command template to read files and run inline
+/// shell, so a repository must not supply them without the user having said "I
+/// trust this directory".
 ///
 /// A bare `.domocode` directory (or one holding only a `sessions/` cache) does
 /// *not* count, matching pi: trust guards *input* the project would inject, not
-/// the mere presence of the config folder. As DoMoCode grows project-local skills
-/// or prompt files, add their names here — the check is the single gate every
+/// the mere presence of the config folder. The check is the single gate every
 /// such resource passes through.
 public func projectRequiresTrust(directory: FilePath) -> Bool {
-    let projectSettings = directory.appending(".domocode").appending("settings.json")
-    return FileManager.default.fileExists(atPath: projectSettings.string)
+    func hasResource(_ path: FilePath) -> Bool {
+        guard FileManager.default.fileExists(atPath: path.string) else { return false }
+        let isDirectory = try? URL(fileURLWithPath: path.string)
+            .resourceValues(forKeys: [.isDirectoryKey]).isDirectory
+        if isDirectory != true { return true }
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: path.string) else { return false }
+        return !entries.isEmpty
+    }
+
+    var current = directory
+    while true {
+        let candidates = [
+            current.appending(".domocode").appending("settings.json"),
+            current.appending(".domocode").appending("SYSTEM.md"),
+            current.appending("SYSTEM.md"),
+            current.appending("AGENTS.md"),
+            current.appending("CLAUDE.md"),
+            current.appending(".domocode").appending("commands"),
+            current.appending(".domocode").appending("skills"),
+            current.appending(".claude").appending("commands"),
+            current.appending(".claude").appending("skills"),
+            current.appending(".agents").appending("commands"),
+            current.appending(".agents").appending("skills"),
+        ]
+        if candidates.contains(where: hasResource) { return true }
+        let parent = current.removingLastComponent()
+        if parent == current { return false }
+        current = parent
+    }
 }
 
 // MARK: - Trust store

@@ -13,18 +13,26 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 
 ## Status: the port is finished; the harness is being built out
 
-**The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine
-and the MCP client are implemented and tested** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8 and the 8.5
-hardening pass — with **2,524 tests in 298 suites green in both debug and `-c release`**.
+**The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine,
+the MCP client, the Phase 5b command layer, and Phase 5c client polish are implemented, with focused
+coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8 and the 8.5 hardening pass had
+**2,535 tests in 301 suites green in the Swift 6.3.3 debug matrix; release verification is green with
+the repository's documented macOS `DoMoCLITests` runtime exception**.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
-**Every phase of the pi port has shipped except one, and what is left after it is not port work at
-all — it is the difference between a correct harness and one you would reach for daily.** The
-exception is Phase 5, the polish pass, whose contents are squarely pi features and which never
-started: the default client has no slash commands at all, and skills, `AGENTS.md` loading, themes,
-external-editor handoff, session-tree navigation and in-session model switching do not exist. Beyond
-it,
+**Every phase of the pi port has shipped except the remaining Phase 5d terminal-native polish.**
+Phase 5a — truth and plumbing — Phase 5b — the command layer — and Phase 5c — the client polish —
+are complete; 5d follows. The default client now receives the same command registry as the inline surface,
+`/review`, `/init`, and `/tree` are available through that registry, trusted project instructions and
+skills participate in the system prompt, and Claude Code-compatible markdown resources load in place.
+The 5c slice adds the shared theme/dialog foundations, command palette, client-side `@` completion,
+model changes, searchable session/tree controls, labels, branch summaries, LLM title generation, and
+`$EDITOR` handoff. Its follow-up polish wires the reusable confirm/form/editor dialogs into real
+actions, refreshes open pickers, presents labels on their target nodes, preserves explicit title clears,
+and starts automatic titling only after a completed first turn. **Next up is Phase 5d terminal-native
+polish.**
+Beyond it,
 [a second survey of the sibling harnesses](#sibling-harnesses-and-prior-art) found **706 distinct
 capabilities DoMoCode does not have** — subagents, checkpoints and undo, a diff review pane, plan mode,
 LSP diagnostics, sandboxing. The [roadmap](#roadmap) now sequences them.
@@ -138,7 +146,7 @@ Sources/
   DoMoAgent/        The pure agent loop: turn structure, tool dispatch, steering and follow-up
                     queues, the awaited event sink. No I/O, no persistence — so it is cheap to test.
   DoMoHarness/      Session tree, JSONL storage, context building, compaction, branch summaries,
-                    hooks. (Skills and prompt templates land here in Phase 5; they do not exist yet.)
+                    hooks, the system-prompt builder, and command/skill resource loading.
   DoMoExec/         FileSystem + Shell over swift-subprocess; gitignore walker; path sandboxing;
                     per-path file mutation coordinator; image-attachment loading.
   DoMoTools/        The built-in tools (read/write/edit/bash/grep/find/ls), headless by design.
@@ -183,7 +191,7 @@ Sources/
 | `@earendil-works/pi-agent-core` (`harness/`) | `DoMoHarness` | Session tree, storage, `buildContext`, compaction, branch summarization, hooks. |
 | `@earendil-works/pi-agent-core` (`env/nodejs.ts`) | `DoMoExec` | Protocol-based FileSystem and Shell with a single POSIX implementation. |
 | `@earendil-works/pi-coding-agent` (`core/tools/`) | `DoMoTools` + `DoMoToolsUI` | The built-in tools, split headless/rendered. |
-| `@earendil-works/pi-coding-agent` (rest) | `DoMoCLI` | Session orchestration, settings, trust, output modes. Slash commands are a Phase-5 item and are still a three-name stub. |
+| `@earendil-works/pi-coding-agent` (rest) | `DoMoCLI` | Session orchestration, settings, trust, output modes, and the Phase 5b command/resource layer. |
 | `@earendil-works/pi-storage-sqlite-node` | `DoMoHarness` protocol; SQLite backend deferred | JSONL is the shipping default and the only implementation; the `SessionStorage` seam exists from Phase 3. |
 | `@earendil-works/pi-server` | `DoMoServer` | No longer a non-goal. Narrowed hard: a *local, loopback-only* HTTP/SSE server (Hummingbird), modeled on opencode's `server.ts`/`event.ts`. Multi-instance supervision, mDNS discovery, and cloud presence stay out. |
 | *(no upstream — pi has no MCP)* | `DoMoMCP` | Original to DoMoCode, not derived from pi. A hand-rolled stdio MCP client, modeled on opencode's/kilocode's `mcp/`. |
@@ -296,16 +304,13 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       `-p` is an interactive session with streaming output, `@` file completion, Escape-to-abort, and
       Enter to queue a follow-up; three end-to-end tests drive the real REPL headlessly against a mock
       gateway. 1059 tests, green in both configurations. (That REPL is `domo --inline` today — Phase 7
-      moved the no-flag default to the full-screen client, which has no `@` completion of its own.)
-- [ ] **Phase 5 — Polish**, split into four the way Phase 8 was. **5a is shipped; 5b–5d are not.**
-      It was sequenced *before* the architecture pivot and was overtaken by it, so what remains is
-      substrate rather than feature: `SlashCommand` + `SlashCommandProvider` and a fuzzy completion
-      popup are built and tested, but dispatch is a hard-coded three-name `switch` in the `--inline`
-      REPL and the default client has none at all; `ToolRenderTheme` / `SelectListTheme` /
-      `EditorTheme` are styling seams with presets nothing can select; the session **tree** exists in
-      the harness and over REST, and the sidebar draws a flat list that never calls it; `model_change`
-      session entries round-trip through the context builder and compactor and nothing ever writes
-      one; `Yams` is declared for skill frontmatter that was never written.
+      moved the no-flag default to the full-screen client; its `@`/slash completion landed in 5c.)
+- [ ] **Phase 5 — Polish**, split into four the way Phase 8 was. **5a and 5b are complete; 5c is in
+      progress; 5d follows.** It was sequenced *before* the architecture pivot and was overtaken by
+      it, so the remaining work is now being landed against the client/server seams: the full-screen
+      client has a shared command registry, theme value model, dialog stack, searchable pickers,
+      model/session/tree mutations, and the existing accounting footer is wired to server-derived
+      values.
 
       **[x] 5a — Truth and plumbing.** Several shipped subsystems reported numbers that were
       structurally wrong: cost was always zero because `rates:` was never passed to a single
@@ -357,7 +362,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       `messageStart` for a turn that never streamed, so the sink infers "was this timed" from the stop
       reason instead of being told.
 
-      **5b — The command layer.** The two seams the rest of the roadmap leans on hardest: a composable
+      **[x] 5b — The command layer.** The two seams the rest of the roadmap leans on hardest: a composable
       `SystemPromptBuilder` (base → `SYSTEM.md` → `AGENTS.md`/`CLAUDE.md` ancestor walk → available
       skills → cwd) and one `CommandDescriptor` registry served to both surfaces over `GET /commands`,
       so they cannot drift. On top of them: markdown-plus-frontmatter commands and skills with a
@@ -367,12 +372,16 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       per-command model and reasoning overrides, keyword-triggered skills, and `/init` and `/review`
       shipped as built-in templates rather than special-cased code. *Exit:* dropping
       `.domocode/commands/review.md` into a repo produces a working `/review` in both surfaces, and an
-      `AGENTS.md` at the root visibly changes the system prompt.
+      `AGENTS.md` at the root visibly changes the system prompt. **Exit met:** the shared builder,
+      registry endpoint, trust gate, template grammar, built-in `/init` and `/review`, project/user
+      precedence, and focused harness coverage are shipped. The command-palette and full-screen
+      `@` affordances are now part of the first 5c slice.
 
-      **5c — Dialogs, themes, and the client's missing hands.** The largest single chunk of Phase 5.
+      **5c — Dialogs, themes, and the client's missing hands (complete).** The largest single chunk
+      of Phase 5.
       One reusable dialog vocabulary (`select`/`confirm`/`input`/`form`/`editor` as async overlays,
-      with a dialog stack and focus save/restore), proven by refactoring the existing permission modal
-      onto it; a `Theme` value type with hex / ANSI-index / `none`-means-inherit and dark-light
+      with a dialog stack and focus save/restore), applied across the permission/diagnostics surfaces
+      and client actions; a `Theme` value type with hex / ANSI-index / `none`-means-inherit and dark-light
       variants; and then both spent on the pickers users expect — command palette, `@` completion in
       the client, model picker writing the first real `model_change`, `/tree` with filter modes,
       folding, labels and branch summaries (giving the already-written `summarizeBranch` a caller),
@@ -380,6 +389,15 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       screen, and a footer showing cwd, branch, tokens, cost and context percentage. *Exit:* in the
       default client a user can theme it, switch models, search and rename sessions, navigate and
       branch the tree, and read a footer whose numbers are derived rather than guessed.
+
+      **Phase 5c exit verified:** `ThemeColor` accepts hex, ANSI-index, and inherited colours with
+      dark/light palettes; `DialogStack` now owns focus-safe overlays including permission and
+      diagnostics; the default client exposes the command palette, `/tree`, Tab-driven `@` and slash
+      completion, model switching, searchable sessions, rename/label forms, tree filtering/folding,
+      branch navigation and summaries, LLM-generated titles, and `$EDITOR` handoff. **The delivered
+      polish** wires the dialog vocabulary, picker refresh, label presentation, title-clear semantics,
+      and completed-turn auto-title trigger, covered by the Swift 6.3.3 debug/release verification
+      matrices.
 
       **5d — Terminal-native polish.** Kitty keyboard protocol negotiation with a `modifyOtherKeys`
       fallback, restoring Shift+Enter (the decoder already carries a `kittyProtocolActive`
@@ -702,8 +720,8 @@ ordering falls out of them rather than out of appeal:
 
 | Seam | Today | Unblocks |
 |---|---|---|
-| **System-prompt builder** | one literal string in `PrintMode.systemPrompt` | `AGENTS.md`, skills, agents, plan mode, tool-visibility rewriting |
-| **Command registry** | a three-name `switch` in `--inline`; nothing in the client | slash commands, palette, keybindings, `/review`, plan-exit UI |
+| **System-prompt builder** | `SystemPromptBuilder` loads trusted system/instruction files and active skills | agents, plan mode, tool-visibility rewriting |
+| **Command registry** | one shared registry, `GET /commands`, and template-backed dispatch | palette polish, keybindings, plan-exit UI |
 | **Dialog vocabulary** | one bespoke permission modal per surface | `question`, every picker, settings, export options, diff review |
 | **Per-turn mutable tool set** | `AgentContext.tools` fixed at construction | plan mode, agents, subagents, MCP `tools/list_changed` |
 | **Git facade** | none | diff viewer, `/review`, checkpoints, undo, worktrees, branch in footer |
@@ -784,8 +802,8 @@ what is left out is named under [Non-goals](#non-goals-and-known-gaps) rather th
 rediscovered. The table below is kept as the record of the first, narrower judgment.
 
 The second survey's blunt finding: the most valuable single absent capability is **checkpoints and
-undo** (Phase 13), and the cheapest large win is **`AGENTS.md` loading** (Phase 5b) — a few hundred
-lines that changes every response the agent gives.
+undo** (Phase 13); the cheapest large win, **`AGENTS.md` loading**, is now shipped in Phase 5b and
+changes every response the agent gives.
 
 "Fit" below is judged against the [non-goals](#non-goals-and-known-gaps): a new *first-party* tool is
 `adaptable`, not free, because the extensibility non-goal forbids plugin-defined tools, not new Swift
@@ -800,9 +818,9 @@ ones — each addition still forces a tool-vs-prompt-injection and in-process-vs
 | Auto-format-after-edit hook; repo `.setup.sh` session-init hook | all three | yes | Phase 16 (format); hooks await the [extensibility decision](#decisions-that-reverse-a-stated-non-goal) |
 | Hard per-task budget cap (abort the loop on a cost ceiling) | OpenHands | yes | Phase 9 (needs Phase 5a's real cost rates) |
 | Trusted-config `{env:}`/`{file:}` interpolation gated by the trust boundary | kilocode | yes | Phase 5a |
-| Local `/review` of a diff, branch, or commit | kilocode, OpenHands | yes | Phase 5 |
-| Skill refinements: keyword auto-injection, task-input `{VAR}` templates | all three | yes | Phase 5 |
-| Slash-command polish: `$ARGUMENTS`/`$N`, inline `` !`shell` ``, per-command overrides, ANSI-index / `none`=inherit theming | opencode, kilocode | yes | Phase 5 |
+| Local `/review` of a diff, branch, or commit | kilocode, OpenHands | yes | Phase 5b |
+| Skill refinements: keyword auto-injection, task-input `{VAR}` templates | all three | yes | Phase 5b |
+| Slash-command polish: `$ARGUMENTS`/`$N`, inline `` !`shell` ``, per-command overrides, ANSI-index / `none`=inherit theming | opencode, kilocode | yes | Phase 5b (commands) + 5c (themes) |
 | First-party tool additions: `question`/`suggest`, todo checklist, `webfetch` (+ gated `apply_patch`, notebook-edit, `recall`) | all three | adaptable | Phase 11; `recall` in Phase 17. `websearch` needs a second vendor and stays out |
 | Selectable/tunable history condensers (observation-masking, recent-window, LLM-summarizing) | OpenHands | adaptable | Phase 10 |
 | Local conveniences: prompt stash, `/btw` side-branch, background jobs, file watcher, JSONL replay, local secrets + env injection, out-of-process notify/sound | opencode, kilocode, OpenHands | yes/adaptable | Scattered: stash in Phase 9, background jobs in 11, replay in 20, notify/sound in 5d, secrets in 5a. Prompt *history* shipped in 8.5; a file watcher remains unscheduled |
@@ -886,7 +904,7 @@ target, and Phase 8.5's was a single intra-package edge from `DoMoClient` to `Do
 | [apple/swift-system](https://github.com/apple/swift-system) | Apache-2.0 | `FilePath`, `FileDescriptor`, `Errno`. Note it does *not* expose termios or ioctl. `from: "1.7.5"`. |
 | [swiftlang/swift-subprocess](https://github.com/swiftlang/swift-subprocess) | Apache-2.0 | Async subprocess with cancellation that reaches the child. `from: "0.5.0"` — the previous sub-0.5 pin was a toolchain cap, not a stability choice. `1.0.0-beta.1` is usable but needs `.exact()`, since SwiftPM never selects a pre-release via `from:`. |
 | [apple/swift-log](https://github.com/apple/swift-log) | Apache-2.0 | Logging facade; handler tees JSON to the session log and human text to stderr. `from: "1.14.0"` — the 6.1 floor capped this at 1.10.0. |
-| [jpsim/Yams](https://github.com/jpsim/Yams) | MIT | YAML frontmatter in skills and prompt templates. `from: "6.2.2"` — that is Yams' own semver and has nothing to do with the Swift version. **Currently unused**: it is declared for Phase 5, which has not started, and no source file imports it. |
+| [jpsim/Yams](https://github.com/jpsim/Yams) | MIT | Permissive YAML frontmatter in skills and prompt templates. `from: "6.2.2"` — that is Yams' own semver and has nothing to do with the Swift version. |
 | [ajevans99/swift-json-schema](https://github.com/ajevans99/swift-json-schema) | MIT | Tool-schema generation *and* draft-2020-12 validation of returned arguments — validation is the half that protects you. `.upToNextMinor(from: "0.13.1")`, pre-1.0. |
 | [swiftlang/swift-markdown](https://github.com/swiftlang/swift-markdown) | Apache-2.0 WITH Swift-exception | cmark-gfm AST for the Markdown component. `.upToNextMinor(from: "0.8.0")` — the 6.1 floor capped this at 0.7.1. The repository moved from `apple/`, which now redirects; pin the semver tag, never a `swift-6.x.y-RELEASE` tag. |
 | [groue/GRDB.swift](https://github.com/groue/GRDB.swift) | MIT | **Not declared.** Held for a possible SQLite session store at `from: "7.11.1"`, validated against this graph and recorded as a comment in `Package.swift`. JSONL is still the only `SessionStorage` implementation. |
@@ -937,7 +955,7 @@ target, and Phase 8.5's was a single intra-package edge from `DoMoClient` to `Do
   pre-1.0 single-maintainer package with a vendored C shim sitting under the key decoder — the same
   bet declined above. Its OSC-query surface is the genuinely non-duplicative part, and the revisit
   never happened because nothing has needed it: there is no background-color detection in the tree,
-  and no theming to want it until Phase 5.
+  and no theming to want it until Phase 5c.
 - **swift-collections** and **swift-async-algorithms** — not *direct* dependencies, but both are
   already in the resolved graph and already built: `swift-collections` 1.6.0 arrives via swift-nio,
   swift-json-schema, and swift-configuration, and `swift-async-algorithms` 1.1.5 via swift-nio-extras
@@ -1004,7 +1022,7 @@ default.**
 | `DOMOCODE_RETRY_BASE_MS` | `1000` | First backoff; each further attempt doubles it before jitter. |
 | `DOMOCODE_RETRY_MAX_MS` | `60000` | Backoff ceiling, which also caps a server-supplied `Retry-After`. |
 | `DOMOCODE_RETRY_BUDGET_MS` | `300000` | Total time one request may spend asleep between attempts. `0` means no budget. |
-| `DOMOCODE_CONFIG_DIR` | `~/.domocode` | Settings and the trust store. (Skills and themes land here in Phase 5.) |
+| `DOMOCODE_CONFIG_DIR` | `~/.domocode` | Settings, trust store, user commands, and user skills. (The default client theme surface shipped in Phase 5c.) |
 | `DOMOCODE_SESSION_DIR` | `$CONFIG_DIR/sessions` | Session JSONL root, and the per-workspace prompt history beside it. Point this elsewhere and both move. |
 | `DOMOCODE_LOG_LEVEL` | `warning` | Logs go to stderr; stdout is reserved for the JSON protocol channel. |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | — | **Not honored.** Nothing reads them, and the default transport is `HTTPClient.shared`, which cannot be given a proxy configuration. Behind a proxy, point `DOMOCODE_BASE_URL` at it directly. |
@@ -1253,10 +1271,10 @@ real — each of these is now a property of the shipped system, not a forecast:
 
 ## Contributing
 
-Every phase of the pi port is implemented; **Phase 5 — Polish** is the current work, and Phases 9–21
-are planned but unstarted. The [dependency spine](#the-dependency-spine) is the useful map: six seams
-gate most of what is left, and a change that lands one of them is worth more than a change that ships
-a feature around it. Issues proposing scope changes — particularly anything in
+All shipped phases through 8.5, plus Phases 5a, 5b, and 5c, are implemented.
+**Phase 5c — Dialogs, themes, and the client's missing hands — is complete**, followed by 5d and Phases 9–21. The [dependency spine](#the-dependency-spine)
+is the useful map: six seams gate most of what is left, and a change that lands one of them is worth
+more than a change that ships a feature around it. Issues proposing scope changes — particularly anything in
 [Non-goals](#non-goals-and-known-gaps) or the
 [reversal table](#decisions-that-reverse-a-stated-non-goal) — are welcome before code lands rather
 than after.

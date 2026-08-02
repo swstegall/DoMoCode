@@ -46,6 +46,10 @@ public enum OutputMode: Sendable, Hashable {
     case json
 }
 
+/// Resolves a command-specific model/reasoning override. Print mode creates the
+/// actual stream so it can always attach its response-head metadata callback.
+public typealias CommandRuntimeFactory = @Sendable (String?, ReasoningEffort?) -> ModelRuntime
+
 // MARK: - Output channel
 
 /// The one place the process writes to stdout and stderr.
@@ -544,6 +548,9 @@ public struct PrintMode: Sendable {
     /// and advances the counter the terminal `result` event reports as `turns`.
     /// Installing a real summarizer is what removes that turn from the count.
     let summarizer: Summarizer?
+    let promptWorkspace: PromptWorkspace?
+    let commandProcessor: PromptCommandProcessor?
+    let commandRuntimeFactory: CommandRuntimeFactory?
 
     /// How often text mode says it is still alive, in turns. Rare enough that a
     /// short run prints nothing extra (the two-turn end-to-end runs are untouched),
@@ -564,7 +571,10 @@ public struct PrintMode: Sendable {
         mcpTools: [any AgentTool] = [],
         modelRuntime: ModelRuntime,
         compaction: CompactionSettings = .default,
-        summarizer: Summarizer? = nil
+        summarizer: Summarizer? = nil,
+        promptWorkspace: PromptWorkspace? = nil,
+        commandProcessor: PromptCommandProcessor? = nil,
+        commandRuntimeFactory: CommandRuntimeFactory? = nil
     ) {
         self.client = client
         self.modelRuntime = modelRuntime
@@ -580,6 +590,9 @@ public struct PrintMode: Sendable {
         self.mcpTools = mcpTools
         self.compaction = compaction
         self.summarizer = summarizer
+        self.promptWorkspace = promptWorkspace
+        self.commandProcessor = commandProcessor
+        self.commandRuntimeFactory = commandRuntimeFactory
     }
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
@@ -616,8 +629,17 @@ public struct PrintMode: Sendable {
         let turnCounter = TurnCounter()
         let runGuard = RunGuard()
 
+        let fallbackSystemPrompt = Self.systemPrompt(
+            workingDirectory: workingDirectory,
+            toolNames: registry.names + mcpTools.map(\.definition.name)
+        )
+        var systemPromptForPrompt: (@Sendable (String) -> String)?
+        if let promptWorkspace {
+            systemPromptForPrompt = { prompt in promptWorkspace.systemPrompt(for: prompt) }
+        }
         let configuration = AgentHarness.Configuration(
-            systemPrompt: Self.systemPrompt(workingDirectory: workingDirectory, toolNames: registry.names + mcpTools.map(\.definition.name)),
+            systemPrompt: promptWorkspace?.baseSystemPrompt ?? fallbackSystemPrompt,
+            systemPromptForPrompt: systemPromptForPrompt,
             tools: tools,
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
@@ -659,7 +681,57 @@ public struct PrintMode: Sendable {
             imageMaxWidth: graphics.maxWidth
         )
 
-        let result = try await harness.run(prompt: prompt, attachments: attachments, sink: sink)
+        let resolution: PromptCommandResolution
+        if let commandProcessor {
+            resolution = try await commandProcessor.resolve(prompt)
+        } else {
+            resolution = .prompt(
+                text: prompt,
+                model: nil,
+                reasoningEffort: nil,
+                systemPrompt: promptWorkspace?.systemPrompt(for: prompt) ?? fallbackSystemPrompt
+            )
+        }
+        let renderedPrompt: String
+        let runOverride: AgentHarness.RunOverride?
+        switch resolution {
+        case .local(let action):
+            throw DoMoError(.configuration, "/\(action.rawValue) is a client-local command")
+        case .unknown(let name):
+            throw DoMoError(.configuration, "Unknown command /\(name)")
+        case .prompt(let text, let commandModel, let reasoningEffort, let systemPrompt):
+            renderedPrompt = text
+            let commandStream: AgentStreamFn?
+            if let commandRuntimeFactory,
+               commandModel != nil || reasoningEffort != nil {
+                let runtime = commandRuntimeFactory(commandModel, reasoningEffort)
+                commandStream = makeStreamFn(
+                    client: client,
+                    runtime: runtime,
+                    onResponse: { [self] metadata in onMetadata(metadata) }
+                )
+            } else {
+                // Ordinary prompts must stay on the base stream so its response
+                // callback, and therefore `response_metadata`, remains attached.
+                commandStream = nil
+            }
+            let stream = streamFunction(
+                counter: turnCounter,
+                runGuard: runGuard,
+                request: commandStream
+            )
+            runOverride = AgentHarness.RunOverride(
+                model: commandModel,
+                streamFn: stream,
+                systemPrompt: systemPrompt
+            )
+        }
+        let result = try await harness.run(
+            prompt: renderedPrompt,
+            attachments: attachments,
+            sink: sink,
+            runOverride: runOverride
+        )
         // The totals come off the harness's own accumulator rather than a second
         // sum kept here: one accumulator per session is the whole reason
         // ``AgentHarness/accounting()`` exists, and a private one in this file
@@ -727,12 +799,16 @@ public struct PrintMode: Sendable {
     /// terminal `.error` turn and settles `.errored`, so the run stops at the
     /// failing turn (exit 1) without a further provider call — the effect Phase 1
     /// got from `shouldStopAfterTurn`.
-    private func streamFunction(counter: TurnCounter, runGuard: RunGuard) -> AgentStreamFn {
+    private func streamFunction(
+        counter: TurnCounter,
+        runGuard: RunGuard,
+        request overrideRequest: AgentStreamFn? = nil
+    ) -> AgentStreamFn {
         // The request itself is ``makeStreamFn``'s, shared with the inline REPL and
         // the embedded server, so an argument added there (per-alias `rates`, say)
         // cannot reach two surfaces and miss the third. Only the guard, the counter
         // and the heartbeat are print mode's own.
-        let request = makeStreamFn(
+        let request = overrideRequest ?? makeStreamFn(
             client: client,
             runtime: modelRuntime,
             onResponse: { metadata in onMetadata(metadata) }

@@ -86,7 +86,8 @@ final class SessionSidebar: @MainActor Focusable {
         }
     }
 
-    /// A compact one-line label: the working-directory basename and a short id.
+    /// A compact one-line label: an explicit session name when present, then the
+    /// working-directory basename and a short id.
     ///
     /// Uses the id's TRAILING hex, which is random in a UUIDv7 — the leading hex is
     /// a time-ordered prefix that is identical for sessions created close together,
@@ -94,6 +95,9 @@ final class SessionSidebar: @MainActor Focusable {
     private func sessionLabel(_ session: SessionSummary) -> String {
         let shortID = String(session.id.suffix(6))
         let cwdName = session.cwd.split(separator: "/").last.map(String.init) ?? session.cwd
-        return "\(cwdName)  \(shortID)"
+        if let name = session.name, !name.isEmpty {
+            return "\(sanitizeUntrustedText(name))  ·  \(sanitizeUntrustedText(cwdName))  \(shortID)"
+        }
+        return "\(sanitizeUntrustedText(cwdName))  \(shortID)"
     }
 }

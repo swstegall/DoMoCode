@@ -672,6 +672,11 @@ struct WedgeSurfaceTests {
         try? await Task.sleep(for: .milliseconds(200))
         client.press()
 
+        // Force-clear is destructive: the first Enter opens the reusable
+        // confirmation dialog, and the second confirms the selected action.
+        #expect(await client.wait(for: "Force-clear run?"), "screen:\n\(client.joined())")
+        client.press()
+
         #expect(await client.wait(for: "the run was cleared — you can send again"), "screen:\n\(client.joined())")
 
         // The notice is the client talking to itself, and so is `markIdle()`. Swap

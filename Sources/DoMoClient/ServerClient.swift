@@ -119,6 +119,10 @@ public struct ServerClient: Sendable {
     private struct CreateBody: Encodable { let resume: String? }
     private struct PromptBody: Encodable { let prompt: String; let images: [ImageBlock]? }
     private struct PermissionReplyBody: Encodable { let requestID: String; let reply: String; let message: String? }
+    private struct ModelBody: Encodable { let modelID: String }
+    private struct RenameBody: Encodable { let name: String? }
+    private struct LabelBody: Encodable { let targetID: String; let label: String? }
+    private struct LeafBody: Encodable { let targetID: String? }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -143,6 +147,24 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode([SessionSummary].self, from: data)
     }
 
+    /// Fetch the runtime's command descriptors. Templates are not included in
+    /// this response; the server expands prompt commands so a remote client never
+    /// has to mirror project files or trust a local shell.
+    public func commands() async throws -> CommandRegistry {
+        let path = "/commands"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(CommandRegistry.self, from: data)
+    }
+
+    /// Fetch aliases available to the runtime's model picker.
+    public func models() async throws -> [ModelOption] {
+        let path = "/models"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([ModelOption].self, from: data)
+    }
+
     /// The linear root-to-leaf transcript to seed the main pane. `GET
     /// /session/{id}/messages` → 200.
     public func messages(sessionID: String) async throws -> [Message] {
@@ -160,6 +182,50 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([SessionTreeEntry].self, from: data)
+    }
+
+    /// Fetch the complete session tree for the `/tree` picker.
+    public func tree(sessionID: String) async throws -> [SessionTreeEntry] {
+        let path = "/session/\(sessionID)/tree"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionTreeEntry].self, from: data)
+    }
+
+    public func changeModel(sessionID: String, modelID: String) async throws {
+        let path = "/session/\(sessionID)/model"
+        let body = try JSONEncoder().encode(ModelBody(modelID: modelID))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+    }
+
+    public func renameSession(sessionID: String, name: String?) async throws {
+        let path = "/session/\(sessionID)/rename"
+        let body = try JSONEncoder().encode(RenameBody(name: name))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+    }
+
+    /// Ask the active model for a short title when the session is unnamed.
+    public func autoTitle(sessionID: String) async throws -> String? {
+        let path = "/session/\(sessionID)/title"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionTitleResult.self, from: data).title
+    }
+
+    public func label(sessionID: String, targetID: String, label: String?) async throws {
+        let path = "/session/\(sessionID)/label"
+        let body = try JSONEncoder().encode(LabelBody(targetID: targetID, label: label))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+    }
+
+    public func moveLeaf(sessionID: String, targetID: String?) async throws {
+        let path = "/session/\(sessionID)/leaf"
+        let body = try JSONEncoder().encode(LeafBody(targetID: targetID))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
     }
 
     /// Submit a prompt. Fire-and-forget: the run streams over the event channel.

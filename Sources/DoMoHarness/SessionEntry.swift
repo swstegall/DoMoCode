@@ -250,13 +250,22 @@ public struct SessionTreeEntry: Sendable, Hashable {
     /// turn and re-deriving it in the new file is impossible.
     public var elapsedMs: Int?
 
+    /// Usage for a metadata-only LLM call, currently session auto-titling.
+    ///
+    /// The JSONL envelope already has a `usage` key for compaction and branch
+    /// summaries. Reusing it for `session_info` keeps the title's cost recoverable
+    /// without changing the established payload case or making every existing
+    /// switch over `Payload` grow another associated value.
+    public var metadataUsage: Usage?
+
     public init(
         id: String,
         parentId: String?,
         timestamp: String,
         payload: Payload,
         seq: Int? = nil,
-        elapsedMs: Int? = nil
+        elapsedMs: Int? = nil,
+        metadataUsage: Usage? = nil
     ) {
         self.id = id
         self.parentId = parentId
@@ -264,6 +273,7 @@ public struct SessionTreeEntry: Sendable, Hashable {
         self.payload = payload
         self.seq = seq
         self.elapsedMs = elapsedMs
+        self.metadataUsage = metadataUsage
     }
 
     /// The type-specific body of an entry.
@@ -341,7 +351,8 @@ extension SessionTreeEntry: Codable {
         // shared by all seven payload shapes (`summary` and `usage` are each
         // used by two of them, `targetId` by two), so a new envelope key has to
         // be checked against every payload's fields, not just the envelope's:
-        // neither `seq` nor `elapsedMs` appears in any payload below.
+        // neither `seq` nor `elapsedMs` appears in any payload below. `usage`
+        // is also reused by `session_info` for an LLM-generated title.
         case seq
         case elapsedMs
         // Payload-specific:
@@ -380,6 +391,7 @@ extension SessionTreeEntry: Codable {
         // format produced before they were added.
         self.seq = try container.decodeIfPresent(Int.self, forKey: .seq)
         self.elapsedMs = try container.decodeIfPresent(Int.self, forKey: .elapsedMs)
+        self.metadataUsage = nil
 
         switch entryType {
         case .message:
@@ -414,6 +426,7 @@ extension SessionTreeEntry: Codable {
             )
         case .sessionInfo:
             self.payload = .sessionInfo(name: try container.decodeIfPresent(String.self, forKey: .name))
+            self.metadataUsage = try container.decodeIfPresent(Usage.self, forKey: .usage)
         case .leaf:
             self.payload = .leaf(targetId: try container.decodeIfPresent(String.self, forKey: .targetId))
         }
@@ -458,6 +471,7 @@ extension SessionTreeEntry: Codable {
             try container.encodeIfPresent(label, forKey: .label)
         case .sessionInfo(let name):
             try container.encodeIfPresent(name, forKey: .name)
+            try container.encodeIfPresent(metadataUsage, forKey: .usage)
         case .leaf(let targetId):
             // Present as `null` when the leaf is reset to before the first entry,
             // which is a distinct state from "no targetId field".

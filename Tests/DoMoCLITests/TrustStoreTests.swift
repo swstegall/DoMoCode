@@ -45,6 +45,26 @@ struct TrustStoreTests {
         #expect(projectRequiresTrust(directory: dir) == false)
     }
 
+    @Test("project instructions require trust")
+    func projectInstructionsRequireTrust() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: dir.string) }
+        try "Keep the repository instructions visible."
+            .write(toFile: dir.appending("AGENTS.md").string, atomically: true, encoding: .utf8)
+        #expect(projectRequiresTrust(directory: dir) == true)
+    }
+
+    @Test("an empty prompt-resource directory requires no trust")
+    func emptyPromptResourceDirectoryNeedsNoTrust() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: dir.string) }
+        try FileManager.default.createDirectory(
+            atPath: dir.appending(".agents").appending("skills").string,
+            withIntermediateDirectories: true
+        )
+        #expect(projectRequiresTrust(directory: dir) == false)
+    }
+
     // MARK: - Decisions
 
     @Test("an unrecorded directory has no decision")

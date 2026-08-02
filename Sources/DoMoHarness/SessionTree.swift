@@ -76,6 +76,22 @@ public struct SessionTree: Sendable {
         entries.filter { $0.parentId == parentID }
     }
 
+    /// Returns the latest session name on a branch, preserving an explicit clear.
+    ///
+    /// A `session_info` entry with `name == nil` is a real metadata update, not an
+    /// absent value. Walking with `compactMap` would skip that update and resurrect
+    /// an older title after the user cleared it. This helper keeps that distinction
+    /// in one place for the harness and the server's session listing.
+    public static func latestSessionName(in branch: [SessionTreeEntry]) -> String? {
+        for entry in branch.reversed() {
+            if case .sessionInfo(let name) = entry.payload {
+                let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed?.isEmpty == true ? nil : trimmed
+            }
+        }
+        return nil
+    }
+
     // MARK: - Path resolution
 
     /// The full path from the root down to `fromID` (or the current leaf), in
@@ -245,7 +261,8 @@ extension JSONLSessionStore {
                     timestamp: entry.timestamp,
                     payload: entry.payload,
                     seq: nextSeq,
-                    elapsedMs: entry.elapsedMs
+                    elapsedMs: entry.elapsedMs,
+                    metadataUsage: entry.metadataUsage
                 )
             )
             nextSeq += 1

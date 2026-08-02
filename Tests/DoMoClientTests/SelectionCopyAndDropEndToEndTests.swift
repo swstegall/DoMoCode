@@ -249,7 +249,7 @@ struct SelectionCopyAndDropEndToEndTests {
         // client builds for an empty single-line prompt: one status row plus a
         // three-row bordered editor.
         let sidebar = 32
-        let transcriptRows = Self.rows - 4
+        let transcriptRows = Self.rows - 5
         let page = oracle(target)
         for row in 0..<transcriptRows {
             for column in sidebar..<Self.columns where page.cell(col: column, row: row)?.style.inverse == true {
@@ -286,8 +286,16 @@ struct SelectionCopyAndDropEndToEndTests {
     /// Where `needle` sits on the painted page, as (row, first column).
     private func locate(_ target: CaptureTarget, _ needle: String) -> (row: Int, column: Int)? {
         for (index, line) in oracle(target).screen.enumerated() {
-            if let range = line.range(of: needle) {
-                return (index, line.distance(from: line.startIndex, to: range.lowerBound))
+            guard index < Self.rows - 5 else { continue }
+            // Auto-titles are painted in the sidebar now, so a prompt that
+            // becomes a session title can appear before its transcript copy.
+            // Search the main-pane slice directly so the first sidebar match on
+            // the same row does not hide the transcript occurrence.
+            let mainOffset = min(32, line.count)
+            let main = line.dropFirst(mainOffset)
+            if let range = main.range(of: needle) {
+                let column = mainOffset + main.distance(from: main.startIndex, to: range.lowerBound)
+                return (index, column)
             }
         }
         return nil
@@ -1376,7 +1384,6 @@ struct SelectionCopyAndDropEndToEndTests {
             input.yield([0x0d])
             _ = await self.waitUntil { self.locate(target, "X10ANCHOR TAILWORD") != nil }
             guard let spot = self.locate(target, "X10ANCHOR") else { return }
-
             input.yield(Term.x10Press(column: spot.column, row: spot.row))
             input.yield(Term.x10Drag(column: spot.column + 9, row: spot.row))
             input.yield(Term.x10Release(column: spot.column + 9, row: spot.row))

@@ -590,6 +590,12 @@ public final class EventStore {
         accountingPolled = true
     }
 
+    /// Force one authoritative accounting refresh after a metadata mutation,
+    /// such as a model change that alters the context window shown by the footer.
+    public func markAccountingStale() {
+        accountingPolled = false
+    }
+
     /// Fold one assistant turn's usage into the running delta.
     private func foldTurn(_ usage: Usage) {
         pendingUsage = pendingUsage + usage

@@ -460,6 +460,25 @@ public final class Editor: Component, Focusable {
         insertTextAtCursorInternal(text)
     }
 
+    /// Apply a provider-produced completion and place the caret at the provider's
+    /// grapheme column. Keeping this operation on the editor preserves undo,
+    /// history, and the logical cursor invariant for every embedding surface.
+    public func applyAutocomplete(_ result: AutocompleteResult) {
+        guard !result.lines.isEmpty,
+              result.cursorLine >= 0,
+              result.cursorLine < result.lines.count
+        else { return }
+        pushUndoSnapshot()
+        lastAction = nil
+        exitHistoryBrowsing()
+        pastes.removeAll()
+        pasteCounter = 0
+        state.lines = result.lines.map(Array.init)
+        state.cursorLine = result.cursorLine
+        setCursorCol(result.cursorCol)
+        onChange?(getText())
+    }
+
     // MARK: Focusable / Component
 
     public func invalidate() {}

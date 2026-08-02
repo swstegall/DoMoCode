@@ -31,6 +31,13 @@ public struct ForceClearResult: Codable, Sendable, Hashable {
     public init(cleared: Bool) { self.cleared = cleared }
 }
 
+/// The result of an optional LLM-generated session title. `nil` means the
+/// session was empty or already had an explicit name.
+public struct SessionTitleResult: Codable, Sendable, Hashable {
+    public var title: String?
+    public init(title: String?) { self.title = title }
+}
+
 private struct CreateBody: Decodable {
     var resume: String?
 }
@@ -49,6 +56,11 @@ private struct PermissionReplyBody: Decodable {
     var reply: String
     var message: String?
 }
+
+private struct ModelBody: Decodable { var modelID: String }
+private struct RenameBody: Decodable { var name: String? }
+private struct LabelBody: Decodable { var targetID: String; var label: String? }
+private struct LeafBody: Decodable { var targetID: String? }
 
 // MARK: - Auth middleware
 
@@ -170,6 +182,18 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        router.get("/commands") { _, _ in
+            try await self.mapErrors {
+                try Self.json(await self.runtime.commands())
+            }
+        }
+
+        router.get("/models") { _, _ in
+            try await self.mapErrors {
+                try Self.json(await self.runtime.models())
+            }
+        }
+
         router.get("/session/:id/messages") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
@@ -182,6 +206,57 @@ public struct DoMoServer: Sendable {
                 let id = try context.parameters.require("id")
                 let parent = request.uri.queryParameters["parent"].map(String.init)
                 return try Self.json(try await self.runtime.children(sessionID: id, parent: parent))
+            }
+        }
+
+        router.get("/session/:id/tree") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.tree(sessionID: id))
+            }
+        }
+
+        router.post("/session/:id/model") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(ModelBody.self, request)
+                try await self.runtime.changeModel(sessionID: id, modelID: body.modelID)
+                return Response(status: .ok)
+            }
+        }
+
+        router.post("/session/:id/rename") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(RenameBody.self, request)
+                try await self.runtime.renameSession(sessionID: id, name: body.name)
+                return Response(status: .ok)
+            }
+        }
+
+        router.post("/session/:id/title") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let title = try await self.runtime.autoTitle(sessionID: id)
+                return try Self.json(SessionTitleResult(title: title), status: .ok)
+            }
+        }
+
+        router.post("/session/:id/label") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(LabelBody.self, request)
+                try await self.runtime.label(sessionID: id, targetID: body.targetID, label: body.label)
+                return Response(status: .ok)
+            }
+        }
+
+        router.post("/session/:id/leaf") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(LeafBody.self, request)
+                try await self.runtime.moveLeaf(sessionID: id, targetID: body.targetID)
+                return Response(status: .ok)
             }
         }
 
