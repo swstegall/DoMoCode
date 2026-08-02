@@ -59,7 +59,7 @@ jobs:
         env:
           # Keep optimized runtime assertions actionable: child-process stderr carries
           # the Swift backtrace instead of only the allocator's final sentence.
-          SWIFT_BACKTRACE: enable
+          SWIFT_BACKTRACE: enable=yes,output-to=stderr,limit=none,threads=all
         run: |
           serial_targets=(
             DoMoLLMTests
@@ -80,11 +80,27 @@ jobs:
             DoMoToolsUITests
           )
 
-          # The CLI target owns real child processes, PTYs, and loopback
-          # gateways. Swift Testing's worker limit still starts separate suites
-          # concurrently, so serialize this target as a whole on both platforms
-          # to keep one fixture's teardown from colliding with the next fixture.
-          swift test --configuration ${{ matrix.configuration }} --no-parallel --filter '^DoMoCLITests\.'
+          # `--no-parallel` limits SwiftPM's test processes, but Swift Testing
+          # still schedules separate suites concurrently inside one process. The
+          # CLI target owns real child processes, PTYs, and loopback gateways, so
+          # run each suite in its own process to keep fixture teardown isolated.
+          run_target_suites_serially() {
+            local target="$1"
+            local suites
+            suites="$(swift test list --configuration ${{ matrix.configuration }} \
+              | sed -n "s/^${target}\\.\\([^/]*\\)\\/.*$/\\1/p" \
+              | sort -u)"
+            if [[ -z "$suites" ]]; then
+              printf 'No test suites discovered for %s\n' "$target" >&2
+              return 1
+            fi
+            while IFS= read -r suite; do
+              swift test --configuration ${{ matrix.configuration }} --no-parallel \
+                --filter "^${target}\\.${suite}/"
+            done <<< "$suites"
+          }
+
+          run_target_suites_serially DoMoCLITests
 
           for target in "${serial_targets[@]}"; do
             swift test --configuration ${{ matrix.configuration }} --no-parallel --filter "^${target}\."
