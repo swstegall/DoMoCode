@@ -7,10 +7,13 @@ import Testing
 @Suite("registry")
 struct RegistryTests {
 
-    @Test("the builtin set has all seven tools in a stable order")
+    @Test("the builtin set has a stable order")
     func builtinSet() {
         let registry = ToolRegistry.builtin
-        #expect(registry.names == ["read", "bash", "edit", "write", "grep", "find", "ls"])
+        #expect(registry.names == [
+            "read", "bash", "edit", "write", "grep", "find", "ls",
+            "todowrite", "glob", "finish",
+        ])
     }
 
     @Test("the coding set is read/bash/edit/write")
@@ -47,6 +50,29 @@ struct RegistryTests {
             #expect(!tool.description.isEmpty)
             #expect(tool.parameters.type == .single(.object))
         }
+    }
+
+    @Test("a supplied todo store is retained by the session registry")
+    func sessionStateFactory() async throws {
+        let store = TodoStore()
+        let registry = ToolRegistry.builtin(todoStore: store)
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+
+        let result = try await registry.execute(
+            "todowrite",
+            arguments: [
+                "todos": [[
+                    "content": "inspect the registry",
+                    "status": "in_progress",
+                    "priority": "high",
+                ]]
+            ],
+            in: fixture.context
+        )
+
+        #expect(!result.isError)
+        #expect((await store.snapshot()).first?.content == "inspect the registry")
     }
 
     @Test("registering the same name twice replaces in place")

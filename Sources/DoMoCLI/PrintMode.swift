@@ -211,7 +211,6 @@ struct RegistryTool: AgentTool {
     func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
         // A tool failure returns an error `ToolResult`, never a throw — only
         // cancellation escapes, and the loop turns that into an aborted result.
-        // No built-in tool sets `terminate`; the print run has no early-stop tool.
         let result = try await tool.execute(arguments, in: context)
         // Image attachments a tool produced (e.g. `read` on a PNG) ride through to
         // the model; the wire layer hoists them into a synthetic user turn, since
@@ -219,6 +218,7 @@ struct RegistryTool: AgentTool {
         return AgentToolResult(
             output: result.text,
             isError: result.isError,
+            terminate: result.terminate,
             details: result.details,
             images: result.images.map { ImageBlock(mediaType: $0.mediaType, data: $0.data) }
         )

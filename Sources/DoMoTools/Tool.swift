@@ -47,11 +47,20 @@ public enum ToolContent: Sendable, Hashable {
 public struct ToolResult: Sendable, Hashable {
     public var content: [ToolContent]
     public var isError: Bool
+    /// Requests that the agent stop after this tool batch. The loop honors the
+    /// request only when every tool in the batch sets it.
+    public var terminate: Bool
     public var details: JSONValue
 
-    public init(content: [ToolContent], isError: Bool = false, details: JSONValue = .null) {
+    public init(
+        content: [ToolContent],
+        isError: Bool = false,
+        terminate: Bool = false,
+        details: JSONValue = .null
+    ) {
         self.content = content
         self.isError = isError
+        self.terminate = terminate
         self.details = details
     }
 
@@ -72,8 +81,12 @@ public struct ToolResult: Sendable, Hashable {
         }
     }
 
-    public static func text(_ text: String, details: JSONValue = .null) -> ToolResult {
-        ToolResult(content: [.text(text)], isError: false, details: details)
+    public static func text(
+        _ text: String,
+        terminate: Bool = false,
+        details: JSONValue = .null
+    ) -> ToolResult {
+        ToolResult(content: [.text(text)], isError: false, terminate: terminate, details: details)
     }
 
     /// An error result the model is expected to read and recover from.
@@ -190,7 +203,17 @@ public struct ToolRegistry: Sendable {
 
     /// All seven built-in tools.
     public static var builtin: ToolRegistry {
-        ToolRegistry([ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool()])
+        builtin(todoStore: TodoStore())
+    }
+
+    /// Builds the complete built-in set with state scoped to the supplied
+    /// session. Keeping this factory beside the legacy property makes the
+    /// lifetime choice explicit for servers that create one registry per run.
+    public static func builtin(todoStore: TodoStore) -> ToolRegistry {
+        ToolRegistry([
+            ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
+            TodoWriteTool(store: todoStore), GlobTool(), FinishTool(),
+        ])
     }
 
     /// Dispatches by name. An unknown name is an error result rather than a
