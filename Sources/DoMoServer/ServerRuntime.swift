@@ -11,6 +11,7 @@ import DoMoPermissions
 import Foundation
 import Synchronization
 import SystemPackage
+import DoMoTermIO
 
 // MARK: - Errors and value types
 
@@ -23,6 +24,8 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     /// A steering request arrived after the active run had already settled.
     /// The client should retry it as a normal prompt.
     case sessionNotRunning
+    /// A terminal id is not owned by the requested session.
+    case terminalNotFound
 }
 
 /// A reference to a session, returned by create and fork.
@@ -327,6 +330,9 @@ public actor ServerRuntime {
         /// The project-scoped durable memory file, exposed to the remote memory
         /// command as well as the model-facing memory tool.
         public var projectMemoryProvider: (any ProjectMemoryProvider)?
+        /// The server-owned PTY service. The default keeps ownership inside the
+        /// runtime while allowing tests and embeddings to inject one service.
+        public var terminalService: PTYService?
         /// Root depth is zero. A child at this depth may not create another
         /// child once the next depth would exceed this cap.
         public var maxSubagentDepth: Int
@@ -370,7 +376,8 @@ public actor ServerRuntime {
             diffSource: (any DiffSource)? = nil,
             subagentCoordinator: SubagentCoordinator? = nil,
             maxSubagentDepth: Int = 2,
-            projectMemoryProvider: (any ProjectMemoryProvider)? = nil
+            projectMemoryProvider: (any ProjectMemoryProvider)? = nil,
+            terminalService: PTYService? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -404,6 +411,7 @@ public actor ServerRuntime {
             self.subagentCoordinator = subagentCoordinator
             self.maxSubagentDepth = max(0, maxSubagentDepth)
             self.projectMemoryProvider = projectMemoryProvider
+            self.terminalService = terminalService
         }
     }
 
@@ -510,6 +518,10 @@ public actor ServerRuntime {
         var pending: [String: PendingApproval] = [:]
         /// Structured questions awaiting an answer from the client.
         var pendingQuestions: [String: PendingQuestion] = [:]
+        /// PTYs started through the future bidirectional terminal transport.
+        /// The runtime keeps the set so a client cannot address another session's
+        /// process even when it guesses a UUID.
+        var terminalIDs: Set<String> = []
 
         init(
             token: Int,
@@ -561,12 +573,14 @@ public actor ServerRuntime {
     }
 
     private let config: Config
+    private let terminalService: PTYService
     private var sessions: [String: SessionState] = [:]
     private var subagents: [String: SubagentRecord] = [:]
     private var nextToken = 0
 
     public init(config: Config) {
         self.config = config
+        self.terminalService = config.terminalService ?? PTYService()
         config.questionBroker?.setHandler { [weak self] sessionID, questions in
             guard let self else { return nil }
             return await self.awaitQuestion(sessionID: sessionID, questions: questions)
@@ -591,6 +605,103 @@ public actor ServerRuntime {
             return [ModelOption(id: config.model, contextWindow: config.contextWindow)]
         }
         return config.modelOptions
+    }
+
+    // MARK: Server-owned terminals
+
+    /// Start a PTY owned by one live server session.
+    ///
+    /// The runtime owns the service even though the current remote tool surface
+    /// intentionally refuses interactive programs: an HTTP client still needs a
+    /// bidirectional input channel before this capability can be exposed safely.
+    /// These methods keep that future transport's ownership boundary explicit now.
+    public func startTerminal(
+        sessionID: String,
+        configuration: PTYLaunchConfiguration
+    ) async throws -> String {
+        guard let session = sessions[sessionID] else {
+            throw ServerRuntimeError.sessionNotFound
+        }
+        let terminalID = try await terminalService.start(configuration)
+        session.terminalIDs.insert(terminalID)
+        return terminalID
+    }
+
+    public func beginTerminalAttach(
+        sessionID: String,
+        terminalID: String
+    ) async throws -> PTYAttachment {
+        _ = try ownedTerminal(sessionID: sessionID, terminalID: terminalID)
+        return try await terminalService.beginAttach(sessionID: terminalID)
+    }
+
+    public func activateTerminal(
+        sessionID: String,
+        terminalID: String,
+        attachmentID: String
+    ) async throws -> AsyncStream<PTYEvent> {
+        _ = try ownedTerminal(sessionID: sessionID, terminalID: terminalID)
+        return try await terminalService.activate(
+            sessionID: terminalID,
+            attachmentID: attachmentID
+        )
+    }
+
+    @discardableResult
+    public func cancelTerminalAttach(
+        sessionID: String,
+        terminalID: String,
+        attachmentID: String
+    ) async throws -> Bool {
+        _ = try ownedTerminal(sessionID: sessionID, terminalID: terminalID)
+        return await terminalService.cancelAttach(
+            sessionID: terminalID,
+            attachmentID: attachmentID
+        )
+    }
+
+    @discardableResult
+    public func writeTerminal(
+        sessionID: String,
+        terminalID: String,
+        bytes: [UInt8]
+    ) async throws -> Bool {
+        _ = try ownedTerminal(sessionID: sessionID, terminalID: terminalID)
+        return await terminalService.write(sessionID: terminalID, bytes: bytes)
+    }
+
+    @discardableResult
+    public func resizeTerminal(
+        sessionID: String,
+        terminalID: String,
+        size: PTYSize
+    ) async throws -> Bool {
+        _ = try ownedTerminal(sessionID: sessionID, terminalID: terminalID)
+        return await terminalService.resize(sessionID: terminalID, size: size)
+    }
+
+    @discardableResult
+    public func stopTerminal(sessionID: String, terminalID: String) async throws -> Bool {
+        _ = try ownedTerminal(sessionID: sessionID, terminalID: terminalID)
+        return await terminalService.stop(sessionID: terminalID)
+    }
+
+    public func terminalSnapshot(
+        sessionID: String,
+        terminalID: String
+    ) async throws -> PTYSnapshot? {
+        _ = try ownedTerminal(sessionID: sessionID, terminalID: terminalID)
+        return await terminalService.snapshot(sessionID: terminalID)
+    }
+
+    private func ownedTerminal(sessionID: String, terminalID: String) throws -> SessionState {
+        guard let session = sessions[sessionID] else {
+            throw ServerRuntimeError.sessionNotFound
+        }
+        guard session.terminalIDs.contains(terminalID) else {
+            throw ServerRuntimeError.terminalNotFound
+        }
+        return session
     }
 
     private func makeState(
@@ -2301,13 +2412,14 @@ public actor ServerRuntime {
 
     /// Cancel every run and finish every open SSE stream, so a graceful shutdown
     /// does not leave clients hanging.
-    public func shutdown() {
+    public func shutdown() async {
         for session in sessions.values {
             session.runTask?.cancel()
             session.subagentResultTask?.cancel()
             drainPending(session, reason: "The server is shutting down.")
             session.sink.closeAll()
         }
+        await terminalService.shutdown()
         sessions.removeAll()
     }
 

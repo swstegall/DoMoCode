@@ -279,7 +279,7 @@ let package = Package(
         .target(
             name: "DoMoServer",
             dependencies: [
-                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness", "DoMoGit", "DoMoPermissions", "DoMoMemory",
+                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness", "DoMoGit", "DoMoPermissions", "DoMoMemory", "DoMoTermIO",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -451,7 +451,7 @@ let package = Package(
         .testTarget(
             name: "DoMoServerTests",
             dependencies: [
-                "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent", "DoMoHarness", "DoMoPermissions",
+                "DoMoServer", "DoMoCore", "DoMoLLM", "DoMoAgent", "DoMoHarness", "DoMoPermissions", "DoMoTermIO",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "JSONSchema", package: "swift-json-schema"),
             ],

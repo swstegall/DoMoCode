@@ -580,6 +580,7 @@ public struct DoMoServer: Sendable {
         } catch let error as ServerRuntimeError {
             switch error {
             case .sessionNotFound: throw HTTPError(.notFound)
+            case .terminalNotFound: throw HTTPError(.notFound)
             case .sessionBusy, .sessionNotRunning: throw HTTPError(.conflict)
             }
         }
