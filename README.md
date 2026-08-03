@@ -600,7 +600,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       reporting; `restored` / `snapshots-disabled` / `unavailable` reaches the banner and REST client;
       and `/timeline`, `/fork`, and `/clone` are wired through the inline REPL, full-screen client,
       server, and client APIs.
-- [ ] **Phase 14 — Agents, personas, and plan mode.** An agent is a value — a name, a system prompt, a
+- [x] **Phase 14 — Agents, personas, and plan mode.** An agent is a value — a name, a system prompt, a
       model, a permission ruleset, a mode. Under one gateway this is unusually cheap: a per-agent
       model is another alias on the same endpoint, with no provider resolution and no second
       credential. Markdown-plus-frontmatter agent files are **inert data with no host and no hot
@@ -611,7 +611,11 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       plus a plan file under `.domocode/plans/`, needing no external-directory concept because the
       sandbox root already contains it, with `plan_exit` as a terminating tool (the loop already
       honours `terminate` and settles as `.terminatedByTool`). *Exit:* Tab switches between `build`
-      and `plan`; plan mode provably cannot edit anything but its plan file.
+      and `plan`; plan mode provably cannot edit anything but its plan file. *Exit met:* inert
+      Markdown agent profiles resolve builtin → user → trusted project, profiles carry model,
+      reasoning, mode, and permissions, server sessions switch build/plan policy with Tab, and the
+      hardened plan rules allow writes only to the session's `.domocode/plans/<session>.md` while
+      `plan_exit` terminates the loop.
 - [ ] **Phase 15 — Subagents.** Transformative, and the most expensive item here. Requires 14, 11, 9
       and 5c. It disturbs a real invariant: `AgentHarness.run` throws if already running and the
       server allows one run per session, so a background child must be a separate harness instance and
