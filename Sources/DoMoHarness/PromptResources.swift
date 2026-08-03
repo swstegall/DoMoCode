@@ -113,6 +113,7 @@ public enum LocalCommand: String, Codable, Hashable, Sendable {
     case clear
     case clone
     case compact
+    case copy
     case context
     case diff
     case exit
@@ -332,6 +333,12 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             description: "Compact the current model context",
             kind: .local,
             action: .compact
+        ),
+        CommandDescriptor(
+            name: "copy",
+            description: "Copy the current transcript as Markdown",
+            kind: .local,
+            action: .copy
         ),
         CommandDescriptor(
             name: "context",

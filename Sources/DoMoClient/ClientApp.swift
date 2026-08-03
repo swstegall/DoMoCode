@@ -2146,6 +2146,43 @@ public final class ClientApp {
         actionTasks.append(task)
     }
 
+    /// Copy the lossless server history through the shared Markdown formatter.
+    /// The visible transcript is a projection and may omit rows folded during
+    /// reconnect, so `/copy` stays aligned with `domo export` rather than with
+    /// the current viewport.
+    private func copyTranscript() {
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let messages = try await self.client.messages(sessionID: id)
+                let text = TranscriptFormatter.markdown(messages: messages, options: .copy)
+                guard !text.isEmpty else {
+                    self.post(notice: "nothing to copy")
+                    return
+                }
+                switch await self.clipboard.copy(text) {
+                case .copied(let mechanism):
+                    self.post(notice: "copied transcript as Markdown via \(mechanism)")
+                case .unavailable:
+                    self.post(notice: "clipboard unavailable; use domo export to write Markdown")
+                case .failed(let reason):
+                    self.post(notice: "clipboard: \(sanitizeUntrustedText(collapseToOneLine(reason)))")
+                }
+            } catch {
+                self.postError("Could not copy the transcript", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
     private func moveWorkspaceHistory(_ operation: SessionHistoryOperation) {
         guard let id = store.selectedSessionID else {
             post(notice: "no session is open")
@@ -2745,6 +2782,8 @@ public final class ClientApp {
                 openTreePicker()
             case .timeline:
                 showTimeline()
+            case .copy:
+                copyTranscript()
             case .undo:
                 moveWorkspaceHistory(.undo)
             case .redo:

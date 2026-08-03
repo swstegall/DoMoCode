@@ -75,7 +75,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             the turn cap exits 2, the runaway guard exits 3, and the cost cap exits 4, so a \
             script can distinguish under-budgeting, a stuck model, and a spend ceiling.
             """,
-        subcommands: [DiffCommand.self]
+        subcommands: [DiffCommand.self, ExportCommand.self]
     )
 
     @Option(
@@ -304,12 +304,19 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 try await diff.run()
                 return
             }
+            if rawArguments.first == "export" {
+                let export = try ExportCommand.parse(Array(rawArguments.dropFirst()))
+                try await export.run()
+                return
+            }
             let parsed = try parseAsRoot()
             // Keep concrete subcommand values intact. Calling `run()` through
             // the protocol existential can re-enter the root's default dispatch
             // path and lose parsed flag storage for a value subcommand.
             if let diff = parsed as? DiffCommand {
                 try await diff.run()
+            } else if let export = parsed as? ExportCommand {
+                try await export.run()
             } else if let root = parsed as? DoMoCodeCommand {
                 try await root.run()
             } else if var asyncCommand = parsed as? AsyncParsableCommand {
@@ -513,7 +520,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     agentProfile: profile,
                     agentMode: selectedMode,
                     modeRules: configuration.agentModes[selectedMode.rawValue] ?? [],
-                    autoFormat: configuration.autoFormat
+                    autoFormat: configuration.autoFormat,
+                    clipboard: SystemClipboard.makeClipboardSink(environment: environment)
                 )
                 try await Self.runInteractive(
                     mode,

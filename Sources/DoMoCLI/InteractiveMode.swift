@@ -451,6 +451,9 @@ final class InteractiveCoordinator {
     /// The local clipboard reader. The CLI supplies the subprocess-backed
     /// implementation; tests and remote callers can leave the no-op default.
     private let clipboardPaste: any ClipboardPasteSource
+    /// The Markdown copy sink. Kept separate from image paste so a headless or
+    /// remote caller can support one without pretending it can read a clipboard.
+    private let clipboard: any ClipboardSink
     private let interactiveInputRouter: InteractiveTerminalInputRouter
 
     // Run state.
@@ -552,7 +555,8 @@ final class InteractiveCoordinator {
         keybindings: Keybindings = Keybindings(),
         imageCapabilities: TerminalCapabilities = TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false),
         cell: CellDimensions = .default,
-        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource()
+        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
+        clipboard: any ClipboardSink = NoClipboardSink()
     ) {
         self.tui = tui
         self.driver = driver
@@ -574,6 +578,7 @@ final class InteractiveCoordinator {
         self.imageCapabilities = imageCapabilities
         self.cell = cell
         self.clipboardPaste = clipboardPaste
+        self.clipboard = clipboard
 
         self.editor = Editor(
             keybindings: keybindings,
@@ -924,6 +929,10 @@ final class InteractiveCoordinator {
                 }
                 self.render()
             }
+            return
+        case .some(.copy):
+            stagedImages = []
+            copyTranscript()
             return
         case .some(.context):
             stagedImages = []
@@ -1835,6 +1844,41 @@ final class InteractiveCoordinator {
         }
     }
 
+    /// Copy the same Markdown projection `domo export` writes. The session file
+    /// is the source of truth, so a copy made after a reconnect includes the
+    /// complete active branch rather than only rows still mounted in the UI.
+    private func copyTranscript() {
+        guard !running else {
+            appendStopNotice("/copy is unavailable while a turn is running")
+            render()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let entries = try await self.harness.timeline()
+                let branch = try SessionTree(entries: entries).branch()
+                let text = TranscriptFormatter.markdown(entries: branch, options: .copy)
+                guard !text.isEmpty else {
+                    self.appendStopNotice("nothing to copy")
+                    self.render()
+                    return
+                }
+                switch await self.clipboard.copy(text) {
+                case .copied(let mechanism):
+                    self.appendStopNotice("copied transcript as Markdown via \(mechanism)")
+                case .unavailable:
+                    self.appendStopNotice("clipboard unavailable; use domo export to write Markdown")
+                case .failed(let reason):
+                    self.appendStopNotice("clipboard: \(sanitizeUntrustedText(collapseToOneLine(reason)))")
+                }
+            } catch {
+                self.appendError(error)
+            }
+            self.render()
+        }
+    }
+
     /// Display recent durable memory without starting a model turn.
     private func showMemory() {
         guard !running else {
@@ -2115,6 +2159,9 @@ public struct InteractiveMode: Sendable {
     /// The sandboxed filesystem behind the tool context, carried through to the
     /// coordinator so a submitted `@path` image mention can be read and attached.
     private let fileSystem: SandboxedFileSystem?
+    /// The Markdown copy sink. Tests and callers without a local clipboard use
+    /// the honest no-op implementation.
+    private let clipboard: any ClipboardSink
     /// The permission engine's late-bound prompter (Phase 8). Built in ``make``
     /// alongside the harness whose `beforeToolCall` gate the engine drives, then set
     /// in ``run`` to the coordinator's approval overlay once the UI exists.
@@ -2161,6 +2208,7 @@ public struct InteractiveMode: Sendable {
         metadataRelay: ResponseMetadataRelay,
         requestedModel: String,
         fileSystem: SandboxedFileSystem? = nil,
+        clipboard: any ClipboardSink = NoClipboardSink(),
         mcpManager: MCPManager? = nil
     ) {
         self.harness = harness
@@ -2182,6 +2230,7 @@ public struct InteractiveMode: Sendable {
         self.metadataRelay = metadataRelay
         self.requestedModel = requestedModel
         self.fileSystem = fileSystem
+        self.clipboard = clipboard
         self.mcpManager = mcpManager
     }
 
@@ -2190,6 +2239,7 @@ public struct InteractiveMode: Sendable {
     public static let defaultSlashCommands: [SlashCommand] = [
         SlashCommand(name: "exit", description: "End the session"),
         SlashCommand(name: "clear", description: "Clear the transcript"),
+        SlashCommand(name: "copy", description: "Copy the current transcript as Markdown"),
     ]
 
     // MARK: Construction
@@ -2246,7 +2296,8 @@ public struct InteractiveMode: Sendable {
         agentProfile: AgentProfile? = nil,
         agentMode: AgentMode = .build,
         modeRules: Ruleset = [],
-        autoFormat: AutoFormatSettings? = nil
+        autoFormat: AutoFormatSettings? = nil,
+        clipboard: any ClipboardSink = NoClipboardSink()
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
@@ -2506,6 +2557,7 @@ public struct InteractiveMode: Sendable {
             metadataRelay: metadataRelay,
             requestedModel: runtime.model,
             fileSystem: toolContext.fileSystem,
+            clipboard: clipboard,
             mcpManager: mcpManager
         )
     }
@@ -2599,7 +2651,8 @@ public struct InteractiveMode: Sendable {
             interactiveInputRouter: interactiveInputRouter,
             imageCapabilities: resolvedCapabilities,
             cell: resolvedCell,
-            clipboardPaste: clipboardPaste
+            clipboardPaste: clipboardPaste,
+            clipboard: self.clipboard
         )
         coordinator.install()
         await interactiveTerminal.setScreenHandler { [weak coordinator] id, screen, running in
