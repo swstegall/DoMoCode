@@ -2330,6 +2330,56 @@ public final class ClientApp {
                 post(notice: names, seconds: 8)
             case .tree:
                 openTreePicker()
+            case .compact:
+                guard let id = store.selectedSessionID else {
+                    post(notice: "no session is open")
+                    return
+                }
+                guard store.runState != .running else {
+                    refuseAsBusy()
+                    return
+                }
+                let task = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        let compacted = try await self.client.compact(sessionID: id)
+                        guard self.store.selectedSessionID == id else { return }
+                        // Compaction is a metadata checkpoint, so it does not
+                        // emit a transcript event. Refresh the lossless pane and
+                        // the cumulative meter explicitly after the REST write.
+                        if let history = try? await self.client.messages(sessionID: id) {
+                            guard self.store.selectedSessionID == id else { return }
+                            self.store.seed(history)
+                        }
+                        await self.seedAccounting(id)
+                        self.post(
+                            notice: compacted
+                                ? "context compacted"
+                                : "nothing to compact in the current context"
+                        )
+                    } catch ServerClientError.unexpectedStatus(409, _, _) {
+                        self.refuseAsBusy()
+                    } catch {
+                        self.postError("Could not compact the context", error)
+                    }
+                }
+                actionTasks.append(task)
+            case .context:
+                guard let id = store.selectedSessionID else {
+                    post(notice: "no session is open")
+                    return
+                }
+                let task = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        let snapshot = try await self.client.context(sessionID: id)
+                        guard self.store.selectedSessionID == id else { return }
+                        self.post(notice: Self.contextNotice(snapshot), seconds: 8)
+                    } catch {
+                        self.postError("Could not inspect the context", error)
+                    }
+                }
+                actionTasks.append(task)
             }
             return
         }
@@ -2404,6 +2454,31 @@ public final class ClientApp {
         let end = rest.firstIndex(where: { $0.isWhitespace }) ?? rest.endIndex
         let name = String(rest[..<end])
         return name.isEmpty ? nil : name
+    }
+
+    /// A bounded, useful `/context` acknowledgement. The full message bodies
+    /// remain available from the REST response, but putting them in a transient
+    /// status line would make a context-inspection command unusable in a TUI.
+    private static func contextNotice(_ snapshot: ContextSnapshot) -> String {
+        var users = 0
+        var assistants = 0
+        var tools = 0
+        var systems = 0
+        for message in snapshot.messages {
+            switch message {
+            case .system: systems += 1
+            case .user: users += 1
+            case .assistant: assistants += 1
+            case .tool: tools += 1
+            }
+        }
+        var result = "context: \(snapshot.messages.count) messages (system \(systems), user \(users), assistant \(assistants), tool \(tools))"
+        if let accounting = snapshot.accounting {
+            result += " · \(FooterRow.formatContext(accounting))"
+        } else {
+            result += " · accounting unavailable"
+        }
+        return result
     }
 
     /// Refuse a prompt because a turn is already in flight — and make the refusal

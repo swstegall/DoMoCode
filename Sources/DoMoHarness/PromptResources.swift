@@ -109,6 +109,8 @@ public struct CommandDescriptor: Codable, Hashable, Sendable {
 /// Actions that are meaningful to a client without starting an agent turn.
 public enum LocalCommand: String, Codable, Hashable, Sendable {
     case clear
+    case compact
+    case context
     case exit
     case help
     case tree
@@ -192,6 +194,18 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             description: "Clear the visible transcript",
             kind: .local,
             action: .clear
+        ),
+        CommandDescriptor(
+            name: "compact",
+            description: "Compact the current model context",
+            kind: .local,
+            action: .compact
+        ),
+        CommandDescriptor(
+            name: "context",
+            description: "Show the current model context",
+            kind: .local,
+            action: .context
         ),
         CommandDescriptor(
             name: "exit",

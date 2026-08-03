@@ -812,6 +812,41 @@ struct AgentHarnessTests {
         #expect(first.text.contains("compacted into the following summary"))
     }
 
+    @Test("an explicit compaction works once even when automatic compaction is disabled")
+    func explicitCompactionIgnoresAutomaticSetting() async throws {
+        let text = String(repeating: "a", count: 40)
+        let responder = ScriptedResponder([
+            assistant(text, usageInput: 10),
+            assistant(text, usageInput: 10),
+        ])
+        let spy = SummarizerSpy(text: "MANUAL SUMMARY")
+        let ids = SequentialIDs(prefix: "manual")
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: responder.fn(),
+                summarizer: spy.fn(),
+                compaction: CompactionSettings(enabled: false, reserveTokens: 100, keepRecentTokens: 25),
+                contextWindow: 1_000,
+                ids: ids
+            )
+        )
+
+        _ = try await harness.run(prompt: text)
+        _ = try await harness.run(prompt: text)
+
+        #expect(try await harness.compactNow())
+        #expect(!(try await harness.compactNow()))
+        #expect(spy.recorded.count == 1)
+        let context = try await harness.contextMessages()
+        guard case .user(let summary) = context.first else {
+            Issue.record("manual compaction did not place a summary at the context head")
+            return
+        }
+        #expect(summary.text.contains("MANUAL SUMMARY"))
+    }
+
     /// The other half of "an empty tip is an empty branch": the pre-turn compaction
     /// check measures a path too, and resolving a `nil` tip there would summarize a
     /// conversation this harness is not on and then anchor the checkpoint it writes

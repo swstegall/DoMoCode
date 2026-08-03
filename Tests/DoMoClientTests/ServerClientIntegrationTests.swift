@@ -11,6 +11,7 @@ import AsyncHTTPClient
 import DoMoAgent
 import DoMoClient
 import DoMoCore
+import DoMoHarness
 import DoMoLLM
 import DoMoServer
 import Foundation
@@ -125,6 +126,79 @@ struct ServerClientIntegrationTests {
         _ = try? await serverTask.value
     }
 
+    @Test("Context inspection and explicit compaction round-trip through the client")
+    func contextAndCompactionRoundTrip() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+
+        let stream: AgentStreamFn = { _ in
+            AsyncThrowingStream { continuation in
+                continuation.yield(.start(AssistantSnapshot(model: "test-model")))
+                continuation.yield(.done(AssistantMessage(
+                    content: [.text("answer")],
+                    model: "test-model",
+                    usage: Usage(input: 40),
+                    stopReason: .stop
+                )))
+                continuation.finish()
+            }
+        }
+        let server = DoMoServer(
+            runtime: ServerRuntime(config: .init(
+                systemPrompt: "You are a test.",
+                tools: [],
+                model: "test-model",
+                streamFn: stream,
+                toolExecution: .sequential,
+                maxTurns: 10,
+                sessionDirectory: FilePath(dirs.sessions.path),
+                cwd: dirs.cwd.path,
+                compaction: CompactionSettings(enabled: false, reserveTokens: 100, keepRecentTokens: 100),
+                summarizer: { _ in SummarizerResult(text: "SERVER SUMMARY") }
+            )),
+            options: .init(host: "127.0.0.1", port: 0, token: Self.token, heartbeatSeconds: 3600)
+        )
+
+        let (portStream, portCont) = AsyncStream<Int>.makeStream()
+        let serverTask = Task { try await server.run(onReady: { port in portCont.yield(port); portCont.finish() }) }
+        var portIterator = portStream.makeAsyncIterator()
+        let port = await portIterator.next() ?? 0
+        #expect(port > 0)
+
+        let http = HTTPClient(eventLoopGroupProvider: .singleton)
+        let client = ServerClient(baseURL: "http://127.0.0.1:\(port)", token: Self.token, http: http)
+        let ref = try await client.createSession()
+        let commands = try await client.commands()
+        #expect(commands.command(named: "compact")?.action == .compact)
+        #expect(commands.command(named: "context")?.action == .context)
+
+        let prompt = String(repeating: "context ", count: 100)
+        try await client.sendPrompt(sessionID: ref.id, prompt: prompt + "one")
+        #expect(await waitUntilIdle(client, ref.id))
+        try await client.sendPrompt(sessionID: ref.id, prompt: prompt + "two")
+        #expect(await waitUntilIdle(client, ref.id))
+
+        let before = try await client.context(sessionID: ref.id)
+        #expect(before.messages.count == 4, "context before compaction was (before.messages.count) messages")
+
+        #expect(try await client.compact(sessionID: ref.id))
+        let after = try await client.context(sessionID: ref.id)
+        guard case .user(let summary) = after.messages.first else {
+            Issue.record("context endpoint did not expose the compaction summary")
+            try await http.shutdown()
+            serverTask.cancel()
+            _ = try? await serverTask.value
+            return
+        }
+        #expect(summary.text.contains("SERVER SUMMARY"))
+        #expect(after.accounting != nil)
+        #expect(!(try await client.compact(sessionID: ref.id)))
+
+        try await http.shutdown()
+        serverTask.cancel()
+        _ = try? await serverTask.value
+    }
+
     @Test("A session from a previous launch is dead until resumed — and resuming revives it")
     func sessionFromAPreviousLaunchMustBeResumed() async throws {
         // The regression this pins: the sidebar lists sessions from DISK, but the
@@ -213,5 +287,17 @@ struct ServerClientIntegrationTests {
         try await http.shutdown()
         serverTask.cancel()
         _ = try? await serverTask.value
+    }
+
+    private func waitUntilIdle(_ client: ServerClient, _ sessionID: String) async -> Bool {
+        var waited = Duration.zero
+        while waited < .seconds(10) {
+            if let status = try? await client.status(sessionID: sessionID), !status.running {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+            waited += .milliseconds(20)
+        }
+        return false
     }
 }

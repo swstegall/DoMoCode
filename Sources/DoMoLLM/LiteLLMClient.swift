@@ -1296,8 +1296,15 @@ public func isContextOverflow(_ message: AssistantMessage, contextWindow: Int? =
     let inputTokens = message.usage.input.saturatingAdding(message.usage.cacheRead)
 
     // Silent overflow: the provider accepted the request but says the prompt
-    // itself was larger than the model's window.
-    if message.stopReason == .stop, inputTokens > contextWindow { return true }
+    // itself was larger than the model's window and produced no usable answer.
+    // A provider can report an over-window input while still returning a valid
+    // answer; replaying that completed turn would duplicate a prompt and charge
+    // an unnecessary second model request.
+    if message.stopReason == .stop, inputTokens > contextWindow,
+       message.text.isEmpty, message.usage.output == 0
+    {
+        return true
+    }
 
     // Truncation overflow: the provider filled its window with the input and
     // had no room to produce output. `window - window / 100` is the same 99%

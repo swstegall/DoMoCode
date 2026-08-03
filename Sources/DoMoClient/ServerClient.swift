@@ -174,6 +174,28 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode([Message].self, from: data)
     }
 
+    /// Fetch the exact projected context the next model request would use. `GET
+    /// /session/{id}/context` → 200. This is intentionally not the same as
+    /// ``messages(sessionID:)``: the latter is the lossless transcript, while this
+    /// response includes compaction and bounded tool-output projection.
+    public func context(sessionID: String) async throws -> ContextSnapshot {
+        let path = "/session/\(sessionID)/context"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(ContextSnapshot.self, from: data)
+    }
+
+    /// Force one compaction checkpoint. `POST /session/{id}/compact` → 200.
+    /// The server returns `compacted: false` when the branch has no complete older
+    /// history that can be summarized.
+    @discardableResult
+    public func compact(sessionID: String) async throws -> Bool {
+        let path = "/session/\(sessionID)/compact"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(CompactionResult.self, from: data).compacted
+    }
+
     /// The child branches of a node, for tree navigation. `GET
     /// /session/{id}/children[?parent=]` → 200.
     public func children(sessionID: String, parent: String? = nil) async throws -> [SessionTreeEntry] {

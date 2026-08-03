@@ -494,6 +494,14 @@ struct ErrorTests {
         )
         #expect(isContextOverflow(silent, contextWindow: 10_000))
 
+        let answered = AssistantMessage(
+            content: [.text("usable answer")],
+            model: "m",
+            usage: Usage(input: 10_001),
+            stopReason: .stop
+        )
+        #expect(!isContextOverflow(answered, contextWindow: 10_000))
+
         let truncated = AssistantMessage(
             model: "m",
             usage: Usage(input: 9_950),

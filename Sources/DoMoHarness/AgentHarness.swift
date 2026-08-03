@@ -641,6 +641,26 @@ public actor AgentHarness {
         try buildContextMessages()
     }
 
+    /// Write a compaction checkpoint for the current branch immediately.
+    ///
+    /// This is the explicit counterpart to the automatic pre-turn check. It is
+    /// intentionally allowed even when automatic compaction is disabled: a user
+    /// who asks for `/compact` is making a one-shot context-management decision,
+    /// not changing the setting for future turns. The operation is idle-only so a
+    /// checkpoint cannot race a persistence sink that is advancing the leaf.
+    ///
+    /// - Returns: `true` when a checkpoint was written, or `false` when the current
+    ///   branch has no complete older history that can be compacted.
+    @discardableResult
+    public func compactNow() async throws -> Bool {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot compact while a turn is running")
+        }
+        isRunning = true
+        defer { isRunning = false }
+        return try await compactIfNeeded(force: true)
+    }
+
     /// What this session has spent and how full its context is.
     ///
     /// The single accounting surface. Every renderer of a footer, a `/cost`
@@ -962,7 +982,7 @@ public actor AgentHarness {
         isRunning = true
         defer { isRunning = false }
 
-        try await compactIfNeeded()
+        _ = try await compactIfNeeded()
 
         let systemPromptInput = messages.compactMap { message -> String? in
             guard case .user(let user) = message else { return nil }
@@ -1159,18 +1179,18 @@ public actor AgentHarness {
     /// place. An unknown window is not a reason to stop bounding the context: an
     /// unbounded session grows until the provider rejects it, which is a harder
     /// failure than compacting a little early against a guess.
-    private func compactIfNeeded() async throws {
+    private func compactIfNeeded(force: Bool = false) async throws -> Bool {
         // Re-clamped rather than trusting the constructor's clamp: `contextWindow`
         // and `compaction` are both `var`s on a struct the caller keeps, so the
         // pairing can be broken after construction. Idempotent when it already
         // holds.
         let window = activeContextWindow ?? Configuration.fallbackContextWindow
         let settings = configuration.compaction.clamped(toContextWindow: window)
-        guard settings.enabled else { return }
+        guard force || settings.enabled else { return false }
         // Same reason as ``buildContextMessages()``: an empty tip is an empty branch,
         // and resolving `nil` here would measure — and then summarize — a path this
         // harness is not on, anchoring the checkpoint it writes at the root.
-        guard let tip = leaf else { return }
+        guard let tip = leaf else { return false }
         let tree = try SessionTree.load(from: store)
         let pathEntries = try tree.pathToRootOrCompaction(from: tip)
         let messages = try ContextBuilder.messages(
@@ -1180,9 +1200,11 @@ public actor AgentHarness {
             )
         )
         let estimate = estimateContextTokens(messages)
-        guard shouldCompact(contextTokens: estimate.tokens, contextWindow: window, settings: settings) else { return }
+        guard force || shouldCompact(contextTokens: estimate.tokens, contextWindow: window, settings: settings) else {
+            return false
+        }
         guard let preparation = prepareCompaction(pathEntries: pathEntries, settings: settings) else {
-            return
+            return false
         }
         // Timed here rather than in the sink, because a compaction checkpoint is
         // not a `Message` and never passes through the event stream — the sink can
@@ -1206,6 +1228,7 @@ public actor AgentHarness {
         if case .compaction(let compaction) = entry.payload, let usage = compaction.usage {
             accumulatedUsage = accumulatedUsage + usage
         }
+        return true
     }
 
     /// Compact the active branch after an overflow that happened during a

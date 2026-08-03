@@ -5,6 +5,12 @@ import Testing
 
 @Suite("Prompt resources", .serialized)
 struct PromptResourcesTests {
+    @Test("built-in context controls are advertised as local commands")
+    func builtInContextCommands() {
+        #expect(CommandRegistry.builtIn.command(named: "compact")?.action == .compact)
+        #expect(CommandRegistry.builtIn.command(named: "context")?.action == .context)
+    }
+
     private func makeDirectory() throws -> FilePath {
         let path = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("domocode-prompts-\(UUID().uuidString)", isDirectory: true)

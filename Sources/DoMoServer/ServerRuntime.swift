@@ -33,6 +33,32 @@ public struct SessionRef: Sendable, Codable, Hashable {
     }
 }
 
+/// The model-facing context and the accounting snapshot that describes it.
+///
+/// Unlike ``messages(sessionID:)``, which is the lossless transcript shown in a
+/// client's history pane, `messages` here has already crossed the active
+/// compaction boundary and the context-output projection. It is therefore the
+/// exact message list the next model request would start with, including pruning
+/// and spill markers.
+public struct ContextSnapshot: Sendable, Codable {
+    public var messages: [Message]
+    public var accounting: SessionAccounting?
+
+    public init(messages: [Message], accounting: SessionAccounting?) {
+        self.messages = messages
+        self.accounting = accounting
+    }
+}
+
+/// The result of an explicit `/compact` request.
+public struct CompactionResult: Sendable, Codable, Hashable {
+    public var compacted: Bool
+
+    public init(compacted: Bool) {
+        self.compacted = compacted
+    }
+}
+
 /// An authoritative snapshot of what the server believes about one session.
 ///
 /// The server owns run state and the pending-prompt set; a client's copy is only
@@ -1200,6 +1226,22 @@ public actor ServerRuntime {
         case .file(let path):
             return try await Self.loadMessages(at: path, from: nil)
         }
+    }
+
+    /// Force one compaction checkpoint on an idle session. Automatic compaction
+    /// settings do not suppress an explicit user request.
+    public func compact(sessionID: String) async throws -> CompactionResult {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        return CompactionResult(compacted: try await session.harness.compactNow())
+    }
+
+    /// Return the exact projected context the next turn would send, rather than
+    /// the lossless transcript returned by ``messages(sessionID:)``.
+    public func context(sessionID: String) async throws -> ContextSnapshot {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        let messages = try await session.harness.contextMessages()
+        return ContextSnapshot(messages: messages, accounting: try? await session.harness.accounting())
     }
 
     /// The direct children of a node (or of the tree roots when `parent` is nil),

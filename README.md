@@ -15,14 +15,14 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 
 **The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine,
 the MCP client, the Phase 5b command layer, Phase 5c client polish, and Phase 5d terminal-native
-polish are implemented, with focused
-coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8 and the 8.5 hardening pass had
-**2,558 tests in 382 suites green in the Swift 6.3.3 debug matrix; release verification is green with
+polish, and Phase 10 context engineering are implemented, with focused
+coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8, 8.5, 9 and 10 had
+**2,566 tests in 382 suites green in the Swift 6.3.3 debug matrix; release verification is green with
 the repository's documented macOS `DoMoCLITests` runtime exception**.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
-**Every phase of the pi port has shipped through Phase 9 steering and run control.**
+**Every phase of the pi port has shipped through Phase 10 context engineering.**
 Phases 5a–5d — truth and plumbing, the command layer, client polish, and terminal-native polish — are
 complete. The default client now receives the same command registry as the inline surface,
 `/review`, `/init`, and `/tree` are available through that registry, trusted project instructions and
@@ -534,15 +534,13 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       while `-p --yolo` grants one more guard window without blocking a script. *Exit met:* typing
       while the agent works queues instead of erroring; focused loop, permission, server/client, and
       compiled-binary tests cover the queue, delivery modes, cost exit, and escalation paths.
-- [ ] **Phase 10 — Context engineering.** Compaction ships and works; the machinery around it is thin.
-      There is no overflow recovery, so an alias resolving to a 32k upstream kills a turn on a session
-      DoMoCode believes is half full. 5a supplies the real window; this spends it — compact-and-retry
-      once with a per-turn latch, cross-provider overflow detection including silent and truncation
-      overflow, a cumulative file manifest carried across compactions, deterministic conversation serialization
-      for the summarizer (halves the bill and stops the model continuing the task), tool-output
-      pruning at context-build time, spill-to-disk for oversized output, and `/compact` and
-      `/context`. *Exit:* a long session against a small-context alias recovers instead of dying, and
-      the meter says `?` when it genuinely does not know.
+- [x] **Phase 10 — Context engineering.** Compaction now has the missing runtime seam: one
+      compact-and-retry recovery per turn, cross-provider overflow detection for explicit, silent, and
+      truncation forms, cumulative file manifests, deterministic non-conversational summarizer input,
+      context-time tool-output pruning, and recoverable spill-to-disk for oversized output. `/compact`
+      and `/context` are available in the inline and full-screen clients and over the server client API.
+      *Exit met:* a long session against a small-context alias recovers instead of dying, and the meter
+      says `?` when the model window is genuinely unknown.
 - [ ] **Phase 11 — Mutable tool set, and the tool suite.** The seam phase. Making tool resolution a
       per-request function — `tools(agent:model:ruleset:config:)`, with the system prompt's tool list
       computed from the result — is the prerequisite for plan mode, agents, subagents, and the MCP
@@ -826,7 +824,7 @@ ones — each addition still forces a tool-vs-prompt-injection and in-process-vs
 | Skill refinements: keyword auto-injection, task-input `{VAR}` templates | all three | yes | Phase 5b |
 | Slash-command polish: `$ARGUMENTS`/`$N`, inline `` !`shell` ``, per-command overrides, ANSI-index / `none`=inherit theming | opencode, kilocode | yes | Phase 5b (commands) + 5c (themes) |
 | First-party tool additions: `question`/`suggest`, todo checklist, `webfetch` (+ gated `apply_patch`, notebook-edit, `recall`) | all three | adaptable | Phase 11; `recall` in Phase 17. `websearch` needs a second vendor and stays out |
-| Selectable/tunable history condensers (observation-masking, recent-window, LLM-summarizing) | OpenHands | adaptable | Phase 10 |
+| Selectable/tunable history condensers (observation-masking, recent-window, LLM-summarizing) | OpenHands | adaptable | **Shipped** (Phase 10) |
 | Local conveniences: prompt stash, `/btw` side-branch, background jobs, file watcher, JSONL replay, local secrets + env injection, out-of-process notify/sound | opencode, kilocode, OpenHands | yes/adaptable | Scattered: stash in Phase 9, background jobs in 11, replay in 20, notify/sound in 5d, secrets in 5a. Prompt *history* shipped in 8.5; a file watcher remains unscheduled |
 | Out-of-process research items: ACP single-session stdio subcommand, LSP post-edit diagnostics, Seatbelt/bubblewrap bash sandbox, local semantic index | all three | adaptable | LSP is Phase 16, the sandbox Phase 18; ACP awaits a [decision](#decisions-that-reverse-a-stated-non-goal); the semantic index is [not planned](#non-goals-and-known-gaps) |
 

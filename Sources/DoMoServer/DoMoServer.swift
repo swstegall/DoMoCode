@@ -201,6 +201,25 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        // The model-facing context after compaction, tool-output pruning, and
+        // spill-to-disk projection. This is deliberately separate from
+        // `/messages`, which remains the lossless transcript for the history pane.
+        router.get("/session/:id/context") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.context(sessionID: id))
+            }
+        }
+
+        // Force one checkpoint even when automatic compaction is disabled. The
+        // runtime rejects this with 409 while a turn owns the session.
+        router.post("/session/:id/compact") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.compact(sessionID: id), status: .ok)
+            }
+        }
+
         router.get("/session/:id/children") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")

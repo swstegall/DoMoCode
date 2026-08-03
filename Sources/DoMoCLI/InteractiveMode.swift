@@ -759,6 +759,43 @@ final class InteractiveCoordinator {
             stagedImages = []
             render()
             return
+        case .some(.compact):
+            stagedImages = []
+            guard !running else {
+                appendStopNotice("/compact is unavailable while a turn is running")
+                render()
+                return
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let compacted = try await self.harness.compactNow()
+                    await self.refreshAccounting()
+                    self.appendStopNotice(
+                        compacted
+                            ? "context compacted"
+                            : "nothing to compact in the current context"
+                    )
+                } catch {
+                    self.appendError(error)
+                }
+                self.render()
+            }
+            return
+        case .some(.context):
+            stagedImages = []
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let messages = try await self.harness.contextMessages()
+                    let accounting = try? await self.harness.accounting()
+                    self.appendStopNotice(Self.contextSummary(messages: messages, accounting: accounting))
+                } catch {
+                    self.appendError(error)
+                }
+                self.render()
+            }
+            return
         case .some(.help):
             let names = commandProcessor.workspace.commands.commands
                 .map { "/\($0.name)" }
@@ -1491,6 +1528,27 @@ final class InteractiveCoordinator {
     /// A run that stopped without finishing, said out loud.
     private func appendStopNotice(_ text: String) {
         transcript.addChild(Text("  \u{1b}[33m⚠ " + text + Self.sgrReset))
+    }
+
+    /// Keep `/context` useful on a narrow terminal: show the shape and meter of
+    /// the projected request without dumping its potentially large message body
+    /// into the transcript.
+    private static func contextSummary(messages: [Message], accounting: SessionAccounting?) -> String {
+        var users = 0
+        var assistants = 0
+        var tools = 0
+        var systems = 0
+        for message in messages {
+            switch message {
+            case .system: systems += 1
+            case .user: users += 1
+            case .assistant: assistants += 1
+            case .tool: tools += 1
+            }
+        }
+        let shape = "\(messages.count) messages (system \(systems), user \(users), assistant \(assistants), tool \(tools))"
+        let meter = InlineAccountingSummary.text(accounting)
+        return meter.isEmpty ? "context: \(shape) · accounting unavailable" : "context: \(shape) · \(meter)"
     }
 
     /// Say out loud that a LiteLLM fallback fired and a different model answered.
