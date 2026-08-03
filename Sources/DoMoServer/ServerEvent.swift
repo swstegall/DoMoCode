@@ -104,6 +104,12 @@ public enum ServerEvent: Sendable, Hashable {
     /// the run ended). A subscriber still showing it should dismiss it.
     case permissionResolved(id: String)
 
+    /// The number of messages waiting for the active run, plus the delivery mode
+    /// the runtime will use at the next turn boundary. Additive and intentionally
+    /// independent of transcript events: a client can render queue state without
+    /// pretending the queued message has already been delivered.
+    case queueUpdate(count: Int, mode: String)
+
     /// Something the run wants the user to see that is not transcript content —
     /// a retry in progress, a provider failure, a runtime error that never
     /// became a message. The wire projection of ``DoMoAgent/AgentNotice``.
@@ -257,6 +263,7 @@ extension ServerEvent: Codable {
         case toolEnd = "tool_end"
         case permissionRequest = "permission_request"
         case permissionResolved = "permission_resolved"
+        case queueUpdate = "queue_update"
         case notice
     }
 
@@ -280,6 +287,8 @@ extension ServerEvent: Codable {
         case always
         case metadata
         case disableAlways
+        case count
+        case mode
         case notice
     }
 
@@ -341,6 +350,11 @@ extension ServerEvent: Codable {
             )
         case .permissionResolved:
             self = .permissionResolved(id: try container.decode(String.self, forKey: .id))
+        case .queueUpdate:
+            self = .queueUpdate(
+                count: try container.decode(Int.self, forKey: .count),
+                mode: try container.decode(String.self, forKey: .mode)
+            )
         case .notice:
             self = .notice(try container.decode(ServerNotice.self, forKey: .notice))
         }
@@ -399,6 +413,10 @@ extension ServerEvent: Codable {
         case .permissionResolved(let id):
             try container.encode(Kind.permissionResolved, forKey: .type)
             try container.encode(id, forKey: .id)
+        case .queueUpdate(let count, let mode):
+            try container.encode(Kind.queueUpdate, forKey: .type)
+            try container.encode(count, forKey: .count)
+            try container.encode(mode, forKey: .mode)
         case .notice(let notice):
             try container.encode(Kind.notice, forKey: .type)
             try container.encode(notice, forKey: .notice)

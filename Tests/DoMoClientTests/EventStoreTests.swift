@@ -122,6 +122,39 @@ struct EventStoreTests {
         #expect(store.pendingPermission?.id == "per_2")
     }
 
+    @Test("A queue_update shows the accepted count and selecting a session clears it")
+    func queueUpdate() {
+        let store = EventStore()
+        store.select("a")
+        store.apply(.queueUpdate(count: 3, mode: "one-at-a-time"))
+        #expect(store.queuedMessageCount == 3)
+        #expect(store.steeringMode == "one-at-a-time")
+
+        store.apply(.queueUpdate(count: 0, mode: "all"))
+        #expect(store.queuedMessageCount == 0)
+        #expect(store.steeringMode == "all")
+        store.select("b")
+        #expect(store.queuedMessageCount == 0)
+        #expect(store.steeringMode == nil)
+    }
+
+    @Test("status adoption reconciles queue state without requiring an SSE frame")
+    func queueStatusAdoption() {
+        let store = EventStore()
+        store.select("a")
+        store.adopt(SessionStatus(
+            sessionID: "a",
+            running: true,
+            pendingPermissionIDs: [],
+            subscribers: 1,
+            runStartedAt: nil,
+            queuedMessageCount: 2,
+            steeringMode: "all"
+        ))
+        #expect(store.queuedMessageCount == 2)
+        #expect(store.steeringMode == "all")
+    }
+
     @Test("A tool call fills its result in place, not as a duplicate row")
     func toolCallInPlace() {
         let store = EventStore()

@@ -237,6 +237,39 @@ public struct ServerClient: Sendable {
         try expect(status, 202, path, body: data)
     }
 
+    /// Queue a prompt for the active run. `POST /session/{id}/steer` → 202.
+    /// The accepted count arrives asynchronously as a `queue_update` SSE frame.
+    public func sendSteer(sessionID: String, prompt: String, images: [ImageBlock] = []) async throws {
+        let path = "/session/\(sessionID)/steer"
+        let body = try JSONEncoder().encode(PromptBody(prompt: prompt, images: images.isEmpty ? nil : images))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 202, path, body: data)
+    }
+
+    /// Submit a prompt using the client's best current run-state knowledge. The
+    /// opposite route is retried once on a 409 because the run can settle between
+    /// reading local state and the HTTP request.
+    public func sendPromptOrSteer(
+        sessionID: String,
+        prompt: String,
+        images: [ImageBlock] = [],
+        preferSteer: Bool
+    ) async throws {
+        if preferSteer {
+            do {
+                try await sendSteer(sessionID: sessionID, prompt: prompt, images: images)
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                try await sendPrompt(sessionID: sessionID, prompt: prompt, images: images)
+            }
+        } else {
+            do {
+                try await sendPrompt(sessionID: sessionID, prompt: prompt, images: images)
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                try await sendSteer(sessionID: sessionID, prompt: prompt, images: images)
+            }
+        }
+    }
+
     /// Abort the running turn. `POST /session/{id}/abort` → 200. Cooperative —
     /// the runtime cancels the run task.
     ///

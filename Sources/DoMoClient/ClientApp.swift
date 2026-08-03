@@ -544,6 +544,9 @@ public final class ClientApp {
             let quiet = Int(Date().timeIntervalSince(store.lastEventAt))
             if quiet >= Int(Self.silenceThreshold) { parts.append("(no data for \(quiet)s)") }
         }
+        if store.queuedMessageCount > 0 {
+            parts.append("queued \(store.queuedMessageCount)")
+        }
         // Contextual controls come before transient notices. The status row is
         // truncated from the right, and a long disconnect or refusal notice can
         // otherwise hide the diagnostic key at exactly the moment it explains the
@@ -2301,11 +2304,10 @@ public final class ClientApp {
     ///
     /// `PromptInput` clears its text BEFORE calling this, so the typed string survives
     /// only as this argument. It used to be handed to a detached `try?`, so a refusal
-    /// (the server allows one turn at a time and answers 409 `sessionBusy`) erased the
-    /// user's message with no message, no retry and no trace. Two guards now: a
-    /// synchronous one for the common case, which can put the text back in the same
-    /// main-actor turn as the keystroke; and a `catch` for every remaining race, which
-    /// restores it too.
+    /// (the server now queues it through `/steer` when a run is active) erased the
+    /// user's message with no message, no retry and no trace. The transport chooses
+    /// the queue or normal prompt route and retries the opposite route once when the
+    /// run state changes during that request; failures still restore the exact input.
     private func submit(_ text: String, _ attachments: [PromptAttachment]) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let commandName = Self.commandName(in: trimmed),
@@ -2336,13 +2338,10 @@ public final class ClientApp {
             post(notice: "no session is open")
             return
         }
-        // The client's view of run state is racy against the server's, so this is an
-        // optimisation of the common case, not the guarantee — the catch below is.
-        if store.runState == .running {
-            promptInput.restore(text, attachments: attachments)
-            refuseAsBusy()
-            return
-        }
+        // The client's view of run state is racy against the server's. The transport
+        // uses this as a fast path only; it retries the opposite route once when the
+        // server says the run changed state between the snapshot and the request.
+        let preferSteer = store.runState == .running
         // Sending snaps the transcript back to the tail: a user who scrolled up to
         // re-read something and then asks a question must see the answer, not stay
         // parked in the history while the reply streams in off-screen.
@@ -2354,7 +2353,12 @@ public final class ClientApp {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                try await self.client.sendPrompt(sessionID: id, prompt: text, images: images)
+                try await self.client.sendPromptOrSteer(
+                    sessionID: id,
+                    prompt: text,
+                    images: images,
+                    preferSteer: preferSteer
+                )
             } catch ServerClientError.unexpectedStatus(413, _, _) {
                 // The body was refused as too large. Everything is put back —
                 // including the chips, which is the whole point: a 413 that
@@ -2368,9 +2372,9 @@ public final class ClientApp {
                     hint: "Remove an image (Backspace on an empty prompt) or send a smaller one. Your text and chips were put back."
                 )
             } catch ServerClientError.unexpectedStatus(409, _, _) {
-                // Expected, recoverable, and already explained by the notice: the
-                // server allows one turn at a time. No transcript row — a red
-                // block for "wait a moment" is noise.
+                // Both routes rejected the prompt with a conflict, so neither an
+                // enqueue nor a new run was accepted. No transcript row — a red
+                // block for a short race is noise.
                 self.promptInput.restore(text, attachments: attachments)
                 self.refuseAsBusy()
                 // The refusal is only trustworthy if the run it names is real. A

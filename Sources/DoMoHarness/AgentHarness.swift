@@ -915,12 +915,18 @@ public actor AgentHarness {
         prompt: String,
         attachments: [ImageBlock] = [],
         sink: (any AgentEventSink)? = nil,
-        runOverride: RunOverride? = nil
+        runOverride: RunOverride? = nil,
+        drainSteeringBeforeFirstTurn: Bool = true
     ) async throws -> AgentRunResult {
         let promptMessage = Message.user(
             UserMessage(content: [.text(prompt)] + attachments.map { .image($0) })
         )
-        return try await run(messages: [promptMessage], sink: sink, runOverride: runOverride)
+        return try await run(
+            messages: [promptMessage],
+            sink: sink,
+            runOverride: runOverride,
+            drainSteeringBeforeFirstTurn: drainSteeringBeforeFirstTurn
+        )
     }
 
     /// Runs a sequence of already-constructed messages to completion.
@@ -932,7 +938,8 @@ public actor AgentHarness {
     public func run(
         messages: [Message],
         sink: (any AgentEventSink)? = nil,
-        runOverride: RunOverride? = nil
+        runOverride: RunOverride? = nil,
+        drainSteeringBeforeFirstTurn: Bool = true
     ) async throws -> AgentRunResult {
         guard !messages.isEmpty else {
             throw DoMoError(.configuration, "AgentHarness cannot run an empty message list")
@@ -981,6 +988,7 @@ public actor AgentHarness {
             maxTurns: configuration.maxTurns,
             beforeToolCall: configuration.beforeToolCall,
             getSteeringMessages: steeringMessages,
+            drainSteeringBeforeFirstTurn: drainSteeringBeforeFirstTurn,
             getFollowUpMessages: followUpMessages,
             shouldStopAfterTurn: configuration.shouldStopAfterTurn
         )

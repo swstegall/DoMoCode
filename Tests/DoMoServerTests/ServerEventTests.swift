@@ -93,6 +93,7 @@ struct ServerEventTests {
                 metadata: ["command": .string("rm -rf /")], disableAlways: false
             ),
             .permissionResolved(id: "per_1"),
+            .queueUpdate(count: 2, mode: "one-at-a-time"),
         ]
         for event in cases {
             #expect(try roundTrip(event) == event, "did not round-trip: \(event)")
@@ -126,5 +127,11 @@ struct ServerEventTests {
         let resolved = try JSONValue(parsing: try JSONEncoder().encode(ServerEvent.permissionResolved(id: "per_1")))
         #expect(resolved["type"]?.stringValue == "permission_resolved")
         #expect(resolved["id"]?.stringValue == "per_1")
+
+        let queue = try JSONValue(parsing: try JSONEncoder().encode(
+            ServerEvent.queueUpdate(count: 2, mode: "one-at-a-time")))
+        #expect(queue["type"]?.stringValue == "queue_update")
+        #expect(queue["count"]?.intValue == 2)
+        #expect(queue["mode"]?.stringValue == "one-at-a-time")
     }
 }

@@ -18,6 +18,9 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     case sessionNotFound
     /// A turn is already running for that session; only one runs at a time.
     case sessionBusy
+    /// A steering request arrived after the active run had already settled.
+    /// The client should retry it as a normal prompt.
+    case sessionNotRunning
 }
 
 /// A reference to a session, returned by create and fork.
@@ -68,6 +71,12 @@ public struct SessionStatus: Sendable, Codable, Hashable {
     /// spent nothing; `nil` says the server did not know.
     public var accounting: SessionAccounting?
 
+    /// Messages accepted by the server but not yet delivered to the agent loop.
+    /// Optional for compatibility with servers that predate Phase 9.
+    public var queuedMessageCount: Int?
+    /// The server's steering delivery mode, when reported.
+    public var steeringMode: String?
+
     /// - Parameter accounting: Defaulted and **last**, so every existing
     ///   construction of this type keeps compiling untouched.
     public init(
@@ -76,7 +85,9 @@ public struct SessionStatus: Sendable, Codable, Hashable {
         pendingPermissionIDs: [String],
         subscribers: Int,
         runStartedAt: String?,
-        accounting: SessionAccounting? = nil
+        accounting: SessionAccounting? = nil,
+        queuedMessageCount: Int? = nil,
+        steeringMode: String? = nil
     ) {
         self.sessionID = sessionID
         self.running = running
@@ -84,6 +95,8 @@ public struct SessionStatus: Sendable, Codable, Hashable {
         self.subscribers = subscribers
         self.runStartedAt = runStartedAt
         self.accounting = accounting
+        self.queuedMessageCount = queuedMessageCount
+        self.steeringMode = steeringMode
     }
 }
 
@@ -210,6 +223,10 @@ public actor ServerRuntime {
         /// configures nothing behaves byte-for-byte as it did.
         public var summarizer: Summarizer?
 
+        /// How prompts typed during a run are delivered at turn boundaries.
+        /// One-at-a-time is deliberately the safe default for interactive use.
+        public var steeringMode: QueueDeliveryMode
+
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
         ///   - compaction: See ``Config/compaction``.
@@ -237,7 +254,8 @@ public actor ServerRuntime {
             commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)? = nil,
             modelOptions: [ModelOption] = [],
             modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
-            modelContextWindow: (@Sendable (String) -> Int?)? = nil
+            modelContextWindow: (@Sendable (String) -> Int?)? = nil,
+            steeringMode: QueueDeliveryMode = .oneAtATime
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -257,6 +275,7 @@ public actor ServerRuntime {
             self.contextWindow = contextWindow
             self.compaction = compaction
             self.summarizer = summarizer
+            self.steeringMode = steeringMode
         }
     }
 
@@ -320,6 +339,7 @@ public actor ServerRuntime {
         let token: Int
         let harness: AgentHarness
         let sink: BroadcastEventSink
+        let steeringBox: SteeringBox
         var runTask: Task<Void, Never>?
         /// The gate on the current run's output. Retained beside `runTask` so
         /// ``forceClearRun(sessionID:)`` can silence a run it is abandoning.
@@ -332,10 +352,11 @@ public actor ServerRuntime {
         /// abort/shutdown) resumes it. Held only inside the actor, never shared.
         var pending: [String: PendingApproval] = [:]
 
-        init(token: Int, harness: AgentHarness, sink: BroadcastEventSink) {
+        init(token: Int, harness: AgentHarness, sink: BroadcastEventSink, steeringBox: SteeringBox) {
             self.token = token
             self.harness = harness
             self.sink = sink
+            self.steeringBox = steeringBox
         }
     }
 
@@ -368,17 +389,32 @@ public actor ServerRuntime {
         return config.modelOptions
     }
 
-    private func makeState(harness: AgentHarness, sink: BroadcastEventSink) -> SessionState {
+    private func makeState(
+        harness: AgentHarness,
+        sink: BroadcastEventSink,
+        steeringBox: SteeringBox
+    ) -> SessionState {
         let token = nextToken
         nextToken += 1
-        return SessionState(token: token, harness: harness, sink: sink)
+        return SessionState(token: token, harness: harness, sink: sink, steeringBox: steeringBox)
+    }
+
+    private func makeSteeringBox() -> SteeringBox {
+        SteeringBox(mode: config.steeringMode)
     }
 
     /// Build the harness configuration for one session, wiring the permission gate
     /// bound to THIS session's id (so a prompt routes its answer back to this
     /// session's pending map). The prompter is `self.awaitPermission` — the runtime
     /// that owns the pending map already exists, so no `PrompterBox` is needed.
-    private func harnessConfiguration(sessionID: String) -> AgentHarness.Configuration {
+    private func harnessConfiguration(
+        sessionID: String,
+        steeringBox: SteeringBox
+    ) -> AgentHarness.Configuration {
+        let steeringReader: @Sendable () async -> [Message] = { [weak self, steeringBox] in
+            guard let self else { return steeringBox.drain() }
+            return await self.drainSteering(sessionID: sessionID, box: steeringBox)
+        }
         var beforeToolCall: BeforeToolCallHook?
         if let permissions = config.permissions {
             let engine = PermissionEngine(
@@ -412,8 +448,22 @@ public actor ServerRuntime {
             maxTurns: config.maxTurns,
             compaction: config.compaction,
             contextWindow: config.contextWindow,
+            getSteeringMessages: steeringReader,
+            steeringBox: steeringBox,
             beforeToolCall: beforeToolCall
         )
+    }
+
+    /// Drain a session's box and publish the level-triggered count immediately.
+    /// The identity check prevents an abandoned harness from reporting the queue
+    /// state of a replacement session after force-clear or fork.
+    private func drainSteering(sessionID: String, box: SteeringBox) -> [Message] {
+        let messages = box.drain()
+        guard !messages.isEmpty,
+              let session = sessions[sessionID], session.steeringBox === box
+        else { return messages }
+        session.sink.broadcast(.queueUpdate(count: box.count, mode: box.mode.rawValue))
+        return messages
     }
 
     // MARK: Permission round-trip
@@ -473,6 +523,7 @@ public actor ServerRuntime {
         // The session id must be known BEFORE building the harness config, so the
         // permission hook can be bound to it (a prompt routes its answer by sessionID).
         let harness: AgentHarness
+        let steeringBox: SteeringBox
         let id: String
         if let resume {
             let path = try await resolveResume(resume)
@@ -483,14 +534,19 @@ public actor ServerRuntime {
             if let existing = sessions[resumedID] {
                 return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
             }
-            harness = try await Self.reopen(path: path, configuration: harnessConfiguration(sessionID: resumedID))
+            steeringBox = makeSteeringBox()
+            harness = try await Self.reopen(
+                path: path,
+                configuration: harnessConfiguration(sessionID: resumedID, steeringBox: steeringBox)
+            )
             id = resumedID
         } else {
             id = UUIDv7.generate().description
+            steeringBox = makeSteeringBox()
             harness = try AgentHarness.start(
                 cwd: config.cwd,
                 sessionDirectory: config.sessionDirectory,
-                configuration: harnessConfiguration(sessionID: id),
+                configuration: harnessConfiguration(sessionID: id, steeringBox: steeringBox),
                 sessionID: id
             )
         }
@@ -499,7 +555,7 @@ public actor ServerRuntime {
         // check: a concurrent resume of the same id must not replace a live session
         // and strand its run and its subscribers. `harness` is dropped unused.
         if sessions[id] != nil { return SessionRef(id: id, path: path.string) }
-        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink())
+        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink(), steeringBox: steeringBox)
         return SessionRef(id: id, path: path.string)
     }
 
@@ -509,17 +565,15 @@ public actor ServerRuntime {
         let forked = try await session.harness.fork(sessionDirectory: config.sessionDirectory)
         let path = await forked.sessionFilePath
         let id = try await Self.readSessionID(at: path)
-        // `fork` reuses the PARENT's configuration, whose permission hook is bound to
-        // the parent's sessionID — a prompt from the forked run would route to the
-        // wrong session and hang. Re-open the forked file with a correctly-bound
-        // config (only when gating is on; ungated forks keep the cheap path).
-        let harness: AgentHarness
-        if config.permissions != nil {
-            harness = try await Self.reopen(path: path, configuration: harnessConfiguration(sessionID: id))
-        } else {
-            harness = forked
-        }
-        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink())
+        // `fork` reuses the PARENT's configuration, whose permission hook and
+        // steering box are both bound to the parent. Re-open the forked file with
+        // fresh per-session state even when permissions are disabled.
+        let steeringBox = makeSteeringBox()
+        let harness = try await Self.reopen(
+            path: path,
+            configuration: harnessConfiguration(sessionID: id, steeringBox: steeringBox)
+        )
+        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink(), steeringBox: steeringBox)
         return SessionRef(id: id, path: path.string)
     }
 
@@ -528,10 +582,46 @@ public actor ServerRuntime {
     /// Start a turn on a session. Returns immediately; the run advances in a
     /// retained ``Task`` whose events flow to the session's broadcast sink.
     ///
-    /// Throws ``ServerRuntimeError/sessionBusy`` if a run is already in flight —
-    /// the single-turn-at-a-time rule the harness enforces internally, surfaced
-    /// here as a 409 rather than swallowed inside a fire-and-forget task.
+    /// Throws ``ServerRuntimeError/sessionBusy`` when the caller is trying to
+    /// start a second normal run. A client that is intentionally typing while a
+    /// run is active uses ``steer(sessionID:prompt:attachments:)`` instead.
     public func startRun(sessionID: String, prompt: String, attachments: [ImageBlock]) throws {
+        let message = Message.user(
+            UserMessage(content: [.text(prompt)] + attachments.map { .image($0) })
+        )
+        try startRun(
+            sessionID: sessionID,
+            messages: [message],
+            commandPrompt: prompt,
+            attachments: attachments
+        )
+    }
+
+    /// Queue a prompt for the active run. The message is delivered by the harness
+    /// at its next steering boundary and is acknowledged with a `queue_update` SSE
+    /// frame. If the run settled in the tiny race between the client's state and
+    /// this call, the client retries through the ordinary prompt route.
+    public func steer(sessionID: String, prompt: String, attachments: [ImageBlock]) throws {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask != nil else { throw ServerRuntimeError.sessionNotRunning }
+        session.steeringBox.enqueue(
+            .user(UserMessage(content: [.text(prompt)] + attachments.map { .image($0) }))
+        )
+        session.sink.broadcast(
+            .queueUpdate(count: session.steeringBox.count, mode: session.steeringBox.mode.rawValue)
+        )
+    }
+
+    /// Admit either a normal prompt (which still passes through the command
+    /// processor) or already-queued messages promoted into the next run after a
+    /// completion/steering race.
+    private func startRun(
+        sessionID: String,
+        messages: [Message],
+        commandPrompt: String?,
+        attachments: [ImageBlock],
+        drainSteeringBeforeFirstTurn: Bool = true
+    ) throws {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
         let harness = session.harness
@@ -543,6 +633,7 @@ public actor ServerRuntime {
         let token = session.token
         let commandProcessor = config.commandProcessor
         let commandStreamFactory = config.commandStreamFactory
+        let promptWorkspace = config.promptWorkspace
         let baseSystemPrompt = config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt
         session.runSink = sink
         session.runStartedAt = Date()
@@ -555,39 +646,53 @@ public actor ServerRuntime {
                 // `result.failure` here would put the identical row on the screen
                 // twice — the frame is not missing, only the frames for the failures
                 // the loop never saw are, and those all arrive as a throw.
-                let resolution: PromptCommandResolution
-                if let processor = commandProcessor {
-                    resolution = try await processor.resolve(prompt)
-                } else {
-                    resolution = .prompt(
-                        text: prompt,
-                        model: nil,
-                        reasoningEffort: nil,
-                        systemPrompt: baseSystemPrompt
-                    )
-                }
-                switch resolution {
-                case .local(let action):
-                    throw DoMoError(.configuration, "/\(action.rawValue) is a client-local command")
-                case .unknown(let name):
-                    throw DoMoError(.configuration, "Unknown command /\(name)")
-                case .prompt(let rendered, let commandModel, let reasoningEffort, let systemPrompt):
-                    var runOverride: AgentHarness.RunOverride?
-                    if commandModel != nil || reasoningEffort != nil || commandStreamFactory != nil {
-                        let stream = commandStreamFactory?(commandModel, reasoningEffort)
-                        runOverride = AgentHarness.RunOverride(
-                            model: commandModel,
-                            streamFn: stream,
-                            systemPrompt: systemPrompt
-                        )
+                if let commandPrompt {
+                    let resolution: PromptCommandResolution
+                    if let processor = commandProcessor {
+                        resolution = try await processor.resolve(commandPrompt)
                     } else {
-                        runOverride = AgentHarness.RunOverride(systemPrompt: systemPrompt)
+                        resolution = .prompt(
+                            text: commandPrompt,
+                            model: nil,
+                            reasoningEffort: nil,
+                            systemPrompt: baseSystemPrompt
+                        )
                     }
+                    switch resolution {
+                    case .local(let action):
+                        throw DoMoError(.configuration, "/\(action.rawValue) is a client-local command")
+                    case .unknown(let name):
+                        throw DoMoError(.configuration, "Unknown command /\(name)")
+                    case .prompt(let rendered, let commandModel, let reasoningEffort, let systemPrompt):
+                        var runOverride: AgentHarness.RunOverride?
+                        if commandModel != nil || reasoningEffort != nil || commandStreamFactory != nil {
+                            let stream = commandStreamFactory?(commandModel, reasoningEffort)
+                            runOverride = AgentHarness.RunOverride(
+                                model: commandModel,
+                                streamFn: stream,
+                                systemPrompt: systemPrompt
+                            )
+                        } else {
+                            runOverride = AgentHarness.RunOverride(systemPrompt: systemPrompt)
+                        }
+                        _ = try await harness.run(
+                            prompt: rendered,
+                            attachments: attachments,
+                            sink: sink,
+                            runOverride: runOverride
+                        )
+                    }
+                } else {
+                    let promptForSystem = messages.compactMap { message -> String? in
+                        guard case .user(let user) = message else { return nil }
+                        return user.text
+                    }.first ?? ""
+                    let systemPrompt = promptWorkspace?.systemPrompt(for: promptForSystem) ?? baseSystemPrompt
                     _ = try await harness.run(
-                        prompt: rendered,
-                        attachments: attachments,
+                        messages: messages,
                         sink: sink,
-                        runOverride: runOverride
+                        runOverride: AgentHarness.RunOverride(systemPrompt: systemPrompt),
+                        drainSteeringBeforeFirstTurn: drainSteeringBeforeFirstTurn
                     )
                 }
             } catch is CancellationError {
@@ -672,11 +777,38 @@ public actor ServerRuntime {
     /// pins exactly that.
     private func finishRun(_ sessionID: String, token: Int) {
         guard let session = sessions[sessionID], session.token == token else { return }
+        let nextMessages = session.steeringBox.drain()
         session.runTask = nil
         session.runSink = nil
         // Cleared beside `runTask`, so `status` can never report `running: false`
         // next to a stale start time a client would render as "running for 14m".
         session.runStartedAt = nil
+
+        guard !nextMessages.isEmpty else { return }
+
+        // A message can arrive after the loop's final steering poll but before
+        // this completion hop. Promote it immediately instead of leaving an idle
+        // session with an accepted-but-never-delivered queue entry. The promoted
+        // run skips its initial steering poll; its first queued message is already
+        // the initial prompt, and the remaining queue is consumed one boundary at
+        // a time by the normal loop poll.
+        session.sink.broadcast(
+            .queueUpdate(count: session.steeringBox.count, mode: session.steeringBox.mode.rawValue)
+        )
+        do {
+            try startRun(
+                sessionID: sessionID,
+                messages: nextMessages,
+                commandPrompt: nil,
+                attachments: [],
+                drainSteeringBeforeFirstTurn: false
+            )
+        } catch {
+            let failure = error as? DoMoError
+                ?? DoMoError(wrapping: error, as: .configuration, "The queued turn could not be run")
+            session.sink.broadcast(Self.noticeEvent(failure))
+            session.sink.broadcast(.agentEnd(reason: "errored"))
+        }
     }
 
     /// Cancel a running turn. The run settles cooperatively and clears its own slot.
@@ -828,9 +960,10 @@ public actor ServerRuntime {
         // retry, whenever the file is behind the live tip — the crash-truncated tail
         // the storage layer explicitly tolerates elsewhere is enough — and a lever of
         // last resort that can refuse is a session that can never be cleared.
+        let steeringBox = makeSteeringBox()
         let fresh = try await Self.reopen(
             path: path,
-            configuration: harnessConfiguration(sessionID: sessionID),
+            configuration: harnessConfiguration(sessionID: sessionID, steeringBox: steeringBox),
             preferring: liveBranch
         )
         // The branch this lever adopts ends, by the nature of what it is for, on an
@@ -863,7 +996,9 @@ public actor ServerRuntime {
         session.runSink?.detach()
         session.runTask?.cancel()
         drainPending(session, reason: Self.clearedReason)
-        sessions[sessionID] = makeState(harness: fresh, sink: session.sink)
+        session.steeringBox.clear()
+        sessions[sessionID] = makeState(harness: fresh, sink: session.sink, steeringBox: steeringBox)
+        session.sink.broadcast(.queueUpdate(count: 0, mode: steeringBox.mode.rawValue))
         // Terminal frame for anyone still attached: the client's run state is
         // edge-triggered, so without this it stays pinned on "thinking…". Sent on
         // the raw sink — this frame is the runtime's, not the abandoned run's.
@@ -924,7 +1059,9 @@ public actor ServerRuntime {
             pendingPermissionIDs: pendingPermissionIDs,
             subscribers: subscribers,
             runStartedAt: runStartedAt,
-            accounting: try? await session.harness.accounting()
+            accounting: try? await session.harness.accounting(),
+            queuedMessageCount: session.steeringBox.count,
+            steeringMode: session.steeringBox.mode.rawValue
         )
     }
 

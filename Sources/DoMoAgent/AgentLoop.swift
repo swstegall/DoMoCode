@@ -130,7 +130,9 @@ public func runAgentLoop(
     var lastSignature: TurnToolSignature?
     var repeatedTurns = 0
     // Steering may already be queued (the user typed while the agent was idle).
-    var pendingMessages = await drain(config.getSteeringMessages)
+    var pendingMessages = config.drainSteeringBeforeFirstTurn
+        ? await drain(config.getSteeringMessages)
+        : []
 
     // Outer loop: resumes when a follow-up arrives after the agent would stop.
     while true {

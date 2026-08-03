@@ -169,6 +169,57 @@ struct StatusAndForceClearRouteTests {
         }
     }
 
+    @Test("a prompt steered during a run is queued, delivered, and reflected in status")
+    func steeringRouteQueuesAndDelivers() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let tool = ParkingTool()
+        defer { tool.releaseAll() }
+        let server = makeServer(dirs, tools: [tool], streamFn: Self.parkThenText())
+
+        try await withServer(server) { http, port in
+            let create = try await send(http, port, .post, "/session")
+            let id = try JSONDecoder().decode(SessionRef.self, from: create.body).id
+            let prompt = try await send(http, port, .post, "/session/\(id)/prompt", json: ["prompt": "go"])
+            #expect(prompt.status == 202)
+
+            var parked = false
+            for _ in 0..<250 where !parked {
+                parked = tool.parkedCount == 1
+                if !parked { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            #expect(parked, "the run never reached the parking tool")
+
+            let queued = try await send(http, port, .post, "/session/\(id)/steer", json: ["prompt": "also check tests"])
+            #expect(queued.status == 202, "steer returned \(queued.status)")
+
+            let statusBody = try await send(http, port, .get, "/session/\(id)/status")
+            let queuedStatus = try JSONDecoder().decode(SessionStatus.self, from: statusBody.body)
+            #expect(queuedStatus.running)
+            #expect(queuedStatus.queuedMessageCount == 1)
+            #expect(queuedStatus.steeringMode == "one-at-a-time")
+
+            let normalPrompt = try await send(http, port, .post, "/session/\(id)/prompt", json: ["prompt": "second run"])
+            #expect(normalPrompt.status == 409, "a second normal run should still conflict")
+
+            tool.releaseAll()
+            var idle = false
+            for _ in 0..<250 where !idle {
+                let body = try await send(http, port, .get, "/session/\(id)/status")
+                idle = !(try JSONDecoder().decode(SessionStatus.self, from: body.body).running)
+                if !idle { try await Task.sleep(for: .milliseconds(20)) }
+            }
+            #expect(idle, "the queued run never settled")
+
+            let finalStatusBody = try await send(http, port, .get, "/session/\(id)/status")
+            let finalStatus = try JSONDecoder().decode(SessionStatus.self, from: finalStatusBody.body)
+            #expect(finalStatus.queuedMessageCount == 0)
+            let history = try await send(http, port, .get, "/session/\(id)/messages")
+            let messages = try JSONDecoder().decode([Message].self, from: history.body)
+            #expect(messages.contains(.user("also check tests")))
+        }
+    }
+
     @Test("Both new routes 404 an unknown session and 401 without the bearer token")
     func routesAreGuarded() async throws {
         let dirs = try Dirs()

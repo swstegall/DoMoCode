@@ -48,6 +48,10 @@ public final class EventStore {
     /// asked over SSE and the run is parked until a client answers. `nil` when nothing
     /// is awaiting approval. Per-session, so it is cleared on a session switch.
     public private(set) var pendingPermission: PermissionRequest?
+    /// Messages accepted while the selected session was already running.
+    public private(set) var queuedMessageCount: Int = 0
+    /// The server's steering delivery mode, when the runtime reports one.
+    public private(set) var steeringMode: String?
     /// Ids of prompts already resolved (or whose run ended) THIS session, so the
     /// `GET /permissions` reconcile can't resurrect a dead one that a `permission_resolved`
     /// raced ahead of. Cleared on a session switch (ids reset per session).
@@ -135,6 +139,8 @@ public final class EventStore {
         // not forget where that session lives. Selecting a different one must.
         sessionPath = nil
         lastNotice = nil
+        queuedMessageCount = 0
+        steeringMode = nil
         // Same rule, same reason. A re-seed after a stream outage replaces the
         // transcript of the SAME session; the turns it already folded still
         // happened and are still missing from the server total it last adopted,
@@ -253,6 +259,10 @@ public final class EventStore {
 
         case .heartbeat, .turnStart, .turnEnd:
             return   // no transcript effect (version handled by the caller)
+
+        case .queueUpdate(let count, let mode):
+            queuedMessageCount = max(0, count)
+            steeringMode = mode
 
         case .notice(let notice):
             // The two doors, and the rule that picks between them: an error the
@@ -448,6 +458,12 @@ public final class EventStore {
             markPendingToolAwaitingApproval()
         }
         adoptAccounting(status)
+        if let count = status.queuedMessageCount {
+            queuedMessageCount = max(0, count)
+        }
+        if let mode = status.steeringMode {
+            steeringMode = mode
+        }
         onChange?()
     }
 

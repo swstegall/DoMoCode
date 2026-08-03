@@ -274,6 +274,19 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        // Phase 9: a prompt typed while a run is active is queued for its next
+        // steering boundary instead of being rejected as a second run.
+        router.post("/session/:id/steer") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(
+                    PromptBody.self, request, upTo: Self.maximumPromptBodyBytes
+                )
+                try await self.runtime.steer(sessionID: id, prompt: body.prompt, attachments: body.images ?? [])
+                return Response(status: .accepted)
+            }
+        }
+
         router.post("/session/:id/abort") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
@@ -429,7 +442,7 @@ public struct DoMoServer: Sendable {
         } catch let error as ServerRuntimeError {
             switch error {
             case .sessionNotFound: throw HTTPError(.notFound)
-            case .sessionBusy: throw HTTPError(.conflict)
+            case .sessionBusy, .sessionNotRunning: throw HTTPError(.conflict)
             }
         }
     }

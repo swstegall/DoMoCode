@@ -316,6 +316,12 @@ public struct AgentLoopConfig: Sendable {
     /// worked. Contract: must not throw; return `[]` when none.
     public var getSteeringMessages: (@Sendable () async -> [Message])?
 
+    /// Whether the loop should poll steering before its first assistant turn.
+    /// Normal prompts leave this enabled; a server-promoted queued message
+    /// disables it so one-at-a-time delivery does not consume the next queued
+    /// message in the same initial turn.
+    public var drainSteeringBeforeFirstTurn: Bool
+
     /// Polled after the agent would otherwise stop. Non-empty means the loop
     /// resumes with another turn. This is the follow-up queue. Contract: must not
     /// throw; return `[]` when none.
@@ -333,6 +339,7 @@ public struct AgentLoopConfig: Sendable {
         beforeToolCall: BeforeToolCallHook? = nil,
         afterToolCall: AfterToolCallHook? = nil,
         getSteeringMessages: (@Sendable () async -> [Message])? = nil,
+        drainSteeringBeforeFirstTurn: Bool = true,
         getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
         shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil
     ) {
@@ -343,6 +350,7 @@ public struct AgentLoopConfig: Sendable {
         self.beforeToolCall = beforeToolCall
         self.afterToolCall = afterToolCall
         self.getSteeringMessages = getSteeringMessages
+        self.drainSteeringBeforeFirstTurn = drainSteeringBeforeFirstTurn
         self.getFollowUpMessages = getFollowUpMessages
         self.shouldStopAfterTurn = shouldStopAfterTurn
     }
