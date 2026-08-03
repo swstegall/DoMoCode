@@ -546,6 +546,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             shell: shell,
             environment: toolEnvironment,
             backgroundProcesses: BackgroundProcessManager(sandbox: processSandbox),
+            processSandbox: processSandbox,
             diagnosticsProvider: CLIDiagnosticsProvider(
                 root: workingDirectory,
                 shell: shell,
@@ -1021,6 +1022,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             shell: shell,
             environment: toolEnvironment,
             backgroundProcesses: BackgroundProcessManager(sandbox: sandbox),
+            processSandbox: sandbox,
             diagnosticsProvider: CLIDiagnosticsProvider(
                 root: workingDirectory,
                 shell: shell,

@@ -451,6 +451,7 @@ final class InteractiveCoordinator {
     /// The local clipboard reader. The CLI supplies the subprocess-backed
     /// implementation; tests and remote callers can leave the no-op default.
     private let clipboardPaste: any ClipboardPasteSource
+    private let interactiveInputRouter: InteractiveTerminalInputRouter
 
     // Run state.
     private var running = false
@@ -469,6 +470,7 @@ final class InteractiveCoordinator {
     // interleaving.
     private var toolBlocks: [String: MutableBlock] = [:]
     private var toolArgs: [String: JSONValue] = [:]
+    private var interactiveTerminalBlock: MutableBlock?
 
     // Completion popup.
     private var popupHandle: OverlayHandle?
@@ -546,6 +548,7 @@ final class InteractiveCoordinator {
         memoryStore: (any ProjectMemoryProvider)? = nil,
         fileSystem: SandboxedFileSystem? = nil,
         terminalRows: @escaping () -> Int,
+        interactiveInputRouter: InteractiveTerminalInputRouter,
         keybindings: Keybindings = Keybindings(),
         imageCapabilities: TerminalCapabilities = TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false),
         cell: CellDimensions = .default,
@@ -559,6 +562,7 @@ final class InteractiveCoordinator {
         self.questionBox = questionBox
         self.memoryStore = memoryStore
         self.fileSystem = fileSystem
+        self.interactiveInputRouter = interactiveInputRouter
         self.provider = provider
         self.commandProcessor = commandProcessor
         self.commandStreamFactory = commandStreamFactory
@@ -606,6 +610,28 @@ final class InteractiveCoordinator {
     /// when nothing needs painting.
     private func render() {
         driver.render()
+    }
+
+    /// Replace the live terminal preview as PTY output arrives. The preview is
+    /// driven by the VT screen model, so control sequences from a foreign program
+    /// cannot become terminal controls in the agent UI. While the child is live,
+    /// the input router owns every key; once it exits, the editor is restored.
+    func updateInteractiveTerminal(id: String, screen: String, running: Bool) {
+        let body = screen.isEmpty ? "(waiting for terminal output…)" : screen
+        let rendered = "  ▸ interactive terminal " + id + "\n" + sanitizeUntrustedText(body)
+        if let block = interactiveTerminalBlock {
+            block.inner = Text(rendered)
+        } else {
+            let block = MutableBlock(Text(rendered))
+            interactiveTerminalBlock = block
+            transcript.addChild(block)
+        }
+        if running {
+            statusLine.text = "  interactive terminal — type to process · ctrl-c to interrupt"
+        } else {
+            statusLine.text = self.running ? runningStatus : idleStatus
+        }
+        render()
     }
 
     // MARK: Input routing
@@ -660,6 +686,14 @@ final class InteractiveCoordinator {
             if isKeyRelease(data) { return }
             list.handleInput(data)
             render()
+            return
+        }
+
+        // A live child owns ordinary keyboard bytes, including Ctrl-C and
+        // Escape. Permission and question overlays are checked first so a
+        // model call cannot strand an approval dialog behind a running PTY.
+        if interactiveInputRouter.route(data) {
+            if popupList != nil { closePopup() }
             return
         }
 
@@ -2092,6 +2126,9 @@ public struct InteractiveMode: Sendable {
     /// Children started by `background_process`; all are stopped when this
     /// interactive session returns.
     private let backgroundProcesses: BackgroundProcessManager
+    /// The inline-only PTY capability and its synchronous keyboard handoff.
+    private let interactiveTerminal: PTYInteractiveTerminalProvider
+    private let interactiveInputRouter: InteractiveTerminalInputRouter
     /// The MCP servers backing this session's MCP tools (Phase 8c), held so ``run``
     /// can tear them down on exit — they spawn in their own process group and would
     /// otherwise be orphaned. `nil` when no MCP servers are configured.
@@ -2119,6 +2156,8 @@ public struct InteractiveMode: Sendable {
         questionBox: QuestionBox,
         memoryStore: (any ProjectMemoryProvider)? = nil,
         backgroundProcesses: BackgroundProcessManager,
+        interactiveTerminal: PTYInteractiveTerminalProvider,
+        interactiveInputRouter: InteractiveTerminalInputRouter,
         metadataRelay: ResponseMetadataRelay,
         requestedModel: String,
         fileSystem: SandboxedFileSystem? = nil,
@@ -2138,6 +2177,8 @@ public struct InteractiveMode: Sendable {
         self.questionBox = questionBox
         self.memoryStore = memoryStore
         self.backgroundProcesses = backgroundProcesses
+        self.interactiveTerminal = interactiveTerminal
+        self.interactiveInputRouter = interactiveInputRouter
         self.metadataRelay = metadataRelay
         self.requestedModel = requestedModel
         self.fileSystem = fileSystem
@@ -2230,6 +2271,8 @@ public struct InteractiveMode: Sendable {
             ? baseEnvironment
             : baseEnvironment.pinnedForSandbox(alsoUnsetting: credentialEnvNames)
         let backgroundProcesses = BackgroundProcessManager(sandbox: sandbox)
+        let interactiveInputRouter = InteractiveTerminalInputRouter()
+        let interactiveTerminal = PTYInteractiveTerminalProvider(inputRouter: interactiveInputRouter)
         let memoryStore = ProjectMemoryStore(
             configDirectory: FilePath(configDirectory),
             cwd: workingDirectory
@@ -2240,6 +2283,8 @@ public struct InteractiveMode: Sendable {
             environment: toolEnvironment,
             questionHandler: { await questionBox.ask($0) },
             backgroundProcesses: backgroundProcesses,
+            processSandbox: sandbox,
+            interactiveTerminal: interactiveTerminal,
             diagnosticsProvider: CLIDiagnosticsProvider(
                 root: workDirectory,
                 shell: shell,
@@ -2456,6 +2501,8 @@ public struct InteractiveMode: Sendable {
             questionBox: questionBox,
             memoryStore: memoryStore,
             backgroundProcesses: toolContext.backgroundProcesses,
+            interactiveTerminal: interactiveTerminal,
+            interactiveInputRouter: interactiveInputRouter,
             metadataRelay: metadataRelay,
             requestedModel: runtime.model,
             fileSystem: toolContext.fileSystem,
@@ -2549,11 +2596,18 @@ public struct InteractiveMode: Sendable {
             memoryStore: memoryStore,
             fileSystem: fileSystem,
             terminalRows: { target.rows },
+            interactiveInputRouter: interactiveInputRouter,
             imageCapabilities: resolvedCapabilities,
             cell: resolvedCell,
             clipboardPaste: clipboardPaste
         )
         coordinator.install()
+        await interactiveTerminal.setScreenHandler { [weak coordinator] id, screen, running in
+            guard let coordinator else { return }
+            await MainActor.run {
+                coordinator.updateInteractiveTerminal(id: id, screen: screen, running: running)
+            }
+        }
         // Now that the approval UI exists, point the engine's prompter at it. Until
         // this runs (it cannot fire before the first frame), the box refuses.
         prompterBox.set { await coordinator.showPermissionPrompt($0) }
@@ -2575,6 +2629,7 @@ public struct InteractiveMode: Sendable {
         })
 
         await backgroundProcesses.shutdown()
+        await interactiveTerminal.shutdown()
         // Tear the MCP servers down before reporting any terminal error — they run in
         // their own process group, so leaving them up would orphan them.
         await mcpManager?.shutdown()
