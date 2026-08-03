@@ -49,8 +49,10 @@ private let enterAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049h".utf8)
 /// the saved cursor, exactly reversing `?1049h`. Part of the full-screen exit
 /// sequence, and the byte a crash must never fail to emit.
 private let exitAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049l".utf8)
-/// Reset the DEC scrolling margins before the shell receives the terminal.
-private let resetScrollRegionSequence: [UInt8] = Array("\u{1b}[r".utf8)
+/// Reset the DEC scrolling margins before the shell receives the terminal, then
+/// park the cursor at the bottom row. The 999 row is intentionally clamped by
+/// the terminal, so no window-size query is needed on the crash path.
+private let resetScrollRegionSequence: [UInt8] = Array("\u{1b}[r\u{1b}[999;1H".utf8)
 /// Enable mouse reporting: `?1000h` turns on button/wheel reports, `?1002h` adds
 /// motion reports *while a button is held*, and `?1006h` asks for all of them in
 /// the SGR encoding (decimal, unbounded coordinates, press and release

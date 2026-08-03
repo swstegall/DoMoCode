@@ -74,4 +74,46 @@ struct SplitFooterTests {
         #expect(oracle.row(2) == "new")
         #expect(oracle.screen.suffix(2) == ["status", "prompt"])
     }
+
+    @Test("The hardware cursor stays in a multiline prompt footer")
+    func multilinePromptCursor() throws {
+        let oracle = ScreenOracle(rows: 5, cols: 20)
+        let target = CaptureTarget(columns: 20, rows: 5)
+        let tui = TUI(target: target, showHardwareCursor: true, renderMode: .splitFooter)
+        let transcript = LinesComponent(["L0"])
+        let prompt = FocusableProbe("prompt", markerColumn: 2)
+        tui.addChild(transcript)
+        tui.addChild(LinesComponent(["status"]))
+        tui.addChild(prompt)
+        tui.setFocus(prompt)
+        tui.setFooterRowsProvider { _, _ in 2 }
+
+        try tui.renderSync()
+        oracle.feed(target.drain())
+
+        #expect(oracle.screen == ["", "", "L0", "status", "prompt"])
+        #expect(oracle.cursor == (2, 4))
+    }
+
+    @Test("Changing the measured footer height forces a safe repaint")
+    func footerHeightChange() throws {
+        let oracle = ScreenOracle(rows: 5, cols: 20)
+        let target = CaptureTarget(columns: 20, rows: 5)
+        let tui = TUI(target: target, renderMode: .splitFooter)
+        let content = LinesComponent(["L0", "status", "prompt"])
+        tui.addChild(content)
+        var footerRows = 2
+        tui.setFooterRowsProvider { _, _ in footerRows }
+
+        try tui.renderSync()
+        oracle.feed(target.drain())
+        footerRows = 3
+        content.lines = ["L0", "status", "prompt", "hint"]
+        try tui.renderSync()
+        let bytes = target.drain()
+        oracle.feed(bytes)
+
+        #expect(bytes.contains("\u{1b}[2J"))
+        #expect(oracle.screen == ["", "L0", "status", "prompt", "hint"])
+    }
 }

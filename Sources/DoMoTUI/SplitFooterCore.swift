@@ -24,7 +24,7 @@ public struct SplitFooterCore {
     private var previousHeight = 0
     private var previousFooterRows = 0
     private var hasRendered = false
-    private var lineRenderer = RenderCore()
+    private let lineRenderer = RenderCore()
     private(set) var fullRedrawCount = 0
 
     public init() {}
@@ -40,7 +40,6 @@ public struct SplitFooterCore {
         previousHeight = -1
         previousFooterRows = 0
         hasRendered = false
-        fullRedrawCount = 0
     }
 
     /// Pad the transcript before its footer so overlay geometry remains
@@ -53,9 +52,12 @@ public struct SplitFooterCore {
         let footerRows = normalizedFooterRows(requestedFooterRows, height: height)
         let footerStart = max(0, lines.count - footerRows)
         let transcript = Array(lines[..<footerStart])
-        let footer = footerStart < lines.count
+        var footer = footerStart < lines.count
             ? Array(lines[footerStart...])
             : Array(repeating: "", count: footerRows)
+        if footer.count < footerRows {
+            footer.append(contentsOf: Array(repeating: "", count: footerRows - footer.count))
+        }
         let transcriptHeight = max(0, height - footerRows)
         guard transcript.count < transcriptHeight else { return lines }
         return Array(repeating: "", count: transcriptHeight - transcript.count)
@@ -79,9 +81,12 @@ public struct SplitFooterCore {
         let cursor = extractCursor(&lines, footerRows: footerRows, height: safeHeight)
         let footerStart = max(0, lines.count - footerRows)
         let transcript = Array(lines[..<footerStart])
-        let footer = footerStart < lines.count
+        var footer = footerStart < lines.count
             ? Array(lines[footerStart...])
             : Array(repeating: "", count: footerRows)
+        if footer.count < footerRows {
+            footer.append(contentsOf: Array(repeating: "", count: footerRows - footer.count))
+        }
         let visibleTranscript = visibleTranscriptLines(
             transcript,
             rows: max(0, safeHeight - footerRows)
@@ -110,10 +115,9 @@ public struct SplitFooterCore {
         if mustRepaint {
             fullRedrawCount += 1
             bytes += "\u{1b}[2J\u{1b}[H"
-            bytes += drawTranscript(renderedTranscript, width: safeWidth)
+            bytes += drawTranscript(renderedTranscript)
             bytes += drawFooter(
                 renderedFooter,
-                width: safeWidth,
                 footerTop: max(1, safeHeight - footerRows + 1)
             )
         } else {
@@ -128,12 +132,11 @@ public struct SplitFooterCore {
             if footerChanged {
                 bytes += drawFooter(
                     renderedFooter,
-                    width: safeWidth,
                     footerTop: max(1, safeHeight - footerRows + 1)
                 )
             }
         }
-        bytes += positionCursor(cursor, footerRows: footerRows, height: safeHeight)
+        bytes += positionCursor(cursor, height: safeHeight)
         bytes += "\u{1b}[?2026l"
 
         previousTranscript = transcript
@@ -160,7 +163,7 @@ public struct SplitFooterCore {
         return Array(repeating: "", count: rows - lines.count) + lines
     }
 
-    private mutating func validateAndReset(
+    private func validateAndReset(
         _ lines: [String],
         width: Int,
         label: String
@@ -212,28 +215,26 @@ public struct SplitFooterCore {
         return nil
     }
 
-    private func positionCursor(_ cursor: Cursor?, footerRows: Int, height: Int) -> String {
+    private func positionCursor(_ cursor: Cursor?, height: Int) -> String {
         guard let cursor else { return "\u{1b}[?25l" }
         let row = min(max(0, cursor.row), max(0, height - 1)) + 1
         let column = max(0, cursor.column) + 1
-        _ = footerRows
         return "\u{1b}[\(row);\(column)H\u{1b}[?25h"
     }
 
     // MARK: Terminal writes
 
-    private func drawTranscript(_ lines: [String], width: Int) -> String {
+    private func drawTranscript(_ lines: [String]) -> String {
         guard !lines.isEmpty else { return "" }
         var result = "\u{1b}[1;1H\u{1b}[1;\(max(1, lines.count))r"
         for index in lines.indices {
             if index > 0 { result += "\r\n" }
             result += lines[index]
         }
-        _ = width
         return result
     }
 
-    private func drawFooter(_ lines: [String], width: Int, footerTop: Int) -> String {
+    private func drawFooter(_ lines: [String], footerTop: Int) -> String {
         var result = "\u{1b}[\(footerTop);1H"
         for index in lines.indices {
             if index > 0 { result += "\r\n" }
@@ -244,7 +245,6 @@ public struct SplitFooterCore {
             result += lines[index]
         }
         result += String(decoding: TerminalNativeSequence.promptMark(.promptEnd), as: UTF8.self)
-        _ = width
         return result
     }
 

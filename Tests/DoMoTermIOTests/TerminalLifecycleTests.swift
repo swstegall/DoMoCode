@@ -61,7 +61,7 @@ struct TerminalLifecycleTests {
 
     @Test("Mini-mode teardown resets DECSTBM before restoring the shell")
     func splitFooterTeardown() {
-        let reset = Array("\u{1b}[r".utf8)
+        let reset = Array("\u{1b}[r\u{1b}[999;1H".utf8)
         let bytes = TerminalLifecycle.teardownSequence(
             useAlternateScreen: false,
             resetScrollRegion: true
