@@ -366,7 +366,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     summarizer: Self.compactionSummarizer(configuration, model: model),
                     credentialEnvNames: Self.gatewayCredentialEnvNames(configuration)
                 )
-                try await Self.runInteractive(mode)
+                try await Self.runInteractive(
+                    mode,
+                    clipboardPaste: SystemClipboardPasteSource.make(environment: environment)
+                )
             } else {
                 try await Self.runClient(
                     configuration: configuration,
@@ -648,12 +651,21 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     /// lifecycle seams are the live producers the injectable ``InteractiveMode/run``
     /// consumes; a test substitutes scripted ones.
     @MainActor
-    private static func runInteractive(_ mode: InteractiveMode) async throws {
+    private static func runInteractive(
+        _ mode: InteractiveMode,
+        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource()
+    ) async throws {
         let target = TerminalOutputTarget()
         let input = TerminalDriver.standardInputStream()
         let resize = TerminalSize.resizeStream()
         let lifecycle = TerminalLifecycle()
-        try await mode.run(target: target, input: input, resize: resize, lifecycle: lifecycle)
+        try await mode.run(
+            target: target,
+            input: input,
+            resize: resize,
+            lifecycle: lifecycle,
+            clipboardPaste: clipboardPaste
+        )
     }
 
     // MARK: Serve
@@ -908,6 +920,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 // which over ssh is the right answer rather than a degraded one —
                 // OSC 52 is the path that reaches the clipboard that matters there.
                 clipboard: SystemClipboard.makeClipboardSink(environment: environment),
+                clipboardPaste: SystemClipboardPasteSource.make(environment: environment),
                 // Whether an OSC 52 has to be wrapped to escape a multiplexer. Read
                 // from the same environment, for the same reason: the detection is
                 // about the process's own surroundings, which only the CLI can see.

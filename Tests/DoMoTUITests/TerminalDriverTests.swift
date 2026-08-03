@@ -23,8 +23,9 @@ import Testing
 /// touching a real terminal — the seam that lets a test assert "restore ran
 /// exactly once" without a `tcsetattr`. `Sendable` (the protocol demands it), so
 /// the counters live behind a `Mutex`.
-private final class RecordingLifecycle: TerminalLifecycleControl {
+private final class RecordingLifecycle: TerminalNativeControl {
     private let counts = Mutex<(enter: Int, stop: Int)>((enter: 0, stop: 0))
+    private let nativeEvents = Mutex<[String]>([])
     private let enterError: DoMoError?
 
     init(enterError: DoMoError? = nil) {
@@ -33,6 +34,7 @@ private final class RecordingLifecycle: TerminalLifecycleControl {
 
     var enterCount: Int { counts.withLock { $0.enter } }
     var stopCount: Int { counts.withLock { $0.stop } }
+    var recordedNativeEvents: [String] { nativeEvents.withLock { $0 } }
 
     func enter() throws(DoMoError) {
         counts.withLock { $0.enter += 1 }
@@ -42,6 +44,26 @@ private final class RecordingLifecycle: TerminalLifecycleControl {
     func stop() {
         counts.withLock { $0.stop += 1 }
     }
+
+    func beginKeyboardProtocolNegotiation() { nativeEvents.withLock { $0.append("query") } }
+    func setModifyOtherKeys(_ enabled: Bool) {
+        nativeEvents.withLock { $0.append(enabled ? "modify-on" : "modify-off") }
+    }
+    func drainInput(maxMilliseconds: Int, idleMilliseconds: Int) {
+        nativeEvents.withLock { $0.append("drain") }
+    }
+}
+
+@MainActor
+private final class NativeAppProbe: TerminalApp {
+    let target: any RenderTarget = CaptureTarget(columns: 20, rows: 4)
+    var received: [[UInt8]] = []
+    var focusChanges: [Bool] = []
+
+    func renderSync() throws(DoMoError) {}
+    func handleInput(_ data: [UInt8]) { received.append(data) }
+    func handleFocusChange(_ focused: Bool) { focusChanges.append(focused) }
+    func stop() {}
 }
 
 /// Let the in-memory capture target adopt an injected resize, the same way the
@@ -169,6 +191,48 @@ struct TerminalDriverTests {
         await driver.run(tui, quit: QuitSignal())
 
         #expect(probe.received == [bytes("\u{1b}[200~pasted\u{1b}[201~")])
+    }
+
+    @Test("Keyboard negotiation and focus reports stay in the driver")
+    func nativeInputNegotiation() async {
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
+        let lifecycle = RecordingLifecycle()
+        let app = NativeAppProbe()
+        let driver = TerminalDriver(input: input, resize: resize, lifecycle: lifecycle)
+
+        inputCont.yield(bytes("\u{1b}[?7u"))
+        inputCont.yield(bytes("\u{1b}[I"))
+        inputCont.yield(bytes("\u{1b}\r"))
+        inputCont.finish()
+        resizeCont.finish()
+
+        await driver.run(app, quit: QuitSignal())
+
+        #expect(app.received == [bytes("\u{1b}[13;2u")])
+        #expect(app.focusChanges == [true])
+        #expect(lifecycle.recordedNativeEvents.contains("query"))
+        #expect(lifecycle.recordedNativeEvents.contains("modify-off"))
+        #expect(lifecycle.recordedNativeEvents.last == "drain")
+    }
+
+    @Test("A device-attributes-only terminal selects modifyOtherKeys")
+    func nativeInputFallback() async {
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, resizeCont) = AsyncStream.makeStream(of: TerminalSize.self)
+        let lifecycle = RecordingLifecycle()
+        let app = NativeAppProbe()
+        let driver = TerminalDriver(input: input, resize: resize, lifecycle: lifecycle)
+
+        inputCont.yield(bytes("\u{1b}[?1;2c"))
+        inputCont.yield(bytes("x"))
+        inputCont.finish()
+        resizeCont.finish()
+
+        await driver.run(app, quit: QuitSignal())
+
+        #expect(app.received == [bytes("x")])
+        #expect(lifecycle.recordedNativeEvents.contains("modify-on"))
     }
 
     /// Key-release events are dropped for an ordinary component and delivered to

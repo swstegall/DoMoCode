@@ -135,7 +135,7 @@ final class TranscriptView: Component {
             case .user(let text):
                 rows += labeledWrap("› ", text, width: width).map(TranscriptVisualRow.text)
             case .assistant(let text):
-                rows += wrapToWidth(text, width: width).map(TranscriptVisualRow.text)
+                rows += assistantRows(text, width: width, capabilities: capabilities)
             case .reasoning(let text):
                 rows += wrapToWidth(text, width: width).map { TranscriptVisualRow.text(dim($0)) }
             case .tool(let name, let detail, let output, let state, let imageCount):
@@ -157,6 +157,36 @@ final class TranscriptView: Component {
             rows.append(.text(""))   // a blank spacer between items
         }
         if running { rows.append(.text(dim(spinner() + " working…"))) }
+        return rows
+    }
+
+    /// The full-screen client keeps ordinary assistant text deliberately plain
+    /// on conservative terminals, but hands it to the existing Markdown renderer
+    /// when OSC 8 is known to be supported. That makes `[label](url)` clickable
+    /// without putting hyperlink escapes into terminals that will display them.
+    private func assistantRows(
+        _ text: String,
+        width: Int,
+        capabilities: TerminalCapabilities
+    ) -> [TranscriptVisualRow] {
+        guard capabilities.hyperlinks else {
+            return wrapToWidth(text, width: width).map(TranscriptVisualRow.text)
+        }
+        // Markdown treats a soft line break as paragraph whitespace. The event
+        // store, however, preserves assistant newlines as transcript rows: the
+        // selection and scroll surfaces rely on that one-to-one geometry. Render
+        // each source line separately so OSC 8 support cannot collapse rows while
+        // still giving each line the existing Markdown/link treatment.
+        var rows: [TranscriptVisualRow] = []
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.isEmpty {
+                rows.append(.text(""))
+            } else {
+                rows += Markdown(String(line), useHyperlinks: true, streaming: running)
+                    .render(width: width)
+                    .map(TranscriptVisualRow.text)
+            }
+        }
         return rows
     }
 

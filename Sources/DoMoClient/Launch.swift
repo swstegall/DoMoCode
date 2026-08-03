@@ -57,6 +57,7 @@ public func runFullScreenClient(
     lifecycle: any TerminalLifecycleControl,
     promptHistoryPath: FilePath? = nil,
     clipboard: any ClipboardSink = NoClipboardSink(),
+    clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
     multiplexer: TerminalMultiplexer = .none,
     mouseOwned: Bool = true
 ) async throws {
@@ -66,6 +67,7 @@ public func runFullScreenClient(
         client: client,
         historyStore: promptHistoryPath.map { PromptHistoryStore(path: $0) },
         clipboard: clipboard,
+        clipboardPaste: clipboardPaste,
         multiplexer: multiplexer,
         mouseOwned: mouseOwned
     )

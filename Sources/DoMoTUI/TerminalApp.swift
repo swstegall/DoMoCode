@@ -41,6 +41,18 @@ public protocol TerminalApp: AnyObject, Sendable {
 
     /// Stop scheduling further frames. Called from the driver's teardown `defer`.
     func stop()
+
+    /// Called after raw mode and terminal-native setup are active, immediately
+    /// before the first frame.
+    func terminalDidEnter()
+
+    /// Receive a terminal focus-in/focus-out report.
+    func handleFocusChange(_ focused: Bool)
+}
+
+public extension TerminalApp {
+    func terminalDidEnter() {}
+    func handleFocusChange(_ focused: Bool) {}
 }
 
 // `TUI` already satisfies every requirement (`target`, `renderSync()`,

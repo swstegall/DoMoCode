@@ -72,7 +72,7 @@ struct KeybindingsTests {
         #expect(!custom.matches([0x0d], .inputSubmit))
     }
 
-    @Test("The newline bindings that actually decode on this package's terminals")
+    @Test("The newline bindings decode in legacy and negotiated forms")
     func newLineBindingsResolve() {
         let kb = Keybindings()
         // Alt/Option+Enter is `ESC \r`. It was bound to nothing and was a silent
@@ -86,9 +86,8 @@ struct KeybindingsTests {
         #expect(!kb.matches([0x0d], .inputNewLine))
         #expect(kb.matches([0x0d], .inputSubmit))
         #expect(!kb.matches(Array("\u{1b}\r".utf8), .inputSubmit))
-        // And the honest part: Shift+Enter cannot be decoded at all without the
-        // Kitty keyboard protocol, which this package never negotiates — a stock
-        // terminal sends a bare CR for it, which submits.
+        // The explicit CSI-u form is what the driver emits/receives after Kitty
+        // negotiation, and it is a newline rather than a submit.
         #expect(!kb.matches(Array("\u{1b}[13;2u".utf8), .inputSubmit))
         #expect(kb.matches(Array("\u{1b}[13;2u".utf8), .inputNewLine))
     }

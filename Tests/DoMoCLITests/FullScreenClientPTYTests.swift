@@ -80,6 +80,24 @@ struct FullScreenClientPTYTests {
     static let alternateScreen = "\u{1b}[?1049h"
     /// Button-event mouse tracking — the sequence `--no-mouse` exists to suppress.
     static let mouseTracking = "\u{1b}[?1002h"
+    /// Every isolated end-to-end workspace is rooted at a `work` directory. The
+    /// session row is rendered only after bootstrap has selected that session, so
+    /// it is the stable readiness signal between the first frame and prompt input.
+    static let openedSessionRow = "work  "
+
+    /// Bootstrap may query the model catalog, and a completed full-screen run may
+    /// ask the same model for an automatic session title. Neither request is a
+    /// conversation turn: title generation is metadata and shares the same
+    /// `/chat/completions` endpoint, so identify it by its private prompt marker.
+    static func completionCount(_ gateway: MockGateway) -> Int {
+        gateway.requests.reduce(into: 0) { count, request in
+            if request.method == "POST",
+               request.path.contains("chat/completions"),
+               !request.body.contains("Give this coding session a useful short title.") {
+                count += 1
+            }
+        }
+    }
 
     /// Launch the full-screen client on a pty and return everything it wrote
     /// before it was stopped.
@@ -215,30 +233,31 @@ struct FullScreenClientPTYTests {
 
         var captured: [UInt8] = []
         // Wait for the UI to exist before typing at it.
-        let started = Self.poll(timeout: .seconds(20)) {
+        let ready = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            return String(decoding: captured, as: UTF8.self).contains(Self.alternateScreen)
+            let output = String(decoding: captured, as: UTF8.self)
+            return output.contains(Self.alternateScreen) && output.contains(Self.openedSessionRow)
         }
-        #expect(started, "the full-screen client never started")
+        #expect(ready, "the full-screen client never opened its session")
 
-        // The session is created asynchronously after the first frame, so the
-        // submit is re-sent until a request actually reaches the gateway.
-        pty.type("walk every directory")
+        // The pty buffers the line until the client is ready to read it, so write
+        // the prompt and submit exactly once. Re-sending Enter while the first
+        // request is still in flight can queue a second copy of the prompt on a
+        // slower runner, making this test count input timing instead of turns.
+        pty.type("walk every directory\r")
         let accepted = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            if gateway.requestCount > 0 { return true }
-            pty.type("\r")
-            return false
+            return Self.completionCount(gateway) > 0
         }
         #expect(accepted, "the prompt was never accepted")
 
         // 25 tool turns plus the final text turn. The old default stopped at 20.
         let finished = Self.poll(timeout: .seconds(60)) {
             pty.drain(into: &captured)
-            return gateway.requestCount >= turns + 1
+            return Self.completionCount(gateway) >= turns + 1
         }
-        #expect(finished, "the run stopped after \(gateway.requestCount) turns")
-        #expect(gateway.requestCount == turns + 1)
+        #expect(finished, "the run stopped after \(Self.completionCount(gateway)) turns")
+        #expect(Self.completionCount(gateway) == turns + 1)
     }
 
     /// …and a genuinely stuck run in that same UI still stops.
@@ -280,30 +299,29 @@ struct FullScreenClientPTYTests {
         }
 
         var captured: [UInt8] = []
-        let started = Self.poll(timeout: .seconds(20)) {
+        let ready = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            return String(decoding: captured, as: UTF8.self).contains(Self.alternateScreen)
+            let output = String(decoding: captured, as: UTF8.self)
+            return output.contains(Self.alternateScreen) && output.contains(Self.openedSessionRow)
         }
-        #expect(started, "the full-screen client never started")
+        #expect(ready, "the full-screen client never opened its session")
 
-        pty.type("keep listing")
+        pty.type("keep listing\r")
         let accepted = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            if gateway.requestCount > 0 { return true }
-            pty.type("\r")
-            return false
+            return Self.completionCount(gateway) > 0
         }
         #expect(accepted, "the prompt was never accepted")
 
         let stopped = Self.poll(timeout: .seconds(30)) {
             pty.drain(into: &captured)
-            return gateway.requestCount >= 12
+            return Self.completionCount(gateway) >= 12
         }
-        #expect(stopped, "the stuck run never reached the guard (\(gateway.requestCount) turns)")
+        #expect(stopped, "the stuck run never reached the guard (\(Self.completionCount(gateway)) turns)")
         // And it STAYS stopped — the guard ended the run rather than merely slowing
         // it, so the remaining three scripted turns are never asked for.
         _ = Self.poll(timeout: .seconds(3)) { pty.drain(into: &captured); return false }
-        #expect(gateway.requestCount == 12, "the run did not stop at the guard")
+        #expect(Self.completionCount(gateway) == 12, "the run did not stop at the guard")
     }
 
     /// Poll `condition` until it holds or the deadline passes.

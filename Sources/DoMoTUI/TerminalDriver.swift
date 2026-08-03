@@ -113,6 +113,30 @@ public extension TerminalLifecycleControl {
 
 extension TerminalLifecycle: TerminalLifecycleControl {}
 
+/// The terminal-native portion of the lifecycle. It is a separate refinement so
+/// headless callers can keep using the small enter/stop seam while the live
+/// driver negotiates keyboard modes, drains stdin, and emits OSC presentation
+/// updates when the concrete lifecycle supports them.
+public protocol TerminalNativeControl: TerminalLifecycleControl {
+    func beginKeyboardProtocolNegotiation()
+    func setModifyOtherKeys(_ enabled: Bool)
+    func setTitle(_ title: String)
+    func setProgress(_ progress: TerminalProgress)
+    func notify(title: String, message: String, protocol: TerminalNotificationProtocol)
+    func drainInput(maxMilliseconds: Int, idleMilliseconds: Int)
+}
+
+public extension TerminalNativeControl {
+    func beginKeyboardProtocolNegotiation() {}
+    func setModifyOtherKeys(_ enabled: Bool) {}
+    func setTitle(_ title: String) {}
+    func setProgress(_ progress: TerminalProgress) {}
+    func notify(title: String, message: String, protocol: TerminalNotificationProtocol) {}
+    func drainInput(maxMilliseconds: Int, idleMilliseconds: Int) {}
+}
+
+extension TerminalLifecycle: TerminalNativeControl {}
+
 // MARK: - Quit signal
 
 /// A one-shot "please stop" the UI can pull from inside a component.
@@ -200,6 +224,11 @@ public final class TerminalDriver {
     /// Background agent work is intentionally not a child of the shutdown
     /// group. A body that ignores cancellation must not delay terminal restore.
     private var backgroundTask: Task<Void, Never>?
+    /// The short fallback window for terminals that ignore the Kitty query.
+    private var keyboardFallbackTask: Task<Void, Never>?
+    private var keyboardProtocolActive = false
+    private var keyboardProtocolResolved = false
+    private var lifecycleEntered = false
 
     /// The session's app and quit handle, held for the duration of `run` so
     /// ``render()`` and the render-error path can reach them without threading
@@ -251,6 +280,11 @@ public final class TerminalDriver {
         framer.reset()
         renderError = nil
         startupError = nil
+        keyboardFallbackTask?.cancel()
+        keyboardFallbackTask = nil
+        keyboardProtocolActive = false
+        keyboardProtocolResolved = false
+        lifecycleEntered = false
 
         // The restore MUST run however the body exits. `app.stop()` first so no
         // late scheduled frame writes after the descriptor is handed back, then
@@ -258,16 +292,23 @@ public final class TerminalDriver {
         defer {
             flushTask?.cancel()
             flushTask = nil
+            keyboardFallbackTask?.cancel()
+            keyboardFallbackTask = nil
             backgroundTask?.cancel()
             backgroundTask = nil
             app.stop()
+            if lifecycleEntered, let native = lifecycle as? any TerminalNativeControl {
+                native.drainInput(maxMilliseconds: 1_000, idleMilliseconds: 50)
+            }
             lifecycle.stop()
+            lifecycleEntered = false
             activeApp = nil
             activeQuit = nil
         }
 
         do {
             try lifecycle.enter()
+            lifecycleEntered = true
         } catch {
             // Typed throw: `error` is a DoMoError. Not a terminal (or raw mode
             // refused) — there is no interactive session to run. Record why and
@@ -275,6 +316,12 @@ public final class TerminalDriver {
             startupError = error
             return
         }
+
+        if let native = lifecycle as? any TerminalNativeControl {
+            native.beginKeyboardProtocolNegotiation()
+            armKeyboardFallback()
+        }
+        app.terminalDidEnter()
 
         // The initial frame, before any input — pi renders once on start for the
         // same reason: the screen should show the UI, not a blank line, at t=0.
@@ -389,13 +436,53 @@ public final class TerminalDriver {
         for event in events {
             switch event {
             case .sequence(let bytes):
-                app.handleInput(bytes)
+                if let response = TerminalNativeSequence.parseKeyboardProtocolResponse(bytes) {
+                    handleKeyboardProtocolResponse(response)
+                    continue
+                }
+                if let focused = TerminalNativeSequence.focusState(from: bytes) {
+                    app.handleFocusChange(focused)
+                    continue
+                }
+                if keyboardProtocolActive,
+                   TerminalNativeSequence.isAmbiguousShiftEnter(bytes) {
+                    app.handleInput(TerminalNativeSequence.shiftEnterSequence())
+                } else {
+                    app.handleInput(bytes)
+                }
             case .paste(let content):
                 var wrapped = Array("\u{1b}[200~".utf8)
                 wrapped.append(contentsOf: content)
                 wrapped.append(contentsOf: Array("\u{1b}[201~".utf8))
                 app.handleInput(wrapped)
             }
+        }
+    }
+
+    /// Arm the modifyOtherKeys fallback. Kitty-capable terminals answer within
+    /// the normal terminal round trip; 150 ms is long enough for a remote tty and
+    /// short enough that the first Shift+Enter does not lose its meaning.
+    private func armKeyboardFallback() {
+        keyboardFallbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard let self, !Task.isCancelled, !self.keyboardProtocolResolved else { return }
+            self.keyboardProtocolResolved = true
+            (self.lifecycle as? any TerminalNativeControl)?.setModifyOtherKeys(true)
+        }
+    }
+
+    /// Consume the handshake response and choose exactly one keyboard mode.
+    private func handleKeyboardProtocolResponse(_ response: TerminalKeyboardProtocolResponse) {
+        switch response {
+        case .kitty(let flags):
+            keyboardProtocolResolved = true
+            keyboardProtocolActive = flags != 0
+            let native = lifecycle as? any TerminalNativeControl
+            native?.setModifyOtherKeys(!keyboardProtocolActive)
+        case .deviceAttributes:
+            guard !keyboardProtocolActive else { return }
+            keyboardProtocolResolved = true
+            (lifecycle as? any TerminalNativeControl)?.setModifyOtherKeys(true)
         }
     }
 

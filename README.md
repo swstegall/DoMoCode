@@ -14,24 +14,25 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 ## Status: the port is finished; the harness is being built out
 
 **The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine,
-the MCP client, the Phase 5b command layer, and Phase 5c client polish are implemented, with focused
+the MCP client, the Phase 5b command layer, Phase 5c client polish, and Phase 5d terminal-native
+polish are implemented, with focused
 coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8 and the 8.5 hardening pass had
-**2,535 tests in 301 suites green in the Swift 6.3.3 debug matrix; release verification is green with
+**2,467 tests in 302 suites green in the Swift 6.3.3 debug matrix; release verification is green with
 the repository's documented macOS `DoMoCLITests` runtime exception**.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
-**Every phase of the pi port has shipped except the remaining Phase 5d terminal-native polish.**
-Phase 5a — truth and plumbing — Phase 5b — the command layer — and Phase 5c — the client polish —
-are complete; 5d follows. The default client now receives the same command registry as the inline surface,
+**Every phase of the pi port has shipped through Phase 5d terminal-native polish.**
+Phases 5a–5d — truth and plumbing, the command layer, client polish, and terminal-native polish — are
+complete. The default client now receives the same command registry as the inline surface,
 `/review`, `/init`, and `/tree` are available through that registry, trusted project instructions and
 skills participate in the system prompt, and Claude Code-compatible markdown resources load in place.
 The 5c slice adds the shared theme/dialog foundations, command palette, client-side `@` completion,
 model changes, searchable session/tree controls, labels, branch summaries, LLM title generation, and
 `$EDITOR` handoff. Its follow-up polish wires the reusable confirm/form/editor dialogs into real
 actions, refreshes open pickers, presents labels on their target nodes, preserves explicit title clears,
-and starts automatic titling only after a completed first turn. **Next up is Phase 5d terminal-native
-polish.**
+and starts automatic titling only after a completed first turn. **Phase 5d now closes the terminal-native
+polish gap.**
 Beyond it,
 [a second survey of the sibling harnesses](#sibling-harnesses-and-prior-art) found **706 distinct
 capabilities DoMoCode does not have** — subagents, checkpoints and undo, a diff review pane, plan mode,
@@ -305,9 +306,9 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       Enter to queue a follow-up; three end-to-end tests drive the real REPL headlessly against a mock
       gateway. 1059 tests, green in both configurations. (That REPL is `domo --inline` today — Phase 7
       moved the no-flag default to the full-screen client; its `@`/slash completion landed in 5c.)
-- [ ] **Phase 5 — Polish**, split into four the way Phase 8 was. **5a and 5b are complete; 5c is in
-      progress; 5d follows.** It was sequenced *before* the architecture pivot and was overtaken by
-      it, so the remaining work is now being landed against the client/server seams: the full-screen
+- [x] **Phase 5 — Polish**, split into four the way Phase 8 was. **5a, 5b, 5c, and 5d are complete.**
+      It was sequenced *before* the architecture pivot and was overtaken by it, so the work landed
+      against the client/server seams: the full-screen
       client has a shared command registry, theme value model, dialog stack, searchable pickers,
       model/session/tree mutations, and the existing accounting footer is wired to server-derived
       values.
@@ -399,15 +400,16 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       and completed-turn auto-title trigger, covered by the Swift 6.3.3 debug/release verification
       matrices.
 
-      **5d — Terminal-native polish.** Kitty keyboard protocol negotiation with a `modifyOtherKeys`
-      fallback, restoring Shift+Enter (the decoder already carries a `kittyProtocolActive`
-      parameter, threaded through every internal call site and exercised by tests, that no production
-      code path ever sets to `true` — the handshake that would set it is what is missing); exit-time stdin drain so key-release escapes do not leak into the
+      **5d — Terminal-native polish (complete).** Kitty keyboard protocol negotiation with a `modifyOtherKeys`
+      fallback, restoring Shift+Enter through negotiated CSI-u input; exit-time stdin drain so
+      key-release escapes do not leak into the
       parent shell; focus tracking; OS notifications via OSC 777 / Kitty OSC 99 written straight down
       the tty, which works unchanged over SSH; terminal title and OSC 9;4 progress, both registered in
       the crash-safe teardown; OSC 8 hyperlinks; clipboard image paste. *Exit:* Shift+Enter works, a
       finished run notifies only when you have tabbed away, and quitting — including crashing — always
-      leaves the terminal clean.
+      leaves the terminal clean. **Phase 5d exit verified:** the lifecycle, driver, client and inline
+      REPL seams cover keyboard negotiation, focus-aware notifications, presentation cleanup, OSC 8
+      links, and bounded clipboard image/text paste.
 - [x] **Phase 5.5 — Inline images, the input half.** `ContentBlock.image(ImageBlock)` and an
       `image_url` data-URL wire encoding for image-bearing *user* turns (assistant turns stay
       plain-string, since some models mirror a content-part array back as garbage). Images a *tool*
@@ -1271,8 +1273,8 @@ real — each of these is now a property of the shipped system, not a forecast:
 
 ## Contributing
 
-All shipped phases through 8.5, plus Phases 5a, 5b, and 5c, are implemented.
-**Phase 5c — Dialogs, themes, and the client's missing hands — is complete**, followed by 5d and Phases 9–21. The [dependency spine](#the-dependency-spine)
+All shipped phases through 8.5, plus Phase 5, are implemented.
+**Phase 5d — Terminal-native polish — is complete**, followed by Phases 9–21. The [dependency spine](#the-dependency-spine)
 is the useful map: six seams gate most of what is left, and a change that lands one of them is worth
 more than a change that ships a feature around it. Issues proposing scope changes — particularly anything in
 [Non-goals](#non-goals-and-known-gaps) or the
