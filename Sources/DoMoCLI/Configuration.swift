@@ -41,6 +41,51 @@ public enum EnvName {
 
 // MARK: - Settings file
 
+/// Trusted, opt-in formatting to run after a successful `write` or `edit`.
+///
+/// The command is intentionally a single shell command rather than a guessed
+/// formatter name. A project may use a script, a package-manager task, or a
+/// formatter that needs flags the CLI cannot know. `{file}` is replaced with a
+/// shell-quoted absolute path; when it is absent, the path is appended.
+///
+/// This setting is not enabled by default. When a project supplies it, the
+/// existing project-trust gate runs before settings are loaded, and the command
+/// runs only after the file mutation has already passed its permission decision.
+public struct AutoFormatSettings: Sendable, Hashable, Codable {
+    public var enabled: Bool?
+    public var command: String?
+    public var timeoutMS: Int?
+
+    public init(
+        enabled: Bool? = nil,
+        command: String? = nil,
+        timeoutMS: Int? = nil
+    ) {
+        self.enabled = enabled
+        self.command = command
+        self.timeoutMS = timeoutMS
+    }
+
+    /// This layer overlaid on top of a weaker layer, field by field.
+    public func merged(over other: AutoFormatSettings) -> AutoFormatSettings {
+        AutoFormatSettings(
+            enabled: enabled ?? other.enabled,
+            command: command ?? other.command,
+            timeoutMS: timeoutMS ?? other.timeoutMS
+        )
+    }
+
+    public var isEmpty: Bool {
+        enabled == nil && command == nil && timeoutMS == nil
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case command
+        case timeoutMS = "timeoutMs"
+    }
+}
+
 /// A `settings.json` file, every field optional.
 ///
 /// This is the persisted, *non-secret* layer of configuration. It deliberately
@@ -97,6 +142,9 @@ public struct Settings: Sendable, Hashable, Codable {
     /// hardening layer; a project may tighten a mode but never widen it.
     public var agentModes: [String: Ruleset]?
 
+    /// Trusted, opt-in post-mutation formatting. See ``AutoFormatSettings``.
+    public var autoFormat: AutoFormatSettings?
+
     public init(
         baseURL: String? = nil,
         model: String? = nil,
@@ -117,7 +165,8 @@ public struct Settings: Sendable, Hashable, Codable {
         modelOverrides: [String: ModelOverride]? = nil,
         compaction: CompactionOverrides? = nil,
         contextWindow: Int? = nil,
-        agentModes: [String: Ruleset]? = nil
+        agentModes: [String: Ruleset]? = nil,
+        autoFormat: AutoFormatSettings? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -139,6 +188,7 @@ public struct Settings: Sendable, Hashable, Codable {
         self.compaction = compaction
         self.contextWindow = contextWindow
         self.agentModes = agentModes
+        self.autoFormat = autoFormat
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -162,6 +212,7 @@ public struct Settings: Sendable, Hashable, Codable {
         case compaction
         case contextWindow
         case agentModes
+        case autoFormat
     }
 
     /// Loads a settings file: `nil` when it is genuinely absent, a thrown error
@@ -767,6 +818,10 @@ public struct ResolvedConfiguration: Sendable {
     /// these to denials before applying them.
     public var agentModes: [String: Ruleset]
 
+    /// Trusted, opt-in post-mutation formatting. Project fields override user
+    /// fields; an absent value leaves formatting disabled at the wiring layer.
+    public var autoFormat: AutoFormatSettings?
+
     /// The *name* of the environment variable the API key was read from, when a
     /// settings file named one. Never the key.
     ///
@@ -809,6 +864,7 @@ public struct ResolvedConfiguration: Sendable {
         compactionModel: String? = nil,
         contextWindow: Int? = nil,
         agentModes: [String: Ruleset] = [:],
+        autoFormat: AutoFormatSettings? = nil,
         apiKeyEnvName: String? = nil,
         warnings: [String] = []
     ) {
@@ -834,6 +890,7 @@ public struct ResolvedConfiguration: Sendable {
         self.compactionModel = compactionModel
         self.contextWindow = contextWindow
         self.agentModes = agentModes
+        self.autoFormat = autoFormat
         self.apiKeyEnvName = apiKeyEnvName
         self.warnings = warnings
     }
@@ -1102,6 +1159,22 @@ extension ResolvedConfiguration {
             agentModes[mode] = merge(agentModes[mode] ?? [], rules)
         }
 
+        if let timeout = project?.autoFormat?.timeoutMS, timeout < 0 {
+            throw DoMoError(
+                .configuration,
+                "timeoutMs in autoFormat in the project settings.json must be non-negative (got \(timeout))"
+            )
+        }
+        if let timeout = user?.autoFormat?.timeoutMS, timeout < 0 {
+            throw DoMoError(
+                .configuration,
+                "timeoutMs in autoFormat in the user settings.json must be non-negative (got \(timeout))"
+            )
+        }
+        let autoFormatOverride = (project?.autoFormat ?? AutoFormatSettings())
+            .merged(over: user?.autoFormat ?? AutoFormatSettings())
+        let autoFormat = autoFormatOverride.isEmpty ? nil : autoFormatOverride
+
         return ResolvedConfiguration(
             baseURL: baseURL,
             apiKey: apiKey,
@@ -1125,6 +1198,7 @@ extension ResolvedConfiguration {
             compactionModel: nonEmpty(compactionOverrides.model),
             contextWindow: contextWindow,
             agentModes: agentModes,
+            autoFormat: autoFormat,
             apiKeyEnvName: apiKeyEnvName,
             warnings: warnings
         )

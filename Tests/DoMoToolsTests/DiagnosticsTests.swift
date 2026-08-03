@@ -25,6 +25,16 @@ private struct FixedDiagnosticsProvider: DiagnosticsProvider {
     }
 }
 
+private struct FixedFormatterProvider: FormatterProvider {
+    let report: FormatterReport
+
+    @concurrent
+    func format(changedPath: FilePath) async -> FormatterReport {
+        _ = changedPath
+        return report
+    }
+}
+
 private func diagnosticsResult(
     stdout: String = "",
     stderr: String = "",
@@ -207,6 +217,69 @@ struct CLIDiagnosticsProviderTests {
         #expect(result.text.contains("Successfully wrote"))
         #expect(result.text.contains("<diagnostics>"))
         #expect(result.text.contains("Sources/App.swift:4:8: cannot find Thing"))
+        #expect(result.details["diagnostics"]?["provider"]?.stringValue == "swift-cli")
+    }
+}
+
+@Suite("CLI formatter")
+struct CLIFormatterTests {
+
+    @Test("runs the trusted command with a shell-quoted file path")
+    func formatsChangedFile() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("main.swift", "let value = 1\n")
+        let script = try fixture.write(
+            "format.sh",
+            "#!/bin/sh\nprintf 'formatted\\n' > \"$1\"\n"
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: script
+        )
+
+        let formatter = CLIFormatter(
+            root: fixture.root,
+            shell: fixture.context.shell,
+            command: "\(script) {file}",
+            timeout: .seconds(2)
+        )
+        let report = await formatter.format(changedPath: FilePath("main.swift"))
+
+        #expect(report.status == .formatted)
+        #expect(try String(contentsOfFile: fixture.path("main.swift"), encoding: .utf8) == "formatted\n")
+        #expect(report.modelText?.contains("formatted") == true)
+    }
+
+    @Test("formatting and diagnostics share the mutation result")
+    func mutationIntegrationKeepsBothReports() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        let context = try await ToolContext.rooted(
+            at: fixture.root,
+            shell: fixture.context.shell,
+            diagnosticsProvider: FixedDiagnosticsProvider(
+                report: DiagnosticsReport(
+                    provider: "swift-cli",
+                    status: .clean
+                )
+            ),
+            formatterProvider: FixedFormatterProvider(
+                report: FormatterReport(
+                    provider: "swift-format",
+                    status: .formatted,
+                    changedPath: "main.swift"
+                )
+            )
+        )
+
+        let result = try await WriteTool().execute(
+            ["path": "main.swift", "content": "let value = 1\n"],
+            in: context
+        )
+
+        #expect(result.text.contains("<formatting>"))
+        #expect(result.details["formatting"]?["provider"]?.stringValue == "swift-format")
         #expect(result.details["diagnostics"]?["provider"]?.stringValue == "swift-cli")
     }
 }

@@ -2159,7 +2159,8 @@ public struct InteractiveMode: Sendable {
         steeringMode: QueueDeliveryMode = .oneAtATime,
         agentProfile: AgentProfile? = nil,
         agentMode: AgentMode = .build,
-        modeRules: Ruleset = []
+        modeRules: Ruleset = [],
+        autoFormat: AutoFormatSettings? = nil
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
@@ -2180,15 +2181,22 @@ public struct InteractiveMode: Sendable {
         let client = LiteLLMClient(configuration: clientConfiguration)
         let shell = try SubprocessShell()
         let questionBox = QuestionBox()
+        let toolEnvironment = ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
         let toolContext = try await ToolContext.rooted(
             at: workDirectory,
             shell: shell,
-            environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames),
+            environment: toolEnvironment,
             questionHandler: { await questionBox.ask($0) },
             diagnosticsProvider: CLIDiagnosticsProvider(
                 root: workDirectory,
                 shell: shell,
-                environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+                environment: toolEnvironment
+            ),
+            formatterProvider: Self.configuredFormatter(
+                settings: autoFormat,
+                root: workDirectory,
+                shell: shell,
+                environment: toolEnvironment
             )
         )
         let registry = ToolRegistry.builtin(
@@ -2510,6 +2518,32 @@ public struct InteractiveMode: Sendable {
 
         if let error = driver.startupError { throw error }
         if let error = driver.renderError { throw error }
+    }
+
+    /// Builds the shared trusted, opt-in formatter for the inline surface.
+    ///
+    /// Keeping this at the composition boundary means `ToolContext` remains a
+    /// library seam: callers decide whether a formatter is trusted and how it
+    /// is configured, while `write` and `edit` only know the provider protocol.
+    private static func configuredFormatter(
+        settings: AutoFormatSettings?,
+        root: FilePath,
+        shell: any Shell,
+        environment: ShellEnvironment
+    ) -> (any FormatterProvider)? {
+        guard let settings,
+              settings.enabled == true,
+              let command = settings.command?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !command.isEmpty
+        else { return nil }
+
+        return CLIFormatter(
+            root: root,
+            shell: shell,
+            command: command,
+            environment: environment,
+            timeout: .milliseconds(settings.timeoutMS ?? 30_000)
+        )
     }
 
     // MARK: Directory lister

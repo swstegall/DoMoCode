@@ -490,7 +490,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     steeringMode: deliveryMode,
                     agentProfile: profile,
                     agentMode: selectedMode,
-                    modeRules: configuration.agentModes[selectedMode.rawValue] ?? []
+                    modeRules: configuration.agentModes[selectedMode.rawValue] ?? [],
+                    autoFormat: configuration.autoFormat
                 )
                 try await Self.runInteractive(
                     mode,
@@ -525,6 +526,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 root: workingDirectory,
                 shell: shell,
                 environment: toolEnvironment
+            ),
+            formatterProvider: Self.configuredFormatter(
+                configuration: configuration,
+                root: workingDirectory,
+                shell: shell
             )
         )
         let registry = ToolRegistry.builtin(
@@ -740,6 +746,32 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         return .inherit(overrides)
     }
 
+    /// Builds the explicitly configured post-mutation formatter, if any.
+    ///
+    /// The project trust gate has already run before this helper is reachable.
+    /// The returned provider is invoked by `write`/`edit` only after their
+    /// mutation permission decision, so formatting does not create a second,
+    /// hidden path around the permission engine.
+    static func configuredFormatter(
+        configuration: ResolvedConfiguration,
+        root: FilePath,
+        shell: any Shell
+    ) -> (any FormatterProvider)? {
+        guard let settings = configuration.autoFormat,
+              settings.enabled == true,
+              let command = settings.command?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !command.isEmpty
+        else { return nil }
+
+        return CLIFormatter(
+            root: root,
+            shell: shell,
+            command: command,
+            environment: toolEnvironment(configuration),
+            timeout: .milliseconds(settings.timeoutMS ?? 30_000)
+        )
+    }
+
     // MARK: Compaction
 
     /// The alias compaction should summarize with, or `nil` to leave the harness's
@@ -932,6 +964,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 root: workingDirectory,
                 shell: shell,
                 environment: toolEnvironment
+            ),
+            formatterProvider: Self.configuredFormatter(
+                configuration: configuration,
+                root: workingDirectory,
+                shell: shell
             ),
             subagentCoordinator: subagentCoordinator
         )

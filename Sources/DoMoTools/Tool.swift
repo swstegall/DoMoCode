@@ -351,6 +351,7 @@ public struct ToolContext: Sendable {
     /// from a later tool call without sharing it with another session.
     public let backgroundProcesses: BackgroundProcessManager
     public let diagnosticsProvider: (any DiagnosticsProvider)?
+    public let formatterProvider: (any FormatterProvider)?
 
     /// The runtime bridge used by ``TaskTool``. It is optional so the ordinary
     /// CLI and library contexts keep the same tool surface and behavior.
@@ -382,6 +383,7 @@ public struct ToolContext: Sendable {
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
+        formatterProvider: (any FormatterProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) {
@@ -394,6 +396,7 @@ public struct ToolContext: Sendable {
         self.webFetch = webFetch
         self.backgroundProcesses = backgroundProcesses
         self.diagnosticsProvider = diagnosticsProvider
+        self.formatterProvider = formatterProvider
         self.subagentCoordinator = subagentCoordinator
         self.sessionID = sessionID
     }
@@ -411,6 +414,7 @@ public struct ToolContext: Sendable {
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
+        formatterProvider: (any FormatterProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) async throws(DoMoError) -> ToolContext {
@@ -424,6 +428,7 @@ public struct ToolContext: Sendable {
             webFetch: webFetch,
             backgroundProcesses: backgroundProcesses,
             diagnosticsProvider: diagnosticsProvider,
+            formatterProvider: formatterProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -437,6 +442,7 @@ public struct ToolContext: Sendable {
             handler,
             backgroundProcesses: backgroundProcesses,
             diagnosticsProvider: diagnosticsProvider,
+            formatterProvider: formatterProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -450,6 +456,7 @@ public struct ToolContext: Sendable {
         _ handler: QuestionHandler?,
         backgroundProcesses: BackgroundProcessManager,
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
+        formatterProvider: (any FormatterProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) -> ToolContext {
@@ -463,6 +470,7 @@ public struct ToolContext: Sendable {
             webFetch: webFetch,
             backgroundProcesses: backgroundProcesses,
             diagnosticsProvider: diagnosticsProvider ?? self.diagnosticsProvider,
+            formatterProvider: formatterProvider ?? self.formatterProvider,
             subagentCoordinator: subagentCoordinator ?? self.subagentCoordinator,
             sessionID: sessionID ?? self.sessionID
         )
@@ -472,21 +480,36 @@ public struct ToolContext: Sendable {
         to result: ToolResult,
         changedPath: FilePath
     ) async -> ToolResult {
-        guard !result.isError, let diagnosticsProvider else { return result }
-        let report = await diagnosticsProvider.check(changedPath: changedPath)
-        guard let modelText = report.modelText else { return result }
-
+        guard !result.isError else { return result }
         var enriched = result
-        enriched.content.append(.text(modelText))
-        switch enriched.details {
-        case .object(var object):
-            object["diagnostics"] = report.details
-            enriched.details = .object(object)
-        default:
-            enriched.details = .object([
-                "tool": enriched.details,
-                "diagnostics": report.details,
-            ])
+
+        func addDetails(_ key: String, _ value: JSONValue) {
+            switch enriched.details {
+            case .object(var object):
+                object[key] = value
+                enriched.details = .object(object)
+            default:
+                enriched.details = .object([
+                    "tool": enriched.details,
+                    key: value,
+                ])
+            }
+        }
+
+        if let formatterProvider {
+            let report = await formatterProvider.format(changedPath: changedPath)
+            if let modelText = report.modelText {
+                enriched.content.append(.text(modelText))
+            }
+            addDetails("formatting", report.details)
+        }
+
+        if let diagnosticsProvider {
+            let report = await diagnosticsProvider.check(changedPath: changedPath)
+            if let modelText = report.modelText {
+                enriched.content.append(.text(modelText))
+            }
+            addDetails("diagnostics", report.details)
         }
         return enriched
     }

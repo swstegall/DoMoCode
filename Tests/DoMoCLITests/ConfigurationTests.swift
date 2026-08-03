@@ -55,6 +55,31 @@ struct ConfigurationTests {
         #expect(decoded.agentModes?["plan"]?.first?.action == .deny)
     }
 
+    @Test
+    func autoFormatIsMergedFieldByFieldAndUsesCamelCaseJSON() throws {
+        let user = Settings(autoFormat: AutoFormatSettings(
+            enabled: false,
+            command: "user-formatter {file}",
+            timeoutMS: 1_000
+        ))
+        let project = Settings(autoFormat: AutoFormatSettings(
+            enabled: true,
+            command: "project-formatter {file}"
+        ))
+        let resolved = try resolve(project: project, user: user)
+        #expect(resolved.autoFormat == AutoFormatSettings(
+            enabled: true,
+            command: "project-formatter {file}",
+            timeoutMS: 1_000
+        ))
+
+        let encoded = #"{"autoFormat":{"enabled":true,"command":"swift-format {file}","timeoutMs":2500}}"#
+        let decoded = try JSONDecoder().decode(Settings.self, from: Data(encoded.utf8))
+        #expect(decoded.autoFormat?.enabled == true)
+        #expect(decoded.autoFormat?.command == "swift-format {file}")
+        #expect(decoded.autoFormat?.timeoutMS == 2_500)
+    }
+
     // MARK: Precedence
 
     @Test
@@ -342,6 +367,13 @@ struct ConfigurationTests {
         }
         let envText = try #require(fromEnv?.description)
         #expect(envText.contains(EnvName.timeoutMS))
+
+        let fromFormatter = #expect(throws: DoMoError.self) {
+            try resolve(project: Settings(autoFormat: AutoFormatSettings(timeoutMS: -1)))
+        }
+        let formatterText = try #require(fromFormatter?.description)
+        #expect(formatterText.contains("autoFormat"))
+        #expect(formatterText.contains("project settings"))
     }
 
     /// An unparseable `logLevel` used to fall through to the next precedence
