@@ -17,12 +17,12 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 the MCP client, the Phase 5b command layer, Phase 5c client polish, and Phase 5d terminal-native
 polish are implemented, with focused
 coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8 and the 8.5 hardening pass had
-**2,467 tests in 302 suites green in the Swift 6.3.3 debug matrix; release verification is green with
+**2,558 tests in 382 suites green in the Swift 6.3.3 debug matrix; release verification is green with
 the repository's documented macOS `DoMoCLITests` runtime exception**.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
-**Every phase of the pi port has shipped through Phase 5d terminal-native polish.**
+**Every phase of the pi port has shipped through Phase 9 steering and run control.**
 Phases 5a–5d — truth and plumbing, the command layer, client polish, and terminal-native polish — are
 complete. The default client now receives the same command registry as the inline surface,
 `/review`, `/init`, and `/tree` are available through that registry, trusted project instructions and
@@ -253,11 +253,11 @@ until every listener has accepted each event. Over a socket that guarantee is un
 would stall the agent loop — so the network fan-out sink is fire-and-forget with a per-subscriber
 bounded buffer and a drop-oldest policy, while the durable persistence sink stays awaited. A client that
 misses frames re-seeds its transcript from `GET /session/:id/messages` on reconnect rather than replaying
-the gap. Second, **mid-run steering did not survive the split.** In-process, the `Mutex`-guarded steering
-box lets a second prompt join a running turn; the server-hosted harness disables steering outright and
-answers a prompt sent during a run with HTTP 409, which the client surfaces as a notice and restores into
-the input box. Steering therefore works under `--inline` and not under the default client. Both are real
-losses of a documented property; see [Non-goals](#non-goals-and-known-gaps).
+the gap. Second, **mid-run steering now survives the split.** A per-session `SteeringBox` accepts prompts
+through `POST /session/:id/steer`, reports its level-triggered count with `queue_update`, and the client
+uses the 409 response only for the narrow race where a run settles between its status check and submit;
+it retries the ordinary prompt route there. The safe default delivers one queued message at a time, with
+an `all` mode for callers that want a batch.
 
 Deliberately *not* adopted: `Span`, `RawSpan`, `UTF8Span`, and `InlineArray`. They are the right shape
 for the escape decoder and for grapheme-cluster width measurement, but every standard-library API that
@@ -522,16 +522,18 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       were reviewed adversarially, and each review was followed by a second one aimed at the *fixes* —
       which found about as many real problems as the review of the original code. That is the durable
       lesson of this phase: review the fix, not just the defect. 1,995 tests green in debug and release.
-- [ ] **Phase 9 — Steering, queues, and run control.** Restores what the client/server split took
-      away: mid-run steering does not survive Phase 6, so a prompt sent during a run gets a 409 in the
-      default surface while `--inline` still has it. `SteeringBox` lifts into `DoMoHarness`, held
-      per-session on `ServerRuntime`, with `POST /session/:id/steer`, a `queue_update` frame, and the
-      client's 409 branch becoming an enqueue. Plus delivery modes (`all` vs one-at-a-time), a
-      `maxCostPerRun` budget cap with its own exit code, and the doom-loop guard escalated into a
-      permission request instead of a silent settle — the `doom_loop` key is already reserved in the
-      ruleset vocabulary and means nothing today. Small phase, outsized effect, and it must precede
-      background subagents, which need somewhere to inject a finished child's result. *Exit:* typing
-      while the agent works queues instead of erroring.
+- [x] **Phase 9 — Steering, queues, and run control.** Restores what the client/server split took
+      away. `SteeringBox` now lives in `DoMoHarness`, is held per session by `ServerRuntime`, and is
+      shared by the inline REPL and the server path. The default full-screen client sends a mid-run
+      prompt to `POST /session/:id/steer`, receives a `queue_update` frame, shows the queued count, and
+      retries the ordinary prompt route only when a settle/submit race returns 409. Delivery is
+      configurable as `one-at-a-time` (the safe default) or `all`, and queued messages survive a run
+      ending in the small late-submit window. `maxCostPerRun` stops after the turn that reaches a
+      positive USD ceiling and gives headless mode exit code 4. The no-progress detector now asks the
+      permission engine under its reserved `doom_loop` key; inline and server prompts can answer it,
+      while `-p --yolo` grants one more guard window without blocking a script. *Exit met:* typing
+      while the agent works queues instead of erroring; focused loop, permission, server/client, and
+      compiled-binary tests cover the queue, delivery modes, cost exit, and escalation paths.
 - [ ] **Phase 10 — Context engineering.** Compaction ships and works; the machinery around it is thin.
       There is no overflow recovery, so an alias resolving to a 32k upstream kills a turn on a session
       DoMoCode believes is half full. 5a supplies the real window; this spends it — compact-and-retry
@@ -727,7 +729,7 @@ ordering falls out of them rather than out of appeal:
 | **Dialog vocabulary** | one bespoke permission modal per surface | `question`, every picker, settings, export options, diff review |
 | **Per-turn mutable tool set** | `AgentContext.tools` fixed at construction | plan mode, agents, subagents, MCP `tools/list_changed` |
 | **Git facade** | none | diff viewer, `/review`, checkpoints, undo, worktrees, branch in footer |
-| **Model metadata** | ~~200k hardcoded; cost always zero~~ — **closed in 5a**: per-alias `modelOverrides`, an optional context window (`nil` renders `?`), and cost from rates or the gateway's own header | ~~context meter, cost display~~ (both shipped); budget cap |
+| **Model metadata** | ~~200k hardcoded; cost always zero~~ — **closed in 5a**: per-alias `modelOverrides`, an optional context window (`nil` renders `?`), and cost from rates or the gateway's own header | ~~context meter, cost display~~ (both shipped); budget cap shipped in Phase 9 |
 
 ### Scale
 
@@ -814,11 +816,11 @@ ones — each addition still forces a tool-vs-prompt-injection and in-process-vs
 | Feature | Seen in | Fit | Lands in |
 |---|---|---|---|
 | Granular permission engine (allow/ask/deny globs, last-match-wins, inline once/always/reject) | all three | yes | **Shipped** (Phase 8) |
-| Headless run (prompt in, streamed/JSON out, exit codes, auto-approve) | kilocode, opencode | yes | **Shipped**, as flags rather than a subcommand: `-p` / `--json` / `--yolo`, exit codes 0–3 |
+| Headless run (prompt in, streamed/JSON out, exit codes, auto-approve) | kilocode, opencode | yes | **Shipped**, as flags rather than a subcommand: `-p` / `--json` / `--yolo`, exit codes 0–4 |
 | Git-shadow snapshot checkpoints + undo/redo + fork-from-any-message | kilocode, opencode | yes | Phase 13 |
 | Config-driven agent/persona profiles + a read-only plan mode | all three | yes | Phase 14 |
 | Auto-format-after-edit hook; repo `.setup.sh` session-init hook | all three | yes | Phase 16 (format); hooks await the [extensibility decision](#decisions-that-reverse-a-stated-non-goal) |
-| Hard per-task budget cap (abort the loop on a cost ceiling) | OpenHands | yes | Phase 9 (needs Phase 5a's real cost rates) |
+| Hard per-task budget cap (abort the loop on a cost ceiling) | OpenHands | yes | **Shipped** (Phase 9; enforced when usage is priced by gateway or configured rates) |
 | Trusted-config `{env:}`/`{file:}` interpolation gated by the trust boundary | kilocode | yes | Phase 5a |
 | Local `/review` of a diff, branch, or commit | kilocode, OpenHands | yes | Phase 5b |
 | Skill refinements: keyword auto-injection, task-input `{VAR}` templates | all three | yes | Phase 5b |
@@ -1114,6 +1116,13 @@ arguments programmatically; a negative value is a usage error. `0` cannot mean "
 loop emits `agent_start`/`turn_start` before its first bound check, so a literal 0 would settle a run
 with a dangling `turn_start`.
 
+`--max-cost-per-run <usd>` — an optional positive USD ceiling for the assistant turns in one run. The
+loop adds each completed turn's effective cost (the gateway-reported value when present, otherwise the
+configured per-model rates) and stops with exit code `4` once the ceiling is reached. An alias with no
+reported or configured price cannot be hard-capped honestly, so the flag remains inert for unpriced
+usage. `--steering-mode <all|one-at-a-time>` selects whether queued prompts are delivered as one batch
+or one message per turn boundary; one-at-a-time is the default.
+
 `--no-mouse` — never claim the mouse in the full-screen client. The app then reports no mouse events
 at all, so the terminal's own selection and scrollback keep working and wheel scrolling inside the
 app is lost in exchange.
@@ -1131,9 +1140,11 @@ Under `-p`, the exit code is the run's verdict:
 | `1` | The run failed: a provider error, an aborted turn, a bad `finish_reason`. |
 | `2` | The `--max-turns` limit was reached before a final answer. Only reachable when a limit was asked for. |
 | `3` | The runaway guard stopped the run: the same tool call returned the same result and made no progress. Raising `--max-turns` would change nothing. |
+| `4` | The `--max-cost-per-run` ceiling was reached after a priced turn; no further model turn was started. |
 
-`2` and `3` are deliberately distinct: a script that retries with a bigger budget on `2` must not
-retry on `3`. In text mode an unbounded run prints `… still working — turn N` to **stderr** every
+`2`, `3`, and `4` are deliberately distinct: a script that retries with a bigger turn budget on `2`
+must not retry on `3`, and a caller can handle a spend ceiling on `4` without misclassifying it as a
+stuck model. In text mode an unbounded run prints `… still working — turn N` to **stderr** every
 twenty-five turns, so a long run in a CI log is not mistaken for a hung one; stdout still carries only
 the answer, and the `--json` event stream is unchanged.
 
@@ -1168,7 +1179,7 @@ There are four ways to run it, and the default changed with Phase 7.
 | Invocation | What it does |
 |---|---|
 | `domo` | The **full-screen** alternate-screen client. It spawns a loopback `DoMoServer` on an ephemeral port with a generated token, attaches over SSE, and tears it down on exit. This is the default. |
-| `domo --inline` | The classic **inline** REPL, painting into normal scrollback, in-process. Mid-run steering works here and not in the client. |
+| `domo --inline` | The classic **inline** REPL, painting into normal scrollback, in-process. Mid-run steering queues here and in the default client. |
 | `domo -p "…"` | Headless: prompt in, answer on stdout, exit code as the verdict. Add `--json` for a newline-delimited event stream. The only mode that pipes. |
 | `domo --serve` | The headless runtime behind a loopback-only HTTP/SSE server (default port 4100). Attach with `domo --url http://127.0.0.1:4100 --token …`. |
 
@@ -1254,12 +1265,13 @@ real — each of these is now a property of the shipped system, not a forecast:
 - **A local server is a new attack surface.** A socket on loopback is reachable by any local process;
   the mitigation is a loopback-only bind plus a per-session token by default, but the single-process
   design never had this exposure.
-- **A weakened backpressure invariant, and no steering over the wire.** The awaited event-emit
-  guarantee is relaxed for the network fan-out sink (bounded buffer, drop-oldest), as
+- **A weakened backpressure invariant, with bounded steering queues.** The awaited event-emit guarantee
+  is relaxed for the network fan-out sink (bounded buffer, drop-oldest), as
   [Concurrency](#concurrency-and-isolation) records; a client that falls behind re-seeds from the
-  transcript rather than replaying the gap. Mid-run steering did not survive the split at all — it
-  works under `--inline`, while the client's second prompt during a run is refused with a 409 and
-  returned to the input box.
+  transcript rather than replaying the gap. Mid-run steering is supported over the wire now, but the
+  queue is deliberately in-memory and per live session: a process restart leaves no accepted-but-
+  undelivered prompt behind, and a queued message can still be lost if the host is terminated before
+  its next turn is persisted. The client reconciles the level-triggered count through `/status`.
 - **MCP widens the prompt-injection surface.** MCP tool descriptions and tool output are
   attacker-controlled text entering the context. That is why the permission engine landed first, why a
   standing caveat in the system prompt marks tool text as data rather than instructions, and why
