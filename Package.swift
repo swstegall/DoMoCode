@@ -202,6 +202,16 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        // Project-local recall and durable memory. This target owns the read-side
+        // session index and the outside-the-repository memory file; it deliberately
+        // does not depend on DoMoTools so the storage policy stays usable by every
+        // surface and the tool layer can remain the adapter.
+        .target(
+            name: "DoMoMemory",
+            dependencies: ["DoMoCore", "DoMoHarness"],
+            swiftSettings: safeSettings
+        ),
+
         // MARK: Tools
 
         // Headless by design — no TUI import. The rendering lives next door in
@@ -209,7 +219,7 @@ let package = Package(
         .target(
             name: "DoMoTools",
             dependencies: [
-                "DoMoCore", "DoMoExec",
+                "DoMoCore", "DoMoExec", "DoMoMemory",
                 .product(name: "JSONSchema", package: "swift-json-schema"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -310,6 +320,7 @@ let package = Package(
             dependencies: [
                 "DoMoCore", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoLLM", "DoMoAgent",
                 "DoMoHarness", "DoMoExec", "DoMoGit", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoMCP", "DoMoLSP", "DoMoServer", "DoMoClient",
+                "DoMoMemory",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -356,7 +367,7 @@ let package = Package(
 
         .testTarget(
             name: "DoMoToolsTests",
-            dependencies: ["DoMoTools", "DoMoExec", "DoMoCore"],
+            dependencies: ["DoMoTools", "DoMoMemory", "DoMoExec", "DoMoCore"],
             swiftSettings: safeSettings
         ),
 
@@ -387,6 +398,12 @@ let package = Package(
         .testTarget(
             name: "DoMoHarnessTests",
             dependencies: ["DoMoHarness", "DoMoAgent", "DoMoLLM", "DoMoExec", "DoMoCore", "DoMoGit", "DoMoPermissions"],
+            swiftSettings: safeSettings
+        ),
+
+        .testTarget(
+            name: "DoMoMemoryTests",
+            dependencies: ["DoMoMemory", "DoMoHarness", "DoMoLLM", "DoMoCore"],
             swiftSettings: safeSettings
         ),
 

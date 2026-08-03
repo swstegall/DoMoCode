@@ -13,6 +13,7 @@
 
 import DoMoCore
 import DoMoExec
+import DoMoMemory
 import Foundation
 import SystemPackage
 #if canImport(FoundationNetworking)
@@ -216,7 +217,8 @@ public struct ToolRegistry: Sendable {
     public static func builtin(
         todoStore: TodoStore = TodoStore(),
         includePlanExit: Bool = false,
-        includeSubagent: Bool = false
+        includeSubagent: Bool = false,
+        includeSessionRecall: Bool = false
     ) -> ToolRegistry {
         var tools: [any Tool] = [
             ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
@@ -225,6 +227,7 @@ public struct ToolRegistry: Sendable {
         ]
         if includePlanExit { tools.append(PlanExitTool()) }
         if includeSubagent { tools.append(TaskTool()) }
+        if includeSessionRecall { tools.append(SessionRecallTool()) }
         return ToolRegistry(tools)
     }
 
@@ -352,6 +355,7 @@ public struct ToolContext: Sendable {
     public let backgroundProcesses: BackgroundProcessManager
     public let diagnosticsProvider: (any DiagnosticsProvider)?
     public let formatterProvider: (any FormatterProvider)?
+    public let sessionRecallProvider: (any SessionRecallProvider)?
 
     /// The runtime bridge used by ``TaskTool``. It is optional so the ordinary
     /// CLI and library contexts keep the same tool surface and behavior.
@@ -384,6 +388,7 @@ public struct ToolContext: Sendable {
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
+        sessionRecallProvider: (any SessionRecallProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) {
@@ -397,6 +402,7 @@ public struct ToolContext: Sendable {
         self.backgroundProcesses = backgroundProcesses
         self.diagnosticsProvider = diagnosticsProvider
         self.formatterProvider = formatterProvider
+        self.sessionRecallProvider = sessionRecallProvider
         self.subagentCoordinator = subagentCoordinator
         self.sessionID = sessionID
     }
@@ -415,6 +421,7 @@ public struct ToolContext: Sendable {
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
+        sessionRecallProvider: (any SessionRecallProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) async throws(DoMoError) -> ToolContext {
@@ -429,6 +436,7 @@ public struct ToolContext: Sendable {
             backgroundProcesses: backgroundProcesses,
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
+            sessionRecallProvider: sessionRecallProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -443,6 +451,7 @@ public struct ToolContext: Sendable {
             backgroundProcesses: backgroundProcesses,
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
+            sessionRecallProvider: sessionRecallProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -457,6 +466,7 @@ public struct ToolContext: Sendable {
         backgroundProcesses: BackgroundProcessManager,
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
+        sessionRecallProvider: (any SessionRecallProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) -> ToolContext {
@@ -471,6 +481,7 @@ public struct ToolContext: Sendable {
             backgroundProcesses: backgroundProcesses,
             diagnosticsProvider: diagnosticsProvider ?? self.diagnosticsProvider,
             formatterProvider: formatterProvider ?? self.formatterProvider,
+            sessionRecallProvider: sessionRecallProvider ?? self.sessionRecallProvider,
             subagentCoordinator: subagentCoordinator ?? self.subagentCoordinator,
             sessionID: sessionID ?? self.sessionID
         )

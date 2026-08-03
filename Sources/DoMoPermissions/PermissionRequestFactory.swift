@@ -349,6 +349,7 @@ public func defaultBaselinePermissionConfig() -> PermissionConfig {
         PermissionConfigEntry(permission: "glob", value: .action(.allow)),
         PermissionConfigEntry(permission: "todowrite", value: .action(.allow)),
         PermissionConfigEntry(permission: "finish", value: .action(.allow)),
+        PermissionConfigEntry(permission: "session_recall", value: .action(.allow)),
         PermissionConfigEntry(permission: "question", value: .action(.ask)),
         PermissionConfigEntry(permission: "webfetch", value: .action(.ask)),
         PermissionConfigEntry(permission: "doom_loop", value: .action(.ask)),

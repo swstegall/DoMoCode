@@ -45,6 +45,7 @@ import DoMoExec
 import DoMoGit
 import DoMoHarness
 import DoMoLLM
+import DoMoMemory
 import DoMoMCP
 import DoMoPermissions
 import DoMoTermGraphics
@@ -2197,11 +2198,16 @@ public struct InteractiveMode: Sendable {
                 root: workDirectory,
                 shell: shell,
                 environment: toolEnvironment
+            ),
+            sessionRecallProvider: SessionRecallIndex(
+                cwd: workingDirectory,
+                sessionDirectory: sessionDir
             )
         )
         let registry = ToolRegistry.builtin(
             includePlanExit: agentMode == .plan,
-            includeSubagent: agentMode == .plan
+            includeSubagent: agentMode == .plan,
+            includeSessionRecall: true
         )
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools to the built-ins. The manager is held on the session and torn down in

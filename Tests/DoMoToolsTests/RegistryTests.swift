@@ -1,4 +1,5 @@
 import DoMoCore
+import DoMoMemory
 import DoMoTools
 import Foundation
 import SystemPackage
@@ -40,6 +41,30 @@ struct RegistryTests {
     func subagentSet() {
         let registry = ToolRegistry.builtin(includePlanExit: true, includeSubagent: true)
         #expect(registry.names.suffix(2) == ["plan_exit", "task"])
+    }
+
+    @Test("the session recall tool is opt-in and labels historical text untrusted")
+    func sessionRecallSet() async throws {
+        let registry = ToolRegistry.builtin(includeSessionRecall: true)
+        #expect(registry.names.last == "session_recall")
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        let context = fixture.context.withQuestionHandler(
+            nil,
+            backgroundProcesses: fixture.context.backgroundProcesses,
+            sessionRecallProvider: StubRecallProvider()
+        )
+
+        let result = try await registry.execute(
+            "session_recall",
+            arguments: ["query": "decision"],
+            in: context
+        )
+
+        #expect(!result.isError)
+        #expect(result.text.contains("trust=\"untrusted\""))
+        #expect(result.text.contains("historical decision"))
+        #expect(result.details["count"]?.intValue == 1)
     }
 
     @Test("task forwards a focused request to its coordinator")
@@ -131,5 +156,20 @@ struct RegistryTests {
         var registry = ToolRegistry([ReadTool()])
         registry.register(ReadTool())
         #expect(registry.names == ["read"])
+    }
+}
+
+private struct StubRecallProvider: SessionRecallProvider {
+    func search(query: String, limit: Int) throws -> [SessionRecallHit] {
+        [
+            SessionRecallHit(
+                sessionID: "session-1",
+                entryID: "entry-1",
+                timestamp: "2026-08-03T12:00:00Z",
+                category: .assistant,
+                score: 7,
+                snippet: "historical decision"
+            )
+        ]
     }
 }

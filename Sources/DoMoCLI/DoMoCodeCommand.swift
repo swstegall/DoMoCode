@@ -9,6 +9,7 @@ import DoMoExec
 import DoMoGit
 import DoMoHarness
 import DoMoLLM
+import DoMoMemory
 import DoMoMCP
 import DoMoPermissions
 import DoMoServer
@@ -203,7 +204,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         try SystemPromptBuilder(
             workingDirectory: workingDirectory,
             configDirectory: configDirectory,
-            toolNames: ToolRegistry.builtin.names,
+            toolNames: ToolRegistry.builtin(includeSessionRecall: true).names,
             projectTrusted: true
         ).build()
     }
@@ -531,11 +532,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 configuration: configuration,
                 root: workingDirectory,
                 shell: shell
+            ),
+            sessionRecallProvider: SessionRecallIndex(
+                cwd: workingDirectory.string,
+                sessionDirectory: configuration.sessionDirectory
             )
         )
         let registry = ToolRegistry.builtin(
             includePlanExit: selectedMode == .plan,
-            includeSubagent: selectedMode == .plan
+            includeSubagent: selectedMode == .plan,
+            includeSessionRecall: true
         )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
 
@@ -678,7 +684,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // every configured MCP server. See ``gatewayCredentialEnvNames(_:)``.
             sensitiveEnvKeys: Self.gatewayCredentialEnvNames(configuration),
             // Reserve the built-in tool names so an MCP tool can never shadow one.
-            reservedNames: Set(ToolRegistry.builtin.names),
+            reservedNames: Set(ToolRegistry.builtin(includeSessionRecall: true).names),
             log: { Self.writeStderr($0 + "\n") }
         )
         return (tools, manager)
@@ -970,12 +976,20 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 root: workingDirectory,
                 shell: shell
             ),
+            sessionRecallProvider: SessionRecallIndex(
+                cwd: workingDirectory.string,
+                sessionDirectory: configuration.sessionDirectory
+            ),
             subagentCoordinator: subagentCoordinator
         )
         // Keep plan_exit in the server registry even when the default mode is build;
         // ServerRuntime filters it from build sessions and reveals it when a session
         // switches to plan mode without rebuilding the process.
-        let registry = ToolRegistry.builtin(includePlanExit: true, includeSubagent: true)
+        let registry = ToolRegistry.builtin(
+            includePlanExit: true,
+            includeSubagent: true,
+            includeSessionRecall: true
+        )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
         // persist the local surfaces use. This gates BOTH `--serve` and the loopback
@@ -1033,7 +1047,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             let sessionRegistry = ToolRegistry.builtin(
                 todoStore: resources.todoStore,
                 includePlanExit: true,
-                includeSubagent: true
+                includeSubagent: true,
+                includeSessionRecall: true
             )
             let sessionContext = toolContext.withQuestionHandler({ prompts in
                 let wirePrompts = prompts.map { prompt in
