@@ -321,6 +321,42 @@ struct EditToolTests {
         #expect(read.text == "let a = \"y\"\nlet b = 2  \n")
     }
 
+    @Test("horizontal whitespace fallback collapses spacing only on changed lines")
+    func horizontalWhitespaceFallback() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("spacing.txt", "let value = 1\nlet untouched = 2  \n")
+
+        let result = try await EditTool().execute(
+            editArgs("spacing.txt", [("let  value = 1", "let value = 3")]), in: fixture.context)
+        #expect(!result.isError)
+
+        let read = try await ReadTool().execute(["path": "spacing.txt"], in: fixture.context)
+        #expect(read.text == "let value = 3\nlet untouched = 2  \n")
+    }
+
+    @Test("indentation fallback matches a block with different leading indentation")
+    func indentationFallback() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("indented.txt", "    if ready {\n        run()\n    }")
+
+        let result = try await EditTool().execute(
+            editArgs(
+                "indented.txt",
+                [(
+                    "if ready {\n    run()\n}",
+                    "    if ready {\n        wait()\n    }"
+                )]
+            ),
+            in: fixture.context
+        )
+        #expect(!result.isError)
+
+        let read = try await ReadTool().execute(["path": "indented.txt"], in: fixture.context)
+        #expect(read.text == "    if ready {\n        wait()\n    }")
+    }
+
     @Test("editing a missing file reports it cannot")
     func editMissing() async throws {
         let fixture = try await ToolFixture.make()

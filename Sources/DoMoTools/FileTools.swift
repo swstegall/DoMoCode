@@ -521,6 +521,28 @@ public struct EditTool: Tool {
 /// consistent and the result is identical.
 enum EditEngine {
 
+    private enum MatchStrategy: CaseIterable {
+        case exact
+        case fuzzy
+        case horizontalWhitespace
+        case indentation
+
+        var usesFuzzyBase: Bool { self != .exact }
+
+        func normalize(_ text: String) -> String {
+            switch self {
+            case .exact:
+                return text
+            case .fuzzy:
+                return EditEngine.normalizeForFuzzyMatch(text)
+            case .horizontalWhitespace:
+                return EditEngine.normalizeHorizontalWhitespace(text)
+            case .indentation:
+                return EditEngine.normalizeIndentation(text)
+            }
+        }
+    }
+
     struct Edit: Sendable, Hashable {
         var oldText: String
         var newText: String
@@ -549,15 +571,32 @@ enum EditEngine {
         }
 
         let contentChars = Array(normalizedContent)
-        let usedFuzzy = normalized.contains { fuzzyFind(content: contentChars, oldText: Array($0.oldText)).usedFuzzy }
-        let base: [Character] = usedFuzzy ? Array(normalizeForFuzzyMatch(normalizedContent)) : contentChars
+        let resolution = try resolve(
+            content: normalizedContent,
+            edits: normalized,
+            path: path
+        )
+        let base = resolution.base
 
         var matched: [Replacement] = []
         for (index, edit) in normalized.enumerated() {
-            let oldChars = Array(edit.oldText)
-            let match = fuzzyFind(content: base, oldText: oldChars)
+            let oldText = resolution.strategy.normalize(edit.oldText)
+            let oldChars = Array(oldText)
+            let match = resolution.matches[index]
             guard match.found else { throw notFoundError(path: path, index: index, total: total) }
-            let occurrences = countOccurrences(content: base, oldText: oldChars)
+            try rejectDisproportionateMatch(
+                content: base,
+                oldText: oldChars,
+                match: match,
+                path: path,
+                index: index,
+                total: total
+            )
+            let occurrences = countOccurrences(
+                content: base,
+                oldText: oldChars,
+                strategy: .exact
+            )
             if occurrences > 1 {
                 throw duplicateError(path: path, index: index, total: total, occurrences: occurrences)
             }
@@ -581,7 +620,7 @@ enum EditEngine {
         }
 
         let newChars: [Character] =
-            usedFuzzy
+            resolution.strategy.usesFuzzyBase
             ? try applyPreservingUnchangedLines(original: contentChars, base: base, replacements: matched)
             : applyReplacements(base, matched)
         let newContent = String(newChars)
@@ -590,6 +629,51 @@ enum EditEngine {
             throw noChangeError(path: path, total: total)
         }
         return (normalizedContent, newContent)
+    }
+
+    private struct Match {
+        var found: Bool
+        var index: Int
+        var matchLength: Int
+    }
+
+    private struct Resolution {
+        var strategy: MatchStrategy
+        var base: [Character]
+        var matches: [Match]
+    }
+
+    /// Resolve every edit against one shared representation. Trying the whole
+    /// batch under one strategy is important: mixing offsets from different
+    /// normalizations would make overlap checks and line preservation unsound.
+    private static func resolve(
+        content: String,
+        edits: [Edit],
+        path: String
+    ) throws(DoMoError) -> Resolution {
+        for strategy in MatchStrategy.allCases {
+            let base = Array(strategy.normalize(content))
+            let matches = edits.map { edit -> Match in
+                let old = Array(strategy.normalize(edit.oldText))
+                guard let index = indexOfSubsequence(base, old, from: 0) else {
+                    return Match(found: false, index: -1, matchLength: 0)
+                }
+                return Match(found: true, index: index, matchLength: old.count)
+            }
+            if matches.allSatisfy(\.found) {
+                return Resolution(strategy: strategy, base: base, matches: matches)
+            }
+        }
+        // Match the existing single-edit/multi-edit error wording at the call
+        // site, while still keeping the strategy search private.
+        let missingIndex = edits.firstIndex { edit in
+            !MatchStrategy.allCases.contains { strategy in
+                let base = Array(strategy.normalize(content))
+                let old = Array(strategy.normalize(edit.oldText))
+                return indexOfSubsequence(base, old, from: 0) != nil
+            }
+        } ?? 0
+        throw notFoundError(path: path, index: missingIndex, total: edits.count)
     }
 
     // MARK: Normalization
@@ -628,34 +712,89 @@ enum EditEngine {
         return String(scalars)
     }
 
-    // MARK: Matching
-
-    private static func fuzzyFind(
-        content: [Character],
-        oldText: [Character]
-    ) -> (found: Bool, index: Int, matchLength: Int, usedFuzzy: Bool) {
-        if let index = indexOfSubsequence(content, oldText, from: 0) {
-            return (true, index, oldText.count, false)
-        }
-        let fuzzyContent = Array(normalizeForFuzzyMatch(String(content)))
-        let fuzzyOld = Array(normalizeForFuzzyMatch(String(oldText)))
-        if let index = indexOfSubsequence(fuzzyContent, fuzzyOld, from: 0) {
-            return (true, index, fuzzyOld.count, true)
-        }
-        return (false, -1, 0, false)
+    /// Collapses only horizontal whitespace. Newlines remain structural so a
+    /// short model-emitted spacing difference cannot jump across a line boundary.
+    private static func normalizeHorizontalWhitespace(_ text: String) -> String {
+        normalizeForFuzzyMatch(text)
+            .components(separatedBy: "\n")
+            .map { line in
+                var result = ""
+                var inWhitespace = false
+                for character in line {
+                    if character == " " || character == "\t" {
+                        inWhitespace = true
+                    } else {
+                        if inWhitespace, !result.isEmpty { result.append(" ") }
+                        result.append(character)
+                        inWhitespace = false
+                    }
+                }
+                return result
+            }
+            .joined(separator: "\n")
     }
 
-    private static func countOccurrences(content: [Character], oldText: [Character]) -> Int {
-        let fuzzyContent = Array(normalizeForFuzzyMatch(String(content)))
-        let fuzzyOld = Array(normalizeForFuzzyMatch(String(oldText)))
-        guard !fuzzyOld.isEmpty else { return 0 }
+    /// Removes leading indentation after the safer normalizations. This is the
+    /// last fallback, because it deliberately treats differently nested code as
+    /// equivalent; duplicate and disproportionate-match checks still run before
+    /// any replacement is accepted.
+    private static func normalizeIndentation(_ text: String) -> String {
+        normalizeHorizontalWhitespace(text)
+            .components(separatedBy: "\n")
+            .map { $0.drop(while: { $0 == " " || $0 == "\t" }) }
+            .map(String.init)
+            .joined(separator: "\n")
+    }
+
+    // MARK: Matching
+
+    private static func countOccurrences(
+        content: [Character],
+        oldText: [Character],
+        strategy: MatchStrategy
+    ) -> Int {
+        let normalizedContent = Array(strategy.normalize(String(content)))
+        let normalizedOld = Array(strategy.normalize(String(oldText)))
+        guard !normalizedOld.isEmpty else { return 0 }
         var count = 0
         var cursor = 0
-        while let index = indexOfSubsequence(fuzzyContent, fuzzyOld, from: cursor) {
+        while let index = indexOfSubsequence(normalizedContent, normalizedOld, from: cursor) {
             count += 1
-            cursor = index + fuzzyOld.count
+            cursor = index + normalizedOld.count
         }
         return count
+    }
+
+    /// Reject a fuzzy result whose accepted span is wildly larger than the
+    /// meaningful text the model supplied. This guard is intentionally before
+    /// duplicate/overlap/application logic and applies to exact results too;
+    /// future strategies cannot bypass it by being added ahead of the cascade.
+    private static func rejectDisproportionateMatch(
+        content: [Character],
+        oldText: [Character],
+        match: Match,
+        path: String,
+        index: Int,
+        total: Int
+    ) throws(DoMoError) {
+        guard match.found else { return }
+        let upper = match.index + match.matchLength
+        guard match.index >= 0, upper <= content.count else {
+            throw notFoundError(path: path, index: index, total: total)
+        }
+        let search = String(content[match.index..<upper])
+        let old = String(oldText)
+        let oldLines = old.components(separatedBy: "\n").count
+        let searchLines = search.components(separatedBy: "\n").count
+        if searchLines >= max(oldLines + 3, oldLines * 2)
+            || (oldLines > 1
+                && search.trimmingCharacters(in: .whitespacesAndNewlines).count
+                    > max(
+                        old.trimmingCharacters(in: .whitespacesAndNewlines).count + 500,
+                        old.trimmingCharacters(in: .whitespacesAndNewlines).count * 4
+                    )) {
+            throw disproportionateError(path: path, index: index, total: total)
+        }
     }
 
     private static func indexOfSubsequence(_ haystack: [Character], _ needle: [Character], from: Int) -> Int? {
@@ -824,6 +963,14 @@ enum EditEngine {
                 "No changes made to \(path). The replacement produced identical content. "
                 + "This might indicate an issue with special characters or the text not existing as expected.")
             : fault("No changes made to \(path). The replacements produced identical content.")
+    }
+
+    private static func disproportionateError(path: String, index: Int, total: Int) -> DoMoError {
+        let target = total == 1 ? "the replacement" : "edits[\(index)]"
+        return fault(
+            "Refused \(target) in \(path): the fuzzy match covered a disproportionately large block. "
+                + "Provide more exact surrounding context before editing."
+        )
     }
 
     private static func overlapError(path: String, first: Int, second: Int) -> DoMoError {
