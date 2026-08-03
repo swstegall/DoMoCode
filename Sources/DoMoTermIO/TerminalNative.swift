@@ -27,6 +27,22 @@ public enum TerminalNotificationProtocol: Sendable, Equatable, Hashable {
     case kittyOSC99
 }
 
+/// The semantic prompt/command boundaries understood by terminals that
+/// implement OSC 133. The mini renderer emits prompt boundaries with each
+/// frame and the interactive coordinator emits command boundaries around a
+/// submitted turn.
+public enum TerminalPromptMark: Sendable, Equatable, Hashable {
+    /// Start of the prompt text.
+    case promptStart
+    /// End of the prompt text, immediately before operator input.
+    case promptEnd
+    /// Start of a submitted command/turn.
+    case commandStart
+    /// End of a submitted command/turn. The exit code is optional because an
+    /// interrupted turn has no meaningful process-style status.
+    case commandEnd(exitCode: Int?)
+}
+
 /// A response to the Kitty keyboard protocol query.
 public enum TerminalKeyboardProtocolResponse: Sendable, Equatable, Hashable {
     /// Kitty answered with its active flag bitset. A value of zero means Kitty
@@ -115,6 +131,28 @@ public enum TerminalNativeSequence {
             let bodyPart = "\u{1b}]99;i=1:p=\(cleanMessage);\(cleanMessage)\u{1b}\\"
             return bytes(titlePart + bodyPart)
         }
+    }
+
+    /// Emit one OSC 133 semantic prompt mark. The payload is deliberately
+    /// numeric and contains no user-controlled text, so the sequence cannot
+    /// become an OSC injection even when a turn ends with an arbitrary error.
+    public static func promptMark(_ mark: TerminalPromptMark) -> [UInt8] {
+        let payload: String
+        switch mark {
+        case .promptStart:
+            payload = "A"
+        case .promptEnd:
+            payload = "B"
+        case .commandStart:
+            payload = "C"
+        case .commandEnd(let exitCode):
+            if let exitCode {
+                payload = "D;\(exitCode)"
+            } else {
+                payload = "D"
+            }
+        }
+        return bytes("\u{1b}]133;\(payload)\u{07}")
     }
 
     /// Parse one complete response framed by ``StdinFramer``.

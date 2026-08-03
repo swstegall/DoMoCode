@@ -610,6 +610,14 @@ final class InteractiveCoordinator {
         statusLine.text = idleStatus
     }
 
+    /// The split-footer compositor keeps the status line and every visible
+    /// editor row below the transcript. The editor is allowed to grow, so this
+    /// is measured from the same components that render the frame.
+    func footerRows(width: Int, height: Int) -> Int {
+        let requested = max(1, statusLine.render(width: width).count + prompt.render(width: width).count)
+        return min(max(1, height), requested)
+    }
+
     /// Flush a frame through the driver's synchronous seam. A no-op before the
     /// driver's `run` is active (there is no ``TUI`` bound yet), which is exactly
     /// when nothing needs painting.
@@ -1564,6 +1572,7 @@ final class InteractiveCoordinator {
         assistantBuffer = ""
         statusLine.text = runningStatus
         startProgressClock()
+        tui.emitPromptMark(.commandStart)
         render()
 
         // Resolve any `@path` image mentions into attachments before the turn —
@@ -1651,6 +1660,9 @@ final class InteractiveCoordinator {
         }
         abortRequested = false
         interruptedShown = false
+        tui.emitPromptMark(
+            .commandEnd(exitCode: wasAborted ? nil : (reason == .errored ? 1 : 0))
+        )
         render()
     }
 
@@ -2610,10 +2622,11 @@ public struct InteractiveMode: Sendable {
         lifecycle: any TerminalLifecycleControl,
         imageCapabilities: TerminalCapabilities? = nil,
         cell: CellDimensions? = nil,
-        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource()
+        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
+        renderMode: RenderMode = .inline
     ) async throws {
         let quit = QuitSignal()
-        let tui = TUI(target: target, showHardwareCursor: true)
+        let tui = TUI(target: target, showHardwareCursor: true, renderMode: renderMode)
         let driver = TerminalDriver(input: input, resize: resize, lifecycle: lifecycle)
 
         let provider = CombinedAutocompleteProvider(providers: [
@@ -2654,6 +2667,11 @@ public struct InteractiveMode: Sendable {
             clipboardPaste: clipboardPaste,
             clipboard: self.clipboard
         )
+        if renderMode == .splitFooter {
+            tui.setFooterRowsProvider { [weak coordinator] width, height in
+                coordinator?.footerRows(width: width, height: height) ?? 1
+            }
+        }
         coordinator.install()
         await interactiveTerminal.setScreenHandler { [weak coordinator] id, screen, running in
             guard let coordinator else { return }

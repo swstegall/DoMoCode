@@ -71,4 +71,28 @@ struct TerminalNativeTests {
             )) == "\u{1b}]99;i=1:d=0;Domo\u{1b}\\\u{1b}]99;i=1:p=Done;Done\u{1b}\\"
         )
     }
+
+    @Test("OSC 133 prompt marks have stable, data-free payloads")
+    func promptMarks() {
+        #expect(
+            text(TerminalNativeSequence.promptMark(.promptStart))
+                == "\u{1b}]133;A\u{07}"
+        )
+        #expect(
+            text(TerminalNativeSequence.promptMark(.promptEnd))
+                == "\u{1b}]133;B\u{07}"
+        )
+        #expect(
+            text(TerminalNativeSequence.promptMark(.commandStart))
+                == "\u{1b}]133;C\u{07}"
+        )
+        #expect(
+            text(TerminalNativeSequence.promptMark(.commandEnd(exitCode: 7)))
+                == "\u{1b}]133;D;7\u{07}"
+        )
+        #expect(
+            text(TerminalNativeSequence.promptMark(.commandEnd(exitCode: nil)))
+                == "\u{1b}]133;D\u{07}"
+        )
+    }
 }

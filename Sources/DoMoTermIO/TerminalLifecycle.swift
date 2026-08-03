@@ -49,6 +49,8 @@ private let enterAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049h".utf8)
 /// the saved cursor, exactly reversing `?1049h`. Part of the full-screen exit
 /// sequence, and the byte a crash must never fail to emit.
 private let exitAlternateScreenSequence: [UInt8] = Array("\u{1b}[?1049l".utf8)
+/// Reset the DEC scrolling margins before the shell receives the terminal.
+private let resetScrollRegionSequence: [UInt8] = Array("\u{1b}[r".utf8)
 /// Enable mouse reporting: `?1000h` turns on button/wheel reports, `?1002h` adds
 /// motion reports *while a button is held*, and `?1006h` asks for all of them in
 /// the SGR encoding (decimal, unbounded coordinates, press and release
@@ -213,6 +215,9 @@ public final class TerminalLifecycle: Sendable {
     /// Whether enter takes over mouse reporting and teardown gives it back. Fixed
     /// at init, and readable, for the same reasons as ``useAlternateScreen``.
     public let enableMouse: Bool
+    /// Whether teardown resets a DECSTBM scrolling region owned by the renderer.
+    /// Mini mode sets this so the shell regains the full terminal on every exit.
+    public let resetScrollRegion: Bool
 
     /// The signal sources, retained so they keep firing, and serialised by the
     /// `Mutex`.
@@ -239,12 +244,14 @@ public final class TerminalLifecycle: Sendable {
         inputDescriptor: Int32 = STDIN_FILENO,
         outputDescriptor: Int32 = STDOUT_FILENO,
         useAlternateScreen: Bool = false,
-        enableMouse: Bool = false
+        enableMouse: Bool = false,
+        resetScrollRegion: Bool = false
     ) {
         self.inputDescriptor = inputDescriptor
         self.outputDescriptor = outputDescriptor
         self.useAlternateScreen = useAlternateScreen
         self.enableMouse = enableMouse
+        self.resetScrollRegion = resetScrollRegion
     }
 
     /// The exact teardown bytes replayed on exit for a given mode.
@@ -254,13 +261,19 @@ public final class TerminalLifecycle: Sendable {
     /// disabled and cursor shown, with `?1049l` LAST — can be asserted without
     /// standing up a real terminal. Because the registration uses this, the tested
     /// bytes are exactly the emitted bytes.
-    public static func teardownSequence(useAlternateScreen: Bool, enableMouse: Bool = false) -> [UInt8] {
+    public static func teardownSequence(
+        useAlternateScreen: Bool,
+        enableMouse: Bool = false,
+        resetScrollRegion: Bool = false
+    ) -> [UInt8] {
+        let base: [UInt8]
         switch (useAlternateScreen, enableMouse) {
-        case (false, false): return inlineExitSequence
-        case (true, false): return alternateScreenExitSequence
-        case (false, true): return mouseInlineExitSequence
-        case (true, true): return mouseAlternateScreenExitSequence
+        case (false, false): base = inlineExitSequence
+        case (true, false): base = alternateScreenExitSequence
+        case (false, true): base = mouseInlineExitSequence
+        case (true, true): base = mouseAlternateScreenExitSequence
         }
+        return resetScrollRegion ? resetScrollRegionSequence + base : base
     }
 
     /// The exact bytes that take (`enabled`) or release the mouse.
@@ -381,7 +394,11 @@ public final class TerminalLifecycle: Sendable {
     public func setMouseReporting(_ enabled: Bool) {
         guard isatty(outputDescriptor) == 1 else { return }
         writeAll(outputDescriptor, Self.mouseSequence(enabled: enabled))
-        let exitSequence = Self.teardownSequence(useAlternateScreen: useAlternateScreen, enableMouse: enabled)
+        let exitSequence = Self.teardownSequence(
+            useAlternateScreen: useAlternateScreen,
+            enableMouse: enabled,
+            resetScrollRegion: resetScrollRegion
+        )
         restoreRegistration.withLock { slot in
             guard let current = slot else { return }
             slot = RestoreRegistration(
@@ -425,7 +442,11 @@ public final class TerminalLifecycle: Sendable {
             writeAll(outputDescriptor, TerminalNativeSequence.focusReportingSequence(enabled: true))
         }
 
-        let exitSequence = Self.teardownSequence(useAlternateScreen: useAlternateScreen, enableMouse: enableMouse)
+        let exitSequence = Self.teardownSequence(
+            useAlternateScreen: useAlternateScreen,
+            enableMouse: enableMouse,
+            resetScrollRegion: resetScrollRegion
+        )
         restoreRegistration.withLock { slot in
             slot = RestoreRegistration(
                 rawMode: rawMode,

@@ -284,6 +284,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     public var inline: Bool = false
 
     @Flag(
+        name: .customLong("mini"),
+        help: "Use normal scrollback with a pinned prompt footer instead of the full-screen client."
+    )
+    public var mini: Bool = false
+
+    @Flag(
         name: [.customLong("yolo"), .customLong("dangerously-allow-all")],
         help: "Headless (-p) only: auto-approve every tool call that would otherwise need interactive approval. Without this, a tool needing approval is refused with a message the model can act on."
     )
@@ -486,6 +492,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         }
         let costLimit = try Self.parseCostLimit(maxCostPerRun)
         let deliveryMode = try Self.parseSteeringMode(steeringMode)
+        if inline, mini {
+            throw DoMoError(.configuration, "--inline and --mini are mutually exclusive.")
+        }
 
         // `--serve` runs the headless HTTP/SSE server and does not return until the
         // process is signalled. It manages sessions itself, so it is branched before
@@ -532,7 +541,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // terminal collaborators are assembled on the main actor so the
         // non-`Sendable` output target never crosses an isolation boundary.
         guard let prompt, !prompt.isEmpty else {
-            if inline {
+            if inline || mini {
                 let mode = try await InteractiveMode.make(
                     clientConfiguration: configuration.clientConfiguration,
                     model: model,
@@ -568,7 +577,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 )
                 try await Self.runInteractive(
                     mode,
-                    clipboardPaste: SystemClipboardPasteSource.make(environment: environment)
+                    clipboardPaste: SystemClipboardPasteSource.make(environment: environment),
+                    renderMode: mini ? .splitFooter : .inline
                 )
             } else {
                 try await Self.runClient(
@@ -966,18 +976,20 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     @MainActor
     private static func runInteractive(
         _ mode: InteractiveMode,
-        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource()
+        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
+        renderMode: RenderMode = .inline
     ) async throws {
         let target = TerminalOutputTarget()
         let input = TerminalDriver.standardInputStream()
         let resize = TerminalSize.resizeStream()
-        let lifecycle = TerminalLifecycle()
+        let lifecycle = TerminalLifecycle(resetScrollRegion: renderMode == .splitFooter)
         try await mode.run(
             target: target,
             input: input,
             resize: resize,
             lifecycle: lifecycle,
-            clipboardPaste: clipboardPaste
+            clipboardPaste: clipboardPaste,
+            renderMode: renderMode
         )
     }
 

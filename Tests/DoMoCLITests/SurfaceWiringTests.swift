@@ -379,6 +379,30 @@ struct SurfaceWiringTests {
         )
     }
 
+    @Test
+    func miniSurfaceUsesNormalScrollbackAndSemanticPromptMarks() throws {
+        let gateway = try MockGateway(chatCompletionBodies: [])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        let terminal = try InlineTerminal()
+        defer { terminal.tearDown() }
+        try terminal.launch(
+            arguments: ["--mini", "--model", "mock-model", "--base-url", gateway.baseURL],
+            workspace: workspace
+        )
+
+        #expect(terminal.waitUntilPainted(), "the mini REPL never painted a frame: \(terminal.text)")
+        let output = terminal.text
+        #expect(output.contains("\u{1b}[1;"), "mini mode never set a DECSTBM region")
+        #expect(output.contains("\u{1b}]133;A\u{07}"), "mini mode never marked prompt start")
+        #expect(output.contains("\u{1b}]133;B\u{07}"), "mini mode never marked prompt end")
+        #expect(!output.contains("\u{1b}[?1049h"), "mini mode entered the alternate screen")
+        #expect(!output.contains("\u{1b}[?1002h"), "mini mode claimed mouse reporting")
+    }
+
     // MARK: - Print mode: compaction.model is read
 
     /// `compaction.model` selects the summarization alias, and print mode installs

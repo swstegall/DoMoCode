@@ -566,6 +566,15 @@ public protocol RenderTarget: AnyObject {
 
 // MARK: - TUI
 
+/// The two normal-screen render policies. Full-screen clients use a separate
+/// ScreenSurface; this choice is for the inline REPL presentation only.
+public enum RenderMode: Sendable, Equatable {
+    /// Differential cursor motion in the terminal's ordinary scrollback.
+    case inline
+    /// DECSTBM transcript region plus a footer pinned below it.
+    case splitFooter
+}
+
 /// The live inline renderer: a ``Container`` root that owns a ``RenderCore``, an
 /// overlay stack, focus, and the render-coalescing scheduler.
 ///
@@ -579,7 +588,10 @@ public final class TUI: Container {
     /// Where frames are written. `public` so ``TUI`` can witness
     /// ``TerminalApp/target`` — the driver reads it to apply a resize.
     public let target: any RenderTarget
+    public let renderMode: RenderMode
     var core: RenderCore
+    private var splitFooterCore: SplitFooterCore
+    private var footerRowsProvider: ((Int, Int) -> Int)?
 
     // Overlay + focus state (methods live in Overlay.swift).
     var focusedComponent: Component?
@@ -598,14 +610,37 @@ public final class TUI: Container {
     /// ``renderSync()`` throws directly instead.
     public var onRenderError: ((DoMoError) -> Void)?
 
-    public init(target: any RenderTarget, showHardwareCursor: Bool = false, clearOnShrink: Bool = false) {
+    public init(
+        target: any RenderTarget,
+        showHardwareCursor: Bool = false,
+        clearOnShrink: Bool = false,
+        renderMode: RenderMode = .inline
+    ) {
         self.target = target
+        self.renderMode = renderMode
         self.core = RenderCore(showHardwareCursor: showHardwareCursor, clearOnShrink: clearOnShrink)
+        self.splitFooterCore = SplitFooterCore()
         super.init()
     }
 
     /// How many full redraws the diff has taken.
-    public var fullRedraws: Int { core.fullRedraws }
+    public var fullRedraws: Int {
+        renderMode == .splitFooter ? splitFooterCore.fullRedraws : core.fullRedraws
+    }
+
+    /// Supply the live footer height after the coordinator has constructed its
+    /// status line and editor. The provider is evaluated on every frame because
+    /// a multi-line prompt can grow and shrink.
+    public func setFooterRowsProvider(_ provider: @escaping (Int, Int) -> Int) {
+        footerRowsProvider = provider
+    }
+
+    /// Emit a semantic prompt/command boundary for the split-footer terminal.
+    /// Ordinary inline rendering leaves the terminal stream untouched.
+    public func emitPromptMark(_ mark: TerminalPromptMark) {
+        guard renderMode == .splitFooter else { return }
+        target.write(String(decoding: TerminalNativeSequence.promptMark(mark), as: UTF8.self))
+    }
 
     /// Whether the focused component is a game-style consumer of key releases.
     var focusedWantsKeyRelease: Bool { focusedComponent?.wantsKeyRelease ?? false }
@@ -627,6 +662,23 @@ public final class TUI: Container {
         let width = target.columns
         let height = target.rows
         var lines = render(width: width)
+        if renderMode == .splitFooter {
+            let footerRows = footerRowsProvider?(width, height) ?? 1
+            if !overlayStack.isEmpty {
+                lines = SplitFooterCore.paddedLines(lines, footerRows: footerRows, height: height)
+                lines = compositeOverlays(lines, termWidth: width, termHeight: height)
+            }
+            let bytes = try splitFooterCore.frame(
+                lines: lines,
+                width: width,
+                height: height,
+                footerRows: footerRows,
+                hasOverlays: !overlayStack.isEmpty
+            )
+            target.write(bytes)
+            lastRenderAt = Date()
+            return
+        }
         if !overlayStack.isEmpty {
             lines = compositeOverlays(lines, termWidth: width, termHeight: height)
         }
@@ -638,6 +690,7 @@ public final class TUI: Container {
     /// Force the next frame to be a full clear+redraw (theme change, resize).
     public func requestFullRedraw() {
         core.forceFullRedraw()
+        splitFooterCore.forceFullRedraw()
         requestRender()
     }
 

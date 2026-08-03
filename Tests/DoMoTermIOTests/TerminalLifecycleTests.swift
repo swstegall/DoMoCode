@@ -59,6 +59,17 @@ struct TerminalLifecycleTests {
         )
     }
 
+    @Test("Mini-mode teardown resets DECSTBM before restoring the shell")
+    func splitFooterTeardown() {
+        let reset = Array("\u{1b}[r".utf8)
+        let bytes = TerminalLifecycle.teardownSequence(
+            useAlternateScreen: false,
+            resetScrollRegion: true
+        )
+        #expect(Array(bytes.prefix(reset.count)) == reset)
+        #expect(Array(bytes.dropFirst(reset.count)) == TerminalLifecycle.teardownSequence(useAlternateScreen: false))
+    }
+
     @Test("Taking the mouse enables button-event tracking, so a drag reports at all")
     func mouseEnableIncludesMotionTracking() {
         #expect(TerminalLifecycle.mouseSequence(enabled: true) == enableMouse)
