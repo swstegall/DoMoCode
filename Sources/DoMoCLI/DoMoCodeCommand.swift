@@ -536,7 +536,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
         // No `-p`: run interactively. The full-screen two-pane client is the
         // default (it drives a loopback runtime over the same HTTP/SSE surface a
-        // remote one would); `--inline` selects the classic inline REPL, and
+        // remote one would); `--inline` selects the classic inline REPL, `--mini`
+        // selects the normal-scrollback split-footer REPL, and
         // `--url` attaches the client to an already-running `domo --serve`. The live
         // terminal collaborators are assembled on the main actor so the
         // non-`Sendable` output target never crosses an isolation boundary.

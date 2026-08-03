@@ -17,16 +17,18 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 the MCP client, the Phase 5b command layer, Phase 5c client polish, Phase 5d terminal-native polish,
 Phase 10 context engineering, Phase 11's mutable tool suite, Phase 12's Git review surface, Phases
 13–17's checkpoints, agents, subagents, diagnostics, and memory, Phase 18 sandboxing, Phase 19's
-PTY/interactive-terminal seam, and Phase 20's export/replay surface are implemented, with focused
-coverage added here** — Phases 0–20 are complete. The focused Swift 6.3.3 debug and release matrices
-for the new paths are green: bounded PTY service, VT screen model, inline terminal provider, server
-ownership, transcript export/copy, HTML rendering, and trajectory replay. The broad macOS integration
+PTY/interactive-terminal seam, Phase 20's export/replay surface, and Phase 21's split-footer mini
+mode are implemented, with focused coverage added here** — Phases 0–21 are complete. The focused
+Swift 6.3.3 debug and release matrices for the new paths are green: bounded PTY service, VT screen
+model, inline terminal provider, server ownership, transcript export/copy, HTML rendering, trajectory
+replay, and split-footer rendering. The broad macOS integration
 matrix remains subject to existing timing-sensitive full-screen client/server tests.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
-`--inline` is the classic scrollback REPL; `-p` is headless.
+`--inline` is the classic scrollback REPL, `--mini` is the split-footer scrollback REPL; `-p`
+is headless.
 
 **Every phase of the pi port has shipped through Phase 12 Git review; the harness build-out is complete
-through Phase 17 memory and recall.**
+through Phase 21 split-footer rendering.**
 Phases 5a–5d — truth and plumbing, the command layer, client polish, and terminal-native polish — are
 complete. The default client now receives the same command registry as the inline surface,
 `/review`, `/init`, and `/tree` are available through that registry, trusted project instructions and
@@ -40,7 +42,7 @@ polish gap.**
 Beyond it,
 [a second survey of the sibling harnesses](#sibling-harnesses-and-prior-art) found a broad set of
 capabilities DoMoCode did not have — sandboxing, PTY access, export/replay, and split-footer rendering
-remain on the roadmap. The [roadmap](#roadmap) now sequences them.
+have since shipped. The [roadmap](#roadmap) records the implementation history.
 
 The goal has changed accordingly. DoMoCode began as a deliberately **narrowed** port; the
 [first scope expansion](#what-expanded-and-what-did-not) widened it in four directions, all of which
@@ -722,16 +724,20 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       *Exit met:* `domo export --html`, the shared Markdown copy flow, and replay branch creation are
       covered by focused debug/release tests; the replay report gives the new session path for a live,
       divergeable follow-up.
-- [ ] **Phase 21 — Split-footer render mode.** Very large, depends on nothing, retires debt, and can
+- [x] **Phase 21 — Split-footer render mode.** Very large, depends on nothing, retires debt, and can
       be pulled forward at any time. The alternate screen is the default today, which is why DoMoCode
       has paid to rebuild what the terminal does for free: ~739 lines of in-app drag selection, a
       mouse-capture debt the code documents, an F8 escape hatch and an OSC 52 copy path. A DECSTBM
       split-footer mode — transcript appended into real scrollback, footer pinned to the bottom N rows
       — makes most of that optional and restores the property
       [Non-goals](#non-goals-and-known-gaps) lists as the largest cost the expansion accepted. With
-      OSC 133 semantic prompt marks, which only pay off once there is real scrollback. *Exit:*
+      OSC 133 semantic prompt marks, which only pay off once there is real scrollback. *Exit met:*
       `domo --mini` gives a live prompt with a genuinely selectable, searchable, shell-composable
-      transcript above it.
+      transcript above it. The shipped mode reuses the interactive agent loop and PTY path, pins a
+      measured multiline footer with DECSTBM, resets terminal margins on crash-safe teardown, and
+      emits OSC 133 prompt and command boundaries. Terminal-oracle and real-binary PTY tests cover
+      append scrolling, retained history, resizing, cursor placement, image cleanup, and mode
+      selection.
 
 ### Decisions that reverse a stated non-goal
 
@@ -1233,12 +1239,13 @@ swift test             # run tests
 swift run domo         # run from source
 ```
 
-There are four ways to run it, and the default changed with Phase 7.
+There are five ways to run it, and the default changed with Phase 7.
 
 | Invocation | What it does |
 |---|---|
 | `domo` | The **full-screen** alternate-screen client. It spawns a loopback `DoMoServer` on an ephemeral port with a generated token, attaches over SSE, and tears it down on exit. This is the default. |
 | `domo --inline` | The classic **inline** REPL, painting into normal scrollback, in-process. Mid-run steering queues here and in the default client. |
+| `domo --mini` | The split-footer REPL: the same live prompt and agent loop, with transcript in normal scrollback and a measured footer pinned below it. |
 | `domo -p "…"` | Headless: prompt in, answer on stdout, exit code as the verdict. Add `--json` for a newline-delimited event stream. The only mode that pipes. |
 | `domo --serve` | The headless runtime behind a loopback-only HTTP/SSE server (default port 4100). Attach with `domo --url http://127.0.0.1:4100 --token …`. |
 
@@ -1344,10 +1351,10 @@ real — each of these is now a property of the shipped system, not a forecast:
 
 ## Contributing
 
-All shipped phases through Phase 20 are implemented.
-**Phase 20 — Export, replay, and scriptability — is complete**, followed by Phase 21. The [dependency spine](#the-dependency-spine)
-is the useful map: six seams gate most of what is left, and a change that lands one of them is worth
-more than a change that ships a feature around it. Issues proposing scope changes — particularly anything in
+All shipped phases through Phase 21 are implemented.
+**Phase 21 — Split-footer render mode — is complete**, including the normal-scrollback mini surface.
+The [dependency spine](#the-dependency-spine) remains useful historical context for how the work was
+sequenced. Issues proposing scope changes — particularly anything in
 [Non-goals](#non-goals-and-known-gaps) or the
 [reversal table](#decisions-that-reverse-a-stated-non-goal) — are welcome before code lands rather
 than after.
