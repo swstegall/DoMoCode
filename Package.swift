@@ -250,6 +250,17 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        // The LSP diagnostics seam. It depends on the headless tool contract,
+        // not the CLI, so another surface can inject the same provider later.
+        .target(
+            name: "DoMoLSP",
+            dependencies: [
+                "DoMoCore", "DoMoExec", "DoMoTools",
+                .product(name: "Subprocess", package: "swift-subprocess"),
+            ],
+            swiftSettings: safeSettings
+        ),
+
         // MARK: Server
 
         // The headless HTTP/SSE runtime server (Phase 6). Wraps the existing
@@ -298,7 +309,7 @@ let package = Package(
             name: "DoMoCLI",
             dependencies: [
                 "DoMoCore", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoLLM", "DoMoAgent",
-                "DoMoHarness", "DoMoExec", "DoMoGit", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoMCP", "DoMoServer", "DoMoClient",
+                "DoMoHarness", "DoMoExec", "DoMoGit", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoMCP", "DoMoLSP", "DoMoServer", "DoMoClient",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -364,6 +375,12 @@ let package = Package(
         .testTarget(
             name: "DoMoMCPTests",
             dependencies: ["DoMoMCP", "DoMoCore", "DoMoAgent", "DoMoLLM"],
+            swiftSettings: safeSettings
+        ),
+
+        .testTarget(
+            name: "DoMoLSPTests",
+            dependencies: ["DoMoLSP", "DoMoTools", "DoMoExec", "DoMoCore"],
             swiftSettings: safeSettings
         ),
 
