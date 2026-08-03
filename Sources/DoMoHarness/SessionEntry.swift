@@ -145,18 +145,30 @@ public struct Compaction: Sendable, Hashable, Codable {
     /// session totals.
     public var usage: Usage?
 
+    /// The cumulative files the compacted history read without modifying.
+    /// Optional for sessions written before the manifest was introduced.
+    public var readFiles: [String]?
+
+    /// The cumulative files the compacted history wrote or edited. Optional for
+    /// sessions written before the manifest was introduced.
+    public var modifiedFiles: [String]?
+
     public init(
         summary: String,
         tokensBefore: Int,
         firstKeptEntryId: String? = nil,
         retainedTail: [Message]? = nil,
-        usage: Usage? = nil
+        usage: Usage? = nil,
+        readFiles: [String]? = nil,
+        modifiedFiles: [String]? = nil
     ) {
         self.summary = summary
         self.tokensBefore = tokensBefore
         self.firstKeptEntryId = firstKeptEntryId
         self.retainedTail = retainedTail
         self.usage = usage
+        self.readFiles = readFiles
+        self.modifiedFiles = modifiedFiles
     }
 }
 
@@ -364,6 +376,8 @@ extension SessionTreeEntry: Codable {
         case firstKeptEntryId
         case retainedTail
         case usage
+        case readFiles
+        case modifiedFiles
         case fromId
         case targetId
         case label
@@ -408,7 +422,9 @@ extension SessionTreeEntry: Codable {
                     tokensBefore: try container.decode(Int.self, forKey: .tokensBefore),
                     firstKeptEntryId: try container.decodeIfPresent(String.self, forKey: .firstKeptEntryId),
                     retainedTail: try container.decodeIfPresent([Message].self, forKey: .retainedTail),
-                    usage: try container.decodeIfPresent(Usage.self, forKey: .usage)
+                    usage: try container.decodeIfPresent(Usage.self, forKey: .usage),
+                    readFiles: try container.decodeIfPresent([String].self, forKey: .readFiles),
+                    modifiedFiles: try container.decodeIfPresent([String].self, forKey: .modifiedFiles)
                 )
             )
         case .branchSummary:
@@ -461,6 +477,8 @@ extension SessionTreeEntry: Codable {
             try container.encodeIfPresent(compaction.firstKeptEntryId, forKey: .firstKeptEntryId)
             try container.encodeIfPresent(compaction.retainedTail, forKey: .retainedTail)
             try container.encodeIfPresent(compaction.usage, forKey: .usage)
+            try container.encodeIfPresent(compaction.readFiles, forKey: .readFiles)
+            try container.encodeIfPresent(compaction.modifiedFiles, forKey: .modifiedFiles)
         case .branchSummary(let branch):
             try container.encode(branch.fromId, forKey: .fromId)
             try container.encode(branch.summary, forKey: .summary)

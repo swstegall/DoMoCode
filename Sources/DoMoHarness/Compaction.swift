@@ -61,9 +61,10 @@ public typealias Summarizer = @Sendable ([Message]) async throws -> SummarizerRe
 public enum CompactionPrompts {
     /// The system prompt for a summarization request.
     public static let system =
-        "You are summarizing a conversation so it can be continued with less context. "
-        + "Produce a concise, faithful summary that preserves decisions, open questions, and any "
-        + "facts the assistant will need to continue the task."
+        "You are summarizing a conversation as a context checkpoint. Read the serialized conversation below and "
+        + "produce a concise, faithful summary that preserves decisions, open questions, and "
+        + "facts the assistant will need to continue the task. Do not continue the conversation "
+        + "or answer questions from it; output only the summary."
 
     /// The trailing user instruction appended after the history to summarize.
     public static let instruction =
@@ -82,6 +83,84 @@ public enum CompactionPrompts {
 
         """ + previous
     }
+}
+
+// MARK: - Deterministic conversation serialization
+
+/// Tool results are often the largest part of a coding-agent transcript. A
+/// summary needs their facts and errors, not several megabytes of command output.
+public let summarizerToolResultMaximumCharacters = 2_000
+
+/// Truncate a block for a summarization request while retaining its beginning and
+/// an exact count of what was omitted.
+public func truncateForSummary(_ text: String, maximumCharacters: Int = summarizerToolResultMaximumCharacters) -> String {
+    guard maximumCharacters >= 0, text.count > maximumCharacters else { return text }
+    let omitted = text.count - maximumCharacters
+    return String(text.prefix(maximumCharacters))
+        + "\n\n[... \(omitted) more characters truncated]"
+}
+
+/// A stable text projection for a model that is summarizing history.
+///
+/// Passing the original user/assistant/tool messages to a summarizer lets it
+/// mistake the request for a live conversation and continue the old task. This
+/// projection labels each role instead, sorts tool-call JSON keys through
+/// ``JSONValue/encodedString()``, and caps tool output before the request is
+/// built. The same input therefore produces the same bytes and a much smaller
+/// summarization bill.
+public func serializeConversation(_ messages: [Message]) -> String {
+    var parts: [String] = []
+
+    for message in messages {
+        switch message {
+        case .system(let system):
+            let text = system.content
+            if !text.isEmpty { parts.append("[System]: \(text)") }
+
+        case .user(let user):
+            var text = user.content.compactMap(\.textBlock?.text).joined()
+            let imageCount = user.content.reduce(into: 0) { count, block in
+                if block.imageBlock != nil { count += 1 }
+            }
+            if imageCount > 0 {
+                if !text.isEmpty { text += "\n" }
+                text += "[\(imageCount) image\(imageCount == 1 ? "" : "s") attached]"
+            }
+            if !text.isEmpty { parts.append("[User]: \(text)") }
+
+        case .assistant(let assistant):
+            var thinking: [String] = []
+            var toolCalls: [String] = []
+            var text: [String] = []
+            for block in assistant.content {
+                switch block {
+                case .reasoning(let reasoning): thinking.append(reasoning.text)
+                case .text(let block): text.append(block.text)
+                case .toolCall(let call):
+                    let arguments = (try? call.arguments.encodedString()) ?? "<unserializable>"
+                    toolCalls.append("\(call.name)(\(arguments))")
+                case .toolResult, .image:
+                    continue
+                }
+            }
+            if !thinking.isEmpty { parts.append("[Assistant thinking]: \(thinking.joined(separator: "\n"))") }
+            if !text.isEmpty { parts.append("[Assistant]: \(text.joined())") }
+            if !toolCalls.isEmpty { parts.append("[Assistant tool calls]: \(toolCalls.joined(separator: "; "))") }
+
+        case .tool(let result):
+            var output = truncateForSummary(result.output)
+            if !result.images.isEmpty {
+                if !output.isEmpty { output += "\n" }
+                output += "[\(result.images.count) image\(result.images.count == 1 ? "" : "s") returned]"
+            }
+            if !output.isEmpty {
+                let error = result.isError ? " error" : ""
+                parts.append("[Tool result\(error) (result.toolName)]: \(output)")
+            }
+        }
+    }
+
+    return parts.joined(separator: "\n\n")
 }
 
 // MARK: - Token estimation
@@ -675,10 +754,13 @@ public func prepareCompaction(
     var previousSummary: String?
     var priorRetained: [Message] = []
     var boundaryStart = 0
+    var fileOps = FileOperations()
     if let priorCompactionIndex, case .compaction(let prior) = pathEntries[priorCompactionIndex].payload {
         previousSummary = prior.summary
         priorRetained = prior.retainedTail ?? []
         boundaryStart = priorCompactionIndex + 1
+        fileOps.read.formUnion(prior.readFiles ?? [])
+        fileOps.edited.formUnion(prior.modifiedFiles ?? [])
     }
 
     var stream: [SourcedMessage] = priorRetained.map { SourcedMessage(message: $0, entryID: nil) }
@@ -712,7 +794,6 @@ public func prepareCompaction(
     let firstKeptEntryID = stream[cut...].first(where: { $0.entryID != nil })?.entryID
         ?? stream.last(where: { $0.entryID != nil })?.entryID
 
-    var fileOps = FileOperations()
     for message in messagesToSummarize { extractFileOps(from: message, into: &fileOps) }
     let lists = computeFileLists(fileOps)
 
@@ -750,7 +831,9 @@ public func makeCompactionEntry(
         tokensBefore: preparation.tokensBefore,
         firstKeptEntryId: preparation.firstKeptEntryId,
         retainedTail: preparation.retainedTail,
-        usage: usage
+        usage: usage,
+        readFiles: preparation.readFiles,
+        modifiedFiles: preparation.modifiedFiles
     )
     return SessionTreeEntry(id: id, parentId: parentId, timestamp: timestamp, payload: .compaction(compaction))
 }
@@ -784,7 +867,8 @@ public func compact(
     if let previousSummary = preparation.previousSummary {
         toSummarize.insert(.user(CompactionPrompts.priorSummaryPreamble(previousSummary)), at: 0)
     }
-    let summarized = try await summarize(toSummarize)
+    let serialized = serializeConversation(toSummarize)
+    let summarized = try await summarize([.user(UserMessage(content: [.text(serialized)]))])
     return makeCompactionEntry(
         from: preparation,
         id: id,

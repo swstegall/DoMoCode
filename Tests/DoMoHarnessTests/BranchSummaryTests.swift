@@ -123,7 +123,7 @@ struct BranchSummaryTests {
             Issue.record("expected a branch-summary payload")
             return
         }
-        #expect(branch.summary.contains("summarized 2 messages"))
+        #expect(branch.summary.contains("summarized 1 messages"))
     }
 
     /// ``BranchSummary/usage`` carries the same doc claim ``Compaction/usage`` does

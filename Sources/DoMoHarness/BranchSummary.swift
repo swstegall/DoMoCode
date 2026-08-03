@@ -160,7 +160,8 @@ public func summarizeBranch(
         let branch = BranchSummary(fromId: fromId, summary: "No content to summarize", usage: usage)
         return SessionTreeEntry(id: id, parentId: parentId, timestamp: timestamp, payload: .branchSummary(branch))
     }
-    let summarized = try await summarize(preparation.messages)
+    let serialized = serializeConversation(preparation.messages)
+    let summarized = try await summarize([.user(UserMessage(content: [.text(serialized)]))])
     return makeBranchSummaryEntry(
         from: preparation,
         fromId: fromId,

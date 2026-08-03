@@ -175,6 +175,76 @@ struct CompactionTests {
         #expect(formatFileOperations(readFiles: [], modifiedFiles: []) == "")
     }
 
+    @Test("serializeConversation is deterministic and caps tool output")
+    func serializeConversationIsStable() {
+        let call = ToolCallBlock(
+            id: "call",
+            name: "read",
+            arguments: .object(["z": .string("last"), "a": .int(1)])
+        )
+        let output = String(repeating: "x", count: 2_500)
+        let messages: [Message] = [
+            .user("inspect this"),
+            .assistant(AssistantMessage(content: [.toolCall(call)], model: "m")),
+            .tool(ToolResultBlock(toolCallID: "call", toolName: "read", output: output))
+        ]
+
+        let first = serializeConversation(messages)
+        let second = serializeConversation(messages)
+        #expect(first == second)
+        #expect(first.contains("[User]: inspect this"))
+        #expect(first.contains("[Assistant tool calls]: read({\"a\":1,\"z\":\"last\"})"))
+        #expect(first.contains("[... 500 more characters truncated]"))
+        #expect(first.count < output.count)
+    }
+
+    @Test("a later compaction carries the earlier file manifest forward")
+    func fileManifestIsCumulative() throws {
+        let prior = Compaction(
+            summary: "old",
+            tokensBefore: 100,
+            retainedTail: [user(chars: 40)],
+            readFiles: ["/old.swift"],
+            modifiedFiles: ["/changed.swift"]
+        )
+        var path = [entry(.compaction(prior), id: "c0", parent: nil)]
+        var parent = "c0"
+        for index in 0..<8 {
+            let message: Message
+            if index == 6 {
+                let call = ToolCallBlock(id: "read-new", name: "read", arguments: .object(["path": .string("/new.swift")]))
+                message = .assistant(AssistantMessage(content: [.toolCall(call)], model: "m"))
+            } else if index == 7 {
+                message = user(chars: 40)
+            } else {
+                message = index.isMultiple(of: 2) ? user(chars: 40) : assistant(text: String(repeating: "y", count: 40), totalTokens: 0)
+            }
+            let id = "e\(index)"
+            path.append(entry(.message(message), id: id, parent: parent))
+            parent = id
+        }
+
+        let preparation = try #require(
+            prepareCompaction(pathEntries: path, settings: CompactionSettings(keepRecentTokens: 1))
+        )
+        #expect(preparation.readFiles == ["/new.swift", "/old.swift"])
+        #expect(preparation.modifiedFiles == ["/changed.swift"])
+
+        let built = makeCompactionEntry(
+            from: preparation,
+            id: "c1",
+            parentId: parent,
+            timestamp: "t",
+            summary: "new"
+        )
+        guard case .compaction(let compaction) = built.payload else {
+            Issue.record("expected a compaction payload")
+            return
+        }
+        #expect(compaction.readFiles == ["/new.swift", "/old.swift"])
+        #expect(compaction.modifiedFiles == ["/changed.swift"])
+    }
+
     // MARK: - Selection
 
     /// A path of `count` alternating user/assistant message entries, each ~40
@@ -378,7 +448,7 @@ struct CompactionTests {
             await box.set(messages.count)
             return SummarizerResult(text: "S")
         }
-        #expect(await box.count == prep.messagesToSummarize.count)
+        #expect(await box.count == 1, "the summarizer receives one deterministic serialized message")
     }
 
     @Test("compact surfaces a thrown summarizer error unchanged")
