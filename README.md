@@ -16,10 +16,11 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 **The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine,
 the MCP client, the Phase 5b command layer, Phase 5c client polish, Phase 5d terminal-native polish,
 Phase 10 context engineering, Phase 11's mutable tool suite, Phase 12's Git review surface, Phases
-13–17's checkpoints, agents, subagents, diagnostics, and memory, Phase 18 sandboxing, and Phase 19's
-PTY/interactive-terminal seam are implemented, with focused coverage added here** — Phases 0–19 are
-complete. The focused Swift 6.3.3 debug and release matrices for the new paths are green: bounded PTY
-service, VT screen model, inline terminal provider, and server ownership. The broad macOS integration
+13–17's checkpoints, agents, subagents, diagnostics, and memory, Phase 18 sandboxing, Phase 19's
+PTY/interactive-terminal seam, and Phase 20's export/replay surface are implemented, with focused
+coverage added here** — Phases 0–20 are complete. The focused Swift 6.3.3 debug and release matrices
+for the new paths are green: bounded PTY service, VT screen model, inline terminal provider, server
+ownership, transcript export/copy, HTML rendering, and trajectory replay. The broad macOS integration
 matrix remains subject to existing timing-sensitive full-screen client/server tests.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
@@ -710,15 +711,17 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       interpretation, inline provider actions, headless refusal, sandbox propagation, and server
       session ownership are covered by focused tests; the live PTY path is suitable for `gh auth
       login` and ssh passphrase prompts.
-- [ ] **Phase 20 — Export, replay, and scriptability.** Small and self-contained. Markdown transcript
-      export with a content-options dialog and a shared `/copy` using the same formatter — the export
-      people actually want, and it should ship before any HTML viewer. Single-file HTML export is
-      implemented as a **second `ToolRenderTheme` emitting spans instead of SGR**, so `DoMoToolsUI`'s
-      renderers are reused verbatim rather than duplicated. Plus **trajectory replay** — a replay
-      `ToolExecutor` keyed by tool-call id over a recorded stream, driven by
-      `domo --replay <session> --until <entry>` — which is the debugging tool DoMoCode lacks entirely
-      and the cheapest possible "branch from here", needing no snapshot infrastructure. *Exit:*
-      `domo export --html` and `domo replay --until <id>` leaving a live, divergeable session.
+- [x] **Phase 20 — Export, replay, and scriptability.** Small and self-contained. Markdown transcript
+      export has content flags plus a full-screen content-options dialog, and `/copy` uses the same
+      formatter — the export people actually want, shipped before the HTML viewer. Single-file HTML
+      export is implemented as a **second `ToolRenderTheme` emitting spans instead of SGR**, so
+      `DoMoToolsUI`'s renderers are reused verbatim rather than duplicated. **Trajectory replay** is
+      a `ReplayToolExecutor` keyed by tool-call id over a recorded stream, driven by both
+      `domo --replay <session> --until <entry>` and `domo replay [<session>] --until <entry>`; it
+      validates the branch and writes a normal resumeable session without snapshot infrastructure.
+      *Exit met:* `domo export --html`, the shared Markdown copy flow, and replay branch creation are
+      covered by focused debug/release tests; the replay report gives the new session path for a live,
+      divergeable follow-up.
 - [ ] **Phase 21 — Split-footer render mode.** Very large, depends on nothing, retires debt, and can
       be pulled forward at any time. The alternate screen is the default today, which is why DoMoCode
       has paid to rebuild what the terminal does for free: ~739 lines of in-app drag selection, a
@@ -1341,8 +1344,8 @@ real — each of these is now a property of the shipped system, not a forecast:
 
 ## Contributing
 
-All shipped phases through Phase 19 are implemented.
-**Phase 19 — PTY and interactive terminal — is complete**, followed by Phases 20–21. The [dependency spine](#the-dependency-spine)
+All shipped phases through Phase 20 are implemented.
+**Phase 20 — Export, replay, and scriptability — is complete**, followed by Phase 21. The [dependency spine](#the-dependency-spine)
 is the useful map: six seams gate most of what is left, and a change that lands one of them is worth
 more than a change that ships a feature around it. Issues proposing scope changes — particularly anything in
 [Non-goals](#non-goals-and-known-gaps) or the
