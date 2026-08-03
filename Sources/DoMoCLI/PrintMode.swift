@@ -31,6 +31,7 @@ import DoMoGit
 import DoMoHarness
 import DoMoLLM
 import DoMoMCP
+import DoMoPermissions
 import DoMoTermGraphics
 import DoMoTermIO
 import DoMoTools
@@ -522,6 +523,10 @@ public struct PrintMode: Sendable {
     let registry: ToolRegistry
     let toolContext: ToolContext
     let workingDirectory: FilePath
+    /// The policy mode selected for this one-shot run. Print mode has no live Tab
+    /// switch, but it shares the same exact plan-file instruction and permission
+    /// boundary as the server and inline surfaces.
+    let agentMode: AgentMode
     let mode: OutputMode
     /// The turn bound, or `nil` for unbounded — the shipping default. See
     /// ``DoMoCodeCommand/turnLimit``.
@@ -573,6 +578,7 @@ public struct PrintMode: Sendable {
         registry: ToolRegistry,
         toolContext: ToolContext,
         workingDirectory: FilePath,
+        agentMode: AgentMode = .build,
         mode: OutputMode,
         maxTurns: Int?,
         channel: OutputChannel,
@@ -596,6 +602,7 @@ public struct PrintMode: Sendable {
         self.registry = registry
         self.toolContext = toolContext
         self.workingDirectory = workingDirectory
+        self.agentMode = agentMode
         self.mode = mode
         self.maxTurns = maxTurns
         self.maxCostPerRun = maxCostPerRun
@@ -660,12 +667,20 @@ public struct PrintMode: Sendable {
             workingDirectory: workingDirectory,
             toolNames: registry.names + mcpTools.map(\.definition.name)
         )
+        let planPath = AgentModePolicy.planPath(
+            workingDirectory: workingDirectory.string,
+            sessionID: "print"
+        )
+        let addModePrompt: @Sendable (String) -> String = { prompt in
+            guard agentMode == .plan else { return prompt }
+            return prompt + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+        }
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         if let promptWorkspace {
-            systemPromptForPrompt = { prompt in promptWorkspace.systemPrompt(for: prompt) }
+            systemPromptForPrompt = { prompt in addModePrompt(promptWorkspace.systemPrompt(for: prompt)) }
         }
         var configuration = AgentHarness.Configuration(
-            systemPrompt: promptWorkspace?.baseSystemPrompt ?? fallbackSystemPrompt,
+            systemPrompt: addModePrompt(promptWorkspace?.baseSystemPrompt ?? fallbackSystemPrompt),
             systemPromptForPrompt: systemPromptForPrompt,
             tools: tools,
             getTools: { [registry, toolContext, mcpTools, mcpToolResolver] _ in
@@ -673,15 +688,19 @@ public struct PrintMode: Sendable {
                 return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + currentMcp
             },
             systemPromptForPromptAndTools: { [promptBuilder, promptWorkspace] prompt, toolNames in
-                guard let promptBuilder else { return promptWorkspace?.systemPrompt(for: prompt) ?? fallbackSystemPrompt }
-                return (try? SystemPromptBuilder(
+                guard let promptBuilder else {
+                    return addModePrompt(promptWorkspace?.systemPrompt(for: prompt) ?? fallbackSystemPrompt)
+                }
+                let base = (try? SystemPromptBuilder(
                     workingDirectory: promptBuilder.workingDirectory,
                     configDirectory: promptBuilder.configDirectory,
                     toolNames: toolNames,
-                    projectTrusted: promptBuilder.projectTrusted
+                    projectTrusted: promptBuilder.projectTrusted,
+                    agentName: promptBuilder.agentName
                 ).build().systemPrompt(for: prompt))
                     ?? promptWorkspace?.systemPrompt(for: prompt)
                     ?? fallbackSystemPrompt
+                return addModePrompt(base)
             },
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
@@ -738,7 +757,7 @@ public struct PrintMode: Sendable {
                 text: prompt,
                 model: nil,
                 reasoningEffort: nil,
-                systemPrompt: promptWorkspace?.systemPrompt(for: prompt) ?? fallbackSystemPrompt
+                systemPrompt: addModePrompt(promptWorkspace?.systemPrompt(for: prompt) ?? fallbackSystemPrompt)
             )
         }
         let renderedPrompt: String
@@ -772,7 +791,7 @@ public struct PrintMode: Sendable {
             runOverride = AgentHarness.RunOverride(
                 model: commandModel,
                 streamFn: stream,
-                systemPrompt: systemPrompt
+                systemPrompt: addModePrompt(systemPrompt)
             )
         }
         let result = try await harness.run(

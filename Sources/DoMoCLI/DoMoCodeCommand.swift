@@ -602,6 +602,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             registry: registry,
             toolContext: toolContext,
             workingDirectory: workingDirectory,
+            agentMode: selectedMode,
             mode: json ? .json : .text,
             maxTurns: turnLimit,
             channel: OutputChannel(),

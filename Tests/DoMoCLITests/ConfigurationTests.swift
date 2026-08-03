@@ -4,6 +4,7 @@
 import DoMoCLI
 import DoMoCore
 import DoMoLLM
+import DoMoPermissions
 import Foundation
 import Testing
 
@@ -33,6 +34,25 @@ struct ConfigurationTests {
         #expect(config.timeout == .milliseconds(600_000))
         #expect(config.streamTimeout == .milliseconds(120_000))
         #expect(config.logLevel == .warning)
+    }
+
+    @Test
+    func modeRulesDecodeAndLayerUserBeforeProject() throws {
+        let user = Settings(agentModes: [
+            "plan": [PermissionRule(permission: "read", pattern: "*.md", action: .deny)]
+        ])
+        let project = Settings(agentModes: [
+            "plan": [PermissionRule(permission: "bash", pattern: "*", action: .deny)]
+        ])
+        let resolved = try resolve(project: project, user: user)
+        #expect(resolved.agentModes["plan"] == [
+            PermissionRule(permission: "read", pattern: "*.md", action: .deny),
+            PermissionRule(permission: "bash", pattern: "*", action: .deny),
+        ])
+
+        let encoded = #"{"agentModes":{"plan":[{"permission":"write","pattern":"*","action":"deny"}]}}"#
+        let decoded = try JSONDecoder().decode(Settings.self, from: Data(encoded.utf8))
+        #expect(decoded.agentModes?["plan"]?.first?.action == .deny)
     }
 
     // MARK: Precedence
