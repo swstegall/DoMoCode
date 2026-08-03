@@ -2078,6 +2078,13 @@ public struct InteractiveMode: Sendable {
         )
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
         let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
+        let connectedMCPManager = mcpManager
+        let connectedMCPTools = mcpTools
+        let toolResolver: @Sendable (String) async -> [any AgentTool] = { _ in
+            let currentMcp = await connectedMCPManager?.tools() ?? connectedMCPTools
+            let visible = PermissionSetup.visibleMCPTools(currentMcp, ruleset: permission.ruleset)
+            return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visible
+        }
 
         let promptWorkspace = try SystemPromptBuilder(
             workingDirectory: workDirectory,
@@ -2085,6 +2092,14 @@ public struct InteractiveMode: Sendable {
             toolNames: registry.names + visibleMcp.map(\.definition.name),
             projectTrusted: true
         ).build()
+        let promptForTools: @Sendable (String, [String]) -> String = { prompt, toolNames in
+            (try? SystemPromptBuilder(
+                workingDirectory: workDirectory,
+                configDirectory: FilePath(configDirectory),
+                toolNames: toolNames,
+                projectTrusted: true
+            ).build().systemPrompt(for: prompt)) ?? promptWorkspace.systemPrompt(for: prompt)
+        }
         let commandProcessor = PromptCommandProcessor(
             workspace: promptWorkspace,
             workingDirectory: workDirectory,
@@ -2122,6 +2137,8 @@ public struct InteractiveMode: Sendable {
             systemPrompt: promptWorkspace.baseSystemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
             tools: tools,
+            getTools: toolResolver,
+            systemPromptForPromptAndTools: promptForTools,
             model: runtime.model,
             streamFn: streamFn,
             // A distinct small model compacts on its own request rather than through

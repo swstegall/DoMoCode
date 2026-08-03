@@ -35,6 +35,48 @@ import DoMoLLM
 /// dropped frame, it is a route that stopped working.
 public let serverProtocolVersion = 1
 
+// MARK: - Structured question wire values
+
+/// One option in a server-originated structured question.
+public struct ServerQuestionOption: Sendable, Hashable, Codable {
+    public var label: String
+    public var description: String?
+
+    public init(label: String, description: String? = nil) {
+        self.label = label
+        self.description = description
+    }
+}
+
+/// One prompt in a server-originated structured question batch.
+public struct ServerQuestionPrompt: Sendable, Hashable, Codable {
+    public var header: String?
+    public var question: String
+    public var options: [ServerQuestionOption]
+    public var allowsMultiple: Bool
+
+    public init(
+        header: String? = nil,
+        question: String,
+        options: [ServerQuestionOption],
+        allowsMultiple: Bool = false
+    ) {
+        self.header = header
+        self.question = question
+        self.options = options
+        self.allowsMultiple = allowsMultiple
+    }
+}
+
+/// The answer for one prompt in a structured question batch.
+public struct ServerQuestionAnswer: Sendable, Hashable, Codable {
+    public var selectedLabels: [String]
+
+    public init(selectedLabels: [String]) {
+        self.selectedLabels = selectedLabels
+    }
+}
+
 // MARK: - ServerEvent
 
 /// One frame on the `GET /session/{id}/events` stream.
@@ -103,6 +145,12 @@ public enum ServerEvent: Sendable, Hashable {
     /// The pending prompt with this id was answered (by a client, or torn down when
     /// the run ended). A subscriber still showing it should dismiss it.
     case permissionResolved(id: String)
+
+    /// A structured question the current tool call is waiting for. Answered
+    /// out-of-band over `POST /session/{id}/question`.
+    case questionRequest(id: String, sessionID: String, questions: [ServerQuestionPrompt])
+    /// The pending structured question was answered or cancelled.
+    case questionResolved(id: String)
 
     /// The number of messages waiting for the active run, plus the delivery mode
     /// the runtime will use at the next turn boundary. Additive and intentionally
@@ -264,6 +312,8 @@ extension ServerEvent: Codable {
         case toolEnd = "tool_end"
         case permissionRequest = "permission_request"
         case permissionResolved = "permission_resolved"
+        case questionRequest = "question_request"
+        case questionResolved = "question_resolved"
         case queueUpdate = "queue_update"
         case notice
     }
@@ -288,6 +338,7 @@ extension ServerEvent: Codable {
         case always
         case metadata
         case disableAlways
+        case questions
         case count
         case mode
         case notice
@@ -351,6 +402,14 @@ extension ServerEvent: Codable {
             )
         case .permissionResolved:
             self = .permissionResolved(id: try container.decode(String.self, forKey: .id))
+        case .questionRequest:
+            self = .questionRequest(
+                id: try container.decode(String.self, forKey: .id),
+                sessionID: try container.decode(String.self, forKey: .sessionID),
+                questions: try container.decode([ServerQuestionPrompt].self, forKey: .questions)
+            )
+        case .questionResolved:
+            self = .questionResolved(id: try container.decode(String.self, forKey: .id))
         case .queueUpdate:
             self = .queueUpdate(
                 count: try container.decode(Int.self, forKey: .count),
@@ -413,6 +472,14 @@ extension ServerEvent: Codable {
             try container.encode(disableAlways, forKey: .disableAlways)
         case .permissionResolved(let id):
             try container.encode(Kind.permissionResolved, forKey: .type)
+            try container.encode(id, forKey: .id)
+        case .questionRequest(let id, let sessionID, let questions):
+            try container.encode(Kind.questionRequest, forKey: .type)
+            try container.encode(id, forKey: .id)
+            try container.encode(sessionID, forKey: .sessionID)
+            try container.encode(questions, forKey: .questions)
+        case .questionResolved(let id):
+            try container.encode(Kind.questionResolved, forKey: .type)
             try container.encode(id, forKey: .id)
         case .queueUpdate(let count, let mode):
             try container.encode(Kind.queueUpdate, forKey: .type)

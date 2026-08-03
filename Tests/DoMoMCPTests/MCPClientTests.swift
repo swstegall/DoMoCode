@@ -332,6 +332,55 @@ struct MCPClientTests {
         }
         #expect(!alive)
     }
+
+    @Test("tools/list_changed refreshes the manager without a reconnect")
+    func toolsListChangedRefreshesManager() async throws {
+        guard FileManager.default.fileExists(atPath: "/usr/bin/python3") else { return }
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("domo-mcp-dynamic-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let script = dir.appendingPathComponent("server.py")
+        let source = #"""
+            import sys, json, threading, time
+            state = {"changed": False}
+            def send(o):
+                sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+            def announce():
+                time.sleep(0.2)
+                state["changed"] = True
+                send({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
+            for line in sys.stdin:
+                line = line.strip()
+                if not line: continue
+                m = json.loads(line); method = m.get("method"); mid = m.get("id")
+                if method == "initialize":
+                    send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":True}},"serverInfo":{"name":"dynamic","version":"1"}}})
+                    threading.Thread(target=announce, daemon=True).start()
+                elif method == "tools/list":
+                    tools = [{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{}}}]
+                    if state["changed"]:
+                        tools.append({"name":"new","description":"Added later","inputSchema":{"type":"object","properties":{}}})
+                    send({"jsonrpc":"2.0","id":mid,"result":{"tools":tools}})
+            """#
+        try source.write(to: script, atomically: true, encoding: .utf8)
+
+        let manager = MCPManager()
+        let initial = await manager.connect(
+            servers: ["srv": MCPServerConfig(command: ["/usr/bin/python3", script.path], timeout: 4000)],
+            workspaceDirectory: dir.path
+        )
+        defer { Task { await manager.shutdown() } }
+        #expect(initial.map(\.definition.name) == ["srv_echo"])
+
+        var refreshed = initial
+        for _ in 0..<100 {
+            refreshed = await manager.tools()
+            if refreshed.contains(where: { $0.definition.name == "srv_new" }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(refreshed.map(\.definition.name) == ["srv_echo", "srv_new"])
+    }
 }
 
 @Suite("LineFramer")

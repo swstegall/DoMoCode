@@ -402,6 +402,33 @@ public struct ToolContext: Sendable {
         )
     }
 
+    /// Return the same sandbox and session resources with a late-bound question
+    /// handler. Server sessions use this to give each request its own session id
+    /// while retaining the one background-process manager for the context.
+    public func withQuestionHandler(_ handler: QuestionHandler?) -> ToolContext {
+        withQuestionHandler(handler, backgroundProcesses: backgroundProcesses)
+    }
+
+    /// Return the same sandbox and session resources with a late-bound question
+    /// handler and an explicitly supplied background-process scope. The server
+    /// uses this overload because its base context is shared while each live
+    /// session needs its own long-running children.
+    public func withQuestionHandler(
+        _ handler: QuestionHandler?,
+        backgroundProcesses: BackgroundProcessManager
+    ) -> ToolContext {
+        ToolContext(
+            fileSystem: fileSystem,
+            shell: shell,
+            mutations: mutations,
+            toolLocator: toolLocator,
+            environment: environment,
+            questionHandler: handler,
+            webFetch: webFetch,
+            backgroundProcesses: backgroundProcesses
+        )
+    }
+
     public var sandbox: PathSandbox { fileSystem.sandbox }
     public var base: any FileSystem { fileSystem.base }
     public var workingDirectory: FilePath { fileSystem.workingDirectory }

@@ -57,6 +57,14 @@ private struct PermissionReplyBody: Decodable {
     var message: String?
 }
 
+/// `POST /session/{id}/question` body. `answers: nil` means the client
+/// cancelled the structured prompt, which the tool turns into a model-visible
+/// cancellation error.
+private struct QuestionReplyBody: Decodable {
+    var requestID: String
+    var answers: [ServerQuestionAnswer]?
+}
+
 private struct ModelBody: Decodable { var modelID: String }
 private struct RenameBody: Decodable { var name: String? }
 private struct LabelBody: Decodable { var targetID: String; var label: String? }
@@ -337,6 +345,31 @@ public struct DoMoServer: Sendable {
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
                 return try Self.json(try await self.runtime.pendingPermissions(sessionID: id))
+            }
+        }
+
+        // Answer a structured question raised by the `question` tool. The
+        // continuation stays parked in the runtime until this route resolves it.
+        router.post("/session/:id/question") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(QuestionReplyBody.self, request)
+                try await self.runtime.resolveQuestion(
+                    sessionID: id,
+                    requestID: body.requestID,
+                    answers: body.answers
+                )
+                return Response(status: .ok)
+            }
+        }
+
+        // The level-triggered companion to the SSE question edge. A reconnecting
+        // client uses it to recover an ask that was dropped from the bounded
+        // event buffer or arrived while the stream was down.
+        router.get("/session/:id/questions") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.pendingQuestions(sessionID: id))
             }
         }
 

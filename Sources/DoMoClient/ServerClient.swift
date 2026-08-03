@@ -119,6 +119,7 @@ public struct ServerClient: Sendable {
     private struct CreateBody: Encodable { let resume: String? }
     private struct PromptBody: Encodable { let prompt: String; let images: [ImageBlock]? }
     private struct PermissionReplyBody: Encodable { let requestID: String; let reply: String; let message: String? }
+    private struct QuestionReplyBody: Encodable { let requestID: String; let answers: [ServerQuestionAnswer]? }
     private struct ModelBody: Encodable { let modelID: String }
     private struct RenameBody: Encodable { let name: String? }
     private struct LabelBody: Encodable { let targetID: String; let label: String? }
@@ -338,6 +339,28 @@ public struct ServerClient: Sendable {
     /// 200. Each is a `ServerEvent.permissionRequest`.
     public func pendingPermissions(sessionID: String) async throws -> [ServerEvent] {
         let path = "/session/\(sessionID)/permissions"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([ServerEvent].self, from: data)
+    }
+
+    /// Answer or cancel a structured question raised by the server-side
+    /// `question` tool. `POST /session/{id}/question` → 200.
+    public func resolveQuestion(
+        sessionID: String,
+        requestID: String,
+        answers: [ServerQuestionAnswer]?
+    ) async throws {
+        let path = "/session/\(sessionID)/question"
+        let body = try JSONEncoder().encode(QuestionReplyBody(requestID: requestID, answers: answers))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+    }
+
+    /// The still-open structured questions for a session. `GET
+    /// /session/{id}/questions` → 200.
+    public func pendingQuestions(sessionID: String) async throws -> [ServerEvent] {
+        let path = "/session/\(sessionID)/questions"
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([ServerEvent].self, from: data)

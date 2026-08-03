@@ -49,6 +49,7 @@ public actor MCPClient {
     private let clientVersion: String
     private let sensitiveEnvKeys: Set<String>
     private let log: (@Sendable (String) -> Void)?
+    private let onToolsChanged: (@Sendable () async -> Void)?
 
     private let process = PersistentProcess()
     private var readerTask: Task<Void, Never>?
@@ -72,7 +73,8 @@ public actor MCPClient {
         workspaceDirectory: String,
         clientVersion: String = "0.1.0",
         sensitiveEnvKeys: Set<String> = [],
-        log: (@Sendable (String) -> Void)? = nil
+        log: (@Sendable (String) -> Void)? = nil,
+        onToolsChanged: (@Sendable () async -> Void)? = nil
     ) {
         self.serverName = serverName
         self.config = config
@@ -80,6 +82,7 @@ public actor MCPClient {
         self.clientVersion = clientVersion
         self.sensitiveEnvKeys = sensitiveEnvKeys
         self.log = log
+        self.onToolsChanged = onToolsChanged
     }
 
     // MARK: Connect / discover
@@ -299,7 +302,9 @@ public actor MCPClient {
         // Don't run before the initial discovery has installed the cache — a mid-handshake
         // list_changed would otherwise race a second listTools into `toolsCache`.
         guard handshakeComplete, !closed, let refreshed = try? await listTools() else { return }
+        guard refreshed != toolsCache else { return }
         toolsCache = refreshed
+        await onToolsChanged?()
     }
 
     private func timeout(id: Int, method: String) async {

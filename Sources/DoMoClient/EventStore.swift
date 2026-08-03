@@ -32,6 +32,22 @@ public final class EventStore {
         case running
     }
 
+    /// A structured question waiting for an answer from the selected client.
+    /// The server keeps the corresponding tool call suspended until the answers
+    /// are posted, so this is deliberately a value snapshot rather than a UI
+    /// callback or a transport object.
+    public struct PendingQuestion: Sendable, Hashable {
+        public var id: String
+        public var sessionID: String
+        public var questions: [ServerQuestionPrompt]
+
+        public init(id: String, sessionID: String, questions: [ServerQuestionPrompt]) {
+            self.id = id
+            self.sessionID = sessionID
+            self.questions = questions
+        }
+    }
+
     /// The session list backing the sidebar. Populated by `GET /sessions`; there
     /// is no cross-session push, so it is refreshed explicitly.
     public private(set) var sessions: [SessionSummary] = []
@@ -48,6 +64,9 @@ public final class EventStore {
     /// asked over SSE and the run is parked until a client answers. `nil` when nothing
     /// is awaiting approval. Per-session, so it is cleared on a session switch.
     public private(set) var pendingPermission: PermissionRequest?
+    /// A pending structured question for the selected session. The full-screen
+    /// client owns the presentation; the store only folds the wire state.
+    public private(set) var pendingQuestion: PendingQuestion?
     /// Messages accepted while the selected session was already running.
     public private(set) var queuedMessageCount: Int = 0
     /// The server's steering delivery mode, when the runtime reports one.
@@ -56,6 +75,9 @@ public final class EventStore {
     /// `GET /permissions` reconcile can't resurrect a dead one that a `permission_resolved`
     /// raced ahead of. Cleared on a session switch (ids reset per session).
     private var resolvedRequestIDs: Set<String> = []
+    /// Question ids already resolved (or whose run ended), so a reconnect
+    /// reconcile cannot resurrect a stale request after its SSE edge was lost.
+    private var resolvedQuestionIDs: Set<String> = []
 
     /// The file backing the selected session, when the server told us.
     ///
@@ -255,6 +277,8 @@ public final class EventStore {
                 settleActiveToolCalls()
                 if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
                 pendingPermission = nil
+                if let id = pendingQuestion?.id { resolvedQuestionIDs.insert(id) }
+                pendingQuestion = nil
             }
 
         case .heartbeat, .turnStart, .turnEnd:
@@ -306,6 +330,8 @@ public final class EventStore {
             // A turn that ended cannot still be waiting on approval.
             if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
             pendingPermission = nil
+            if let id = pendingQuestion?.id { resolvedQuestionIDs.insert(id) }
+            pendingQuestion = nil
             // The loop emits a `tool_end` for every call it started, including
             // aborted ones — but a run that died before the loop settled (the
             // server's `errored` close) can leave a row in flight. Settle it, so a
@@ -329,6 +355,16 @@ public final class EventStore {
             if pendingPermission?.id == id {
                 pendingPermission = nil
                 markPendingToolAwaitingApproval()
+            }
+
+        case .questionRequest(let id, let sessionID, let questions):
+            guard sessionID == selectedSessionID, !resolvedQuestionIDs.contains(id) else { return }
+            pendingQuestion = PendingQuestion(id: id, sessionID: sessionID, questions: questions)
+
+        case .questionResolved(let id):
+            resolvedQuestionIDs.insert(id)
+            if pendingQuestion?.id == id {
+                pendingQuestion = nil
             }
 
         case .messageStart(let message):
@@ -448,6 +484,8 @@ public final class EventStore {
             settleActiveToolCalls()
             if let id = pendingPermission?.id { resolvedRequestIDs.insert(id) }
             pendingPermission = nil
+            if let id = pendingQuestion?.id { resolvedQuestionIDs.insert(id) }
+            pendingQuestion = nil
         }
         // Drop a modal the server no longer has parked. This is the case where the
         // `permission_resolved` echo was the frame that got lost: the run moved on,
@@ -456,6 +494,12 @@ public final class EventStore {
             resolvedRequestIDs.insert(pending.id)
             pendingPermission = nil
             markPendingToolAwaitingApproval()
+        }
+        if let pending = pendingQuestion,
+           let ids = status.pendingQuestionIDs,
+           !ids.contains(pending.id) {
+            resolvedQuestionIDs.insert(pending.id)
+            pendingQuestion = nil
         }
         adoptAccounting(status)
         if let count = status.queuedMessageCount {
@@ -660,6 +704,14 @@ public final class EventStore {
         return ids.contains { !resolvedRequestIDs.contains($0) }
     }
 
+    /// Whether any server-reported question is neither parked in this store nor
+    /// already answered. This is the level-triggered companion to the SSE
+    /// `question_request` edge.
+    public func hasUnseenQuestion(in ids: [String]) -> Bool {
+        guard pendingQuestion == nil else { return false }
+        return ids.contains { !resolvedQuestionIDs.contains($0) }
+    }
+
     // MARK: Failures
 
     /// Append a failure row.
@@ -806,6 +858,14 @@ public final class EventStore {
         onChange?()
     }
 
+    /// Clear a question optimistically after the client submits its answer. The
+    /// server's `question_resolved` echo remains authoritative and idempotent.
+    public func clearPendingQuestion() {
+        guard pendingQuestion != nil else { return }
+        pendingQuestion = nil
+        onChange?()
+    }
+
     /// Turn any still-in-flight tool row into a terminal state. A call that never
     /// reported an end did not succeed, so it settles as failed rather than being
     /// left to look either finished or forever busy.
@@ -849,5 +909,7 @@ public final class EventStore {
         // it (GET /permissions), so it must not linger and show against the wrong one.
         pendingPermission = nil
         resolvedRequestIDs = []
+        pendingQuestion = nil
+        resolvedQuestionIDs = []
     }
 }

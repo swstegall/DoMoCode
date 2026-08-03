@@ -29,6 +29,7 @@ import DoMoAgent
 import DoMoCore
 import DoMoHarness
 import DoMoLLM
+import DoMoMCP
 import DoMoTermGraphics
 import DoMoTermIO
 import DoMoTools
@@ -540,6 +541,9 @@ public struct PrintMode: Sendable {
     /// Tools discovered from configured MCP servers (Phase 8c), appended after the
     /// built-ins. Already connected by the caller, which owns their teardown.
     let mcpTools: [any AgentTool]
+    /// Resolves the current visible MCP tools before each assistant request.
+    /// `nil` preserves the fixed set used by callers without a live manager.
+    let mcpToolResolver: (@Sendable () async -> [any AgentTool])?
     /// When and how aggressively automatic pre-turn compaction fires. Forwarded to
     /// the harness, which clamps it against the window; before it was plumbed, a
     /// `-p` run ignored the user's `compaction` settings entirely.
@@ -554,6 +558,7 @@ public struct PrintMode: Sendable {
     /// Installing a real summarizer is what removes that turn from the count.
     let summarizer: Summarizer?
     let promptWorkspace: PromptWorkspace?
+    let promptBuilder: SystemPromptBuilder?
     let commandProcessor: PromptCommandProcessor?
     let commandRuntimeFactory: CommandRuntimeFactory?
 
@@ -574,10 +579,12 @@ public struct PrintMode: Sendable {
         sessionDirectory: FilePath,
         beforeToolCall: BeforeToolCallHook? = nil,
         mcpTools: [any AgentTool] = [],
+        mcpToolResolver: (@Sendable () async -> [any AgentTool])? = nil,
         modelRuntime: ModelRuntime,
         compaction: CompactionSettings = .default,
         summarizer: Summarizer? = nil,
         promptWorkspace: PromptWorkspace? = nil,
+        promptBuilder: SystemPromptBuilder? = nil,
         commandProcessor: PromptCommandProcessor? = nil,
         commandRuntimeFactory: CommandRuntimeFactory? = nil,
         maxCostPerRun: Decimal? = nil,
@@ -597,9 +604,11 @@ public struct PrintMode: Sendable {
         self.beforeToolCall = beforeToolCall
         self.onNoProgress = onNoProgress
         self.mcpTools = mcpTools
+        self.mcpToolResolver = mcpToolResolver
         self.compaction = compaction
         self.summarizer = summarizer
         self.promptWorkspace = promptWorkspace
+        self.promptBuilder = promptBuilder
         self.commandProcessor = commandProcessor
         self.commandRuntimeFactory = commandRuntimeFactory
     }
@@ -650,6 +659,21 @@ public struct PrintMode: Sendable {
             systemPrompt: promptWorkspace?.baseSystemPrompt ?? fallbackSystemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
             tools: tools,
+            getTools: { [registry, toolContext, mcpTools, mcpToolResolver] _ in
+                let currentMcp = await mcpToolResolver?() ?? mcpTools
+                return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + currentMcp
+            },
+            systemPromptForPromptAndTools: { [promptBuilder, promptWorkspace] prompt, toolNames in
+                guard let promptBuilder else { return promptWorkspace?.systemPrompt(for: prompt) ?? fallbackSystemPrompt }
+                return (try? SystemPromptBuilder(
+                    workingDirectory: promptBuilder.workingDirectory,
+                    configDirectory: promptBuilder.configDirectory,
+                    toolNames: toolNames,
+                    projectTrusted: promptBuilder.projectTrusted
+                ).build().systemPrompt(for: prompt))
+                    ?? promptWorkspace?.systemPrompt(for: prompt)
+                    ?? fallbackSystemPrompt
+            },
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
             // Installing one is not only about spending less on compaction. The

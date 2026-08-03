@@ -122,6 +122,58 @@ struct EventStoreTests {
         #expect(store.pendingPermission?.id == "per_2")
     }
 
+    // MARK: Structured question fold
+
+    private func questionEvent(id: String = "q_1", session: String = "s") -> ServerEvent {
+        .questionRequest(
+            id: id,
+            sessionID: session,
+            questions: [ServerQuestionPrompt(
+                header: "Storage",
+                question: "Which format?",
+                options: [
+                    ServerQuestionOption(label: "JSON", description: "Portable"),
+                    ServerQuestionOption(label: "SQLite"),
+                ],
+                allowsMultiple: false
+            )]
+        )
+    }
+
+    @Test("A question_request becomes pending and question_resolved clears it")
+    func questionFold() {
+        let store = EventStore()
+        store.select("s")
+        store.apply(questionEvent())
+        #expect(store.pendingQuestion?.id == "q_1")
+        #expect(store.pendingQuestion?.questions.first?.options.map(\.label) == ["JSON", "SQLite"])
+        store.apply(.questionResolved(id: "q_1"))
+        #expect(store.pendingQuestion == nil)
+    }
+
+    @Test("Question reconciliation drops stale ids and recovers unseen ids")
+    func questionReconciliation() {
+        let store = EventStore()
+        store.select("s")
+        #expect(store.hasUnseenQuestion(in: ["q_1"]))
+        store.apply(questionEvent())
+        #expect(!store.hasUnseenQuestion(in: ["q_1"]))
+        store.adopt(SessionStatus(
+            sessionID: "s",
+            running: true,
+            pendingPermissionIDs: [],
+            subscribers: 1,
+            runStartedAt: nil,
+            pendingQuestionIDs: []
+        ))
+        #expect(store.pendingQuestion == nil)
+        store.apply(questionEvent(id: "q_2"))
+        #expect(store.pendingQuestion?.id == "q_2")
+        store.apply(.questionResolved(id: "q_2"))
+        store.apply(questionEvent(id: "q_2"))
+        #expect(store.pendingQuestion == nil)
+    }
+
     @Test("A queue_update shows the accepted count and selecting a session clears it")
     func queueUpdate() {
         let store = EventStore()

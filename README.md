@@ -541,26 +541,22 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       and `/context` are available in the inline and full-screen clients and over the server client API.
       *Exit met:* a long session against a small-context alias recovers instead of dying, and the meter
       says `?` when the model window is genuinely unknown.
-- [ ] **Phase 11 — Mutable tool set, and the tool suite.** The seam phase. Making tool resolution a
-      per-request function — `tools(agent:model:ruleset:config:)`, with the system prompt's tool list
-      computed from the result — is the prerequisite for plan mode, agents, subagents, and the MCP
-      `tools/list_changed` work already deferred out of Phase 8d for exactly this reason. Registration
-      order must stay stable, because a reshuffling tool list breaks prompt caching. Spent on:
-      `todowrite`; `question` (structured multiple-choice, on 5c's dialog seam, denied outright under
-      `-p` or a headless run deadlocks); `webfetch` with its own permission kind; `glob`; `read`
-      gaining directory listing, "did you mean", and nested-`AGENTS.md` injection; `finish`;
-      session-scoped `background_process`; the edit engine's multi-strategy replacer cascade — with
-      the disproportionate-match guard ported **first and unconditionally**, because a fuzzy matcher
-      without it eats whole functions; and `external_directory` as a real permission derived from
-      parsed bash arguments. That last one closes a real asymmetry: the file tools *refuse* an
-      out-of-workspace path outright, while the same read through bash is merely *asked* about —
-      the baseline ruleset is `{"*": ask}`, so it prompts rather than running unbidden, but nothing
-      confines it and an "allow always" on a bash prefix widens further than a user expects.
-      Also re-enables parallel tool dispatch, which is fully implemented in `ToolDispatch.runParallel`
-      and opted out of by all three production surfaces — `-p`, `--inline`, and the server behind the
-      default client each pass `toolExecution: .sequential`. *Exit:* the model keeps a todo list, asks a
-      structured question, and fetches a URL under permission; an MCP server that changes its tools
-      mid-session is picked up without a restart.
+- [x] **Phase 11 — Mutable tool set, and the tool suite.** The seam phase is complete. Tool resolution
+      is now a per-request function, with the system prompt's tool list computed from the same result;
+      registration order stays stable for prompt caching. The full suite is shipped: `todowrite`; the
+      structured `question` tool (inline and full-screen client/server round-trip, denied in headless
+      mode); `webfetch` with its own permission kind; `glob`; `read` gaining directory listing,
+      "did you mean", and nested-`AGENTS.md` injection; `finish`; session-scoped `background_process`;
+      the edit engine's multi-strategy replacer cascade — with the disproportionate-match guard
+      ported **first and unconditionally**; and `external_directory` as a real permission derived from
+      parsed bash arguments. The MCP resolver now refreshes tools and schemas after
+      `tools/list_changed` without a restart, while server sessions receive independent mutable-tool
+      state. Parallel tool dispatch is enabled on all production surfaces, with a tool-level
+      sequential override still available. *Exit met:* the model keeps a todo list, asks a structured
+      question, fetches a URL under permission, and picks up an MCP tool added mid-session; focused
+      and end-to-end tests cover the suite. The file-tool refusal versus bash's
+      `external_directory` prompt closes the last permission asymmetry in this slice: an
+      "allow always" on a bash prefix no longer silently widens a read beyond the workspace.
 - [ ] **Phase 12 — Git: facade, diff, review.** The first phase needing a new subsystem rather than a
       seam. DoMoCode has no git integration at all, and a `DoMoGit` facade gates the diff viewer,
       `/review`, checkpoints and eventually worktrees — so it is built once, deliberately, with the
@@ -725,7 +721,7 @@ ordering falls out of them rather than out of appeal:
 | **System-prompt builder** | `SystemPromptBuilder` loads trusted system/instruction files and active skills | agents, plan mode, tool-visibility rewriting |
 | **Command registry** | one shared registry, `GET /commands`, and template-backed dispatch | palette polish, keybindings, plan-exit UI |
 | **Dialog vocabulary** | one bespoke permission modal per surface | `question`, every picker, settings, export options, diff review |
-| **Per-turn mutable tool set** | `AgentContext.tools` fixed at construction | plan mode, agents, subagents, MCP `tools/list_changed` |
+| **Per-turn mutable tool set** | `AgentHarness` resolves tools and rebuilds the prompt list per request; MCP `tools/list_changed` refreshes the live manager | plan mode, agents, subagents |
 | **Git facade** | none | diff viewer, `/review`, checkpoints, undo, worktrees, branch in footer |
 | **Model metadata** | ~~200k hardcoded; cost always zero~~ — **closed in 5a**: per-alias `modelOverrides`, an optional context window (`nil` renders `?`), and cost from rates or the gateway's own header | ~~context meter, cost display~~ (both shipped); budget cap shipped in Phase 9 |
 

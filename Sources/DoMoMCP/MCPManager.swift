@@ -13,8 +13,21 @@ import Foundation
 
 /// Connects and owns the run's stdio MCP servers.
 public actor MCPManager {
-    private var clients: [MCPClient] = []
+    private struct ServerKey: Hashable {
+        let server: String
+        let tool: String
+    }
+
+    private struct ConnectedServer {
+        let name: String
+        let client: MCPClient
+    }
+
+    private var servers: [ConnectedServer] = []
     private var mcpTools: [any AgentTool] = []
+    private var reservedNames: Set<String> = []
+    private var nameOverrides: [ServerKey: String] = [:]
+    private var log: (@Sendable (String) -> Void)?
 
     public init() {}
 
@@ -36,9 +49,10 @@ public actor MCPManager {
         reservedNames: Set<String> = [],
         log: (@Sendable (String) -> Void)? = nil
     ) async -> [any AgentTool] {
+        self.reservedNames = reservedNames
+        self.log = log
         // Seed with the built-in names (forward-looking; see the doc-comment) so a
         // namespaced MCP name that ever collided with one would be renamed, not shadow it.
-        var usedNames = reservedNames
         for (name, config) in servers.sorted(by: { $0.key < $1.key }) {
             if config.enabled == false { continue }
             // An empty command would trap on `command[0]` at spawn (an uncatchable index
@@ -50,27 +64,16 @@ public actor MCPManager {
             let client = MCPClient(
                 serverName: name, config: config,
                 workspaceDirectory: workspaceDirectory, clientVersion: clientVersion,
-                sensitiveEnvKeys: sensitiveEnvKeys, log: log
+                sensitiveEnvKeys: sensitiveEnvKeys, log: log,
+                onToolsChanged: { [weak self] in
+                    await self?.rebuildTools()
+                }
             )
             do {
                 try await client.connect()
-                clients.append(client)
-                var count = 0
-                for info in await client.tools() {
-                    // Validate the (untrusted) schema BEFORE reserving a name: a tool whose
-                    // schema can't convert is dropped with a log line rather than advertised
-                    // with an empty (misleading) parameter list.
-                    let parameters: JSONSchema
-                    do {
-                        parameters = try McpTool.makeParameters(info.inputSchema)
-                    } catch {
-                        log?("MCP server '\(name)' tool '\(info.name)' has an unusable input schema; skipping it.")
-                        continue
-                    }
-                    let unique = dedupedName(server: name, tool: info.name, used: &usedNames, log: log)
-                    mcpTools.append(McpTool(client: client, serverName: name, info: info, nameOverride: unique, parameters: parameters))
-                    count += 1
-                }
+                self.servers.append(ConnectedServer(name: name, client: client))
+                await rebuildTools()
+                let count = mcpTools.filter { $0.definition.name.hasPrefix(McpTool.sanitize(name) + "_") }.count
                 log?("MCP server '\(name)' connected with \(count) tool(s).")
             } catch {
                 // Redacted: a spawn failure quotes the command, and a configured
@@ -113,10 +116,55 @@ public actor MCPManager {
     /// The bridged tools connected so far.
     public func tools() -> [any AgentTool] { mcpTools }
 
+    /// Rebuild the bridge after one of the connected clients receives
+    /// `notifications/tools/list_changed`. The current server/tool order is
+    /// deterministic, and an existing `(server, raw tool)` keeps its exposed
+    /// name across description/schema refreshes and remove/re-add cycles.
+    private func rebuildTools() async {
+        var usedNames = reservedNames
+        var rebuilt: [any AgentTool] = []
+        for server in servers {
+            for info in await server.client.tools() {
+                let parameters: JSONSchema
+                do {
+                    parameters = try McpTool.makeParameters(info.inputSchema)
+                } catch {
+                    log?("MCP server '\(server.name)' tool '\(info.name)' has an unusable input schema; skipping it.")
+                    continue
+                }
+
+                let key = ServerKey(server: server.name, tool: info.name)
+                let exposedName: String
+                if let previous = nameOverrides[key], !usedNames.contains(previous) {
+                    exposedName = previous
+                    usedNames.insert(previous)
+                } else {
+                    exposedName = dedupedName(
+                        server: server.name,
+                        tool: info.name,
+                        used: &usedNames,
+                        log: log
+                    )
+                    nameOverrides[key] = exposedName
+                }
+                rebuilt.append(
+                    McpTool(
+                        client: server.client,
+                        serverName: server.name,
+                        info: info,
+                        nameOverride: exposedName,
+                        parameters: parameters
+                    )
+                )
+            }
+        }
+        mcpTools = rebuilt
+    }
+
     /// Tear down every connected server.
     public func shutdown() async {
-        for client in clients { await client.shutdown() }
-        clients.removeAll()
+        for server in servers { await server.client.shutdown() }
+        servers.removeAll()
         mcpTools.removeAll()
     }
 }

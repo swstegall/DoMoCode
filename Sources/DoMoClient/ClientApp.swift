@@ -109,6 +109,12 @@ public final class ClientApp {
     /// The modal's row values in order, so Escape can find the "Reject" row without
     /// assuming a fixed layout (the "always" row is conditional).
     private var permissionItemValues: [String] = []
+    // Structured question modal. It is a component rather than a SelectList
+    // because a batch can mix single- and multiple-choice prompts and needs to
+    // retain answers while advancing through them.
+    private var questionHandle: ScreenOverlayHandle?
+    private var questionDialog: QuestionDialog?
+    private var questionOverlaySize: (columns: Int, rows: Int)?
     /// Whether the session's event stream is currently up. Surfaced in the status
     /// line, because a dead stream is otherwise indistinguishable from a slow model.
     private var streamConnected = true
@@ -324,6 +330,7 @@ public final class ClientApp {
             self?.observeRunStateChange()
             self?.clearNoticeIfRunSettled()
             self?.reconcilePermissionOverlay()
+            self?.reconcileQuestionOverlay()
             self?.surface?.requestRender()
         }
         // An info/warning notice is transient status, not transcript. The store
@@ -920,6 +927,9 @@ public final class ClientApp {
         // therefore no `connected` frame is ever generated to trigger it.
         if store.hasUnseenPermission(in: status.pendingPermissionIDs) {
             await reconcilePendingPermissions(id)
+        }
+        if store.hasUnseenQuestion(in: status.pendingQuestionIDs ?? []) {
+            await reconcilePendingQuestions(id)
         }
     }
 
@@ -1791,6 +1801,23 @@ public final class ClientApp {
             // this, so the user has to know the modal they are waiting for may
             // never arrive. Transient: the retry is automatic and close.
             post(notice: "could not check for pending approvals")
+            return
+        }
+        guard store.selectedSessionID == sessionID else { return }
+        for event in pending { store.apply(event) }
+    }
+
+    /// Fetch and fold any still-open structured questions for `sessionID`, using
+    /// the same level-triggered recovery as permission prompts. A question is a
+    /// parked tool call, so silently missing this request would leave the run
+    /// waiting forever with no visible affordance.
+    private func reconcilePendingQuestions(_ sessionID: String) async {
+        guard store.selectedSessionID == sessionID else { return }
+        let pending: [ServerEvent]
+        do {
+            pending = try await client.pendingQuestions(sessionID: sessionID)
+        } catch {
+            post(notice: "could not check for pending questions")
             return
         }
         guard store.selectedSessionID == sessionID else { return }
@@ -2725,6 +2752,113 @@ public final class ClientApp {
         actionTasks.append(task)
     }
 
+    // MARK: Structured questions
+
+    /// Keep the question modal level-triggered from the store, just like the
+    /// permission modal. This makes SSE delivery, reconnect reconciliation and a
+    /// successful REST answer all converge on the same presentation path.
+    private func reconcileQuestionOverlay() {
+        if let pending = store.pendingQuestion {
+            if questionHandle == nil { presentQuestionOverlay(pending) }
+        } else if questionHandle != nil {
+            dismissQuestionOverlay()
+        }
+        diagnosticsHandle?.bringToFront()
+    }
+
+    private static let questionOverlayWidth = 78
+
+    private func presentQuestionOverlay(_ pending: EventStore.PendingQuestion) {
+        guard !pending.questions.isEmpty else { return }
+        let dialog = QuestionDialog(questions: pending.questions, keybindings: keybindings)
+        dialog.onSubmit = { [weak self] answers in self?.answerQuestion(answers) }
+        dialog.onCancel = { [weak self] in self?.answerQuestion(nil) }
+
+        let width = min(
+            Self.questionOverlayWidth,
+            max(30, surface?.target.columns ?? Self.questionOverlayWidth)
+        )
+        let innerWidth = max(1, width - 4)
+        let naturalHeight = dialog.render(width: innerWidth).count
+        let maxHeight = max(1, (surface?.target.rows ?? 24) - 2)
+        questionOverlaySize = surface.map { ($0.target.columns, $0.target.rows) }
+        questionHandle = dialogs?.present(
+            Box(dialog, paddingX: 1),
+            options: OverlayOptions(
+                width: .absolute(width),
+                minWidth: 20,
+                maxHeight: .absolute(min(naturalHeight + 2, maxHeight)),
+                anchor: .center
+            )
+        )
+        questionDialog = dialog
+    }
+
+    private func rebuildQuestionOverlayIfResized() {
+        guard questionHandle != nil, let surface, let pending = store.pendingQuestion else { return }
+        let size = (surface.target.columns, surface.target.rows)
+        guard let previous = questionOverlaySize, previous != size else {
+            questionOverlaySize = size
+            return
+        }
+        // The dialog's current prompt/selection is kept in the component.
+        // Rebuilding a resized overlay must not reset a multi-select batch.
+        let dialog = questionDialog
+        dismissQuestionOverlay()
+        if let dialog {
+            let width = min(Self.questionOverlayWidth, max(30, surface.target.columns))
+            let naturalHeight = dialog.render(width: max(1, width - 4)).count
+            let maxHeight = max(1, surface.target.rows - 2)
+            questionOverlaySize = (surface.target.columns, surface.target.rows)
+            questionHandle = dialogs?.present(
+                Box(dialog, paddingX: 1),
+                options: OverlayOptions(
+                    width: .absolute(width),
+                    minWidth: 20,
+                    maxHeight: .absolute(min(naturalHeight + 2, maxHeight)),
+                    anchor: .center
+                )
+            )
+        } else {
+            presentQuestionOverlay(pending)
+        }
+    }
+
+    private func dismissQuestionOverlay() {
+        dismissDialog(questionHandle)
+        questionHandle = nil
+        questionDialog = nil
+        questionOverlaySize = nil
+    }
+
+    /// Submit the selected answers (or nil for Escape), then optimistically hide
+    /// the modal. A failed POST re-fetches the parked request so a transport
+    /// error cannot leave the server suspended with no way to answer.
+    private func answerQuestion(_ answers: [ServerQuestionAnswer]?) {
+        guard let pending = store.pendingQuestion else {
+            dismissQuestionOverlay()
+            return
+        }
+        dismissQuestionOverlay()
+        store.clearPendingQuestion()
+        let sessionID = pending.sessionID
+        let requestID = pending.id
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.resolveQuestion(
+                    sessionID: sessionID,
+                    requestID: requestID,
+                    answers: answers
+                )
+            } catch {
+                self.post(notice: "the answer did not reach the server — re-asking")
+                await self.reconcilePendingQuestions(sessionID)
+            }
+        }
+        actionTasks.append(task)
+    }
+
     // MARK: Permission approval
 
     /// Show or hide the approval modal to match `store.pendingPermission`. Called from
@@ -2961,6 +3095,7 @@ extension ClientApp: TerminalApp {
         // The driver repaints on resize, which is the only hook the app gets; use it
         // to re-fit a modal that is already up.
         rebuildPermissionOverlayIfResized()
+        rebuildQuestionOverlayIfResized()
         rebuildDiagnosticsOverlayIfResized()
         try surface?.renderSync()
     }
@@ -3018,7 +3153,8 @@ extension ClientApp: TerminalApp {
         // aborts a turn when no dialog owns the surface.
         if autocompleteHandle != nil || paletteHandle != nil || sessionPickerHandle != nil
             || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
-            || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil {
+            || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
+            || questionHandle != nil {
             surface?.handleInput(data)
             return
         }

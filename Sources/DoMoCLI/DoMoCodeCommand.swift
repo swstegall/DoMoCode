@@ -481,20 +481,28 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // Hide any MCP tool a `deny` rule blocks (Phase 8d visibility). The ruleset is the
         // same one headlessHook resolves internally (resolvedRuleset is pure over the same
         // settings files), so what is hidden matches what would be denied at call time.
+        let resolvedPermissionRules = PermissionSetup.resolvedRuleset(
+            workingDirectory: workingDirectory.string,
+            configDirectory: configuration.configDirectory.string,
+            homeDirectory: homeDirectory
+        )
         let visibleMcp = PermissionSetup.visibleMCPTools(
             mcpTools,
-            ruleset: PermissionSetup.resolvedRuleset(
-                workingDirectory: workingDirectory.string,
-                configDirectory: configuration.configDirectory.string,
-                homeDirectory: homeDirectory
-            )
+            ruleset: resolvedPermissionRules
         )
-        let promptWorkspace = try SystemPromptBuilder(
+        let promptBuilder = SystemPromptBuilder(
             workingDirectory: workingDirectory,
             configDirectory: configuration.configDirectory,
             toolNames: registry.names + visibleMcp.map(\.definition.name),
             projectTrusted: true
-        ).build()
+        )
+        let promptWorkspace = try promptBuilder.build()
+        let mcpToolResolver: @Sendable () async -> [any AgentTool] = {
+            PermissionSetup.visibleMCPTools(
+                await mcpManager.tools(),
+                ruleset: resolvedPermissionRules
+            )
+        }
         let commandProcessor = PromptCommandProcessor(
             workspace: promptWorkspace,
             workingDirectory: workingDirectory,
@@ -514,10 +522,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionDirectory: configuration.sessionDirectory,
             beforeToolCall: permissionHook,
             mcpTools: visibleMcp,
+            mcpToolResolver: mcpToolResolver,
             modelRuntime: configuration.modelRuntime(for: model),
             compaction: configuration.compaction,
             summarizer: Self.compactionSummarizer(configuration, model: model, client: client),
             promptWorkspace: promptWorkspace,
+            promptBuilder: promptBuilder,
             commandProcessor: commandProcessor,
             commandRuntimeFactory: { commandModel, effort in
                 var selected = configuration.modelRuntime(for: commandModel ?? model)
@@ -749,7 +759,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         maxCostPerRun: Decimal?,
         steeringMode: QueueDeliveryMode
     ) async throws {
-        let (runtime, mcpManager) = try await Self.buildServerRuntime(
+        let (runtime, mcpManager, backgroundSessions) = try await Self.buildServerRuntime(
             configuration: configuration,
             model: model,
             workingDirectory: workingDirectory,
@@ -781,9 +791,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             })
         } catch {
             await mcpManager.shutdown()
+            await backgroundSessions.shutdown()
             throw error
         }
         await mcpManager.shutdown()
+        await backgroundSessions.shutdown()
     }
 
     /// Assemble the shared runtime ingredients — the sandboxed tool context, the
@@ -796,7 +808,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         maxTurns: Int?,
         maxCostPerRun: Decimal?,
         steeringMode: QueueDeliveryMode
-    ) async throws -> (runtime: ServerRuntime, mcpManager: MCPManager) {
+    ) async throws -> (
+        runtime: ServerRuntime,
+        mcpManager: MCPManager,
+        backgroundSessions: BackgroundProcessSessions
+    ) {
         let shell = try SubprocessShell()
         let toolContext = try await ToolContext.rooted(
             at: workingDirectory,
@@ -820,14 +836,50 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // down (they spawn in their own process group and would otherwise be orphaned).
         // Deny'd MCP tools are hidden from both the tool set and the system prompt.
         let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
+        let questionBroker = QuestionBroker()
+        let backgroundSessions = BackgroundProcessSessions()
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
         let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
+        let toolResolver: @Sendable (String) async -> [any AgentTool] = { _ in
+            let currentMcp = await mcpManager.tools()
+            let visible = PermissionSetup.visibleMCPTools(currentMcp, ruleset: permission.ruleset)
+            return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visible
+        }
+        let sessionToolResolver: @Sendable (String, String) async -> [any AgentTool] = { sessionID, _ in
+            let resources = await backgroundSessions.resources(for: sessionID)
+            let sessionRegistry = ToolRegistry.builtin(todoStore: resources.todoStore)
+            let sessionContext = toolContext.withQuestionHandler({ prompts in
+                let wirePrompts = prompts.map { prompt in
+                    ServerQuestionPrompt(
+                        header: prompt.header,
+                        question: prompt.question,
+                        options: prompt.options.map { ServerQuestionOption(label: $0.label, description: $0.description) },
+                        allowsMultiple: prompt.allowsMultiple
+                    )
+                }
+                guard let answers = await questionBroker.ask(sessionID: sessionID, questions: wirePrompts) else {
+                    return nil
+                }
+                return answers.map { QuestionAnswer(selectedLabels: $0.selectedLabels) }
+            }, backgroundProcesses: resources.backgroundProcesses)
+            let currentMcp = await mcpManager.tools()
+            let visible = PermissionSetup.visibleMCPTools(currentMcp, ruleset: permission.ruleset)
+            return sessionRegistry.all.map { RegistryTool(tool: $0, context: sessionContext) } + visible
+        }
         let promptWorkspace = try SystemPromptBuilder(
             workingDirectory: workingDirectory,
             configDirectory: configuration.configDirectory,
             toolNames: registry.names + visibleMcp.map(\.definition.name),
             projectTrusted: true
         ).build()
+        let promptForTools: @Sendable (String, [String]) -> String = { prompt, toolNames in
+            (try? SystemPromptBuilder(
+                workingDirectory: workingDirectory,
+                configDirectory: configuration.configDirectory,
+                toolNames: toolNames,
+                projectTrusted: true
+            ).build().systemPrompt(for: prompt)) ?? promptWorkspace.systemPrompt(for: prompt)
+        }
         let commandProcessor = PromptCommandProcessor(
             workspace: promptWorkspace,
             workingDirectory: workingDirectory,
@@ -879,9 +931,13 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             },
             modelContextWindow: { alias in configuration.modelRuntime(for: alias).contextWindow },
             steeringMode: steeringMode,
-            maxCostPerRun: maxCostPerRun
+            maxCostPerRun: maxCostPerRun,
+            getTools: toolResolver,
+            systemPromptForPromptAndTools: promptForTools,
+            toolsForSession: sessionToolResolver,
+            questionBroker: questionBroker
         ))
-        return (runtime, mcpManager)
+        return (runtime, mcpManager, backgroundSessions)
     }
 
     // MARK: Full-screen client
@@ -913,6 +969,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // The MCP manager for the locally-spawned server (nil under `--url`, where the
         // remote host owns its own MCP servers). Torn down when the client returns.
         var mcpManager: MCPManager?
+        var backgroundSessions: BackgroundProcessSessions?
 
         if let url = serverURL {
             baseURL = url
@@ -922,7 +979,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // reproduce it. (`register` ignores the empty string.)
             Redaction.register(token)
         } else {
-            let (runtime, manager) = try await Self.buildServerRuntime(
+            let (runtime, manager, sessions) = try await Self.buildServerRuntime(
                 configuration: configuration,
                 model: model,
                 workingDirectory: workingDirectory,
@@ -931,6 +988,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 steeringMode: steeringMode
             )
             mcpManager = manager
+            backgroundSessions = sessions
             let generated = Self.generateToken()
             // Never announced anywhere (the client is in this process), but it is
             // still a bearer credential that a request-header dump would carry.
@@ -951,6 +1009,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             guard boundPort != 0 else {
                 serverTask?.cancel()
                 await mcpManager?.shutdown()
+                await backgroundSessions?.shutdown()
                 throw DoMoError(.configuration, "The local runtime server did not bind a port.")
             }
             baseURL = "http://127.0.0.1:\(boundPort)"
@@ -1007,10 +1066,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         } catch {
             serverTask?.cancel()
             await mcpManager?.shutdown()
+            await backgroundSessions?.shutdown()
             throw error
         }
         serverTask?.cancel()
         await mcpManager?.shutdown()
+        await backgroundSessions?.shutdown()
     }
 
     /// A 32-byte random bearer token, hex-encoded. Formatted by hand rather than

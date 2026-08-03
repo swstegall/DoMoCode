@@ -70,6 +70,9 @@ public struct SessionStatus: Sendable, Codable, Hashable {
     public var sessionID: String
     public var running: Bool
     public var pendingPermissionIDs: [String]
+    /// Pending structured question ids, when this runtime supports the
+    /// question round-trip. Optional so clients can read older servers.
+    public var pendingQuestionIDs: [String]?
     public var subscribers: Int
     /// ISO8601, or nil when nothing is running. Lets a client say "running for
     /// 14m" instead of an undifferentiated spinner.
@@ -113,11 +116,13 @@ public struct SessionStatus: Sendable, Codable, Hashable {
         runStartedAt: String?,
         accounting: SessionAccounting? = nil,
         queuedMessageCount: Int? = nil,
-        steeringMode: String? = nil
+        steeringMode: String? = nil,
+        pendingQuestionIDs: [String]? = nil
     ) {
         self.sessionID = sessionID
         self.running = running
         self.pendingPermissionIDs = pendingPermissionIDs
+        self.pendingQuestionIDs = pendingQuestionIDs
         self.subscribers = subscribers
         self.runStartedAt = runStartedAt
         self.accounting = accounting
@@ -219,6 +224,15 @@ public actor ServerRuntime {
         public var modelStreamFactory: (@Sendable (String) -> AgentStreamFn)?
         public var modelContextWindow: (@Sendable (String) -> Int?)?
         public var tools: [any AgentTool]
+        /// Optional per-session resolver. The session id is part of the seam so
+        /// tools such as `question` can route their answer to the right client.
+        public var toolsForSession: (@Sendable (String, String) async -> [any AgentTool])?
+        /// Resolves the current tool set before each assistant request. A server
+        /// can use this to reflect MCP `tools/list_changed` without rebuilding
+        /// every live session.
+        public var getTools: (@Sendable (String) async -> [any AgentTool])?
+        /// Rebuilds the prompt from the current tool names and user prompt.
+        public var systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)?
         public var model: String
         public var streamFn: AgentStreamFn
         public var toolExecution: ToolExecutionMode
@@ -255,6 +269,9 @@ public actor ServerRuntime {
 
         /// Optional hard USD ceiling for each assistant run.
         public var maxCostPerRun: Decimal?
+        /// Late-bound bridge used by a tool context to suspend the owning
+        /// session on a structured question.
+        public var questionBroker: QuestionBroker?
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -285,7 +302,11 @@ public actor ServerRuntime {
             modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
             modelContextWindow: (@Sendable (String) -> Int?)? = nil,
             steeringMode: QueueDeliveryMode = .oneAtATime,
-            maxCostPerRun: Decimal? = nil
+            maxCostPerRun: Decimal? = nil,
+            getTools: (@Sendable (String) async -> [any AgentTool])? = nil,
+            systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)? = nil,
+            toolsForSession: (@Sendable (String, String) async -> [any AgentTool])? = nil,
+            questionBroker: QuestionBroker? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -295,6 +316,9 @@ public actor ServerRuntime {
             self.modelStreamFactory = modelStreamFactory
             self.modelContextWindow = modelContextWindow
             self.tools = tools
+            self.toolsForSession = toolsForSession
+            self.getTools = getTools
+            self.systemPromptForPromptAndTools = systemPromptForPromptAndTools
             self.model = model
             self.streamFn = streamFn
             self.toolExecution = toolExecution
@@ -307,6 +331,7 @@ public actor ServerRuntime {
             self.summarizer = summarizer
             self.steeringMode = steeringMode
             self.maxCostPerRun = maxCostPerRun
+            self.questionBroker = questionBroker
         }
     }
 
@@ -382,6 +407,8 @@ public actor ServerRuntime {
         /// engine's prompter suspends on the continuation; a REST answer (or an
         /// abort/shutdown) resumes it. Held only inside the actor, never shared.
         var pending: [String: PendingApproval] = [:]
+        /// Structured questions awaiting an answer from the client.
+        var pendingQuestions: [String: PendingQuestion] = [:]
 
         init(token: Int, harness: AgentHarness, sink: BroadcastEventSink, steeringBox: SteeringBox) {
             self.token = token
@@ -398,12 +425,22 @@ public actor ServerRuntime {
         let continuation: CheckedContinuation<PermissionReply, Never>
     }
 
+    private struct PendingQuestion {
+        let sessionID: String
+        let questions: [ServerQuestionPrompt]
+        let continuation: CheckedContinuation<[ServerQuestionAnswer]?, Never>
+    }
+
     private let config: Config
     private var sessions: [String: SessionState] = [:]
     private var nextToken = 0
 
     public init(config: Config) {
         self.config = config
+        config.questionBroker?.setHandler { [weak self] sessionID, questions in
+            guard let self else { return nil }
+            return await self.awaitQuestion(sessionID: sessionID, questions: questions)
+        }
     }
 
     /// The one command registry shared by every client surface. Templates are
@@ -464,10 +501,18 @@ public actor ServerRuntime {
         if let workspace = config.promptWorkspace {
             systemPromptForPrompt = { prompt in workspace.systemPrompt(for: prompt) }
         }
+        let toolsForTurn: (@Sendable (String) async -> [any AgentTool])?
+        if let resolver = config.toolsForSession {
+            toolsForTurn = { model in await resolver(sessionID, model) }
+        } else {
+            toolsForTurn = config.getTools
+        }
         return AgentHarness.Configuration(
             systemPrompt: config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
             tools: config.tools,
+            getTools: toolsForTurn,
+            systemPromptForPromptAndTools: config.systemPromptForPromptAndTools,
             model: config.model,
             streamFn: config.streamFn,
             streamFnForModel: config.modelStreamFactory,
@@ -548,6 +593,62 @@ public actor ServerRuntime {
             metadata: request.metadata,
             disableAlways: request.disableAlways
         )
+    }
+
+    // MARK: Structured question round-trip
+
+    /// Suspend the current tool call until the owning client answers the
+    /// structured question batch. The broker keeps the DoMoTools dependency at
+    /// the CLI edge while the runtime speaks only its wire DTOs.
+    private func awaitQuestion(
+        sessionID: String,
+        questions: [ServerQuestionPrompt]
+    ) async -> [ServerQuestionAnswer]? {
+        guard !questions.isEmpty, !Task.isCancelled, let session = sessions[sessionID] else {
+            return nil
+        }
+        let requestID = UUIDv7.generate().description
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { (continuation: CheckedContinuation<[ServerQuestionAnswer]?, Never>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                session.pendingQuestions[requestID] = PendingQuestion(
+                    sessionID: sessionID,
+                    questions: questions,
+                    continuation: continuation
+                )
+                session.sink.broadcast(
+                    .questionRequest(id: requestID, sessionID: sessionID, questions: questions)
+                )
+            }
+        }, onCancel: {
+            Task { [weak self] in
+                try? await self?.resolveQuestion(sessionID: sessionID, requestID: requestID, answers: nil)
+            }
+        })
+    }
+
+    /// Resolve a pending structured question. A missing request is a harmless
+    /// duplicate or a cancellation race, matching permission resolution.
+    public func resolveQuestion(
+        sessionID: String,
+        requestID: String,
+        answers: [ServerQuestionAnswer]?
+    ) throws {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard let question = session.pendingQuestions.removeValue(forKey: requestID) else { return }
+        question.continuation.resume(returning: answers)
+        session.sink.broadcast(.questionResolved(id: requestID))
+    }
+
+    /// The still-open structured questions for reconnect reconciliation.
+    public func pendingQuestions(sessionID: String) throws -> [ServerEvent] {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        return session.pendingQuestions.map { id, question in
+            .questionRequest(id: id, sessionID: question.sessionID, questions: question.questions)
+        }
     }
 
     // MARK: Lifecycle
@@ -1086,6 +1187,7 @@ public actor ServerRuntime {
         // Sorted so the projection is stable across calls; the pending map is
         // a dictionary and its iteration order is not.
         let pendingPermissionIDs = session.pending.keys.sorted()
+        let pendingQuestionIDs = session.pendingQuestions.keys.sorted()
         let subscribers = session.sink.subscriberCount
         let runStartedAt = session.runStartedAt.map(Self.iso8601)
         return SessionStatus(
@@ -1096,7 +1198,8 @@ public actor ServerRuntime {
             runStartedAt: runStartedAt,
             accounting: try? await session.harness.accounting(),
             queuedMessageCount: session.steeringBox.count,
-            steeringMode: session.steeringBox.mode.rawValue
+            steeringMode: session.steeringBox.mode.rawValue,
+            pendingQuestionIDs: pendingQuestionIDs
         )
     }
 
@@ -1115,6 +1218,12 @@ public actor ServerRuntime {
         for (id, approval) in approvals {
             approval.continuation.resume(returning: .reject(message: reason))
             session.sink.broadcast(.permissionResolved(id: id))
+        }
+        let questions = session.pendingQuestions
+        session.pendingQuestions.removeAll()
+        for (id, question) in questions {
+            question.continuation.resume(returning: nil)
+            session.sink.broadcast(.questionResolved(id: id))
         }
     }
 

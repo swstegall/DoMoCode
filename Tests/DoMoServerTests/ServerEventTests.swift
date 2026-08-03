@@ -95,6 +95,17 @@ struct ServerEventTests {
                 metadata: ["command": .string("rm -rf /")], disableAlways: false
             ),
             .permissionResolved(id: "per_1"),
+            .questionRequest(
+                id: "q_1",
+                sessionID: "s-1",
+                questions: [ServerQuestionPrompt(
+                    header: "Storage",
+                    question: "Which format?",
+                    options: [ServerQuestionOption(label: "JSON", description: "Portable")],
+                    allowsMultiple: false
+                )]
+            ),
+            .questionResolved(id: "q_1"),
             .queueUpdate(count: 2, mode: "one-at-a-time"),
         ]
         for event in cases {
@@ -129,6 +140,18 @@ struct ServerEventTests {
         let resolved = try JSONValue(parsing: try JSONEncoder().encode(ServerEvent.permissionResolved(id: "per_1")))
         #expect(resolved["type"]?.stringValue == "permission_resolved")
         #expect(resolved["id"]?.stringValue == "per_1")
+
+        let question = try JSONValue(parsing: try JSONEncoder().encode(
+            ServerEvent.questionRequest(
+                id: "q_1",
+                sessionID: "s-1",
+                questions: [ServerQuestionPrompt(
+                    question: "Continue?",
+                    options: [ServerQuestionOption(label: "Yes")]
+                )]
+            )))
+        #expect(question["type"]?.stringValue == "question_request")
+        #expect(question["questions"]?.arrayValue?.count == 1)
 
         let queue = try JSONValue(parsing: try JSONEncoder().encode(
             ServerEvent.queueUpdate(count: 2, mode: "one-at-a-time")))

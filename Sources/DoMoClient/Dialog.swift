@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import DoMoTUI
+import DoMoServer
 import DoMoTermIO
 
 /// The full-screen client's reusable overlay owner. `ScreenSurface` already
@@ -205,6 +206,103 @@ final class DialogConfirm: Component {
     }
 
     func handleInput(_ data: [UInt8]) { list.handleInput(data) }
+}
+
+/// The full-screen client's structured-question surface. A server question may
+/// contain several prompts, so the dialog advances one prompt at a time and
+/// returns one answer for each in the original order. Multiple-choice prompts
+/// use Space to toggle rows; single-choice prompts use the highlighted row.
+@MainActor
+final class QuestionDialog: Component {
+    private let questions: [ServerQuestionPrompt]
+    private let keybindings: Keybindings
+    private var questionIndex = 0
+    private var selectedIndex = 0
+    private var selectedLabels: [Set<String>]
+
+    var onSubmit: (([ServerQuestionAnswer]) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(questions: [ServerQuestionPrompt], keybindings: Keybindings = Keybindings()) {
+        self.questions = questions
+        self.keybindings = keybindings
+        self.selectedLabels = questions.map { _ in [] }
+    }
+
+    func render(width: Int) -> [String] {
+        guard width > 0, questions.indices.contains(questionIndex) else { return [] }
+        let prompt = questions[questionIndex]
+        let ordinal = "Question \(questionIndex + 1) of \(questions.count)"
+        let title = prompt.header.map(sanitizeUntrustedText).map(collapseToOneLine) ?? ordinal
+        var lines = [truncateToWidth("\u{1b}[1m\(title)\u{1b}[0m  \(ordinal)", width, ellipsis: "")]
+        lines.append(truncateToWidth(
+            sanitizeUntrustedText(collapseToOneLine(prompt.question)), width, ellipsis: ""
+        ))
+        lines.append("")
+
+        for (index, option) in prompt.options.enumerated() {
+            let isSelected = index == selectedIndex
+            let isChecked = selectedLabels[questionIndex].contains(option.label)
+            let prefix: String
+            if prompt.allowsMultiple {
+                prefix = (isChecked ? "[x] " : "[ ] ")
+            } else {
+                prefix = isSelected ? "> " : "  "
+            }
+            var text = prefix + sanitizeUntrustedText(collapseToOneLine(option.label))
+            if let description = option.description, !description.isEmpty {
+                text += " — " + sanitizeUntrustedText(collapseToOneLine(description))
+            }
+            lines.append(truncateToWidth(text, width, ellipsis: ""))
+        }
+        let hint = prompt.allowsMultiple
+            ? "↑/↓ choose · Space toggle · Enter next · Esc cancel"
+            : "↑/↓ choose · Enter confirm · Esc cancel"
+        lines.append("")
+        lines.append(truncateToWidth(dim(hint), width, ellipsis: ""))
+        return lines
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        guard !isKeyRelease(data), questions.indices.contains(questionIndex) else {
+            return
+        }
+        let prompt = questions[questionIndex]
+        guard !prompt.options.isEmpty else { return }
+        if keybindings.matches(data, .selectCancel) {
+            onCancel?()
+        } else if keybindings.matches(data, .selectUp) {
+            selectedIndex = selectedIndex == 0 ? prompt.options.count - 1 : selectedIndex - 1
+        } else if keybindings.matches(data, .selectDown) {
+            selectedIndex = selectedIndex == prompt.options.count - 1 ? 0 : selectedIndex + 1
+        } else if prompt.allowsMultiple, data == [0x20] {
+            let label = prompt.options[selectedIndex].label
+            if selectedLabels[questionIndex].contains(label) {
+                selectedLabels[questionIndex].remove(label)
+            } else {
+                selectedLabels[questionIndex].insert(label)
+            }
+        } else if keybindings.matches(data, .selectConfirm) {
+            submitCurrent(prompt)
+        }
+    }
+
+    private func submitCurrent(_ prompt: ServerQuestionPrompt) {
+        if !prompt.allowsMultiple {
+            selectedLabels[questionIndex] = [prompt.options[selectedIndex].label]
+        }
+        guard questionIndex + 1 < questions.count else {
+            let answers = questions.enumerated().map { index, prompt in
+                ServerQuestionAnswer(
+                    selectedLabels: prompt.options.compactMap { selectedLabels[index].contains($0.label) ? $0.label : nil }
+                )
+            }
+            onSubmit?(answers)
+            return
+        }
+        questionIndex += 1
+        selectedIndex = 0
+    }
 }
 
 /// A small, keyboard-first form. Each field owns a normal `Editor`, so paste,
