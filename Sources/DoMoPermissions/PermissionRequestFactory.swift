@@ -65,6 +65,14 @@ public struct PermissionRequestFactory: Sendable {
                 patternAliases: aliases(for: path),
                 always: pathGrant(path)
             )
+        case "webfetch":
+            let url = arguments["url"]?.stringValue ?? ""
+            return PermissionRequestSpec(
+                permission: "webfetch",
+                patterns: [url],
+                always: [],
+                metadata: ["url": .string(url)]
+            )
         default:
             // find/grep/todo/etc. and every MCP tool: a coarse `*` resource. Known
             // read-only tools are auto-allowed by the baseline; an unknown MCP name is
@@ -218,6 +226,11 @@ public func defaultBaselinePermissionConfig() -> PermissionConfig {
         PermissionConfigEntry(permission: "ls", value: .action(.allow)),
         PermissionConfigEntry(permission: "find", value: .action(.allow)),
         PermissionConfigEntry(permission: "grep", value: .action(.allow)),
+        PermissionConfigEntry(permission: "glob", value: .action(.allow)),
+        PermissionConfigEntry(permission: "todowrite", value: .action(.allow)),
+        PermissionConfigEntry(permission: "finish", value: .action(.allow)),
+        PermissionConfigEntry(permission: "question", value: .action(.ask)),
+        PermissionConfigEntry(permission: "webfetch", value: .action(.ask)),
         PermissionConfigEntry(permission: "doom_loop", value: .action(.ask)),
     ]
 }

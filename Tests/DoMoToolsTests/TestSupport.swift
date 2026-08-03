@@ -11,7 +11,11 @@ struct ToolFixture {
     private let cleanupURL: URL
 
     /// Builds a fresh temp directory and a ``ToolContext`` sandboxed to it.
-    static func make(toolLocator: ExternalToolLocator = .pathSearch) async throws -> ToolFixture {
+    static func make(
+        toolLocator: ExternalToolLocator = .pathSearch,
+        questionHandler: QuestionHandler? = nil,
+        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch
+    ) async throws -> ToolFixture {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("domotools-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -19,7 +23,9 @@ struct ToolFixture {
         let context = try await ToolContext.rooted(
             at: FilePath(base.path),
             shell: shell,
-            toolLocator: toolLocator
+            toolLocator: toolLocator,
+            questionHandler: questionHandler,
+            webFetch: webFetch
         )
         return ToolFixture(root: context.workingDirectory, context: context, cleanupURL: base)
     }

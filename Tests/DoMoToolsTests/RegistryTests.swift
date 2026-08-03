@@ -12,7 +12,7 @@ struct RegistryTests {
         let registry = ToolRegistry.builtin
         #expect(registry.names == [
             "read", "bash", "edit", "write", "grep", "find", "ls",
-            "todowrite", "glob", "finish",
+            "todowrite", "glob", "finish", "question", "webfetch",
         ])
     }
 

@@ -15,6 +15,9 @@ import DoMoCore
 import DoMoExec
 import Foundation
 import SystemPackage
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 // MARK: - Result
 
@@ -212,7 +215,7 @@ public struct ToolRegistry: Sendable {
     public static func builtin(todoStore: TodoStore) -> ToolRegistry {
         ToolRegistry([
             ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
-            TodoWriteTool(store: todoStore), GlobTool(), FinishTool(),
+            TodoWriteTool(store: todoStore), GlobTool(), FinishTool(), QuestionTool(), WebFetchTool(),
         ])
     }
 
@@ -233,6 +236,67 @@ public struct ToolRegistry: Sendable {
 }
 
 // MARK: - Context
+
+/// The response returned by the web-fetch seam. Keeping the transport here
+/// injectable makes URL handling testable without a live network.
+public struct WebFetchResponse: Sendable, Hashable {
+    public let statusCode: Int
+    public let contentType: String?
+    public let data: Data
+
+    public init(statusCode: Int, contentType: String? = nil, data: Data) {
+        self.statusCode = statusCode
+        self.contentType = contentType
+        self.data = data
+    }
+}
+
+/// Fetches one URL for WebFetchTool.
+public typealias WebFetch = @Sendable (URL) async throws -> WebFetchResponse
+
+/// One structured multiple-choice option.
+public struct QuestionOption: Sendable, Hashable {
+    public let label: String
+    public let description: String?
+
+    public init(label: String, description: String? = nil) {
+        self.label = label
+        self.description = description
+    }
+}
+
+/// One structured question presented by QuestionTool.
+public struct QuestionPrompt: Sendable, Hashable {
+    public let header: String?
+    public let question: String
+    public let options: [QuestionOption]
+    public let allowsMultiple: Bool
+
+    public init(
+        header: String? = nil,
+        question: String,
+        options: [QuestionOption],
+        allowsMultiple: Bool = false
+    ) {
+        self.header = header
+        self.question = question
+        self.options = options
+        self.allowsMultiple = allowsMultiple
+    }
+}
+
+/// The answer selected by an interactive surface.
+public struct QuestionAnswer: Sendable, Hashable {
+    public let selectedLabels: [String]
+
+    public init(selectedLabels: [String]) {
+        self.selectedLabels = selectedLabels
+    }
+}
+
+/// The UI seam for QuestionTool. A missing handler is intentional: print mode
+/// and other headless surfaces must return an error rather than deadlock.
+public typealias QuestionHandler = @Sendable ([QuestionPrompt]) async -> [QuestionAnswer]?
 
 /// Everything a tool needs to touch the outside world, all of it confined to the
 /// sandbox root.
@@ -266,18 +330,42 @@ public struct ToolContext: Sendable {
     /// the fix has to live.
     public let environment: ShellEnvironment
 
+    /// Optional interactive multiple-choice handler. A missing handler means the
+    /// context is headless and QuestionTool refuses the call.
+    public let questionHandler: QuestionHandler?
+
+    /// The HTTP seam used by WebFetchTool.
+    public let webFetch: WebFetch
+
+    /// The default web-fetch implementation. It follows redirects according to
+    /// the platform URL loading system and leaves permission decisions to the
+    /// caller's PermissionEngine.
+    public static let defaultWebFetch: WebFetch = { url in
+        let (data, response) = try await URLSession.shared.data(from: url)
+        let http = response as? HTTPURLResponse
+        return WebFetchResponse(
+            statusCode: http?.statusCode ?? 0,
+            contentType: http?.mimeType,
+            data: data
+        )
+    }
+
     public init(
         fileSystem: SandboxedFileSystem,
         shell: any Shell,
         mutations: FileMutationCoordinator? = nil,
         toolLocator: ExternalToolLocator = .pathSearch,
-        environment: ShellEnvironment = ToolContext.scrubbedEnvironment()
+        environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
+        questionHandler: QuestionHandler? = nil,
+        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch
     ) {
         self.fileSystem = fileSystem
         self.shell = shell
         self.mutations = mutations ?? FileMutationCoordinator(fileSystem: fileSystem)
         self.toolLocator = toolLocator
         self.environment = environment
+        self.questionHandler = questionHandler
+        self.webFetch = webFetch
     }
 
     /// Builds a context confined to `root`, resolving the root through the base
@@ -288,14 +376,18 @@ public struct ToolContext: Sendable {
         shell: any Shell,
         base: some FileSystem = POSIXFileSystem(),
         toolLocator: ExternalToolLocator = .pathSearch,
-        environment: ShellEnvironment = ToolContext.scrubbedEnvironment()
+        environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
+        questionHandler: QuestionHandler? = nil,
+        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch
     ) async throws(DoMoError) -> ToolContext {
         let sandboxed = try await SandboxedFileSystem.rooted(at: root, using: base)
         return ToolContext(
             fileSystem: sandboxed,
             shell: shell,
             toolLocator: toolLocator,
-            environment: environment
+            environment: environment,
+            questionHandler: questionHandler,
+            webFetch: webFetch
         )
     }
 

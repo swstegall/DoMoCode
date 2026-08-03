@@ -1,5 +1,6 @@
 import DoMoCore
 import DoMoTools
+import Foundation
 import Testing
 
 @Suite("utility tools")
@@ -72,5 +73,93 @@ struct UtilityToolTests {
         #expect(!result.isError)
         #expect(result.terminate)
         #expect(result.text == "Everything is done.")
+    }
+
+    @Test("webfetch validates the scheme and preserves response details")
+    func webFetch() async throws {
+        let fixture = try await ToolFixture.make(
+            webFetch: { url in
+                #expect(url.absoluteString == "https://example.test/docs")
+                return WebFetchResponse(
+                    statusCode: 200,
+                    contentType: "text/plain",
+                    data: Data("hello from the web".utf8)
+                )
+            }
+        )
+        defer { fixture.removeCleanup() }
+
+        let result = try await WebFetchTool().execute(
+            ["url": "https://example.test/docs"],
+            in: fixture.context
+        )
+
+        #expect(!result.isError)
+        #expect(result.text == "hello from the web")
+        #expect(result.details["statusCode"]?.intValue == 200)
+        #expect(result.details["contentType"]?.stringValue == "text/plain")
+    }
+
+    @Test("webfetch refuses non-web URLs")
+    func webFetchInvalidURL() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+
+        let result = try await WebFetchTool().execute(
+            ["url": "file:///etc/passwd"],
+            in: fixture.context
+        )
+
+        #expect(result.isError)
+        #expect(result.text.contains("only http and https"))
+    }
+
+    @Test("question returns structured selections through its handler")
+    func question() async throws {
+        let fixture = try await ToolFixture.make(
+            questionHandler: { questions in
+                #expect(questions.count == 1)
+                #expect(questions[0].options.map(\.label) == ["Use SQLite", "Use JSON"])
+                return [QuestionAnswer(selectedLabels: ["Use SQLite"])]
+            }
+        )
+        defer { fixture.removeCleanup() }
+
+        let result = try await QuestionTool().execute(
+            [
+                "questions": [[
+                    "header": "Storage",
+                    "question": "Which storage should we use?",
+                    "options": [
+                        ["label": "Use SQLite", "description": "Queryable"],
+                        ["label": "Use JSON"],
+                    ],
+                ]]
+            ],
+            in: fixture.context
+        )
+
+        #expect(!result.isError)
+        #expect(result.text.contains("Which storage should we use?: Use SQLite"))
+        #expect(result.details["answers"]?.arrayValue?.count == 1)
+    }
+
+    @Test("question fails closed without an interactive handler")
+    func questionHeadless() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+
+        let result = try await QuestionTool().execute(
+            [
+                "questions": [[
+                    "question": "Continue?",
+                    "options": [["label": "Yes"]],
+                ]]
+            ],
+            in: fixture.context
+        )
+
+        #expect(result.isError)
+        #expect(result.text.contains("headless"))
     }
 }
