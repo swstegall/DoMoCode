@@ -366,4 +366,25 @@ enum PermissionSetup {
             sessionID: "print"
         )
     }
+
+    /// The headless no-progress decision. It uses the same baseline and user
+    /// rules as tool permissions, but never blocks: `--yolo` answers once and a
+    /// normal print run rejects the escalation so a script cannot hang waiting
+    /// for a prompt that has no terminal UI.
+    static func headlessNoProgressHook(
+        workingDirectory: String,
+        configDirectory: String,
+        homeDirectory: String,
+        yolo: Bool
+    ) -> @Sendable (TurnResult) async -> Bool {
+        let engine = PermissionEngine(
+            ruleset: resolvedRuleset(
+                workingDirectory: workingDirectory,
+                configDirectory: configDirectory,
+                homeDirectory: homeDirectory
+            ),
+            prompt: headlessPrompter(yolo: yolo)
+        )
+        return doomLoopHook(engine: engine, sessionID: "print")
+    }
 }

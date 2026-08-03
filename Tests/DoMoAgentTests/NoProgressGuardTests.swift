@@ -67,6 +67,57 @@ private func finalTextTurn(_ text: String = "done") -> [AssemblyEvent] {
     assistantTurn(text: text, stopReason: .stop)
 }
 
+@Test func noProgressHookCanGrantOneMoreGuardWindow() async {
+    let approvals = Box(0)
+    let stream = ScriptedStream(stuckTurns(6) + [finalTextTurn()])
+
+    let result = await runOnce(
+        context: AgentContext(tools: [constantTool("stuck")]),
+        config: AgentLoopConfig(
+            model: "test-model",
+            noProgressLimit: 2,
+            onNoProgress: { _ in
+                let count = approvals.withLock { value -> Int in
+                    value += 1
+                    return value
+                }
+                return count == 1
+            }
+        ),
+        sink: RecordingSink(),
+        streamFn: stream.fn
+    )
+
+    #expect(result.stopReason == .noProgress)
+    #expect(result.assistantMessages.count == 4)
+    #expect(approvals.withLock { $0 } == 2)
+}
+
+@Test func costLimitStopsAfterTheTurnThatReachesIt() async {
+    let sink = RecordingSink()
+    let stream = ScriptedStream([
+        assistantTurn(
+            text: "done",
+            stopReason: .stop,
+            usage: Usage(cost: Cost(input: Decimal(string: "0.25")!))
+        ),
+        finalTextTurn("never requested"),
+    ])
+
+    let result = await runOnce(
+        config: AgentLoopConfig(
+            model: "test-model",
+            maxCostPerRun: Decimal(string: "0.20")!
+        ),
+        sink: sink,
+        streamFn: stream.fn
+    )
+
+    #expect(result.stopReason == .costLimitReached)
+    #expect(result.assistantMessages.count == 1)
+    #expect(Array(sink.kinds.suffix(2)) == ["turnEnd", "agentEnd"])
+}
+
 // MARK: - It fires on genuine non-progress
 
 @Test func noProgressStopsAnIdenticalFailingToolLoop() async {

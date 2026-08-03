@@ -68,8 +68,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             alike. A run continues until the model produces a final answer, you abort it, or the \
             runaway guard trips (the same tool calls returning the same results, twelve turns \
             running). Set --max-turns N to cap a run instead; --max-turns 0 asks for unlimited \
-            explicitly. Under -p, hitting the cap exits 2 and the runaway guard exits 3, so a \
-            script can tell "I under-budgeted" from "the model is stuck".
+            explicitly. Add --max-cost-per-run USD for a priced budget cap. Under -p, hitting \
+            the turn cap exits 2, the runaway guard exits 3, and the cost cap exits 4, so a \
+            script can distinguish under-budgeting, a stuck model, and a spend ceiling.
             """
     )
 
@@ -116,6 +117,24 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     )
     public var maxTurns: Int?
 
+    @Option(
+        name: .customLong("max-cost-per-run"),
+        help: ArgumentHelp(
+            "Maximum effective USD cost of assistant turns in one run. Omit for no cost ceiling.",
+            valueName: "usd"
+        )
+    )
+    public var maxCostPerRun: String?
+
+    @Option(
+        name: .customLong("steering-mode"),
+        help: ArgumentHelp(
+            "Delivery mode for prompts typed during a run: all or one-at-a-time (default).",
+            valueName: "mode"
+        )
+    )
+    public var steeringMode: String = QueueDeliveryMode.oneAtATime.rawValue
+
     /// The turn bound the runtimes actually receive.
     ///
     /// `nil` — the default, and the meaning of `--max-turns 0` — is unbounded, which
@@ -127,6 +146,32 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     var turnLimit: Int? {
         guard let maxTurns, maxTurns > 0 else { return nil }
         return maxTurns
+    }
+
+    private static func parseCostLimit(_ raw: String?) throws -> Decimal? {
+        guard let raw else { return nil }
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, let decimal = DecimalText.strict(value), decimal > 0 else {
+            throw DoMoError(
+                .configuration,
+                "--max-cost-per-run must be a positive USD amount such as 0.25 (got \(raw))."
+            )
+        }
+        return decimal
+    }
+
+    private static func parseSteeringMode(_ raw: String) throws -> QueueDeliveryMode {
+        switch raw.lowercased().replacingOccurrences(of: "_", with: "-") {
+        case QueueDeliveryMode.all.rawValue:
+            return .all
+        case QueueDeliveryMode.oneAtATime.rawValue, "oneatatime":
+            return .oneAtATime
+        default:
+            throw DoMoError(
+                .configuration,
+                "--steering-mode must be all or one-at-a-time (got \(raw))."
+            )
+        }
     }
 
     @Flag(
@@ -303,12 +348,20 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         if let maxTurns, maxTurns < 0 {
             throw DoMoError(.configuration, "--max-turns must be 0 (unlimited) or greater (got \(maxTurns)).")
         }
+        let costLimit = try Self.parseCostLimit(maxCostPerRun)
+        let deliveryMode = try Self.parseSteeringMode(steeringMode)
 
         // `--serve` runs the headless HTTP/SSE server and does not return until the
         // process is signalled. It manages sessions itself, so it is branched before
         // the print/interactive session-source resolution below.
         if serve {
-            try await runServer(configuration: configuration, model: model, workingDirectory: workingDirectory)
+            try await runServer(
+                configuration: configuration,
+                model: model,
+                workingDirectory: workingDirectory,
+                maxCostPerRun: costLimit,
+                steeringMode: deliveryMode
+            )
             return
         }
 
@@ -364,7 +417,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     modelRuntimeFor: { configuration.modelRuntime(for: $0) },
                     compaction: configuration.compaction,
                     summarizer: Self.compactionSummarizer(configuration, model: model),
-                    credentialEnvNames: Self.gatewayCredentialEnvNames(configuration)
+                    credentialEnvNames: Self.gatewayCredentialEnvNames(configuration),
+                    maxCostPerRun: costLimit,
+                    steeringMode: deliveryMode
                 )
                 try await Self.runInteractive(
                     mode,
@@ -376,6 +431,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     model: model,
                     workingDirectory: workingDirectory,
                     maxTurns: turnLimit,
+                    maxCostPerRun: costLimit,
+                    steeringMode: deliveryMode,
                     environment: environment,
                     noMouse: noMouse,
                     serverURL: serverURL,
@@ -399,6 +456,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // `--yolo` auto-approves it. Read-only tools run silently under the baseline.
         let homeDirectory = environment["HOME"] ?? NSHomeDirectory()
         let permissionHook = PermissionSetup.headlessHook(
+            workingDirectory: workingDirectory.string,
+            configDirectory: configuration.configDirectory.string,
+            homeDirectory: homeDirectory,
+            yolo: yolo
+        )
+        let noProgressHook = PermissionSetup.headlessNoProgressHook(
             workingDirectory: workingDirectory.string,
             configDirectory: configuration.configDirectory.string,
             homeDirectory: homeDirectory,
@@ -460,7 +523,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 var selected = configuration.modelRuntime(for: commandModel ?? model)
                 if let effort { selected.reasoningEffort = effort }
                 return selected
-            }
+            },
+            maxCostPerRun: costLimit,
+            onNoProgress: noProgressHook
         )
 
         let code: Int32
@@ -680,13 +745,17 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     private func runServer(
         configuration: ResolvedConfiguration,
         model: String,
-        workingDirectory: FilePath
+        workingDirectory: FilePath,
+        maxCostPerRun: Decimal?,
+        steeringMode: QueueDeliveryMode
     ) async throws {
         let (runtime, mcpManager) = try await Self.buildServerRuntime(
             configuration: configuration,
             model: model,
             workingDirectory: workingDirectory,
-            maxTurns: turnLimit
+            maxTurns: turnLimit,
+            maxCostPerRun: maxCostPerRun,
+            steeringMode: steeringMode
         )
         let token = Self.generateToken()
         let server = DoMoServer(
@@ -724,7 +793,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         configuration: ResolvedConfiguration,
         model: String,
         workingDirectory: FilePath,
-        maxTurns: Int?
+        maxTurns: Int?,
+        maxCostPerRun: Decimal?,
+        steeringMode: QueueDeliveryMode
     ) async throws -> (runtime: ServerRuntime, mcpManager: MCPManager) {
         let shell = try SubprocessShell()
         let toolContext = try await ToolContext.rooted(
@@ -806,7 +877,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             modelStreamFactory: { alias in
                 makeStreamFn(client: client, runtime: configuration.modelRuntime(for: alias))
             },
-            modelContextWindow: { alias in configuration.modelRuntime(for: alias).contextWindow }
+            modelContextWindow: { alias in configuration.modelRuntime(for: alias).contextWindow },
+            steeringMode: steeringMode,
+            maxCostPerRun: maxCostPerRun
         ))
         return (runtime, mcpManager)
     }
@@ -827,6 +900,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         model: String,
         workingDirectory: FilePath,
         maxTurns: Int?,
+        maxCostPerRun: Decimal?,
+        steeringMode: QueueDeliveryMode,
         environment: [String: String],
         noMouse: Bool,
         serverURL: String?,
@@ -851,7 +926,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 configuration: configuration,
                 model: model,
                 workingDirectory: workingDirectory,
-                maxTurns: maxTurns
+                maxTurns: maxTurns,
+                maxCostPerRun: maxCostPerRun,
+                steeringMode: steeringMode
             )
             mcpManager = manager
             let generated = Self.generateToken()

@@ -68,6 +68,25 @@ struct TurnLimitEndToEndTests {
         """
     }
 
+    /// A priced final turn, used to exercise the real settings → model runtime →
+    /// usage-cost → loop-budget path rather than only the loop seam.
+    static func finalTextTurnWithUsage(_ text: String, input: Int = 42, output: Int = 8) -> String {
+        """
+        data: {"id":"priced-final","object":"chat.completion.chunk","model":"mock-model","choices":\
+        [{"index":0,"delta":{"role":"assistant","content":"\(text)"},"finish_reason":null}]}
+
+        data: {"id":"priced-final","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},\
+        "finish_reason":"stop"}]}
+
+        data: {"id":"priced-final","object":"chat.completion.chunk","choices":[],"usage":\
+        {"prompt_tokens":\(input),"completion_tokens":\(output),"total_tokens":\(input + output)}}
+
+        data: [DONE]
+
+
+        """
+    }
+
     /// `count` turns of varied tool work, then a final answer. The directories the
     /// script `ls`es are created by ``workspaceWithDirectories(_:)``, so every turn
     /// gets a distinct call AND a distinct result.
@@ -173,6 +192,40 @@ struct TurnLimitEndToEndTests {
         )
     }
 
+    @Test
+    func invalidCostLimitIsAUsageError() async throws {
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+
+        let result = try runDomo(
+            arguments: ["-p", "hello", "--model", "mock-model", "--max-cost-per-run=-1"],
+            workspace: workspace
+        )
+
+        #expect(result.exitCode != 0)
+        #expect(
+            result.standardError.contains("--max-cost-per-run must be a positive USD amount"),
+            "stderr: \(result.standardError)"
+        )
+    }
+
+    @Test
+    func invalidSteeringModeIsAUsageError() async throws {
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+
+        let result = try runDomo(
+            arguments: ["-p", "hello", "--model", "mock-model", "--steering-mode=burst"],
+            workspace: workspace
+        )
+
+        #expect(result.exitCode != 0)
+        #expect(
+            result.standardError.contains("--steering-mode must be all or one-at-a-time"),
+            "stderr: \(result.standardError)"
+        )
+    }
+
     // MARK: The exit-code contract
 
     /// Exit `2` is unchanged and still reachable — it just has to be ASKED for
@@ -237,6 +290,66 @@ struct TurnLimitEndToEndTests {
         // Exactly the default streak, so a wrong limit shows up as a wrong count
         // rather than as a still-passing test.
         #expect(gateway.requestCount == 12, "stderr: \(result.standardError)")
+    }
+
+    /// `--yolo` is also the headless answer to the doom-loop permission request.
+    /// One approval grants one more guard window, after which the scripted final
+    /// answer proves the run was allowed to continue rather than silently settled.
+    @Test
+    func yoloApprovesDoomLoopAndContinues() async throws {
+        let gateway = try MockGateway(
+            chatCompletionBodies: (0..<12).map { Self.toolCallTurn(id: "same\($0)", path: ".") }
+                + [Self.finalTextTurn("escaped the loop.")]
+        )
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        try workspace.writeFile(named: "hello.txt", contents: "hi\n")
+
+        let result = try runDomo(
+            arguments: [
+                "-p", "keep listing", "--model", "mock-model", "--base-url", gateway.baseURL,
+                "--yolo",
+            ],
+            workspace: workspace
+        )
+
+        #expect(result.exitCode == 0, "stderr: \(result.standardError)")
+        #expect(result.standardOutput.contains("escaped the loop."))
+        #expect(gateway.requestCount == 13, "stderr: \(result.standardError)")
+    }
+
+    @Test
+    func costLimitExitsFourAndStopsBeforeAnotherModelTurn() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.finalTextTurnWithUsage("too expensive")])
+        gateway.start()
+        defer { gateway.stop() }
+
+        let workspace = try Workspace()
+        defer { workspace.cleanUp() }
+        // $3/M input + $15/M output makes this turn cost $0.000246.
+        try #"{"modelOverrides":{"mock-model":{"input":3,"output":15}}}"#.write(
+            to: workspace.configDirectory.appendingPathComponent("settings.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = try runDomo(
+            arguments: [
+                "-p", "price the run", "--model", "mock-model", "--base-url", gateway.baseURL,
+                "--max-cost-per-run", "0.0002", "--json",
+            ],
+            workspace: workspace
+        )
+
+        #expect(result.exitCode == 4, "stderr: \(result.standardError)")
+        #expect(gateway.requestCount == 1, "stderr: \(result.standardError)")
+        #expect(result.standardError.contains("Reached --max-cost-per-run limit ($0.0002)"))
+        let events = try Self.parseEventStream(result.standardOutput)
+        let error = try #require(events.last { $0["type"]?.stringValue == "error" })
+        #expect(error["stopReason"]?.stringValue == "costLimitReached")
     }
 
     // MARK: The JSON stream is unchanged

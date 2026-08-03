@@ -83,12 +83,13 @@ func assistantTurn(
     text: String? = nil,
     toolCalls: [ToolCallBlock] = [],
     stopReason: StopReason,
-    model: String = "test-model"
+    model: String = "test-model",
+    usage: Usage = .zero
 ) -> [AssemblyEvent] {
     var content: [ContentBlock] = []
     if let text { content.append(.text(text)) }
     for call in toolCalls { content.append(.toolCall(call)) }
-    let message = AssistantMessage(content: content, model: model, stopReason: stopReason)
+    let message = AssistantMessage(content: content, model: model, usage: usage, stopReason: stopReason)
     let terminal: AssemblyEvent = message.failure == nil ? .done(message) : .failed(message)
     return [.start(AssistantSnapshot(model: model)), terminal]
 }

@@ -5,7 +5,9 @@
 // the tool-aware request factory, and the `PermissionEngine` actor's ask/reply/persist
 // semantics.
 
+import DoMoAgent
 import DoMoCore
+import DoMoLLM
 import Foundation
 import Synchronization
 import Testing
@@ -246,6 +248,35 @@ struct EngineTests {
         let engine = PermissionEngine(ruleset: baseline(), prompt: { _ in .reject(message: "not now") })
         let decision = await engine.ask(PermissionRequestSpec(permission: "bash", patterns: ["ls"], always: ["ls *"]), sessionID: "s")
         #expect(decision == .deny(reason: "not now"))
+    }
+
+    @Test("doom-loop escalation uses the reserved permission and repeated tool metadata")
+    func doomLoopEscalation() async {
+        let request = Mutex<PermissionRequest?>(nil)
+        let engine = PermissionEngine(
+            ruleset: baseline(),
+            prompt: { value in request.withLock { $0 = value }; return .once }
+        )
+        let call = ToolCallBlock(
+            id: "call-1",
+            name: "bash",
+            arguments: .object(["command": .string("false")])
+        )
+        let turn = TurnResult(
+            message: AssistantMessage(content: [.toolCall(call)], model: "test-model"),
+            toolResults: [],
+            messages: []
+        )
+
+        let hook = doomLoopHook(engine: engine, sessionID: "session-1")
+        let allowed = await hook(turn)
+
+        #expect(allowed)
+        #expect(request.withLock { $0 }?.permission == "doom_loop")
+        #expect(request.withLock { $0 }?.patterns == ["bash"])
+        #expect(request.withLock { $0 }?.always == ["bash"])
+        #expect(request.withLock { $0 }?.metadata["tool"] == .string("bash"))
+        #expect(request.withLock { $0 }?.metadata["input"] == call.arguments)
     }
 }
 

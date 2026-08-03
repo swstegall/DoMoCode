@@ -227,6 +227,9 @@ public actor ServerRuntime {
         /// One-at-a-time is deliberately the safe default for interactive use.
         public var steeringMode: QueueDeliveryMode
 
+        /// Optional hard USD ceiling for each assistant run.
+        public var maxCostPerRun: Decimal?
+
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
         ///   - compaction: See ``Config/compaction``.
@@ -255,7 +258,8 @@ public actor ServerRuntime {
             modelOptions: [ModelOption] = [],
             modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
             modelContextWindow: (@Sendable (String) -> Int?)? = nil,
-            steeringMode: QueueDeliveryMode = .oneAtATime
+            steeringMode: QueueDeliveryMode = .oneAtATime,
+            maxCostPerRun: Decimal? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -276,6 +280,7 @@ public actor ServerRuntime {
             self.compaction = compaction
             self.summarizer = summarizer
             self.steeringMode = steeringMode
+            self.maxCostPerRun = maxCostPerRun
         }
     }
 
@@ -416,6 +421,7 @@ public actor ServerRuntime {
             return await self.drainSteering(sessionID: sessionID, box: steeringBox)
         }
         var beforeToolCall: BeforeToolCallHook?
+        var onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil
         if let permissions = config.permissions {
             let engine = PermissionEngine(
                 ruleset: permissions.ruleset,
@@ -426,6 +432,7 @@ public actor ServerRuntime {
                 persist: permissions.persist
             )
             beforeToolCall = permissionHook(engine: engine, factory: permissions.factory, sessionID: sessionID)
+            onNoProgress = doomLoopHook(engine: engine, sessionID: sessionID)
         }
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         if let workspace = config.promptWorkspace {
@@ -450,7 +457,9 @@ public actor ServerRuntime {
             contextWindow: config.contextWindow,
             getSteeringMessages: steeringReader,
             steeringBox: steeringBox,
-            beforeToolCall: beforeToolCall
+            beforeToolCall: beforeToolCall,
+            onNoProgress: onNoProgress,
+            maxCostPerRun: config.maxCostPerRun
         )
     }
 

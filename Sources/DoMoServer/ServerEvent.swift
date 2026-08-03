@@ -173,6 +173,7 @@ public enum ServerEvent: Sendable, Hashable {
         case .stoppedByHook: return "stopped_by_hook"
         case .terminatedByTool: return "terminated_by_tool"
         case .noProgress: return "no_progress"
+        case .costLimitReached: return "cost_limit_reached"
         }
     }
 }

@@ -524,6 +524,8 @@ public struct PrintMode: Sendable {
     /// The turn bound, or `nil` for unbounded — the shipping default. See
     /// ``DoMoCodeCommand/turnLimit``.
     let maxTurns: Int?
+    /// The optional hard USD ceiling for assistant turns in this run.
+    let maxCostPerRun: Decimal?
     let channel: OutputChannel
     /// Where this run's session file comes from — new, resumed, or forked.
     let sessionSource: SessionSource
@@ -532,6 +534,9 @@ public struct PrintMode: Sendable {
     /// The permission gate (Phase 8). `nil` runs every tool ungated; the headless
     /// gate rejects any tool needing approval unless `--yolo` is set.
     let beforeToolCall: BeforeToolCallHook?
+    /// The headless decision for a repeated-work escalation. It is separate
+    /// from the tool gate because a print run has no modal to suspend on.
+    let onNoProgress: (@Sendable (TurnResult) async -> Bool)?
     /// Tools discovered from configured MCP servers (Phase 8c), appended after the
     /// built-ins. Already connected by the caller, which owns their teardown.
     let mcpTools: [any AgentTool]
@@ -574,7 +579,9 @@ public struct PrintMode: Sendable {
         summarizer: Summarizer? = nil,
         promptWorkspace: PromptWorkspace? = nil,
         commandProcessor: PromptCommandProcessor? = nil,
-        commandRuntimeFactory: CommandRuntimeFactory? = nil
+        commandRuntimeFactory: CommandRuntimeFactory? = nil,
+        maxCostPerRun: Decimal? = nil,
+        onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil
     ) {
         self.client = client
         self.modelRuntime = modelRuntime
@@ -583,10 +590,12 @@ public struct PrintMode: Sendable {
         self.workingDirectory = workingDirectory
         self.mode = mode
         self.maxTurns = maxTurns
+        self.maxCostPerRun = maxCostPerRun
         self.channel = channel
         self.sessionSource = sessionSource
         self.sessionDirectory = sessionDirectory
         self.beforeToolCall = beforeToolCall
+        self.onNoProgress = onNoProgress
         self.mcpTools = mcpTools
         self.compaction = compaction
         self.summarizer = summarizer
@@ -662,7 +671,9 @@ public struct PrintMode: Sendable {
             // model it was talking to or what the user configured.
             compaction: compaction,
             contextWindow: modelRuntime.contextWindow,
-            beforeToolCall: beforeToolCall
+            beforeToolCall: beforeToolCall,
+            onNoProgress: onNoProgress,
+            maxCostPerRun: maxCostPerRun
         )
 
         let harness = try await makeHarness(configuration: configuration)
@@ -862,7 +873,8 @@ public struct PrintMode: Sendable {
     ///
     /// This is the one place the run decides success from failure, so the exit-code
     /// contract lives here: a clean completion is `0`, hitting ``maxTurns`` is `2`,
-    /// stopping for lack of progress is `3`, and every other non-completion is `1`.
+    /// stopping for lack of progress is `3`, hitting the cost ceiling is `4`, and
+    /// every other non-completion is `1`.
     ///
     /// What the unlimited default changed is REACHABILITY, not the contract. With
     /// no `--max-turns`, ``maxTurns`` is `nil`, the loop's bound check never fires,
@@ -941,6 +953,14 @@ public struct PrintMode: Sendable {
             log.emit("error", ["message": .string(message), "stopReason": .string("noProgress")])
             channel.writeErr(message + "\n")
             return 3
+
+        case .costLimitReached:
+            let limit = maxCostPerRun.map { NSDecimalNumber(decimal: $0).stringValue }
+                ?? "the configured limit"
+            let message = "Reached --max-cost-per-run limit ($\(limit)); no further model turns were started."
+            log.emit("error", ["message": .string(message), "stopReason": .string("costLimitReached")])
+            channel.writeErr(message + "\n")
+            return 4
         }
     }
 

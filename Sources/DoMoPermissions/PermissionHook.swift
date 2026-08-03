@@ -29,3 +29,38 @@ public func permissionHook(
         }
     }
 }
+
+/// A no-progress hook backed by the same permission engine as tool calls.
+///
+/// The agent loop deliberately knows nothing about permission policy. When its
+/// repeated-work guard fires, this hook presents the repeated tool names under
+/// the reserved `doom_loop` permission and returns whether the run may have
+/// another guard window.
+public func doomLoopHook(
+    engine: PermissionEngine,
+    sessionID: String
+) -> @Sendable (TurnResult) async -> Bool {
+    { turn in
+        let toolCalls = turn.message.toolCalls
+        guard !toolCalls.isEmpty else { return false }
+
+        var names: [String] = []
+        for call in toolCalls where !names.contains(call.name) {
+            names.append(call.name)
+        }
+        let first = toolCalls[0]
+        let spec = PermissionRequestSpec(
+            permission: "doom_loop",
+            patterns: names,
+            always: names,
+            metadata: [
+                "tool": .string(first.name),
+                "input": first.arguments,
+            ]
+        )
+        if case .allow = await engine.ask(spec, sessionID: sessionID) {
+            return true
+        }
+        return false
+    }
+}

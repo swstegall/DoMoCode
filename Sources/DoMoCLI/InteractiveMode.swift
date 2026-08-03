@@ -76,39 +76,6 @@ struct PendingSubmission: Sendable {
     }
 }
 
-// MARK: - Steering box
-
-/// The `Sendable` seam that carries a mid-run submission into the running agent.
-///
-/// One `Mutex`-guarded queue shared across an isolation boundary: the harness's
-/// ``AgentHarness/Configuration/getSteeringMessages`` closure ``drain()``s it from
-/// the agent loop (which polls at each turn boundary, off the main actor), while a
-/// submit-while-running ``append(_:)``s to it on the main actor. There is no async
-/// work under the lock, so a `Mutex` is the right tool — never a lock across an
-/// `await`.
-///
-/// ``drain()`` reads-and-clears in one critical section, which is what makes the
-/// race benign: a message appended concurrently with a poll is either wholly
-/// returned by that poll (injected into the current turn) or wholly retained for
-/// the next — it can be neither split nor processed twice.
-final class SteeringBox: Sendable {
-    private let messages = Mutex<[Message]>([])
-
-    /// Enqueue a message for the running agent's next turn.
-    func append(_ message: Message) {
-        messages.withLock { $0.append(message) }
-    }
-
-    /// Atomically take everything queued and clear the box.
-    func drain() -> [Message] {
-        messages.withLock { queued in
-            let taken = queued
-            queued.removeAll()
-            return taken
-        }
-    }
-}
-
 // MARK: - Response metadata relay
 
 /// A late-bound sink for the response headers of every LLM request this session
@@ -819,7 +786,7 @@ final class InteractiveCoordinator {
                     do {
                         switch try await commandProcessor.resolve(trimmed) {
                         case .prompt(let rendered, _, _, _):
-                            self.steering.append(
+                            self.steering.enqueue(
                                 .user(UserMessage(content: [.text(rendered)] + images.map(ContentBlock.image)))
                             )
                         case .local:
@@ -844,7 +811,7 @@ final class InteractiveCoordinator {
             // The message is built by hand rather than with `Message.user(_:)` so
             // the attachments ride it: the convenience builds a TEXT-ONLY message,
             // which is how a mid-run drop used to be silently discarded.
-            steering.append(
+            steering.enqueue(
                 .user(UserMessage(content: [.text(trimmed)] + images.map(ContentBlock.image)))
             )
         } else {
@@ -1573,6 +1540,8 @@ final class InteractiveCoordinator {
         case .noProgress:
             return "stopped — the model repeated the same tool call with the same result "
                 + "and made no progress"
+        case .costLimitReached:
+            return "stopped at the per-run cost limit — send another message to continue"
         case .completed, .terminatedByTool, .stoppedByHook, .errored, .aborted:
             return nil
         }
@@ -1776,7 +1745,9 @@ public struct InteractiveMode: Sendable {
         // read the key back with a one-word `bash` command. Empty leaves only
         // `ToolContext`'s own built-in scrub, which is what a test that never
         // configured a credential wants.
-        credentialEnvNames: Set<String> = []
+        credentialEnvNames: Set<String> = [],
+        maxCostPerRun: Decimal? = nil,
+        steeringMode: QueueDeliveryMode = .oneAtATime
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
@@ -1857,7 +1828,7 @@ public struct InteractiveMode: Sendable {
         // The steering seam: the loop drains this box for mid-run submissions at
         // each turn boundary, and the coordinator appends to it. Built here so the
         // harness Configuration and the coordinator share the one instance.
-        let steering = SteeringBox()
+        let steering = SteeringBox(mode: steeringMode)
 
         let prompterBox = PrompterBox()
         let engine = PermissionEngine(
@@ -1866,6 +1837,7 @@ public struct InteractiveMode: Sendable {
             persist: permission.persist
         )
         let gate = permissionHook(engine: engine, factory: permission.factory, sessionID: "interactive")
+        let noProgress = doomLoopHook(engine: engine, sessionID: "interactive")
 
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         systemPromptForPrompt = { prompt in promptWorkspace.systemPrompt(for: prompt) }
@@ -1889,7 +1861,9 @@ public struct InteractiveMode: Sendable {
             compaction: compaction,
             contextWindow: runtime.contextWindow,
             getSteeringMessages: { steering.drain() },
-            beforeToolCall: gate
+            beforeToolCall: gate,
+            onNoProgress: noProgress,
+            maxCostPerRun: maxCostPerRun
         )
 
         // MCP is already connected by here; if harness construction fails, tear the

@@ -7,6 +7,7 @@
 
 import DoMoCore
 import DoMoLLM
+import Foundation
 
 // MARK: - Stream seam
 
@@ -282,8 +283,15 @@ public struct AgentLoopConfig: Sendable {
     /// into the pure loop so every embedding gets it.
     public var maxTurns: Int?
 
+    /// Maximum effective USD cost for the assistant turns in one run. `nil` is
+    /// unlimited. The loop checks the accumulated, gateway-preferred or
+    /// rate-derived cost after each completed turn and stops with
+    /// ``RunStopReason/costLimitReached`` when it reaches the ceiling.
+    public var maxCostPerRun: Decimal?
+
     /// Consecutive turns that made the SAME tool calls and got the SAME results
-    /// before the run stops with ``RunStopReason/noProgress``.
+    /// before the run stops with ``RunStopReason/noProgress`` or asks the
+    /// optional ``onNoProgress`` hook for permission to continue.
     ///
     /// Safe to leave on when ``maxTurns`` is `nil`: it cannot fire on varied
     /// work, however long that work runs — only on a turn that is byte-for-byte
@@ -331,6 +339,13 @@ public struct AgentLoopConfig: Sendable {
     /// with ``RunStopReason/stoppedByHook`` before polling steering or follow-up.
     public var shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)?
 
+    /// Called when the no-progress guard trips on a non-terminating repeated
+    /// tool batch. Returning `true` grants one more guard window; returning
+    /// `false` preserves the normal ``RunStopReason/noProgress`` stop. The
+    /// agent layer owns only this generic decision so a permission module can
+    /// provide the surface-specific prompt without creating a dependency cycle.
+    public var onNoProgress: (@Sendable (TurnResult) async -> Bool)?
+
     public init(
         model: String = "unknown",
         toolExecution: ToolExecutionMode = .parallel,
@@ -341,11 +356,14 @@ public struct AgentLoopConfig: Sendable {
         getSteeringMessages: (@Sendable () async -> [Message])? = nil,
         drainSteeringBeforeFirstTurn: Bool = true,
         getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
-        shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil
+        shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil,
+        onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
+        maxCostPerRun: Decimal? = nil
     ) {
         self.model = model
         self.toolExecution = toolExecution
         self.maxTurns = maxTurns
+        self.maxCostPerRun = maxCostPerRun
         self.noProgressLimit = noProgressLimit
         self.beforeToolCall = beforeToolCall
         self.afterToolCall = afterToolCall
@@ -353,6 +371,7 @@ public struct AgentLoopConfig: Sendable {
         self.drainSteeringBeforeFirstTurn = drainSteeringBeforeFirstTurn
         self.getFollowUpMessages = getFollowUpMessages
         self.shouldStopAfterTurn = shouldStopAfterTurn
+        self.onNoProgress = onNoProgress
     }
 }
 
@@ -403,6 +422,8 @@ public enum RunStopReason: Sendable, Hashable {
     /// unbounded `maxTurns` safe — the shape that can spin forever is repeated
     /// identical tool calls, and this catches exactly that shape.
     case noProgress
+    /// The accumulated effective cost reached ``AgentLoopConfig/maxCostPerRun``.
+    case costLimitReached
 }
 
 /// What a turn's tool activity looked like, reduced to the parts that decide
@@ -464,7 +485,8 @@ public struct AgentRunResult: Sendable {
     ///
     /// Always `nil` for ``RunStopReason/completed``, ``RunStopReason/aborted``,
     /// ``RunStopReason/maxTurnsReached``, ``RunStopReason/stoppedByHook``,
-    /// ``RunStopReason/terminatedByTool`` and ``RunStopReason/noProgress`` — a
+    /// ``RunStopReason/terminatedByTool``, ``RunStopReason/noProgress`` and
+    /// ``RunStopReason/costLimitReached`` — a
     /// cancellation is not a failure, and a budget that ran out is not one
     /// either. ``RunStopReason/errored`` is the case this exists for.
     ///

@@ -7,6 +7,7 @@
 
 import DoMoCore
 import DoMoLLM
+import Foundation
 
 // MARK: - Entry point
 
@@ -122,6 +123,7 @@ public func runAgentLoop(
 
     var firstTurn = true
     var turnCount = 0
+    var accumulatedCost: Decimal = 0
     var lastBatchTerminated = false
     // Runaway guard state. `lastSignature` is the tool work of the previous turn
     // that did any; `repeatedTurns` is how many turns in a row have now produced
@@ -225,6 +227,19 @@ public func runAgentLoop(
 
             await sink.emit(.turnEnd(message: message, toolResults: toolResults))
 
+            // Cost is known only once the assistant message is complete. A
+            // turn that reaches the ceiling is therefore allowed to finish
+            // dispatching and persisting its tool results, but the loop will
+            // not issue another model request. Negative values are ignored so
+            // a malformed provider response cannot buy additional work.
+            if let maxCost = config.maxCostPerRun {
+                let turnCost = message.usage.effectiveCostTotal
+                if turnCost > 0 { accumulatedCost += turnCost }
+                if accumulatedCost >= maxCost {
+                    return await settle(.costLimitReached)
+                }
+            }
+
             // ── Runaway guard ────────────────────────────────────────────────
             // The replacement for a turn cap. It fires ONLY on a state that is
             // definitionally not progress — `noProgressLimit` turns in a row
@@ -287,9 +302,9 @@ public func runAgentLoop(
             //
             // Checked after `turn_end` so the turn the user can see is complete
             // before the run settles, and before `shouldStopAfterTurn`, matching
-            // the design. Note the hook is NOT consulted on the turn that trips
-            // the guard: the run has already been decided, so the guard's reason
-            // wins over `.stoppedByHook`.
+            // the design. A non-terminating trip can be handed to the optional
+            // hook; an approval clears the streak and grants another window,
+            // while a denial preserves `.noProgress`.
             //
             // `nil` is the ONLY disable. Anything else clamps UP to 2 rather
             // than switching off, because this is the only bound on a run once
@@ -311,7 +326,20 @@ public func runAgentLoop(
                     repeatedTurns = 1
                 }
                 if repeatedTurns >= limit {
-                    return await settle(lastBatchTerminated ? .terminatedByTool : .noProgress)
+                    if lastBatchTerminated {
+                        return await settle(.terminatedByTool)
+                    }
+                    let turnResult = TurnResult(message: message, toolResults: toolResults, messages: produced)
+                    if let onNoProgress = config.onNoProgress, await onNoProgress(turnResult) {
+                        // The user explicitly allowed another window. Clearing
+                        // the streak means the next approval is another honest
+                        // decision after the model has had a chance to change
+                        // its behavior.
+                        lastSignature = nil
+                        repeatedTurns = 0
+                    } else {
+                        return await settle(.noProgress)
+                    }
                 }
             } else {
                 lastSignature = nil

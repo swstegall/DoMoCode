@@ -218,5 +218,6 @@ public func defaultBaselinePermissionConfig() -> PermissionConfig {
         PermissionConfigEntry(permission: "ls", value: .action(.allow)),
         PermissionConfigEntry(permission: "find", value: .action(.allow)),
         PermissionConfigEntry(permission: "grep", value: .action(.allow)),
+        PermissionConfigEntry(permission: "doom_loop", value: .action(.ask)),
     ]
 }

@@ -25,6 +25,8 @@ struct ServerEventTests {
         #expect(ServerEvent.project(.agentEnd(messages: [], reason: .aborted)) == .agentEnd(reason: "aborted"))
         #expect(ServerEvent.project(.agentEnd(messages: [], reason: .maxTurnsReached))
             == .agentEnd(reason: "max_turns_reached"))
+        #expect(ServerEvent.project(.agentEnd(messages: [], reason: .costLimitReached))
+            == .agentEnd(reason: "cost_limit_reached"))
         #expect(ServerEvent.project(.turnStart) == .turnStart)
         #expect(ServerEvent.project(.turnEnd(message: assistant, toolResults: [])) == .turnEnd)
         #expect(ServerEvent.project(.messageStart(msg)) == .messageStart(msg))

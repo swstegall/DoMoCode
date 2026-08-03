@@ -231,6 +231,10 @@ public actor AgentHarness {
 
         public var maxTurns: Int?
 
+        /// Optional hard USD ceiling for the assistant turns in one run.
+        /// Forwarded to ``AgentLoopConfig/maxCostPerRun``.
+        public var maxCostPerRun: Decimal?
+
         /// When and how aggressively automatic pre-turn compaction fires.
         ///
         /// Clamped at construction against ``contextWindow`` (see
@@ -292,6 +296,10 @@ public actor AgentHarness {
         /// Forwarded into ``AgentLoopConfig/shouldStopAfterTurn``.
         public var shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)?
 
+        /// Consulted when the no-progress guard trips. A surface can use this
+        /// to turn a silent stop into an explicit permission decision.
+        public var onNoProgress: (@Sendable (TurnResult) async -> Bool)?
+
         /// Runs before each tool executes and may reject or rewrite the call. The
         /// permission engine's gate (Phase 8) is injected here; the loop already
         /// awaits it in `ToolDispatch.prepare` strictly before any side effect, but
@@ -320,7 +328,9 @@ public actor AgentHarness {
             getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
             followUpBox: FollowUpBox? = nil,
             shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil,
-            beforeToolCall: BeforeToolCallHook? = nil
+            beforeToolCall: BeforeToolCallHook? = nil,
+            onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
+            maxCostPerRun: Decimal? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.systemPromptForPrompt = systemPromptForPrompt
@@ -332,6 +342,7 @@ public actor AgentHarness {
             self.summarizer = summarizer
             self.toolExecution = toolExecution
             self.maxTurns = maxTurns
+            self.maxCostPerRun = maxCostPerRun
             // Clamped here as well as at the point of use, because this value is a
             // `var` a caller can set afterwards; the check in `compactIfNeeded` is
             // the one that cannot be walked around, and this one is what makes the
@@ -349,6 +360,7 @@ public actor AgentHarness {
             self.followUpBox = followUpBox
             self.shouldStopAfterTurn = shouldStopAfterTurn
             self.beforeToolCall = beforeToolCall
+            self.onNoProgress = onNoProgress
         }
 
         /// The window compaction assumes when ``contextWindow`` is `nil`.
@@ -990,7 +1002,9 @@ public actor AgentHarness {
             getSteeringMessages: steeringMessages,
             drainSteeringBeforeFirstTurn: drainSteeringBeforeFirstTurn,
             getFollowUpMessages: followUpMessages,
-            shouldStopAfterTurn: configuration.shouldStopAfterTurn
+            shouldStopAfterTurn: configuration.shouldStopAfterTurn,
+            onNoProgress: configuration.onNoProgress,
+            maxCostPerRun: configuration.maxCostPerRun
         )
         let errorBox = PersistenceErrorBox()
         let persistenceSink = SessionPersistenceSink(
