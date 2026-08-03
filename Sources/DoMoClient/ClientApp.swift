@@ -126,6 +126,8 @@ public final class ClientApp {
     private var questionHandle: ScreenOverlayHandle?
     private var questionDialog: QuestionDialog?
     private var questionOverlaySize: (columns: Int, rows: Int)?
+    private var copyOptionsHandle: ScreenOverlayHandle?
+    private var copyOptionsDialog: TranscriptOptionsDialog?
     /// Whether the session's event stream is currently up. Surfaced in the status
     /// line, because a dead stream is otherwise indistinguishable from a slow model.
     private var streamConnected = true
@@ -2146,11 +2148,39 @@ public final class ClientApp {
         actionTasks.append(task)
     }
 
-    /// Copy the lossless server history through the shared Markdown formatter.
+    /// Open the content-options dialog before copying the lossless server history.
     /// The visible transcript is a projection and may omit rows folded during
     /// reconnect, so `/copy` stays aligned with `domo export` rather than with
     /// the current viewport.
-    private func copyTranscript() {
+    private func openCopyOptionsDialog() {
+        guard store.selectedSessionID != nil else {
+            post(notice: "no session is open")
+            return
+        }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        let dialog = TranscriptOptionsDialog(keybindings: keybindings)
+        dialog.onCancel = { [weak self] in self?.dismissCopyOptionsDialog() }
+        dialog.onSubmit = { [weak self] options in
+            self?.dismissCopyOptionsDialog()
+            self?.copyTranscript(options: options)
+        }
+        copyOptionsDialog = dialog
+        copyOptionsHandle = dialogs?.present(
+            Box(dialog, paddingX: 1),
+            options: overlayOptions(width: 68, height: 10)
+        )
+    }
+
+    private func dismissCopyOptionsDialog() {
+        dismissDialog(copyOptionsHandle)
+        copyOptionsHandle = nil
+        copyOptionsDialog = nil
+    }
+
+    private func copyTranscript(options: TranscriptFormatOptions) {
         guard let id = store.selectedSessionID else {
             post(notice: "no session is open")
             return
@@ -2163,7 +2193,7 @@ public final class ClientApp {
             guard let self else { return }
             do {
                 let messages = try await self.client.messages(sessionID: id)
-                let text = TranscriptFormatter.markdown(messages: messages, options: .copy)
+                let text = TranscriptFormatter.markdown(messages: messages, options: options)
                 guard !text.isEmpty else {
                     self.post(notice: "nothing to copy")
                     return
@@ -2783,7 +2813,7 @@ public final class ClientApp {
             case .timeline:
                 showTimeline()
             case .copy:
-                copyTranscript()
+                openCopyOptionsDialog()
             case .undo:
                 moveWorkspaceHistory(.undo)
             case .redo:
@@ -3627,7 +3657,7 @@ extension ClientApp: TerminalApp {
             || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
             || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
             || diffReviewHandle != nil || diffRevertHandle != nil
-            || questionHandle != nil {
+            || questionHandle != nil || copyOptionsHandle != nil {
             surface?.handleInput(data)
             return
         }

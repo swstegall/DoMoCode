@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import DoMoGit
+import DoMoHarness
 import DoMoTUI
 import DoMoServer
 import DoMoTermIO
@@ -518,6 +519,79 @@ final class QuestionDialog: Component {
         }
         questionIndex += 1
         selectedIndex = 0
+    }
+}
+
+/// Chooses which transcript content crosses the clipboard boundary.
+///
+/// Export and copy share the same formatter, but copy is an interactive gesture:
+/// a small multi-select lets a user keep the default complete conversation or
+/// remove reasoning, tool activity, or session bookkeeping before the Markdown
+/// is handed to the clipboard.
+@MainActor
+final class TranscriptOptionsDialog: Component {
+    private let keybindings: Keybindings
+    private var selectedIndex = 0
+    private var includeReasoning: Bool
+    private var includeTools: Bool
+    private var includeMetadata: Bool
+
+    var onSubmit: ((TranscriptFormatOptions) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(options: TranscriptFormatOptions = .copy, keybindings: Keybindings = Keybindings()) {
+        self.keybindings = keybindings
+        self.includeReasoning = options.includeReasoning
+        self.includeTools = options.includeToolCalls || options.includeToolResults
+        self.includeMetadata = options.includeMetadata
+    }
+
+    func render(width: Int) -> [String] {
+        guard width > 0 else { return [] }
+        let rows = [
+            ("Reasoning", includeReasoning),
+            ("Tool calls and results", includeTools),
+            ("Session metadata", includeMetadata),
+        ]
+        var lines = [truncateToWidth("\u{1b}[1mCopy transcript\u{1b}[0m", width, ellipsis: "")]
+        for (index, row) in rows.enumerated() {
+            let marker = row.1 ? "[x]" : "[ ]"
+            let prefix = index == selectedIndex ? "> " : "  "
+            lines.append(truncateToWidth("\(prefix)\(marker) \(row.0)", width, ellipsis: ""))
+        }
+        lines.append("")
+        lines.append(truncateToWidth(dim("↑/↓ choose · Space toggle · Enter copy · Esc cancel"), width, ellipsis: ""))
+        return lines
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        guard !isKeyRelease(data) else { return }
+        if keybindings.matches(data, .selectCancel) {
+            onCancel?()
+        } else if keybindings.matches(data, .selectUp) {
+            selectedIndex = selectedIndex == 0 ? 2 : selectedIndex - 1
+        } else if keybindings.matches(data, .selectDown) {
+            selectedIndex = selectedIndex == 2 ? 0 : selectedIndex + 1
+        } else if data == [0x20] {
+            toggleSelected()
+        } else if keybindings.matches(data, .selectConfirm) {
+            onSubmit?(
+                TranscriptFormatOptions(
+                    includeReasoning: includeReasoning,
+                    includeToolCalls: includeTools,
+                    includeToolResults: includeTools,
+                    includeMetadata: includeMetadata
+                )
+            )
+        }
+    }
+
+    private func toggleSelected() {
+        switch selectedIndex {
+        case 0: includeReasoning.toggle()
+        case 1: includeTools.toggle()
+        default: includeMetadata.toggle()
+        }
     }
 }
 
