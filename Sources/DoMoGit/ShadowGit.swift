@@ -255,6 +255,18 @@ public actor DoMoShadowGit: WorkspaceSnapshotSource {
 
     private func ensureInitialized() async throws(DoMoError) {
         guard !initialized else { return }
+        do {
+            try FileManager.default.createDirectory(
+                atPath: gitDirectory.string,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw DoMoError(
+                .file(path: gitDirectory, errno: nil),
+                "create shadow Git directory",
+                cause: error
+            )
+        }
         // `git init --bare` rejects `--work-tree`; add the work-tree setting
         // immediately after initialization instead.
         let initResult = try await runShadowSetup(["init", "--bare", "--quiet"])

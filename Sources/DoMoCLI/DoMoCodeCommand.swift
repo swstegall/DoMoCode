@@ -918,7 +918,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             let runtime = configuration.modelRuntime(for: alias)
             return ModelOption(id: alias, contextWindow: runtime.contextWindow)
         }
-        let runtime = ServerRuntime(config: ServerRuntime.Config(
+        let snapshotRoot = configuration.sessionDirectory
+            .appending(JSONLSessionStore.sanitizedDirectoryName(forCwd: workingDirectory.string))
+            .appending("snapshots")
+        var runtimeConfiguration = ServerRuntime.Config(
             systemPrompt: promptWorkspace.baseSystemPrompt,
             tools: tools,
             model: model,
@@ -958,7 +961,15 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             questionBroker: questionBroker,
             sessionStartHead: sessionStartHead,
             diffSource: DoMoGit(shell: shell)
-        ))
+        )
+        runtimeConfiguration.workspaceSnapshotsForSession = { sessionID in
+            DoMoShadowGit(
+                shell: shell,
+                workspace: workingDirectory,
+                gitDirectory: snapshotRoot.appending(sessionID).appending("shadow.git")
+            )
+        }
+        let runtime = ServerRuntime(config: runtimeConfiguration)
         return (runtime, mcpManager, backgroundSessions)
     }
 

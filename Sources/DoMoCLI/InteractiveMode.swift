@@ -412,6 +412,7 @@ final class InteractiveCoordinator {
     private let toolTheme: ToolRenderTheme
     private let homeDirectory: String?
     private let keybindings: Keybindings
+    private let sessionDirectory: FilePath
 
     /// The terminal's inline-image capability and cell pixel size, detected once by
     /// `run` (the REPL owns the tty). A tool result's image blocks render through
@@ -537,6 +538,7 @@ final class InteractiveCoordinator {
         toolRendererRegistry: ToolRendererRegistry,
         toolTheme: ToolRenderTheme,
         homeDirectory: String?,
+        sessionDirectory: FilePath,
         steering: SteeringBox,
         questionBox: QuestionBox,
         fileSystem: SandboxedFileSystem? = nil,
@@ -559,6 +561,7 @@ final class InteractiveCoordinator {
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
         self.homeDirectory = homeDirectory
+        self.sessionDirectory = sessionDirectory
         self.keybindings = keybindings
         self.imageCapabilities = imageCapabilities
         self.cell = cell
@@ -897,6 +900,26 @@ final class InteractiveCoordinator {
                 }
                 self.render()
             }
+            return
+        case .some(.timeline):
+            stagedImages = []
+            showTimeline()
+            return
+        case .some(.undo):
+            stagedImages = []
+            moveWorkspaceHistory(.undo)
+            return
+        case .some(.redo):
+            stagedImages = []
+            moveWorkspaceHistory(.redo)
+            return
+        case .some(.fork):
+            stagedImages = []
+            forkSession(clone: false)
+            return
+        case .some(.clone):
+            stagedImages = []
+            forkSession(clone: true)
             return
         case .some(.help):
             let names = commandProcessor.workspace.commands.commands
@@ -1744,6 +1767,79 @@ final class InteractiveCoordinator {
         transcript.addChild(Text("  \u{1b}[33m⚠ " + text + Self.sgrReset))
     }
 
+    /// Show the durable entries without projecting metadata into the model's
+    /// context. The inline surface has no tree picker, so the tail is deliberately
+    /// compact and points users to the session file for the complete record.
+    private func showTimeline() {
+        guard !running else {
+            appendStopNotice("/timeline is unavailable while a turn is running")
+            render()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                self.appendStopNotice(Self.timelineNotice(try await self.harness.timeline()))
+            } catch {
+                self.appendError(error)
+            }
+            self.render()
+        }
+    }
+
+    /// Move the active conversation and shadow workspace as one append-only
+    /// operation. The transcript already contains the old branch, so the notice
+    /// names the durable move; the next turn is seeded from the adopted branch.
+    private func moveWorkspaceHistory(_ operation: SessionHistoryOperation) {
+        guard !running else {
+            appendStopNotice("/\(operation.rawValue) is unavailable while a turn is running")
+            render()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result: WorkspaceHistoryResult
+                switch operation {
+                case .undo: result = try await self.harness.undo()
+                case .redo: result = try await self.harness.redo()
+                }
+                self.appendStopNotice(Self.historyNotice(result))
+            } catch {
+                self.appendError(error)
+            }
+            self.render()
+        }
+    }
+
+    /// Create a sibling session from the active branch. The inline surface keeps
+    /// running in the current file; the new path is explicit so it can be resumed
+    /// with `--resume` without pretending that an immutable coordinator switched
+    /// sessions underneath the active transcript.
+    private func forkSession(clone: Bool) {
+        guard !running else {
+            appendStopNotice("/\(clone ? "clone" : "fork") is unavailable while a turn is running")
+            render()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let forked: AgentHarness
+                if clone {
+                    forked = try await self.harness.clone(sessionDirectory: self.sessionDirectory)
+                } else {
+                    forked = try await self.harness.fork(sessionDirectory: self.sessionDirectory)
+                }
+                let path = await forked.sessionFilePath.string
+                self.appendStopNotice((clone ? "cloned" : "forked") + " session: " + path)
+            } catch {
+                self.appendError(error)
+            }
+            self.render()
+        }
+    }
+
     /// Keep `/context` useful on a narrow terminal: show the shape and meter of
     /// the projected request without dumping its potentially large message body
     /// into the transcript.
@@ -1763,6 +1859,29 @@ final class InteractiveCoordinator {
         let shape = "\(messages.count) messages (system \(systems), user \(users), assistant \(assistants), tool \(tools))"
         let meter = InlineAccountingSummary.text(accounting)
         return meter.isEmpty ? "context: \(shape) · accounting unavailable" : "context: \(shape) · \(meter)"
+    }
+
+    private static func timelineNotice(_ entries: [SessionTreeEntry]) -> String {
+        let tail = entries.suffix(6).map { entry in
+            entry.entryType.rawValue + "#" + String(entry.id.prefix(8))
+        }.joined(separator: " · ")
+        return "timeline: " + String(entries.count) + " entries" + (tail.isEmpty ? "" : " · " + tail)
+    }
+
+    private static func historyNotice(_ result: WorkspaceHistoryResult) -> String {
+        var notice = result.operation.rawValue + ": "
+            + (result.moved ? "moved" : "no change")
+            + " · " + result.status.rawValue
+        if !result.restoredPaths.isEmpty {
+            notice += " · restored " + String(result.restoredPaths.count)
+        }
+        if !result.skippedPaths.isEmpty {
+            notice += " · skipped " + String(result.skippedPaths.count)
+        }
+        if !result.failedPaths.isEmpty {
+            notice += " · failed " + String(result.failedPaths.count)
+        }
+        return notice
     }
 
     /// Say out loud that a LiteLLM fallback fired and a different model answered.
@@ -1901,6 +2020,7 @@ final class InteractiveCoordinator {
 /// stays a plain sendable bundle of run inputs.
 public struct InteractiveMode: Sendable {
     private let harness: AgentHarness
+    private let sessionDirectory: FilePath
     private let directoryLister: DirectoryLister
     private let slashCommands: [SlashCommand]
     private let commandProcessor: PromptCommandProcessor
@@ -1938,6 +2058,7 @@ public struct InteractiveMode: Sendable {
 
     private init(
         harness: AgentHarness,
+        sessionDirectory: FilePath,
         directoryLister: @escaping DirectoryLister,
         slashCommands: [SlashCommand],
         commandProcessor: PromptCommandProcessor,
@@ -1955,6 +2076,7 @@ public struct InteractiveMode: Sendable {
         mcpManager: MCPManager? = nil
     ) {
         self.harness = harness
+        self.sessionDirectory = sessionDirectory
         self.directoryLister = directoryLister
         self.slashCommands = slashCommands
         self.commandProcessor = commandProcessor
@@ -2147,7 +2269,7 @@ public struct InteractiveMode: Sendable {
 
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         systemPromptForPrompt = { prompt in promptWorkspace.systemPrompt(for: prompt) }
-        let configuration = AgentHarness.Configuration(
+        var configuration = AgentHarness.Configuration(
             systemPrompt: promptWorkspace.baseSystemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
             tools: tools,
@@ -2174,6 +2296,13 @@ public struct InteractiveMode: Sendable {
             maxCostPerRun: maxCostPerRun,
             sessionStartHead: sessionStartHead
         )
+        configuration.workspaceSnapshots = DoMoShadowGit(
+            shell: shell,
+            workspace: workDirectory,
+            gitDirectory: sessionDir
+                .appending(JSONLSessionStore.sanitizedDirectoryName(forCwd: workDirectory.string))
+                .appending("interactive-shadow.git")
+        )
 
         // MCP is already connected by here; if harness construction fails, tear the
         // servers down before rethrowing — this is the one throwing call between the
@@ -2196,6 +2325,7 @@ public struct InteractiveMode: Sendable {
 
         return InteractiveMode(
             harness: harness,
+            sessionDirectory: sessionDir,
             directoryLister: lister,
             slashCommands: promptWorkspace.commands.commands.map {
                 SlashCommand(name: $0.name, description: $0.description, argumentHint: $0.argumentHint)
@@ -2305,6 +2435,7 @@ public struct InteractiveMode: Sendable {
             toolRendererRegistry: toolRendererRegistry,
             toolTheme: toolTheme,
             homeDirectory: homeDirectory,
+            sessionDirectory: sessionDirectory,
             steering: steering,
             questionBox: questionBox,
             fileSystem: fileSystem,

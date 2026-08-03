@@ -10,6 +10,7 @@
 
 import DoMoCore
 import DoMoExec
+import DoMoGit
 import DoMoHarness
 import DoMoLLM
 import DoMoPermissions
@@ -124,6 +125,10 @@ public final class ClientApp {
     /// Whether the session's event stream is currently up. Surfaced in the status
     /// line, because a dead stream is otherwise indistinguishable from a slow model.
     private var streamConnected = true
+    /// The runtime's last level-triggered workspace snapshot answer. It is shown
+    /// in the status row so the UI never implies that undo restored files when
+    /// snapshots are disabled or unavailable.
+    private var workspaceSnapshotStatus: WorkspaceSnapshotStatus = .unavailable
     /// A transient status-line message and when it lapses — the client's only error
     /// surface. Without one there is nowhere to report a refused or failed action,
     /// which is precisely why they used to be swallowed.
@@ -560,6 +565,9 @@ public final class ClientApp {
         }
         if store.queuedMessageCount > 0 {
             parts.append("queued \(store.queuedMessageCount)")
+        }
+        if store.selectedSessionID != nil {
+            parts.append("ws " + workspaceSnapshotStatus.rawValue)
         }
         // Contextual controls come before transient notices. The status row is
         // truncated from the right, and a long disconnect or refusal notice can
@@ -1641,6 +1649,7 @@ public final class ClientApp {
         // adopted.
         lastStatusPollAt = Date()
         await seedAccounting(sessionID)
+        await seedWorkspaceStatus(sessionID)
     }
 
     /// Fill the footer's totals for a session that was already under way.
@@ -1655,6 +1664,19 @@ public final class ClientApp {
         }
         guard store.selectedSessionID == id else { return }
         store.adoptAccounting(status)
+    }
+
+    private func seedWorkspaceStatus(_ id: String) async {
+        guard let status = try? await client.workspaceStatus(sessionID: id) else {
+            if store.selectedSessionID == id {
+                workspaceSnapshotStatus = .unavailable
+                surface?.requestRender()
+            }
+            return
+        }
+        guard store.selectedSessionID == id else { return }
+        workspaceSnapshotStatus = status
+        surface?.requestRender()
     }
 
     /// Subscribe to a session's event stream, and KEEP it subscribed.
@@ -1893,6 +1915,11 @@ public final class ClientApp {
             SelectItem(value: "title", label: "Auto-title session", description: "Ask the active model for a short name"),
             SelectItem(value: "model", label: "Switch model", description: "Write a model_change entry"),
             SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
+            SelectItem(value: "timeline", label: "Show session timeline", description: "Inspect checkpoints and history moves"),
+            SelectItem(value: "undo", label: "Undo conversation and workspace", description: "Restore the previous checkpoint"),
+            SelectItem(value: "redo", label: "Redo conversation and workspace", description: "Reapply the most recent undo"),
+            SelectItem(value: "fork", label: "Fork session", description: "Open a new session from this branch"),
+            SelectItem(value: "clone", label: "Clone session", description: "Open an independent copy of this branch"),
             SelectItem(value: "diff", label: "Review working-tree diff", description: "Inspect changes since the session started"),
             SelectItem(value: "review", label: "Review diff (guided)", description: "Mark files reviewed and restore individual paths"),
             SelectItem(value: "theme-dark", label: "Theme: dark", description: "Use the dark palette"),
@@ -1924,6 +1951,11 @@ public final class ClientApp {
         case "title": autoTitleSession()
         case "model": openModelPicker()
         case "tree": openTreePicker()
+        case "timeline": showTimeline()
+        case "undo": moveWorkspaceHistory(.undo)
+        case "redo": moveWorkspaceHistory(.redo)
+        case "fork": forkSession(clone: false)
+        case "clone": forkSession(clone: true)
         case "diff": openDiffReview(advisory: false)
         case "review": openDiffReview(advisory: true)
         case "theme-dark": setAppearance(.dark)
@@ -2035,6 +2067,88 @@ public final class ClientApp {
                 self.treePickerHandle = self.dialogs?.present(dialog, options: self.overlayOptions(width: 92, height: 20))
             } catch {
                 self.postError("Could not load the conversation tree", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func showTimeline() {
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let entries = try await self.client.timeline(sessionID: id)
+                guard self.store.selectedSessionID == id else { return }
+                self.post(notice: Self.timelineNotice(entries), seconds: 8)
+            } catch {
+                self.postError("Could not load the session timeline", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func moveWorkspaceHistory(_ operation: SessionHistoryOperation) {
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result: WorkspaceHistoryResult
+                switch operation {
+                case .undo: result = try await self.client.undo(sessionID: id)
+                case .redo: result = try await self.client.redo(sessionID: id)
+                }
+                guard self.store.selectedSessionID == id else { return }
+                if let history = try? await self.client.messages(sessionID: id) {
+                    guard self.store.selectedSessionID == id else { return }
+                    self.store.seed(history)
+                }
+                await self.seedAccounting(id)
+                await self.seedWorkspaceStatus(id)
+                self.post(notice: Self.historyNotice(result), seconds: 8)
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                self.refuseAsBusy()
+            } catch {
+                self.postError("Could not move workspace history", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func forkSession(clone: Bool) {
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let ref: SessionRef
+                if clone {
+                    ref = try await self.client.clone(sessionID: id)
+                } else {
+                    ref = try await self.client.fork(sessionID: id)
+                }
+                self.store.setSessions(try await self.client.listSessions())
+                await self.open(ref.id)
+                self.post(notice: (clone ? "cloned" : "forked") + " session")
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                self.refuseAsBusy()
+            } catch {
+                self.postError(clone ? "Could not clone the session" : "Could not fork the session", error)
             }
         }
         actionTasks.append(task)
@@ -2530,13 +2644,23 @@ public final class ClientApp {
                 store.seed([])
                 transcriptView.scrollToBottom()
                 post(notice: "transcript cleared")
+            case .clone:
+                forkSession(clone: true)
             case .exit:
                 quit.quit()
+            case .fork:
+                forkSession(clone: false)
             case .help:
                 let names = commandRegistry.commands.map { "/\($0.name)" }.joined(separator: " · ")
                 post(notice: names, seconds: 8)
             case .tree:
                 openTreePicker()
+            case .timeline:
+                showTimeline()
+            case .undo:
+                moveWorkspaceHistory(.undo)
+            case .redo:
+                moveWorkspaceHistory(.redo)
             case .diff:
                 openDiffReview(advisory: false)
             case .review:
@@ -2665,6 +2789,29 @@ public final class ClientApp {
         let end = rest.firstIndex(where: { $0.isWhitespace }) ?? rest.endIndex
         let name = String(rest[..<end])
         return name.isEmpty ? nil : name
+    }
+
+    private static func timelineNotice(_ entries: [SessionTreeEntry]) -> String {
+        let tail = entries.suffix(6).map { entry in
+            entry.entryType.rawValue + "#" + String(entry.id.prefix(8))
+        }.joined(separator: " · ")
+        return "timeline: " + String(entries.count) + " entries" + (tail.isEmpty ? "" : " · " + tail)
+    }
+
+    private static func historyNotice(_ result: WorkspaceHistoryResult) -> String {
+        var notice = result.operation.rawValue + ": "
+            + (result.moved ? "moved" : "no change")
+            + " · " + result.status.rawValue
+        if !result.restoredPaths.isEmpty {
+            notice += " · restored " + String(result.restoredPaths.count)
+        }
+        if !result.skippedPaths.isEmpty {
+            notice += " · skipped " + String(result.skippedPaths.count)
+        }
+        if !result.failedPaths.isEmpty {
+            notice += " · failed " + String(result.failedPaths.count)
+        }
+        return notice
     }
 
     /// A bounded, useful `/context` acknowledgement. The full message bodies

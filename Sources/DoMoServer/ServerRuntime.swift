@@ -276,6 +276,12 @@ public actor ServerRuntime {
         /// Git operations for diff/review routes. Nil keeps embedded test
         /// runtimes and older integrations free of repository access.
         public var git: DoMoGit?
+        /// A shared snapshot source used by small embedded runtimes and tests.
+        /// Production callers should prefer `workspaceSnapshotsForSession` so
+        /// each session receives its own shadow object database.
+        public var workspaceSnapshots: (any WorkspaceSnapshotSource)?
+        /// Builds an isolated shadow snapshot source for a session id.
+        public var workspaceSnapshotsForSession: (@Sendable (String) -> (any WorkspaceSnapshotSource)?)?
         /// The review source abstraction. The git property remains as a
         /// compatibility fallback for callers that predate DiffSource.
         public var diffSource: (any DiffSource)?
@@ -346,6 +352,8 @@ public actor ServerRuntime {
             self.maxCostPerRun = maxCostPerRun
             self.sessionStartHead = sessionStartHead
             self.git = git
+            self.workspaceSnapshots = nil
+            self.workspaceSnapshotsForSession = nil
             self.diffSource = diffSource
             self.questionBroker = questionBroker
         }
@@ -523,7 +531,7 @@ public actor ServerRuntime {
         } else {
             toolsForTurn = config.getTools
         }
-        return AgentHarness.Configuration(
+        var configuration = AgentHarness.Configuration(
             systemPrompt: config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
             tools: config.tools,
@@ -549,6 +557,8 @@ public actor ServerRuntime {
             maxCostPerRun: config.maxCostPerRun,
             sessionStartHead: config.sessionStartHead
         )
+        configuration.workspaceSnapshots = config.workspaceSnapshotsForSession?(sessionID) ?? config.workspaceSnapshots
+        return configuration
     }
 
     /// Drain a session's box and publish the level-triggered count immediately.
@@ -728,6 +738,14 @@ public actor ServerRuntime {
         )
         sessions[id] = makeState(harness: harness, sink: BroadcastEventSink(), steeringBox: steeringBox)
         return SessionRef(id: id, path: path.string)
+    }
+
+    /// Clone a live session into an independent session file.
+    public func clone(sessionID: String) async throws -> SessionRef {
+        // The fork implementation already creates a fresh runtime state and
+        // preserves the append-only branch; clone is a separate entry point for
+        // surfaces that want copy semantics without tree-navigation terminology.
+        try await fork(sessionID: sessionID)
     }
 
     // MARK: Runs
@@ -1282,6 +1300,34 @@ public actor ServerRuntime {
     /// are visible without inventing a second wire representation.
     public func tree(sessionID: String) async throws -> [SessionTreeEntry] {
         try await Self.loadTree(at: try await sessionPath(sessionID))
+    }
+
+    /// The append-only timeline, including workspace checkpoints and undo/redo
+    /// actions. Kept distinct from `/tree` so a client can use a stable command
+    /// name even when the tree picker evolves.
+    public func timeline(sessionID: String) async throws -> [SessionTreeEntry] {
+        try await tree(sessionID: sessionID)
+    }
+
+    /// Current workspace snapshot capability for the session.
+    public func workspaceStatus(sessionID: String) async throws -> WorkspaceSnapshotStatus {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        return await session.harness.workspaceStatus()
+    }
+
+    /// Move the active conversation and shadow workspace to the previous
+    /// checkpoint. The harness owns the append-only action and conflict result.
+    public func undo(sessionID: String) async throws -> WorkspaceHistoryResult {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        return try await session.harness.undo()
+    }
+
+    /// Reapply the most recent undo when no newer entry superseded it.
+    public func redo(sessionID: String) async throws -> WorkspaceHistoryResult {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        return try await session.harness.redo()
     }
 
     /// Persist a model selection for a session and make it the stream used by its

@@ -275,6 +275,34 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        router.get("/session/:id/timeline") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.timeline(sessionID: id))
+            }
+        }
+
+        router.get("/session/:id/workspace-status") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.workspaceStatus(sessionID: id))
+            }
+        }
+
+        router.post("/session/:id/undo") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.undo(sessionID: id), status: .ok)
+            }
+        }
+
+        router.post("/session/:id/redo") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.redo(sessionID: id), status: .ok)
+            }
+        }
+
         router.post("/session/:id/model") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
@@ -435,6 +463,13 @@ public struct DoMoServer: Sendable {
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
                 return try Self.json(try await self.runtime.fork(sessionID: id), status: .created)
+            }
+        }
+
+        router.post("/session/:id/clone") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.clone(sessionID: id), status: .created)
             }
         }
 

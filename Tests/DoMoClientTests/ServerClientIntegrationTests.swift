@@ -11,6 +11,7 @@ import AsyncHTTPClient
 import DoMoAgent
 import DoMoClient
 import DoMoCore
+import DoMoGit
 import DoMoHarness
 import DoMoLLM
 import DoMoServer
@@ -21,6 +22,30 @@ import Testing
 @Suite(.serialized)
 struct ServerClientIntegrationTests {
     static let token = "client-test-token-xyz"
+
+    private actor SnapshotScript: WorkspaceSnapshotSource {
+        private let snapshots: [WorkspaceSnapshot]
+        private var index = 0
+
+        init(_ snapshots: [WorkspaceSnapshot]) {
+            self.snapshots = snapshots
+        }
+
+        func availability() async -> WorkspaceSnapshotStatus { .restored }
+
+        func track(from previousID: String?) async throws(DoMoError) -> WorkspaceSnapshot {
+            guard !snapshots.isEmpty else {
+                throw DoMoError(.configuration, "snapshot script is empty")
+            }
+            let snapshot = snapshots[min(index, snapshots.count - 1)]
+            index += 1
+            return WorkspaceSnapshot(id: snapshot.id, previousID: previousID, files: snapshot.files)
+        }
+
+        func restore(_ plan: WorkspaceRevertPlan) async throws(DoMoError) -> WorkspaceRestoreResult {
+            WorkspaceRestoreResult(status: .restored, restoredPaths: plan.paths)
+        }
+    }
 
     /// One assistant turn producing `text`, then stop.
     static func streamFn(_ text: String) -> AgentStreamFn {
@@ -120,6 +145,69 @@ struct ServerClientIntegrationTests {
         // Fork yields a new id.
         let forked = try await client.fork(sessionID: ref.id)
         #expect(forked.id != ref.id)
+
+        try await http.shutdown()
+        serverTask.cancel()
+        _ = try? await serverTask.value
+    }
+
+    @Test("workspace status, timeline, undo, redo, and clone round-trip through ServerClient")
+    func workspaceHistoryFlow() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+
+        var configuration = ServerRuntime.Config(
+            systemPrompt: "You are a test.",
+            tools: [],
+            model: "test-model",
+            streamFn: Self.streamFn("answer"),
+            toolExecution: .sequential,
+            maxTurns: 10,
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path
+        )
+        configuration.workspaceSnapshotsForSession = { _ in
+            SnapshotScript([
+                WorkspaceSnapshot(id: "base", files: []),
+                WorkspaceSnapshot(id: "one", files: ["Sources/One.swift"]),
+                WorkspaceSnapshot(id: "two", files: ["Sources/One.swift", "Sources/Two.swift"]),
+            ])
+        }
+        let server = DoMoServer(
+            runtime: ServerRuntime(config: configuration),
+            options: .init(host: "127.0.0.1", port: 0, token: Self.token, heartbeatSeconds: 3600)
+        )
+
+        let (portStream, portCont) = AsyncStream<Int>.makeStream()
+        let serverTask = Task { try await server.run(onReady: { port in portCont.yield(port); portCont.finish() }) }
+        var portIterator = portStream.makeAsyncIterator()
+        let port = await portIterator.next() ?? 0
+        let http = HTTPClient(eventLoopGroupProvider: .singleton)
+        let client = ServerClient(baseURL: "http://127.0.0.1:\(port)", token: Self.token, http: http)
+        let ref = try await client.createSession()
+
+        #expect(try await client.workspaceStatus(sessionID: ref.id) == .restored)
+        try await client.sendPrompt(sessionID: ref.id, prompt: "first")
+        #expect(await waitUntilIdle(client, ref.id))
+        try await client.sendPrompt(sessionID: ref.id, prompt: "second")
+        #expect(await waitUntilIdle(client, ref.id))
+
+        let timeline = try await client.timeline(sessionID: ref.id)
+        #expect(timeline.contains { if case .workspaceCheckpoint = $0.payload { true } else { false } })
+        #expect(timeline.count >= 3)
+
+        let undo = try await client.undo(sessionID: ref.id)
+        #expect(undo.moved)
+        #expect(undo.status == .restored)
+        #expect((try await client.context(sessionID: ref.id)).messages.count == 2)
+
+        let redo = try await client.redo(sessionID: ref.id)
+        #expect(redo.moved)
+        #expect(redo.status == .restored)
+        #expect((try await client.context(sessionID: ref.id)).messages.count == 4)
+
+        let cloned = try await client.clone(sessionID: ref.id)
+        #expect(cloned.id != ref.id)
 
         try await http.shutdown()
         serverTask.cancel()

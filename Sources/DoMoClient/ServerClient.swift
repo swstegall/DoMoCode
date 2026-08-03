@@ -243,6 +243,39 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode([SessionTreeEntry].self, from: data)
     }
 
+    /// Fetch the append-only timeline, including workspace checkpoints and
+    /// undo/redo actions.
+    public func timeline(sessionID: String) async throws -> [SessionTreeEntry] {
+        let path = "/session/\(sessionID)/timeline"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionTreeEntry].self, from: data)
+    }
+
+    /// Fetch the truthful workspace snapshot state.
+    public func workspaceStatus(sessionID: String) async throws -> WorkspaceSnapshotStatus {
+        let path = "/session/\(sessionID)/workspace-status"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(WorkspaceSnapshotStatus.self, from: data)
+    }
+
+    /// Undo conversation and workspace history together.
+    public func undo(sessionID: String) async throws -> WorkspaceHistoryResult {
+        let path = "/session/\(sessionID)/undo"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(WorkspaceHistoryResult.self, from: data)
+    }
+
+    /// Redo the most recent undo.
+    public func redo(sessionID: String) async throws -> WorkspaceHistoryResult {
+        let path = "/session/\(sessionID)/redo"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(WorkspaceHistoryResult.self, from: data)
+    }
+
     public func changeModel(sessionID: String, modelID: String) async throws {
         let path = "/session/\(sessionID)/model"
         let body = try JSONEncoder().encode(ModelBody(modelID: modelID))
@@ -340,6 +373,14 @@ public struct ServerClient: Sendable {
     /// Fork the session into a new branch/file. `POST /session/{id}/fork` → 201.
     public func fork(sessionID: String) async throws -> SessionRef {
         let path = "/session/\(sessionID)/fork"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 201, path, body: data)
+        return try JSONDecoder().decode(SessionRef.self, from: data)
+    }
+
+    /// Clone the session into an independent file. `POST /session/{id}/clone` → 201.
+    public func clone(sessionID: String) async throws -> SessionRef {
+        let path = "/session/\(sessionID)/clone"
         let (status, data) = try await send(.post, path)
         try expect(status, 201, path, body: data)
         return try JSONDecoder().decode(SessionRef.self, from: data)

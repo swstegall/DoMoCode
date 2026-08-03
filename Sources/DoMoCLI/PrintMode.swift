@@ -664,7 +664,7 @@ public struct PrintMode: Sendable {
         if let promptWorkspace {
             systemPromptForPrompt = { prompt in promptWorkspace.systemPrompt(for: prompt) }
         }
-        let configuration = AgentHarness.Configuration(
+        var configuration = AgentHarness.Configuration(
             systemPrompt: promptWorkspace?.baseSystemPrompt ?? fallbackSystemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
             tools: tools,
@@ -706,6 +706,12 @@ public struct PrintMode: Sendable {
             onNoProgress: onNoProgress,
             maxCostPerRun: maxCostPerRun,
             sessionStartHead: sessionStartHead
+        )
+        configuration.workspaceSnapshots = try? DoMoShadowGit(
+            workspace: workingDirectory,
+            gitDirectory: sessionDirectory
+                .appending(JSONLSessionStore.sanitizedDirectoryName(forCwd: workingDirectory.string))
+                .appending("inline-shadow.git")
         )
 
         let harness = try await makeHarness(configuration: configuration)

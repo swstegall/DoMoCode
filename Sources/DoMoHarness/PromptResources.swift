@@ -109,13 +109,18 @@ public struct CommandDescriptor: Codable, Hashable, Sendable {
 /// Actions that are meaningful to a client without starting an agent turn.
 public enum LocalCommand: String, Codable, Hashable, Sendable {
     case clear
+    case clone
     case compact
     case context
     case diff
     case exit
+    case fork
     case help
+    case redo
     case review
+    case timeline
     case tree
+    case undo
 }
 
 /// A skill loaded from a `SKILL.md` or compatible markdown file.
@@ -198,6 +203,12 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             action: .clear
         ),
         CommandDescriptor(
+            name: "clone",
+            description: "Clone the current conversation into a new session",
+            kind: .local,
+            action: .clone
+        ),
+        CommandDescriptor(
             name: "compact",
             description: "Compact the current model context",
             kind: .local,
@@ -222,6 +233,12 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             action: .exit
         ),
         CommandDescriptor(
+            name: "fork",
+            description: "Fork the current conversation into a new session",
+            kind: .local,
+            action: .fork
+        ),
+        CommandDescriptor(
             name: "quit",
             description: "End the session",
             kind: .local,
@@ -234,16 +251,34 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             action: .help
         ),
         CommandDescriptor(
+            name: "redo",
+            description: "Redo the most recent undo",
+            kind: .local,
+            action: .redo
+        ),
+        CommandDescriptor(
             name: "review",
             description: "Review current changes and their risks",
             kind: .local,
             action: .review
         ),
         CommandDescriptor(
+            name: "timeline",
+            description: "Show the append-only conversation timeline",
+            kind: .local,
+            action: .timeline
+        ),
+        CommandDescriptor(
             name: "tree",
             description: "Browse and branch the conversation tree",
             kind: .local,
             action: .tree
+        ),
+        CommandDescriptor(
+            name: "undo",
+            description: "Undo the latest conversation and workspace step",
+            kind: .local,
+            action: .undo
         ),
         CommandDescriptor(
             name: "init",

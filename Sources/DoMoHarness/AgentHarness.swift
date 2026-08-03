@@ -690,6 +690,14 @@ public actor AgentHarness {
         return AgentHarness(store: forked, leaf: updatedForkedTree.leafID, configuration: configuration, seed: seed)
     }
 
+    /// Clone the active branch into an independent session. Clone is a named
+    /// alias at the harness layer; the persisted header and re-chained entries
+    /// use the same safe fork primitive, while the separate command gives clients
+    /// a discoverable copy operation.
+    public func clone(sessionDirectory: FilePath) throws -> AgentHarness {
+        try fork(sessionDirectory: sessionDirectory)
+    }
+
     // MARK: - Inspection
 
     /// The file this session persists to.
