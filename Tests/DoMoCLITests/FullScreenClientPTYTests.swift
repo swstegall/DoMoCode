@@ -85,10 +85,15 @@ struct FullScreenClientPTYTests {
     /// it is the stable readiness signal between the first frame and prompt input.
     static let openedSessionRow = "work  "
 
-    /// Bootstrap may query the model catalog, and that request is not a turn.
+    /// Bootstrap may query the model catalog, and a completed full-screen run may
+    /// ask the same model for an automatic session title. Neither request is a
+    /// conversation turn: title generation is metadata and shares the same
+    /// `/chat/completions` endpoint, so identify it by its private prompt marker.
     static func completionCount(_ gateway: MockGateway) -> Int {
         gateway.requests.reduce(into: 0) { count, request in
-            if request.method == "POST", request.path.contains("chat/completions") {
+            if request.method == "POST",
+               request.path.contains("chat/completions"),
+               !request.body.contains("Give this coding session a useful short title.") {
                 count += 1
             }
         }
