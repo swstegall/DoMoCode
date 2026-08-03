@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import Testing
+import DoMoTermGraphics
 @testable import DoMoTUI
 
 @MainActor
@@ -115,5 +116,29 @@ struct SplitFooterTests {
 
         #expect(bytes.contains("\u{1b}[2J"))
         #expect(oracle.screen == ["", "L0", "status", "prompt", "hint"])
+    }
+
+    @Test("A split-footer repaint deletes stale Kitty image pixels")
+    func imageDeletionOnRepaint() throws {
+        var core = SplitFooterCore()
+        let image = encodeKitty("QUJD", columns: 5, rows: 2, imageId: 41, moveCursor: false)
+        _ = try core.frame(
+            lines: ["top", image, "", "status"],
+            width: 20,
+            height: 5,
+            footerRows: 1
+        )
+        let replacement = try core.frame(
+            lines: ["top", "replacement", "status"],
+            width: 20,
+            height: 5,
+            footerRows: 1
+        )
+
+        #expect(replacement.contains(deleteKittyImage(41)))
+        #expect(replacement.contains("\u{1b}[2J"))
+        let deleteRange = try #require(replacement.range(of: deleteKittyImage(41)))
+        let clearRange = try #require(replacement.range(of: "\u{1b}[2J"))
+        #expect(deleteRange.lowerBound < clearRange.lowerBound)
     }
 }

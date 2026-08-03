@@ -25,6 +25,7 @@ public struct SplitFooterCore {
     private var previousFooterRows = 0
     private var hasRendered = false
     private let lineRenderer = RenderCore()
+    private var previousKittyImageIds: Set<UInt32> = []
     private(set) var fullRedrawCount = 0
 
     public init() {}
@@ -40,6 +41,7 @@ public struct SplitFooterCore {
         previousHeight = -1
         previousFooterRows = 0
         hasRendered = false
+        previousKittyImageIds = []
     }
 
     /// Pad the transcript before its footer so overlay geometry remains
@@ -97,6 +99,7 @@ public struct SplitFooterCore {
             label: "transcript"
         )
         let renderedFooter = try validateAndReset(footer, width: safeWidth, label: "footer")
+        let currentKittyImageIds = lineRenderer.collectKittyImageIds(renderedTranscript)
 
         let widthChanged = previousWidth > 0 && previousWidth != safeWidth
         let heightChanged = previousHeight > 0 && previousHeight != safeHeight
@@ -114,6 +117,7 @@ public struct SplitFooterCore {
         bytes += "\u{1b}[1;\(max(1, safeHeight - footerRows))r"
         if mustRepaint {
             fullRedrawCount += 1
+            bytes += lineRenderer.deleteKittyImages(previousKittyImageIds)
             bytes += "\u{1b}[2J\u{1b}[H"
             bytes += drawTranscript(renderedTranscript)
             bytes += drawFooter(
@@ -121,6 +125,8 @@ public struct SplitFooterCore {
                 footerTop: max(1, safeHeight - footerRows + 1)
             )
         } else {
+            let removedImageIds = previousKittyImageIds.subtracting(currentKittyImageIds)
+            bytes += lineRenderer.deleteKittyImages(removedImageIds)
             if transcriptAppend {
                 bytes += appendTranscript(
                     renderedTranscript,
@@ -144,6 +150,7 @@ public struct SplitFooterCore {
         previousWidth = safeWidth
         previousHeight = safeHeight
         previousFooterRows = footerRows
+        previousKittyImageIds = currentKittyImageIds
         hasRendered = true
         return bytes
     }
