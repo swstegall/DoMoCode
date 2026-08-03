@@ -151,6 +151,7 @@ extension AgentEvent {
         case .messageEnd(let message): "messageEnd(\(message.role.rawValue))"
         case .toolExecutionStart(_, let name, _): "toolStart(\(name))"
         case .toolExecutionEnd(_, let name, _, _): "toolEnd(\(name))"
+        case .subagent(let event): "subagent(\(event.status.rawValue))"
         // Two producers: the classified failure of an errored run, immediately
         // before `agentEnd` (`AgentFailureTests`), and one per retry the client
         // is about to sleep through, ahead of the turn's `messageStart`

@@ -52,6 +52,11 @@ public enum AgentModePolicy {
             PermissionRule(permission: "question", pattern: "*", action: .ask),
             PermissionRule(permission: "webfetch", pattern: "*", action: .ask),
             PermissionRule(permission: "plan_exit", pattern: "*", action: .allow),
+            // Delegation creates a read-only child session. The runtime still
+            // enforces the depth cap and derives the child's permissions from
+            // parent denials; this allow keeps the broad plan deny from
+            // swallowing the task tool itself.
+            PermissionRule(permission: "task", pattern: "*", action: .allow),
         ])
 
         // An exact plan path is the only write/edit exception. PermissionRequest
@@ -76,7 +81,7 @@ public enum AgentModePolicy {
 
     public static func systemPrompt(planPath: String) -> String {
         """
-        You are in plan mode. Inspect the workspace with read-only tools and write the plan only to \(planPath). Do not edit, write, patch, shell out, launch background processes, or call external tools. When the plan is complete, call plan_exit; do not claim completion without using it.
+        You are in plan mode. Inspect the workspace with read-only tools and write the plan only to \(planPath). You may delegate focused read-only exploration to child agents with task. Do not edit, write, patch, shell out, launch background processes, or call external tools yourself. When the plan is complete, call plan_exit; do not claim completion without using it.
         """
     }
 }

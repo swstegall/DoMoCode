@@ -594,7 +594,7 @@ public actor ServerRuntime {
             let mode = modeState.get()
             let hidden = disabledTools(tools.map(\.definition.name), rulesetForCurrentMode())
             return tools.filter { tool in
-                (mode == .plan || tool.definition.name != "plan_exit")
+                (mode == .plan || (tool.definition.name != "plan_exit" && tool.definition.name != "task"))
                     && !hidden.contains(tool.definition.name)
             }
         }

@@ -195,7 +195,7 @@ public actor AgentHarness {
                 if let compactionUsage = compaction.usage { usage = usage + compactionUsage }
             case .branchSummary(let branch):
                 if let branchUsage = branch.usage { usage = usage + branchUsage }
-            case .message, .modelChange, .label, .leaf, .workspaceCheckpoint, .historyAction:
+            case .message, .modelChange, .label, .leaf, .workspaceCheckpoint, .historyAction, .subagent:
                 break
             case .sessionInfo, .sessionStart:
                 if let metadataUsage = entry.metadataUsage { usage = usage + metadataUsage }
@@ -450,12 +450,14 @@ public actor AgentHarness {
         cwd: String,
         sessionDirectory: FilePath,
         configuration: Configuration,
-        sessionID: String? = nil
+        sessionID: String? = nil,
+        parentSession: String? = nil
     ) throws -> AgentHarness {
         let store = try JSONLSessionStore.create(
             cwd: cwd,
             sessionDirectory: sessionDirectory,
             sessionID: sessionID,
+            parentSession: parentSession,
             now: configuration.now,
             entryIDFactory: configuration.entryIDFactory
         )
@@ -927,6 +929,14 @@ public actor AgentHarness {
             throw DoMoError(.file(path: store.path, errno: nil), "Session entry not found: \(targetID)")
         }
         try appendMetadata(.label(targetId: targetID, label: label))
+    }
+
+    /// Persist a delegated child lifecycle event without adding it to model
+    /// context. The runtime may call this while the parent is running; unlike
+    /// user-facing metadata such as rename, delegation is part of that run and
+    /// must remain appendable during it.
+    public func recordSubagentEvent(_ event: SubagentTaskEvent) throws {
+        try appendMetadata(.subagent(event))
     }
 
     /// Move the active leaf to another node, recording a summary of the abandoned

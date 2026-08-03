@@ -1680,6 +1680,12 @@ final class InteractiveCoordinator {
             startTool(id: id, name: name, arguments: arguments.value)
         case .toolExecutionEnd(let id, let name, let result, let isError):
             endTool(id: id, name: name, result: result, isError: isError)
+        case .subagent(let event):
+            appendNotice(AgentNotice(
+                level: .info,
+                code: "subagent",
+                text: "Subagent \(event.status.rawValue): \(event.description)"
+            ))
         case .notice(let notice):
             appendNotice(notice)
 
@@ -2180,7 +2186,10 @@ public struct InteractiveMode: Sendable {
             environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames),
             questionHandler: { await questionBox.ask($0) }
         )
-        let registry = ToolRegistry.builtin(includePlanExit: agentMode == .plan)
+        let registry = ToolRegistry.builtin(
+            includePlanExit: agentMode == .plan,
+            includeSubagent: agentMode == .plan
+        )
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools to the built-ins. The manager is held on the session and torn down in
         // ``run`` — the servers spawn in their own process group and would otherwise be

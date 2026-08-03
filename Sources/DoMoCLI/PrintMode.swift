@@ -336,6 +336,21 @@ struct PrintEventSink: AgentEventSink {
             )
             emitImages(result.images)
 
+        case .subagent(let event):
+            log.emit(
+                "subagent",
+                [
+                    "task_id": .string(event.taskID),
+                    "child_session_id": .string(event.childSessionID),
+                    "parent_session_id": .string(event.parentSessionID),
+                    "description": .string(event.description),
+                    "status": .string(event.status.rawValue),
+                    "output": event.output.map(JSONValue.string) ?? .null,
+                    "error": event.error.map(JSONValue.string) ?? .null,
+                    "depth": .int(event.depth),
+                ]
+            )
+
         case .notice(let notice):
             // Only retries are reported here, and only on stderr.
             //

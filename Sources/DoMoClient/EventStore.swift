@@ -452,6 +452,12 @@ public final class EventStore {
             } else {
                 transcript.append(item)
             }
+        case .subagent(let event):
+            onNotice?(ServerNotice(
+                level: .info,
+                code: "subagent",
+                text: "Subagent \(event.status.rawValue): \(event.description)"
+            ))
         }
         onChange?()
     }

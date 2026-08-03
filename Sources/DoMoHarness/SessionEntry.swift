@@ -261,9 +261,10 @@ public struct SessionHistoryAction: Sendable, Hashable, Codable {
 /// The load-bearing set for Phase 3 is `message`, `compaction`, `branch_summary`,
 /// `label`, `session_info` and `model_change`; `session_start` records the Git
 /// checkpoint for Phase 12, `workspace_checkpoint` and `history_action` carry
-/// Phase 13's append-only file/conversation history, and `leaf` is included
-/// because tree navigation records the active tip as a `leaf` entry and it is
-/// cheap. The extension-facing entries (`custom`, `custom_message`) and the
+/// Phase 13's append-only file/conversation history, `subagent` records a
+/// navigable delegated child, and `leaf` is included because tree navigation
+/// records the active tip as a `leaf` entry and it is cheap. The extension-facing
+/// entries (`custom`, `custom_message`) and the
 /// settings entries pi has for thinking level and dynamic tool sets are
 /// deliberately not modeled: DoMoCode has no extension host and no
 /// thinking-level or dynamic-tool feature, so a case for each would be a wire
@@ -369,6 +370,8 @@ public struct SessionTreeEntry: Sendable, Hashable {
         /// A record that the active leaf moved to `targetId` (`nil` = before the
         /// first entry). Written by tree navigation, not by the conversation.
         case leaf(targetId: String?)
+        /// A delegated child-session lifecycle event.
+        case subagent(SubagentTaskEvent)
     }
 }
 
@@ -385,6 +388,7 @@ extension SessionTreeEntry {
         case workspaceCheckpoint = "workspace_checkpoint"
         case historyAction = "history_action"
         case leaf
+        case subagent
     }
 
     public var entryType: EntryType {
@@ -399,6 +403,7 @@ extension SessionTreeEntry {
         case .workspaceCheckpoint: return .workspaceCheckpoint
         case .historyAction: return .historyAction
         case .leaf: return .leaf
+        case .subagent: return .subagent
         }
     }
 
@@ -464,6 +469,7 @@ extension SessionTreeEntry: Codable {
         case skippedPaths
         case failedPaths
         case status
+        case subagent
     }
 
     public init(from decoder: any Decoder) throws {
@@ -568,6 +574,8 @@ extension SessionTreeEntry: Codable {
             )
         case .leaf:
             self.payload = .leaf(targetId: try container.decodeIfPresent(String.self, forKey: .targetId))
+        case .subagent:
+            self.payload = .subagent(try container.decode(SubagentTaskEvent.self, forKey: .subagent))
         }
     }
 
@@ -634,6 +642,8 @@ extension SessionTreeEntry: Codable {
             // Present as `null` when the leaf is reset to before the first entry,
             // which is a distinct state from "no targetId field".
             try container.encode(targetId, forKey: .targetId)
+        case .subagent(let event):
+            try container.encode(event, forKey: .subagent)
         }
     }
 }

@@ -63,6 +63,11 @@ public enum AgentEvent: Sendable, Hashable {
     /// matching tool-result messages are appended in — see ``ToolDispatch``.
     case toolExecutionEnd(toolCallID: String, toolName: String, result: AgentToolResult, isError: Bool)
 
+    /// A child session was started, accepted, completed, or failed. Unlike a
+    /// normal tool result this is a first-class lifecycle event so clients can
+    /// navigate to the child and resume it by task id.
+    case subagent(SubagentTaskEvent)
+
     /// Something the run wants the user to see that is not transcript content:
     /// a retry the client is about to make, a provider failure that ended a
     /// turn, a runtime error that never became a message.

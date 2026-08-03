@@ -112,6 +112,29 @@ struct SessionEntryTests {
         #expect(json.contains(#""head":"abc123""#))
     }
 
+    @Test("subagent metadata round-trips without entering message context")
+    func subagentRoundTrips() throws {
+        let event = SubagentTaskEvent(
+            taskID: "task-1",
+            childSessionID: "child",
+            parentSessionID: "parent",
+            description: "inspect parser",
+            status: .completed,
+            output: "done",
+            depth: 1
+        )
+        let entry = SessionTreeEntry(
+            id: "delegation-1",
+            parentId: "m1",
+            timestamp: "2026-07-23T12:00:02.750Z",
+            payload: .subagent(event)
+        )
+        let decoded = try roundTrip(entry)
+        #expect(decoded == entry)
+        #expect(decoded.entryType == .subagent)
+        #expect(ContextBuilder.messages(for: decoded).isEmpty)
+    }
+
     @Test("message entry round-trips an assistant message with tool calls and usage")
     func messageAssistantRoundTrips() throws {
         let assistant = AssistantMessage(

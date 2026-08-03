@@ -31,6 +31,15 @@ struct ServerEventTests {
         #expect(ServerEvent.project(.turnEnd(message: assistant, toolResults: [])) == .turnEnd)
         #expect(ServerEvent.project(.messageStart(msg)) == .messageStart(msg))
         #expect(ServerEvent.project(.messageEnd(msg)) == .messageEnd(msg))
+        let delegation = SubagentTaskEvent(
+            taskID: "task-1",
+            childSessionID: "child",
+            parentSessionID: "parent",
+            description: "inspect",
+            status: .started,
+            depth: 1
+        )
+        #expect(ServerEvent.project(.subagent(delegation)) == .subagent(delegation))
     }
 
     @Test("Streaming assembly deltas project to text/reasoning; snapshots drop")
@@ -107,6 +116,15 @@ struct ServerEventTests {
             ),
             .questionResolved(id: "q_1"),
             .queueUpdate(count: 2, mode: "one-at-a-time"),
+            .subagent(SubagentTaskEvent(
+                taskID: "task-1",
+                childSessionID: "child",
+                parentSessionID: "s-1",
+                description: "inspect",
+                status: .completed,
+                output: "done",
+                depth: 1
+            )),
         ]
         for event in cases {
             #expect(try roundTrip(event) == event, "did not round-trip: \(event)")

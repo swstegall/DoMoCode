@@ -215,7 +215,8 @@ public struct ToolRegistry: Sendable {
     /// lifetime choice explicit for servers that create one registry per run.
     public static func builtin(
         todoStore: TodoStore = TodoStore(),
-        includePlanExit: Bool = false
+        includePlanExit: Bool = false,
+        includeSubagent: Bool = false
     ) -> ToolRegistry {
         var tools: [any Tool] = [
             ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
@@ -223,6 +224,7 @@ public struct ToolRegistry: Sendable {
             BackgroundProcessTool(),
         ]
         if includePlanExit { tools.append(PlanExitTool()) }
+        if includeSubagent { tools.append(TaskTool()) }
         return ToolRegistry(tools)
     }
 
@@ -349,6 +351,13 @@ public struct ToolContext: Sendable {
     /// from a later tool call without sharing it with another session.
     public let backgroundProcesses: BackgroundProcessManager
 
+    /// The runtime bridge used by ``TaskTool``. It is optional so the ordinary
+    /// CLI and library contexts keep the same tool surface and behavior.
+    public let subagentCoordinator: SubagentCoordinator?
+
+    /// The live session id used to parent a delegated task.
+    public let sessionID: String?
+
     /// The default web-fetch implementation. It follows redirects according to
     /// the platform URL loading system and leaves permission decisions to the
     /// caller's PermissionEngine.
@@ -370,7 +379,9 @@ public struct ToolContext: Sendable {
         environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
-        backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager()
+        backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
+        subagentCoordinator: SubagentCoordinator? = nil,
+        sessionID: String? = nil
     ) {
         self.fileSystem = fileSystem
         self.shell = shell
@@ -380,6 +391,8 @@ public struct ToolContext: Sendable {
         self.questionHandler = questionHandler
         self.webFetch = webFetch
         self.backgroundProcesses = backgroundProcesses
+        self.subagentCoordinator = subagentCoordinator
+        self.sessionID = sessionID
     }
 
     /// Builds a context confined to `root`, resolving the root through the base
@@ -393,7 +406,9 @@ public struct ToolContext: Sendable {
         environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
-        backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager()
+        backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
+        subagentCoordinator: SubagentCoordinator? = nil,
+        sessionID: String? = nil
     ) async throws(DoMoError) -> ToolContext {
         let sandboxed = try await SandboxedFileSystem.rooted(at: root, using: base)
         return ToolContext(
@@ -403,7 +418,9 @@ public struct ToolContext: Sendable {
             environment: environment,
             questionHandler: questionHandler,
             webFetch: webFetch,
-            backgroundProcesses: backgroundProcesses
+            backgroundProcesses: backgroundProcesses,
+            subagentCoordinator: subagentCoordinator,
+            sessionID: sessionID
         )
     }
 
@@ -411,7 +428,12 @@ public struct ToolContext: Sendable {
     /// handler. Server sessions use this to give each request its own session id
     /// while retaining the one background-process manager for the context.
     public func withQuestionHandler(_ handler: QuestionHandler?) -> ToolContext {
-        withQuestionHandler(handler, backgroundProcesses: backgroundProcesses)
+        withQuestionHandler(
+            handler,
+            backgroundProcesses: backgroundProcesses,
+            subagentCoordinator: subagentCoordinator,
+            sessionID: sessionID
+        )
     }
 
     /// Return the same sandbox and session resources with a late-bound question
@@ -420,7 +442,9 @@ public struct ToolContext: Sendable {
     /// session needs its own long-running children.
     public func withQuestionHandler(
         _ handler: QuestionHandler?,
-        backgroundProcesses: BackgroundProcessManager
+        backgroundProcesses: BackgroundProcessManager,
+        subagentCoordinator: SubagentCoordinator? = nil,
+        sessionID: String? = nil
     ) -> ToolContext {
         ToolContext(
             fileSystem: fileSystem,
@@ -430,7 +454,9 @@ public struct ToolContext: Sendable {
             environment: environment,
             questionHandler: handler,
             webFetch: webFetch,
-            backgroundProcesses: backgroundProcesses
+            backgroundProcesses: backgroundProcesses,
+            subagentCoordinator: subagentCoordinator ?? self.subagentCoordinator,
+            sessionID: sessionID ?? self.sessionID
         )
     }
 

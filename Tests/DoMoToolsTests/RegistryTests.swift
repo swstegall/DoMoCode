@@ -36,6 +36,42 @@ struct RegistryTests {
         #expect(result.text == "ready")
     }
 
+    @Test("plan mode exposes task after plan_exit")
+    func subagentSet() {
+        let registry = ToolRegistry.builtin(includePlanExit: true, includeSubagent: true)
+        #expect(registry.names.suffix(2) == ["plan_exit", "task"])
+    }
+
+    @Test("task forwards a focused request to its coordinator")
+    func taskDispatch() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        let coordinator = SubagentCoordinator()
+        coordinator.setRunner { request in
+            SubagentTaskResult(
+                taskID: request.taskID,
+                childSessionID: "child-session",
+                status: .completed,
+                output: "inspected: \(request.prompt)"
+            )
+        }
+        let context = fixture.context.withQuestionHandler(
+            nil,
+            backgroundProcesses: fixture.context.backgroundProcesses,
+            subagentCoordinator: coordinator,
+            sessionID: "parent-session"
+        )
+
+        let result = try await TaskTool().execute(
+            ["prompt": "inspect the parser", "agent": "explore"],
+            in: context
+        )
+
+        #expect(!result.isError)
+        #expect(result.text == "inspected: inspect the parser")
+        #expect(result.details["child_session_id"]?.stringValue == "child-session")
+    }
+
     @Test("dispatches by name")
     func dispatch() async throws {
         let fixture = try await ToolFixture.make()

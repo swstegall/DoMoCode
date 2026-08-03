@@ -168,6 +168,11 @@ public enum ServerEvent: Sendable, Hashable {
     /// can grow a field without touching any of them again.
     case notice(ServerNotice)
 
+    /// A typed child-session lifecycle event. The child id is intentionally
+    /// carried on the wire so a client can open the real session rather than
+    /// rendering delegation as an opaque tool transcript.
+    case subagent(SubagentTaskEvent)
+
     /// Projects one runtime event onto the wire, or `nil` when the event carries
     /// nothing a client needs (an assembly frame that is neither a text nor a
     /// reasoning delta — a snapshot boundary the client reconstructs from the
@@ -207,6 +212,8 @@ public enum ServerEvent: Sendable, Hashable {
             )
         case .notice(let notice):
             return .notice(ServerNotice(notice))
+        case .subagent(let event):
+            return .subagent(event)
         }
     }
 
@@ -316,6 +323,7 @@ extension ServerEvent: Codable {
         case questionResolved = "question_resolved"
         case queueUpdate = "queue_update"
         case notice
+        case subagent
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -342,6 +350,7 @@ extension ServerEvent: Codable {
         case count
         case mode
         case notice
+        case subagent
     }
 
     public init(from decoder: any Decoder) throws {
@@ -417,6 +426,8 @@ extension ServerEvent: Codable {
             )
         case .notice:
             self = .notice(try container.decode(ServerNotice.self, forKey: .notice))
+        case .subagent:
+            self = .subagent(try container.decode(SubagentTaskEvent.self, forKey: .subagent))
         }
     }
 
@@ -488,6 +499,9 @@ extension ServerEvent: Codable {
         case .notice(let notice):
             try container.encode(Kind.notice, forKey: .type)
             try container.encode(notice, forKey: .notice)
+        case .subagent(let event):
+            try container.encode(Kind.subagent, forKey: .type)
+            try container.encode(event, forKey: .subagent)
         }
     }
 }

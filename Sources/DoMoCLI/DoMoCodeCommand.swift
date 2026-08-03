@@ -521,7 +521,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             shell: shell,
             environment: Self.toolEnvironment(configuration)
         )
-        let registry = ToolRegistry.builtin(includePlanExit: selectedMode == .plan)
+        let registry = ToolRegistry.builtin(
+            includePlanExit: selectedMode == .plan,
+            includeSubagent: selectedMode == .plan
+        )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
 
         // The permission gate (Phase 8). Headless has no human to prompt, so a tool
@@ -921,7 +924,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // Keep plan_exit in the server registry even when the default mode is build;
         // ServerRuntime filters it from build sessions and reveals it when a session
         // switches to plan mode without rebuilding the process.
-        let registry = ToolRegistry.builtin(includePlanExit: true)
+        let registry = ToolRegistry.builtin(includePlanExit: true, includeSubagent: true)
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
         // persist the local surfaces use. This gates BOTH `--serve` and the loopback
@@ -970,7 +973,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         }
         let sessionToolResolver: @Sendable (String, String) async -> [any AgentTool] = { sessionID, _ in
             let resources = await backgroundSessions.resources(for: sessionID)
-            let sessionRegistry = ToolRegistry.builtin(todoStore: resources.todoStore, includePlanExit: true)
+            let sessionRegistry = ToolRegistry.builtin(
+                todoStore: resources.todoStore,
+                includePlanExit: true,
+                includeSubagent: true
+            )
             let sessionContext = toolContext.withQuestionHandler({ prompts in
                 let wirePrompts = prompts.map { prompt in
                     ServerQuestionPrompt(
@@ -991,7 +998,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // can widen only back to the ordinary build policy.
             return sessionRegistry.all.map { RegistryTool(tool: $0, context: sessionContext) } + currentMcp
         }
-        let promptToolNames = registry.names.filter { agentMode == .plan || $0 != "plan_exit" }
+        let promptToolNames = registry.names.filter {
+            agentMode == .plan || ($0 != "plan_exit" && $0 != "task")
+        }
             + visibleMcp.map(\.definition.name)
         let promptWorkspace = try SystemPromptBuilder(
             workingDirectory: workingDirectory,

@@ -22,6 +22,7 @@ struct AgentModePolicyTests {
         #expect(evaluate("unknown_mcp_tool", "*", rules).action == .deny)
         #expect(evaluate("read", "/work/README.md", rules).action == .allow)
         #expect(evaluate("plan_exit", "*", rules).action == .allow)
+        #expect(evaluate("task", "*", rules).action == .allow)
     }
 
     @Test("project allow rules cannot widen a hardened mode")

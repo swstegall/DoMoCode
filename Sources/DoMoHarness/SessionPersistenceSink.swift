@@ -308,7 +308,7 @@ public struct SessionPersistenceSink: AgentEventSink {
                 }
             }
         case .agentStart, .agentEnd, .turnStart, .messageUpdate,
-            .toolExecutionStart, .toolExecutionEnd, .notice:
+            .toolExecutionStart, .toolExecutionEnd, .subagent, .notice:
             break
         }
         await forward?.emit(event)

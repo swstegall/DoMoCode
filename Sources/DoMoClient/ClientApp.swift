@@ -2283,6 +2283,10 @@ public final class ClientApp {
                 kind = .branch
                 label = "branch  \(targetID ?? "root")"
                 description = entry.id
+            case .subagent(let event):
+                kind = .branch
+                label = "subagent  \(event.status.rawValue)  \(collapseToOneLine(event.description))"
+                description = event.childSessionID
             }
             let currentLabel = labelsByTarget[entry.id]
             let decoratedLabel = currentLabel.map { label + "  [" + $0 + "]" } ?? label
