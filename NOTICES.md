@@ -149,6 +149,14 @@ from pi-tui's `stdin-buffer.ts`, which upstream derives from **OpenTUI** — a p
 authors (the `anomalyco` org). OpenTUI's own attribution is recorded above under the Pi Agent
 Harness section.
 
+The Phase 13 shadow-workspace snapshot shape and its separate `GIT_DIR` approach are derived from
+opencode's MIT-licensed snapshot service:
+`packages/opencode/src/snapshot/index.ts` at
+[`anomalyco/opencode`](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/snapshot/index.ts).
+The Swift implementation, append-only session integration, and conflict-safe restore planner are
+original DoMoCode work. `Sources/DoMoGit/ShadowGit.swift` retains the upstream copyright and SPDX
+header.
+
 The `DoMoServer` and `DoMoMCP` modules model their *architecture* on opencode's server
 (`server.ts` / `event.ts` / `session.ts`) and `mcp/` respectively — design reference only, no code
 derived — and `DoMoTUI`'s full-screen layer re-derives OpenTUI's retained-cell-buffer + flexbox design
