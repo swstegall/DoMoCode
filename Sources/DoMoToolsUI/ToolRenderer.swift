@@ -113,6 +113,26 @@ public struct ToolRenderTheme: Sendable {
         diffContext: { sgr("2", $0, "22") },
         inverse: { sgr("7", $0, "27") }
     )
+
+    /// An HTML palette for the exact same renderers used by the terminal UI.
+    ///
+    /// The hooks emit semantic spans rather than terminal control sequences. The
+    /// exporter supplies CSS for these classes, so changing a renderer's output
+    /// or a tool's diff semantics changes both surfaces together. Raw tool text
+    /// is escaped by ``htmlSpan``; nested spans produced by another hook are
+    /// preserved so intra-line diff highlighting remains composable.
+    public static let html = ToolRenderTheme(
+        title: { htmlSpan("title", $0) },
+        accent: { htmlSpan("accent", $0) },
+        output: { htmlSpan("output", $0) },
+        muted: { htmlSpan("muted", $0) },
+        warning: { htmlSpan("warning", $0) },
+        error: { htmlSpan("error", $0) },
+        diffAdded: { htmlSpan("diff-added", $0) },
+        diffRemoved: { htmlSpan("diff-removed", $0) },
+        diffContext: { htmlSpan("diff-context", $0) },
+        inverse: { htmlSpan("inverse", $0) }
+    )
 }
 
 /// Wraps `text` in an SGR pair — `open` before, `close` after — the one styling
@@ -121,6 +141,50 @@ public struct ToolRenderTheme: Sendable {
 @Sendable
 nonisolated func sgr(_ open: String, _ text: String, _ close: String) -> String {
     "\u{1b}[\(open)m\(text)\u{1b}[\(close)m"
+}
+
+/// Escapes model/tool-controlled text for an HTML text node.
+public nonisolated func htmlEscape(_ text: String) -> String {
+    text
+        .replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
+        .replacingOccurrences(of: "\"", with: "&quot;")
+        .replacingOccurrences(of: "'", with: "&#39;")
+}
+
+/// Wraps escaped text in a renderer-owned semantic span. A diff renderer can
+/// pass a span emitted by an inner hook to an outer hook, so the small scanner
+/// preserves only the tags this theme itself emits and escapes everything else.
+nonisolated func htmlSpan(_ name: String, _ text: String) -> String {
+    "<span class=\"domo-\(name)\">\(htmlEscapePreservingSpans(text))</span>"
+}
+
+private nonisolated func htmlEscapePreservingSpans(_ text: String) -> String {
+    var result = ""
+    var index = text.startIndex
+    while index < text.endIndex {
+        if text[index] == "<", let end = text[index...].firstIndex(of: ">") {
+            let tag = String(text[index...end])
+            if isRendererSpanTag(tag) {
+                result += tag
+                index = text.index(after: end)
+                continue
+            }
+        }
+        let next = text.index(after: index)
+        result += htmlEscape(String(text[index..<next]))
+        index = next
+    }
+    return result
+}
+
+private nonisolated func isRendererSpanTag(_ tag: String) -> Bool {
+    if tag == "</span>" { return true }
+    return [
+        "title", "accent", "output", "muted", "warning", "error",
+        "diff-added", "diff-removed", "diff-context", "inverse",
+    ].contains(where: { tag == "<span class=\"domo-\($0)\">" })
 }
 
 // MARK: - Request
@@ -354,7 +418,96 @@ public final class ToolResultView: Component {
 /// multi-line `bash` command, a path or pattern carrying a newline) reaches here
 /// with the newline intact, and this is where it is neutralised.
 nonisolated func clip(_ line: String, to width: Int) -> String {
-    truncateToWidth(flattenToSingleRow(line), width)
+    let flattened = flattenToSingleRow(line)
+    if flattened.contains("<span ") || flattened.contains("</span>") {
+        return truncateHTMLToWidth(flattened, width)
+    }
+    return truncateToWidth(flattened, width)
+}
+
+/// The terminal clipping primitive treats HTML tags as visible text. Exported
+/// tool lines use the same width budget, so this companion counts renderer spans
+/// and escaped entities as zero/one visible units and closes any span it cuts.
+private nonisolated func truncateHTMLToWidth(_ line: String, _ width: Int) -> String {
+    guard width > 0 else { return "" }
+    let totalWidth = htmlVisibleWidth(line)
+    guard totalWidth > width else { return line }
+    let ellipsis = "..."
+    let ellipsisWidth = ellipsis.count
+    guard ellipsisWidth < width else { return String(ellipsis.prefix(width)) }
+    let target = width - ellipsisWidth
+
+    var result = ""
+    var openTags: [String] = []
+    var index = line.startIndex
+    var keptWidth = 0
+    while index < line.endIndex {
+        if let (tag, end) = rendererSpanTag(in: line, at: index) {
+            result += tag
+            if tag == "</span>" {
+                if !openTags.isEmpty { openTags.removeLast() }
+            } else {
+                openTags.append(tag)
+            }
+            index = line.index(after: end)
+            continue
+        }
+        if let (entity, end) = htmlEntity(in: line, at: index) {
+            guard keptWidth + 1 <= target else { break }
+            result += entity
+            keptWidth += 1
+            index = line.index(after: end)
+            continue
+        }
+        let end = line.index(after: index)
+        let character = line[index]
+        let characterWidth = graphemeWidth(character)
+        guard keptWidth + characterWidth <= target else { break }
+        result.append(character)
+        keptWidth += characterWidth
+        index = end
+    }
+    for _ in openTags.reversed() { result += "</span>" }
+    return result + ellipsis
+}
+
+private nonisolated func htmlVisibleWidth(_ text: String) -> Int {
+    var width = 0
+    var index = text.startIndex
+    while index < text.endIndex {
+        if let (_, end) = rendererSpanTag(in: text, at: index) {
+            index = text.index(after: end)
+        } else if let (_, end) = htmlEntity(in: text, at: index) {
+            width += 1
+            index = text.index(after: end)
+        } else {
+            width += graphemeWidth(text[index])
+            index = text.index(after: index)
+        }
+    }
+    return width
+}
+
+private nonisolated func rendererSpanTag(
+    in text: String,
+    at index: String.Index
+) -> (String, String.Index)? {
+    guard text[index] == "<", let end = text[index...].firstIndex(of: ">") else { return nil }
+    let tag = String(text[index...end])
+    guard isRendererSpanTag(tag) else { return nil }
+    return (tag, end)
+}
+
+private nonisolated func htmlEntity(
+    in text: String,
+    at index: String.Index
+) -> (String, String.Index)? {
+    guard text[index] == "&", let end = text[index...].firstIndex(of: ";") else { return nil }
+    let entity = String(text[index...end])
+    guard entity.count <= 12, entity.dropFirst().contains("#") || entity.dropFirst().allSatisfy({ $0.isLetter }) else {
+        return nil
+    }
+    return (entity, end)
 }
 
 /// Collapses every carriage return / line feed in `text` to a single space so the

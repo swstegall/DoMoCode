@@ -57,10 +57,9 @@ public struct ExportCommand: AsyncParsableCommand {
             includeToolResults: !noTools,
             includeMetadata: metadata
         )
-        guard !html else {
-            throw DoMoError(.configuration, "HTML export is added after the Markdown export slice.")
-        }
-        let text = TranscriptFormatter.markdown(header: header, entries: entries, options: options)
+        let text = html
+            ? HTMLTranscriptExporter.render(header: header, entries: entries, options: options)
+            : TranscriptFormatter.markdown(header: header, entries: entries, options: options)
         try Self.write(text, to: outputPath)
     }
 

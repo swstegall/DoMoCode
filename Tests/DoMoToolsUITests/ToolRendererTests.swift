@@ -435,6 +435,36 @@ struct ToolRendererTests {
         expectAllFit(ansi, width: 60, "error")
     }
 
+    @Test("The HTML theme emits semantic spans and escapes tool output")
+    func htmlThemeEscapesAndSpans() {
+        let lines = ToolRendererRegistry.builtin.render(
+            toolName: "bash",
+            arguments: object(["command": .string("printf '<script>'")]),
+            result: .text("<script> & done"),
+            width: 80,
+            theme: .html,
+            expanded: true
+        )
+        #expect(lines.first?.contains("<span class=\"domo-title\">") == true)
+        #expect(lines.contains { $0.contains("&lt;script&gt; &amp; done") })
+        #expect(!lines.contains { $0.contains("<script>") })
+    }
+
+    @Test("HTML clipping closes spans instead of exposing a partial tag")
+    func htmlClippingClosesSpans() {
+        let lines = ToolRendererRegistry.builtin.render(
+            toolName: "read",
+            arguments: object(["path": .string("/a/very/long/path.swift")]),
+            result: .text("one very long output line"),
+            width: 12,
+            theme: .html,
+            expanded: true
+        )
+        for line in lines {
+            #expect(line.components(separatedBy: "<span ").count == line.components(separatedBy: "</span>").count)
+        }
+    }
+
     @Test("An invalid (non-string) path argument renders an invalid-arg marker")
     func invalidPathArg() {
         let lines = ToolRendererRegistry.builtin.render(
