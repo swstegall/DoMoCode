@@ -18,6 +18,54 @@ struct ReadToolTests {
         #expect(result.text == "line one\nline two\nline three\n")
     }
 
+    @Test("reading a directory lists its immediate entries")
+    func readDirectory() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.makeDirectory("src")
+        try fixture.write("src/main.swift", "main")
+        try fixture.write("src/.gitkeep", "")
+
+        let result = try await ReadTool().execute(["path": "src"], in: fixture.context)
+
+        #expect(!result.isError)
+        #expect(result.text.contains("Directory"))
+        #expect(result.text.contains(".gitkeep"))
+        #expect(result.text.contains("main.swift"))
+    }
+
+    @Test("a missing path suggests a nearby sibling")
+    func missingPathSuggestion() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("hello.txt", "hello")
+
+        let result = try await ReadTool().execute(["path": "helo.txt"], in: fixture.context)
+
+        #expect(result.isError)
+        #expect(result.text.contains("No such file"))
+        #expect(result.text.contains("Did you mean hello.txt?"))
+    }
+
+    @Test("reading a nested file injects ancestor AGENTS instructions")
+    func nestedAgentsInstructions() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.makeDirectory("nested/deeper")
+        try fixture.write("nested/AGENTS.md", "Use the nested API conventions.")
+        try fixture.write("nested/deeper/file.swift", "let answer = 42")
+
+        let result = try await ReadTool().execute(
+            ["path": "nested/deeper/file.swift"],
+            in: fixture.context
+        )
+
+        #expect(!result.isError)
+        #expect(result.text.contains("<directory-instructions"))
+        #expect(result.text.contains("Use the nested API conventions."))
+        #expect(result.text.contains("let answer = 42"))
+    }
+
     @Test("offset and limit select a line window and report continuation")
     func offsetLimit() async throws {
         let fixture = try await ToolFixture.make()

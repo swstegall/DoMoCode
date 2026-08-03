@@ -42,7 +42,8 @@ extension FileMutationCoordinator {
 // MARK: - Read
 
 /// Reads a file: text with offset/limit windowing and truncation, images as
-/// attachments, binary refused.
+/// attachments, binary refused. A directory is listed, and missing names get a
+/// nearby sibling suggestion when one is unambiguous.
 public struct ReadTool: Tool {
 
     public init() {}
@@ -53,8 +54,9 @@ public struct ReadTool: Tool {
         Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
         Images are sent as attachments. For text files, output is truncated to \
         \(OutputTruncation.defaultMaxLines) lines or \(OutputTruncation.defaultMaxBytes / 1024)KB \
-        (whichever is hit first). Use offset/limit for large files. When you need the full file, \
-        continue with offset until complete.
+        (whichever is hit first). Reading a directory lists its entries. Use offset/limit for \
+        large files. When you need the full file, continue with offset until complete. If a \
+        path is missing, check the suggested nearby name before trying bash.
         """
 
     public var parameters: JSONSchema {
@@ -86,6 +88,24 @@ public struct ReadTool: Tool {
         context: ToolContext
     ) async throws(DoMoError) -> ToolResult {
         let filePath = FilePath(path)
+        let metadata: FileMetadata
+        do {
+            metadata = try await context.fileSystem.metadata(filePath)
+        } catch {
+            if Self.isMissing(error) {
+                return ToolResult.error(await Self.missingMessage(path: path, context: context))
+            }
+            throw error
+        }
+
+        if metadata.kind == .directory {
+            return try await listDirectory(
+                path: path,
+                limit: limit ?? 500,
+                context: context
+            )
+        }
+
         let bytes = try await context.fileSystem.read(filePath)
 
         switch FileContentProbe.classify(bytes) {
@@ -104,6 +124,11 @@ public struct ReadTool: Tool {
         }
 
         let decoded = try FileContentProbe.decode(bytes, path: filePath)
+        let instructions = await Self.nestedInstructions(for: filePath, context: context)
+        func withInstructions(_ text: String) -> String {
+            guard let instructions else { return text }
+            return instructions + "\n\n" + text
+        }
         let allLines = decoded.text.components(separatedBy: "\n")
         let totalFileLines = allLines.count
 
@@ -143,7 +168,7 @@ public struct ReadTool: Tool {
             let text =
                 "[Line \(startLineDisplay) is \(firstLineSize), exceeds \(maxBytesSize) limit. "
                 + "Use bash: sed -n '\(startLineDisplay)p' \(path) | head -c \(OutputTruncation.defaultMaxBytes)]"
-            return ToolResult.text(text, details: Self.truncationDetails(truncation))
+            return ToolResult.text(withInstructions(text), details: Self.truncationDetails(truncation))
         }
 
         if truncation.truncated {
@@ -159,17 +184,140 @@ public struct ReadTool: Tool {
                     "\n\n[Showing lines \(startLineDisplay)-\(endLineDisplay) of \(totalFileLines) "
                     + "(\(maxBytesSize) limit). Use offset=\(nextOffset) to continue.]"
             }
-            return ToolResult.text(text, details: Self.truncationDetails(truncation))
+            return ToolResult.text(withInstructions(text), details: Self.truncationDetails(truncation))
         }
 
         if let userLimitedLines, startLine + userLimitedLines < allLines.count {
             let remaining = allLines.count - (startLine + userLimitedLines)
             let nextOffset = startLine + userLimitedLines + 1
             let text = "\(truncation.content)\n\n[\(remaining) more lines in file. Use offset=\(nextOffset) to continue.]"
-            return ToolResult.text(text)
+            return ToolResult.text(withInstructions(text))
         }
 
-        return ToolResult.text(truncation.content)
+        return ToolResult.text(withInstructions(truncation.content))
+    }
+
+    private func listDirectory(
+        path: String,
+        limit: Int,
+        context: ToolContext
+    ) async throws(DoMoError) -> ToolResult {
+        let directory = FilePath(path)
+        let display = context.fileSystem.absolutePath(directory).string
+        var entries = try await context.fileSystem.list(directory)
+        entries.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+        let safeLimit = max(0, limit)
+        let visible = Array(entries.prefix(safeLimit))
+        var lines = visible.map { entry in
+            switch entry.kind {
+            case .directory: return entry.name + "/"
+            case .symlink: return entry.name + "@"
+            case .file: return entry.name
+            }
+        }
+        if entries.count > visible.count {
+            lines.append("[\(visible.count) entries shown; use limit=\(max(1, safeLimit * 2)) for more.]")
+        }
+        let text: String
+        if lines.isEmpty {
+            text = "Directory \(display) is empty."
+        } else {
+            text = "Directory \(display):\n" + lines.joined(separator: "\n")
+        }
+        return ToolResult.text(
+            text,
+            details: .object([
+                "directory": .string(display),
+                "entryCount": .int(entries.count),
+                "shown": .int(visible.count),
+                "truncated": .bool(entries.count > visible.count),
+            ])
+        )
+    }
+
+    private static func isMissing(_ error: any Error) -> Bool {
+        guard let domo = error as? DoMoError,
+              case .file(_, let errno) = domo.kind
+        else { return false }
+        return errno == .noSuchFileOrDirectory || errno == .notDirectory
+    }
+
+    private static func missingMessage(path: String, context: ToolContext) async -> String {
+        if let suggestion = await suggestion(for: path, context: context) {
+            return "No such file or directory: \(path). Did you mean \(suggestion)?"
+        }
+        return "No such file or directory: \(path)"
+    }
+
+    private static func suggestion(for path: String, context: ToolContext) async -> String? {
+        let absolute = context.fileSystem.absolutePath(FilePath(path))
+        guard let requestedName = absolute.lastComponent?.string, !requestedName.isEmpty else { return nil }
+        var parent = absolute
+        parent.removeLastComponent()
+        guard let entries = try? await context.fileSystem.list(parent) else { return nil }
+        let target = requestedName.lowercased()
+        let threshold = max(2, target.count / 3)
+        let ranked = entries.map { entry in
+            (entry.name, editDistance(target, entry.name.lowercased()))
+        }
+        return ranked
+            .filter { $0.1 <= threshold }
+            .sorted {
+                if $0.1 != $1.1 { return $0.1 < $1.1 }
+                return $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending
+            }
+            .first?.0
+    }
+
+    private static func editDistance(_ lhs: String, _ rhs: String) -> Int {
+        let left = Array(lhs)
+        let right = Array(rhs)
+        var previous = Array(0...right.count)
+        for (leftIndex, leftCharacter) in left.enumerated() {
+            var current = [leftIndex + 1]
+            current.reserveCapacity(right.count + 1)
+            for (rightIndex, rightCharacter) in right.enumerated() {
+                let substitution = leftCharacter == rightCharacter ? 0 : 1
+                current.append(
+                    min(
+                        current[rightIndex] + 1,
+                        previous[rightIndex + 1] + 1,
+                        previous[rightIndex] + substitution
+                    )
+                )
+            }
+            previous = current
+        }
+        return previous[right.count]
+    }
+
+    private static func nestedInstructions(for path: FilePath, context: ToolContext) async -> String? {
+        guard let canonical = try? await context.fileSystem.canonicalPath(path) else { return nil }
+        var directory = canonical
+        directory.removeLastComponent()
+        var blocks: [(path: String, text: String)] = []
+        let root = context.fileSystem.sandbox.root
+
+        while directory.starts(with: root) {
+            let instructionsPath = directory.appending("AGENTS.md")
+            if (try? await context.fileSystem.exists(instructionsPath)) == true,
+               let bytes = try? await context.fileSystem.read(instructionsPath),
+               let decoded = try? FileContentProbe.decode(bytes, path: instructionsPath)
+            {
+                blocks.append((instructionsPath.string, decoded.text))
+            }
+            if directory == root { break }
+            var parent = directory
+            parent.removeLastComponent()
+            if parent == directory { break }
+            directory = parent
+        }
+
+        guard !blocks.isEmpty else { return nil }
+        return blocks.reversed().map { block in
+            "<directory-instructions path=\"\(block.path)\">\n\(block.text)\n</directory-instructions>"
+        }.joined(separator: "\n\n")
     }
 
     static func truncationDetails(_ result: OutputTruncation.Result) -> JSONValue {
