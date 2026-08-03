@@ -270,7 +270,7 @@ public actor ServerRuntime {
             tools: [any AgentTool],
             model: String,
             streamFn: @escaping AgentStreamFn,
-            toolExecution: ToolExecutionMode = .sequential,
+            toolExecution: ToolExecutionMode = .parallel,
             maxTurns: Int? = nil,
             sessionDirectory: FilePath,
             cwd: String,

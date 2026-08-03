@@ -206,6 +206,16 @@ public actor AgentHarness {
         /// hands the bound tools in.
         public var tools: [any AgentTool]
 
+        /// Resolves the tools for every assistant request. The selected model is
+        /// passed to the resolver, so a caller can vary the set by model or
+        /// refresh a session-scoped registry between turns. `nil` preserves the
+        /// fixed ``tools`` behavior used by existing callers.
+        public var getTools: (@Sendable (String) async -> [any AgentTool])?
+
+        /// Rebuilds a prompt-aware system prompt from the current tool names.
+        /// Returning a string keeps the definitions and prompt listing in sync.
+        public var systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)?
+
         /// The model name stamped onto synthesized messages and used for
         /// compaction's summarization request. Model *selection* is the injected
         /// ``streamFn``'s job.
@@ -311,6 +321,8 @@ public actor AgentHarness {
             systemPrompt: String? = nil,
             systemPromptForPrompt: (@Sendable (String) -> String)? = nil,
             tools: [any AgentTool] = [],
+            getTools: (@Sendable (String) async -> [any AgentTool])? = nil,
+            systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)? = nil,
             model: String,
             streamFn: @escaping AgentStreamFn,
             streamFnForModel: (@Sendable (String) -> AgentStreamFn)? = nil,
@@ -335,6 +347,8 @@ public actor AgentHarness {
             self.systemPrompt = systemPrompt
             self.systemPromptForPrompt = systemPromptForPrompt
             self.tools = tools
+            self.getTools = getTools
+            self.systemPromptForPromptAndTools = systemPromptForPromptAndTools
             self.model = model
             self.streamFn = streamFn
             self.streamFnForModel = streamFnForModel
@@ -1010,6 +1024,16 @@ public actor AgentHarness {
         let systemPrompt = runOverride?.systemPrompt
             ?? configuration.systemPromptForPrompt?(systemPromptInput)
             ?? configuration.systemPrompt
+        let systemPromptForTools: (@Sendable (String, [String]) -> String?)?
+        if runOverride?.systemPrompt != nil {
+            systemPromptForTools = nil
+        } else if let configured = configuration.systemPromptForPromptAndTools {
+            systemPromptForTools = { _, toolNames in
+                configured(systemPromptInput, toolNames)
+            }
+        } else {
+            systemPromptForTools = nil
+        }
         let loopConfig = AgentLoopConfig(
             model: runOverride?.model ?? activeModel,
             toolExecution: configuration.toolExecution,
@@ -1020,7 +1044,9 @@ public actor AgentHarness {
             getFollowUpMessages: followUpMessages,
             shouldStopAfterTurn: configuration.shouldStopAfterTurn,
             onNoProgress: configuration.onNoProgress,
-            maxCostPerRun: configuration.maxCostPerRun
+            maxCostPerRun: configuration.maxCostPerRun,
+            getTools: configuration.getTools,
+            systemPromptForTools: systemPromptForTools
         )
         let errorBox = PersistenceErrorBox()
         let streamFn = runOverride?.streamFn ?? activeStreamFn

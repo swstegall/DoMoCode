@@ -39,9 +39,7 @@ public func runAgentLoop(
     sink: any AgentEventSink,
     streamFn: AgentStreamFn
 ) async -> AgentRunResult {
-    let systemPrompt = context.systemPrompt
-    let toolDefinitions = context.tools.map(\.definition)
-    let dispatch = ToolDispatch(tools: context.tools, config: config, sink: sink)
+    let staticSystemPrompt = context.systemPrompt
 
     // `transcript` is the full history sent to the model; `produced` is only what
     // this run added, which is what pi returns as `newMessages`.
@@ -172,6 +170,17 @@ public func runAgentLoop(
             }
 
             turnCount += 1
+            let tools = if let getTools = config.getTools {
+                await getTools(config.model)
+            } else {
+                context.tools
+            }
+            let toolDefinitions = tools.map(\.definition)
+            let systemPrompt = config.systemPromptForTools?(
+                config.model,
+                toolDefinitions.map(\.name)
+            ) ?? staticSystemPrompt
+            let dispatch = ToolDispatch(tools: tools, config: config, sink: sink)
             let outcome = await streamAssistantResponse(
                 context: Context(systemPrompt: systemPrompt, messages: transcript, tools: toolDefinitions),
                 model: config.model,

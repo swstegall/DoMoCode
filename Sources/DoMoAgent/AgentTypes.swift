@@ -346,6 +346,17 @@ public struct AgentLoopConfig: Sendable {
     /// provide the surface-specific prompt without creating a dependency cycle.
     public var onNoProgress: (@Sendable (TurnResult) async -> Bool)?
 
+    /// Resolves the tools for each assistant request. The model name is passed
+    /// so a surface can choose a model-specific tool set, while the async seam
+    /// also permits a session-scoped registry (including MCP tools) to refresh
+    /// between turns. `nil` keeps using ``AgentContext/tools``.
+    public var getTools: (@Sendable (String) async -> [any AgentTool])?
+
+    /// Builds the system prompt after the current tool set is known. The names
+    /// are supplied in registration order; returning `nil` falls back to the
+    /// static ``AgentContext/systemPrompt``.
+    public var systemPromptForTools: (@Sendable (String, [String]) -> String?)?
+
     public init(
         model: String = "unknown",
         toolExecution: ToolExecutionMode = .parallel,
@@ -358,7 +369,9 @@ public struct AgentLoopConfig: Sendable {
         getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
         shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil,
         onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
-        maxCostPerRun: Decimal? = nil
+        maxCostPerRun: Decimal? = nil,
+        getTools: (@Sendable (String) async -> [any AgentTool])? = nil,
+        systemPromptForTools: (@Sendable (String, [String]) -> String?)? = nil
     ) {
         self.model = model
         self.toolExecution = toolExecution
@@ -372,6 +385,8 @@ public struct AgentLoopConfig: Sendable {
         self.getFollowUpMessages = getFollowUpMessages
         self.shouldStopAfterTurn = shouldStopAfterTurn
         self.onNoProgress = onNoProgress
+        self.getTools = getTools
+        self.systemPromptForTools = systemPromptForTools
     }
 }
 

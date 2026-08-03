@@ -660,11 +660,9 @@ public struct PrintMode: Sendable {
             // event by one per compaction. A real summarizer bypasses that seam
             // entirely.
             summarizer: summarizer,
-            // Sequential to preserve Phase 1's strictly source-ordered tool
-            // dispatch: `tool_use`/`tool_result` events, and the tool-result
-            // messages fed back to the model, appear in the model's own call
-            // order. Parallel would reorder the completion-order `tool_result`s.
-            toolExecution: .sequential,
+            // The dispatcher keeps tool-result messages in source order even
+            // when completion events arrive concurrently.
+            toolExecution: .parallel,
             maxTurns: maxTurns,
             // Both were previously omitted, which meant every `-p` run compacted on
             // the default settings against the 200K fallback window no matter what

@@ -1909,9 +1909,9 @@ public struct InteractiveMode: Sendable {
             // `streamFn`; with none configured this is `nil` and the harness keeps
             // its built-in summarizer, unchanged.
             summarizer: summarizer,
-            // Sequential keeps tool-start/tool-result transcript order equal to the
-            // model's own call order, which is what a reader expects to watch.
-            toolExecution: .sequential,
+            // Parallel execution still appends tool-result messages in source
+            // order; only completion events are allowed to arrive as work ends.
+            toolExecution: .parallel,
             maxTurns: maxTurns,
             // Neither was forwarded before, so the REPL compacted on the built-in
             // defaults against the 200K fallback window whatever the user configured

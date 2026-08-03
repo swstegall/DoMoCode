@@ -189,6 +189,53 @@ func runOnce(
 
 // MARK: - Turn loop
 
+@Test func resolvesToolsAndSystemPromptForEachAssistantRequest() async {
+    let ranA = Box(0)
+    let ranB = Box(0)
+    let toolA = echoTool("a", ran: ranA)
+    let toolB = echoTool("b", ran: ranB)
+    let providerCalls = Box(0)
+    let contexts = Box<[[String]]>([])
+    let prompts = Box<[String?]>([])
+    let scripts = ScriptedStream([
+        assistantTurn(toolCalls: [tc("a")], stopReason: .toolUse),
+        assistantTurn(toolCalls: [tc("b")], stopReason: .toolUse),
+        assistantTurn(text: "done", stopReason: .stop),
+    ])
+    let stream: AgentStreamFn = { context in
+        contexts.withLock { $0.append(context.tools.map(\.name)) }
+        prompts.withLock { $0.append(context.systemPrompt) }
+        return scripts.fn(context)
+    }
+
+    let result = await runOnce(
+        context: AgentContext(systemPrompt: "static"),
+        config: AgentLoopConfig(
+            model: "model-a",
+            getTools: { _ in
+                let call = providerCalls.withLock { value -> Int in
+                    value += 1
+                    return value
+                }
+                return call == 1 ? [toolA] : [toolB]
+            },
+            systemPromptForTools: { _, names in
+                "available=" + names.joined(separator: ",")
+            }
+        ),
+        sink: RecordingSink(),
+        streamFn: stream
+    )
+
+    #expect(providerCalls.value == 3)
+    #expect(contexts.value == [["a"], ["b"], ["b"]])
+    #expect(prompts.value == ["available=a", "available=b", "available=b"])
+    #expect(ranA.value == 1)
+    #expect(ranB.value == 1)
+    #expect(result.toolResults.map(\.toolName) == ["a", "b"])
+    #expect(result.stopReason == .completed)
+}
+
 @Test func singleTurnNoToolCallsCompletes() async {
     let sink = RecordingSink()
     let stream = ScriptedStream([assistantTurn(text: "hello", stopReason: .stop)])

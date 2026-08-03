@@ -851,7 +851,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             tools: tools,
             model: model,
             streamFn: streamFn,
-            toolExecution: .sequential,
+            toolExecution: .parallel,
             maxTurns: maxTurns,
             sessionDirectory: configuration.sessionDirectory,
             cwd: workingDirectory.string,
