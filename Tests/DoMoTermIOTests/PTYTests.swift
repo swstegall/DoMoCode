@@ -69,6 +69,12 @@ struct PTYTests {
         let snapshot = try #require(await service.snapshot(sessionID: id))
         #expect(snapshot.retainedByteCount <= 128)
         #expect(snapshot.retainedOutputTruncated)
+        let attachment = try await service.beginAttach(sessionID: id)
+        #expect(attachment.droppedOutput)
+        #expect(attachment.replay.contains { event in
+            if case .gap = event { return true }
+            return false
+        })
         await service.shutdown()
     }
 

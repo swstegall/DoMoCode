@@ -106,6 +106,7 @@ public actor PTYInteractiveTerminalProvider: InteractiveTerminalProvider {
     private final class Session {
         let id: String
         var screen: VTScreen
+        var outputWasDropped = false
         var streamTask: Task<Void, Never>?
 
         init(id: String, size: PTYSize) {
@@ -245,13 +246,18 @@ public actor PTYInteractiveTerminalProvider: InteractiveTerminalProvider {
         guard let session = sessions[id], let snapshot = await service.snapshot(sessionID: id) else {
             throw InteractiveTerminalProviderError.missingSession
         }
-        return InteractiveTerminalResult(id: id, state: snapshot.state, screen: session.screen.text)
+        return InteractiveTerminalResult(id: id, state: snapshot.state, screen: renderedScreen(for: session))
     }
 
     private func apply(_ event: PTYEvent, to session: Session) {
         switch event {
         case .output(_, let bytes): session.screen.feed(bytes)
-        case .gap: break
+        case .gap:
+            // A VT screen reconstructed from a suffix is not authoritative:
+            // the missing prefix may have moved the cursor, changed the style,
+            // or switched buffers. Start a fresh model and tell the caller why.
+            session.screen = VTScreen(columns: session.screen.columns, rows: session.screen.rows)
+            session.outputWasDropped = true
         case .exited: break
         }
     }
@@ -276,9 +282,14 @@ public actor PTYInteractiveTerminalProvider: InteractiveTerminalProvider {
         let snapshot = await service.snapshot(sessionID: session.id)
         await screenHandler(
             session.id,
-            session.screen.text,
+            renderedScreen(for: session),
             running ?? (snapshot?.state == .running)
         )
+    }
+
+    private func renderedScreen(for session: Session) -> String {
+        guard session.outputWasDropped else { return session.screen.text }
+        return "[terminal output truncated; screen starts at the retained window]\n" + session.screen.text
     }
 }
 
