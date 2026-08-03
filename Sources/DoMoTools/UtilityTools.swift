@@ -211,3 +211,32 @@ public struct FinishTool: Tool {
         }
     }
 }
+
+/// Ends a plan-mode run after the plan file has been written.
+///
+/// This is intentionally separate from FinishTool so a plan cannot settle by
+/// merely producing prose: the model must use the mode-specific terminating
+/// capability the loop already honors.
+public struct PlanExitTool: Tool {
+    public init() {}
+
+    public let name = "plan_exit"
+    public let description = "Finish plan mode after writing the plan file and stop the agent run."
+
+    public var parameters: JSONSchema {
+        .object(.optional("message", .string(description: "Short summary of the completed plan")))
+    }
+
+    @concurrent
+    public func execute(
+        _ arguments: JSONValue,
+        in context: ToolContext
+    ) async throws(DoMoError) -> ToolResult {
+        try await ToolResult.capturing(tool: name) {
+            let args = try ArgumentReader(tool: name, arguments: arguments)
+            let message = try args.optionalString("message") ?? "Plan complete."
+            let clean = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ToolResult.text(clean.isEmpty ? "Plan complete." : clean, terminate: true)
+        }
+    }
+}

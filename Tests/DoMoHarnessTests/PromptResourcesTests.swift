@@ -1,4 +1,5 @@
 import DoMoHarness
+import DoMoPermissions
 import Foundation
 import SystemPackage
 import Testing
@@ -67,6 +68,69 @@ struct PromptResourcesTests {
         #expect(workspace.baseSystemPrompt.contains("Be precise about this repository."))
         #expect(workspace.baseSystemPrompt.contains("Use the project vocabulary."))
         #expect(workspace.systemPrompt(for: "review this Swift concurrency code").contains("actor isolation"))
+    }
+
+    @Test("agent files layer builtin, user, and trusted project values")
+    func layersAgentProfiles() throws {
+        let project = try makeDirectory()
+        let config = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(atPath: project.string)
+            try? FileManager.default.removeItem(atPath: config.string)
+        }
+        try write(
+            """
+            ---
+            name: reviewer
+            description: User reviewer
+            model: user-model
+            ---
+            User persona.
+            """,
+            to: config.appending("agents").appending("reviewer.md")
+        )
+        try write(
+            """
+            ---
+            name: reviewer
+            description: Project reviewer
+            model: project-model
+            mode: plan
+            permissions:
+              - permission: write
+                pattern: "*"
+                action: allow
+            ---
+            Project persona.
+            """,
+            to: project.appending(".domocode").appending("agents").appending("reviewer.md")
+        )
+
+        let untrusted = try SystemPromptBuilder(
+            workingDirectory: project,
+            configDirectory: config,
+            toolNames: [],
+            projectTrusted: false
+        ).build()
+        #expect(untrusted.agents.profile(named: "plan")?.mode == .plan)
+        #expect(untrusted.agents.profile(named: "reviewer")?.model == "user-model")
+        #expect(untrusted.agents.profile(named: "reviewer")?.source == .user)
+
+        let trusted = try SystemPromptBuilder(
+            workingDirectory: project,
+            configDirectory: config,
+            toolNames: [],
+            projectTrusted: true
+        ).build()
+        let reviewer = try #require(trusted.agents.profile(named: "reviewer"))
+        #expect(reviewer.model == "project-model")
+        #expect(reviewer.mode == .plan)
+        #expect(reviewer.permissionRules == [
+            PermissionRule(permission: "write", pattern: "*", action: .allow)
+        ])
+        let selected = try #require(trusted.selecting(agent: "reviewer"))
+        #expect(selected.systemPrompt(for: "inspect").contains("<agent name=\"reviewer\">"))
+        #expect(selected.systemPrompt(for: "inspect").contains("Project persona."))
     }
 
     @Test("command templates support arguments, defaults, and file inclusion")

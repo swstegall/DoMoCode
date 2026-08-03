@@ -110,11 +110,27 @@ enum PermissionSetup {
     /// The resolved ruleset: baseline first, then the user's global permission,
     /// then the project's (which wins — matching how every other setting layers
     /// project over user, gated by project trust). The engine appends session grants.
-    static func resolvedRuleset(workingDirectory: String, configDirectory: String, homeDirectory: String) -> Ruleset {
+    static func resolvedRuleset(
+        workingDirectory: String,
+        configDirectory: String,
+        homeDirectory: String,
+        mode: AgentMode = .build,
+        planPath: String? = nil,
+        profileRules: Ruleset = [],
+        modeRules: Ruleset = []
+    ) -> Ruleset {
         let baseline = fromConfig(defaultBaselinePermissionConfig(), homeDirectory: homeDirectory)
         let user = fromConfig(loadConfig(userSettingsPath(configDirectory)), homeDirectory: homeDirectory)
         let project = fromConfig(loadConfig(projectSettingsPath(workingDirectory)), homeDirectory: homeDirectory)
-        return merge(baseline, user, project)
+        let layered = merge(baseline, user, project, profileRules)
+        let resolvedPlanPath = planPath ?? AgentModePolicy.planPath(
+            workingDirectory: workingDirectory,
+            sessionID: "current"
+        )
+        return merge(
+            layered,
+            AgentModePolicy.rules(for: mode, planPath: resolvedPlanPath, additional: modeRules)
+        )
     }
 
     /// The MCP tools the model should actually SEE, given the resolved ruleset: a tool
@@ -323,10 +339,22 @@ enum PermissionSetup {
     static func runtime(
         workingDirectory: String,
         configDirectory: String,
-        homeDirectory: String
+        homeDirectory: String,
+        mode: AgentMode = .build,
+        planPath: String? = nil,
+        profileRules: Ruleset = [],
+        modeRules: Ruleset = []
     ) -> (ruleset: Ruleset, factory: PermissionRequestFactory, persist: @Sendable (Ruleset) async -> Void) {
         (
-            resolvedRuleset(workingDirectory: workingDirectory, configDirectory: configDirectory, homeDirectory: homeDirectory),
+            resolvedRuleset(
+                workingDirectory: workingDirectory,
+                configDirectory: configDirectory,
+                homeDirectory: homeDirectory,
+                mode: mode,
+                planPath: planPath,
+                profileRules: profileRules,
+                modeRules: modeRules
+            ),
             factory(workingDirectory: workingDirectory, configDirectory: configDirectory),
             persister(configDirectory: configDirectory)
         )
@@ -350,13 +378,21 @@ enum PermissionSetup {
         workingDirectory: String,
         configDirectory: String,
         homeDirectory: String,
-        yolo: Bool
+        yolo: Bool,
+        mode: AgentMode = .build,
+        planPath: String? = nil,
+        profileRules: Ruleset = [],
+        modeRules: Ruleset = []
     ) -> BeforeToolCallHook {
         let engine = PermissionEngine(
             ruleset: resolvedRuleset(
                 workingDirectory: workingDirectory,
                 configDirectory: configDirectory,
-                homeDirectory: homeDirectory
+                homeDirectory: homeDirectory,
+                mode: mode,
+                planPath: planPath,
+                profileRules: profileRules,
+                modeRules: modeRules
             ),
             prompt: headlessPrompter(yolo: yolo)
         )
@@ -375,13 +411,21 @@ enum PermissionSetup {
         workingDirectory: String,
         configDirectory: String,
         homeDirectory: String,
-        yolo: Bool
+        yolo: Bool,
+        mode: AgentMode = .build,
+        planPath: String? = nil,
+        profileRules: Ruleset = [],
+        modeRules: Ruleset = []
     ) -> @Sendable (TurnResult) async -> Bool {
         let engine = PermissionEngine(
             ruleset: resolvedRuleset(
                 workingDirectory: workingDirectory,
                 configDirectory: configDirectory,
-                homeDirectory: homeDirectory
+                homeDirectory: homeDirectory,
+                mode: mode,
+                planPath: planPath,
+                profileRules: profileRules,
+                modeRules: modeRules
             ),
             prompt: headlessPrompter(yolo: yolo)
         )

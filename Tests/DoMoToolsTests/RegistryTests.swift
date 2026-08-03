@@ -21,6 +21,21 @@ struct RegistryTests {
         #expect(ToolRegistry.coding.names == ["read", "bash", "edit", "write"])
     }
 
+    @Test("plan mode adds a terminating plan_exit tool")
+    func planExitSet() async throws {
+        let registry = ToolRegistry.builtin(includePlanExit: true)
+        #expect(registry.names.last == "plan_exit")
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        let result = try await registry.execute(
+            "plan_exit",
+            arguments: ["message": "ready"],
+            in: fixture.context
+        )
+        #expect(result.terminate)
+        #expect(result.text == "ready")
+    }
+
     @Test("dispatches by name")
     func dispatch() async throws {
         let fixture = try await ToolFixture.make()

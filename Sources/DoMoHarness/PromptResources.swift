@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import DoMoExec
+import DoMoCore
 import DoMoLLM
+import DoMoPermissions
 import Foundation
 import SystemPackage
 import Yams
@@ -146,22 +148,131 @@ public struct PromptSkill: Hashable, Sendable {
     }
 }
 
+/// An inert, value-based agent persona loaded from a Markdown file.
+///
+/// The file contributes only data: prompt text, an optional model alias, a
+/// mode, and optional policy rules. It has no host API, executable section, or
+/// watcher. A runtime owns the value returned by ``SystemPromptBuilder`` for
+/// the lifetime of its session.
+public struct AgentProfile: Codable, Hashable, Sendable {
+    public let name: String
+    public let description: String?
+    public let systemPrompt: String
+    public let model: String?
+    public let reasoningEffort: ReasoningEffort?
+    public let mode: AgentMode
+    public let permissionRules: Ruleset
+    public let source: PromptResourceSource
+
+    public init(
+        name: String,
+        description: String? = nil,
+        systemPrompt: String = "",
+        model: String? = nil,
+        reasoningEffort: ReasoningEffort? = nil,
+        mode: AgentMode = .build,
+        permissionRules: Ruleset = [],
+        source: PromptResourceSource = .project
+    ) {
+        self.name = name
+        self.description = description
+        self.systemPrompt = systemPrompt
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+        self.mode = mode
+        self.permissionRules = permissionRules
+        self.source = source
+    }
+}
+
+/// A deterministic, layered profile registry.
+public struct AgentProfileRegistry: Codable, Hashable, Sendable {
+    public let profiles: [AgentProfile]
+
+    public init(profiles: [AgentProfile]) {
+        var byName: [String: AgentProfile] = [:]
+        for profile in profiles {
+            byName[profile.name.lowercased()] = profile
+        }
+        self.profiles = byName.values.sorted { $0.name < $1.name }
+    }
+
+    /// The two profiles that are always available, even with no dotfiles.
+    public static let builtIn = AgentProfileRegistry(profiles: [
+        AgentProfile(
+            name: "build",
+            description: "Inspect, modify, and verify the workspace.",
+            mode: .build,
+            source: .builtin
+        ),
+        AgentProfile(
+            name: "plan",
+            description: "Reason about the task and write only the session plan.",
+            systemPrompt: """
+                You are in plan mode. Do not modify source files or run commands that can
+                change the workspace. Record the proposed implementation in the plan file
+                named by the runtime. When the plan is complete, call plan_exit.
+                """,
+            mode: .plan,
+            source: .builtin
+        ),
+    ])
+
+    public func profile(named name: String) -> AgentProfile? {
+        profiles.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    public func selecting(_ name: String?) -> AgentProfile? {
+        guard let name else { return nil }
+        return profile(named: name)
+    }
+}
+
 /// The command and prompt resources visible to one runtime.
 public struct PromptWorkspace: Hashable, Sendable {
     public let baseSystemPrompt: String
     public let commands: CommandRegistry
     public let skills: [PromptSkill]
+    public let agents: AgentProfileRegistry
+    public let activeAgent: AgentProfile?
 
-    public init(baseSystemPrompt: String, commands: CommandRegistry, skills: [PromptSkill]) {
+    public init(
+        baseSystemPrompt: String,
+        commands: CommandRegistry,
+        skills: [PromptSkill],
+        agents: AgentProfileRegistry = .builtIn,
+        activeAgent: AgentProfile? = nil
+    ) {
         self.baseSystemPrompt = baseSystemPrompt
         self.commands = commands
         self.skills = skills
+        self.agents = agents
+        self.activeAgent = activeAgent
+    }
+
+    /// Returns a copy with an already-resolved persona selected. The profile is
+    /// still inert data; selection only changes the prompt assembled for turns.
+    public func selecting(agent name: String) -> PromptWorkspace? {
+        guard let profile = agents.profile(named: name) else { return nil }
+        return PromptWorkspace(
+            baseSystemPrompt: baseSystemPrompt,
+            commands: commands,
+            skills: skills,
+            agents: agents,
+            activeAgent: profile
+        )
     }
 
     /// Returns the base prompt plus any skills whose keywords occur in the user
     /// prompt. Skill bodies are added only for the matching turn, keeping the
     /// default context small while preserving the available-skill catalogue.
     public func systemPrompt(for userPrompt: String) -> String {
+        var prompt = baseSystemPrompt
+        if let activeAgent, !activeAgent.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt += "\n\n<agent name=\"\(activeAgent.name)\">\n"
+                + activeAgent.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                + "\n</agent>"
+        }
         let lowerPrompt = userPrompt.lowercased()
         let active = skills.filter { skill in
             let triggers = skill.keywords.isEmpty ? [skill.name] : skill.keywords
@@ -170,7 +281,7 @@ public struct PromptWorkspace: Hashable, Sendable {
                 return !value.isEmpty && lowerPrompt.contains(value)
             }
         }
-        guard !active.isEmpty else { return baseSystemPrompt }
+        guard !active.isEmpty else { return prompt }
 
         let bodies = active.map { skill in
             """
@@ -179,7 +290,7 @@ public struct PromptWorkspace: Hashable, Sendable {
             </skill>
             """
         }.joined(separator: "\n\n")
-        return baseSystemPrompt + "\n\n<active-skills>\n" + bodies + "\n</active-skills>"
+        return prompt + "\n\n<active-skills>\n" + bodies + "\n</active-skills>"
     }
 }
 
@@ -613,22 +724,26 @@ public struct SystemPromptBuilder: Sendable {
     public let configDirectory: FilePath
     public let toolNames: [String]
     public let projectTrusted: Bool
+    public let agentName: String?
 
     public init(
         workingDirectory: FilePath,
         configDirectory: FilePath,
         toolNames: [String],
-        projectTrusted: Bool = true
+        projectTrusted: Bool = true,
+        agentName: String? = nil
     ) {
         self.workingDirectory = workingDirectory
         self.configDirectory = configDirectory
         self.toolNames = toolNames
         self.projectTrusted = projectTrusted
+        self.agentName = agentName
     }
 
     public func build() throws -> PromptWorkspace {
         let commands = try loadCommands()
         let skills = try loadSkills()
+        let agents = try loadAgents()
         var sections = [Self.basePrompt(workingDirectory: workingDirectory, toolNames: toolNames)]
 
         for file in [configDirectory.appending("SYSTEM.md")] where fileExists(file) {
@@ -656,11 +771,13 @@ public struct SystemPromptBuilder: Sendable {
             }.joined(separator: "\n") + "\n</available-skills>"
         sections.append(skillCatalogue)
         sections.append("<cwd>\n\(workingDirectory.string)\n</cwd>")
-        return PromptWorkspace(
+        let workspace = PromptWorkspace(
             baseSystemPrompt: sections.joined(separator: "\n\n"),
             commands: commands,
-            skills: skills
+            skills: skills,
+            agents: agents
         )
+        return agentName.flatMap { workspace.selecting(agent: $0) } ?? workspace
     }
 
     private func loadCommands() throws -> CommandRegistry {
@@ -689,6 +806,42 @@ public struct SystemPromptBuilder: Sendable {
             }
         }
         return byName.values.sorted { $0.name < $1.name }
+    }
+
+    private func loadAgents() throws -> AgentProfileRegistry {
+        var values = AgentProfileRegistry.builtIn.profiles
+        let userRoot = configDirectory.appending("agents")
+        if directoryExists(userRoot) {
+            values.append(contentsOf: try agentFiles(in: userRoot, source: .user))
+        }
+        if projectTrusted {
+            for root in projectResourceRoots(named: "agents") where directoryExists(root) {
+                values.append(contentsOf: try agentFiles(in: root, source: .project))
+            }
+        }
+        return AgentProfileRegistry(profiles: values)
+    }
+
+    private func agentFiles(in root: FilePath, source: PromptResourceSource) throws -> [AgentProfile] {
+        let names = try directoryContents(root)
+        return try names.compactMap { name in
+            let file = root.appending(name)
+            guard name.lowercased().hasSuffix(".md"), !directoryExists(file) else { return nil }
+            let parsed = try parseMarkdown(file)
+            let fallbackName = String(name.dropLast(3))
+            let profileName = Self.normalizeName(parsed.name ?? fallbackName)
+            guard !profileName.isEmpty else { return nil }
+            return AgentProfile(
+                name: profileName,
+                description: parsed.description,
+                systemPrompt: parsed.body,
+                model: parsed.model,
+                reasoningEffort: parsed.reasoningEffort,
+                mode: parsed.mode ?? .build,
+                permissionRules: parsed.permissionRules,
+                source: source
+            )
+        }
     }
 
     private func commandFiles(in root: FilePath, source: PromptResourceSource) throws -> [CommandDescriptor] {
@@ -808,6 +961,8 @@ public struct SystemPromptBuilder: Sendable {
             reasoningEffort: Self.stringValue(map, keys: ["reasoning-effort", "reasoning_effort", "reasoningEffort"]).map(ReasoningEffort.init(rawValue:)),
             action: Self.stringValue(map, keys: ["action"]),
             keywords: Self.stringList(map, keys: ["keywords", "triggers", "trigger"]),
+            mode: Self.stringValue(map, keys: ["mode"]).flatMap { AgentMode(rawValue: $0.lowercased()) },
+            permissionRules: Self.permissionRules(map),
             body: body
         )
     }
@@ -841,6 +996,8 @@ public struct SystemPromptBuilder: Sendable {
         var reasoningEffort: ReasoningEffort?
         var action: String?
         var keywords: [String]
+        var mode: AgentMode?
+        var permissionRules: Ruleset
         var body: String
 
         init(
@@ -851,6 +1008,8 @@ public struct SystemPromptBuilder: Sendable {
             reasoningEffort: ReasoningEffort? = nil,
             action: String? = nil,
             keywords: [String] = [],
+            mode: AgentMode? = nil,
+            permissionRules: Ruleset = [],
             body: String
         ) {
             self.name = name
@@ -860,6 +1019,8 @@ public struct SystemPromptBuilder: Sendable {
             self.reasoningEffort = reasoningEffort
             self.action = action
             self.keywords = keywords
+            self.mode = mode
+            self.permissionRules = permissionRules
             self.body = body
         }
     }
@@ -879,6 +1040,20 @@ public struct SystemPromptBuilder: Sendable {
             if let value = map[AnyHashable(key)] as? String { return [value] }
         }
         return []
+    }
+
+    private static func permissionRules(_ map: [AnyHashable: Any]) -> Ruleset {
+        let raw = map[AnyHashable("permissions")] ?? map[AnyHashable("permissionRules")]
+        guard let entries = raw as? [Any] else { return [] }
+        return entries.compactMap { entry in
+            guard let rule = entry as? [AnyHashable: Any],
+                  let permission = stringValue(rule, keys: ["permission"]),
+                  let pattern = stringValue(rule, keys: ["pattern"]) ?? Optional("*"),
+                  let actionText = stringValue(rule, keys: ["action"]),
+                  let action = PermissionAction(rawValue: actionText.lowercased())
+            else { return nil }
+            return PermissionRule(permission: permission, pattern: pattern, action: action)
+        }
     }
 
     private static func normalizeName(_ name: String) -> String {

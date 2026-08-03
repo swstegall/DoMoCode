@@ -65,6 +65,16 @@ struct TrustStoreTests {
         #expect(projectRequiresTrust(directory: dir) == false)
     }
 
+    @Test("an agent profile directory requires trust when it has data")
+    func agentProfileRequiresTrust() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: dir.string) }
+        let agents = dir.appending(".domocode").appending("agents")
+        try FileManager.default.createDirectory(atPath: agents.string, withIntermediateDirectories: true)
+        try "{}".write(toFile: agents.appending("reviewer.md").string, atomically: true, encoding: .utf8)
+        #expect(projectRequiresTrust(directory: dir) == true)
+    }
+
     // MARK: - Decisions
 
     @Test("an unrecorded directory has no decision")

@@ -23,7 +23,7 @@ public enum PermissionAction: String, Sendable, Hashable, Codable {
 
 /// One rule: `permission` (tool key / glob) and `pattern` (resource/command glob) are
 /// both globs matched by ``wildcardMatch(_:_:)``; `action` is the verdict.
-public struct PermissionRule: Sendable, Hashable {
+public struct PermissionRule: Sendable, Hashable, Codable {
     public var permission: String
     public var pattern: String
     public var action: PermissionAction

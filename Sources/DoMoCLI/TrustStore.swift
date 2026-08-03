@@ -53,10 +53,13 @@ public func projectRequiresTrust(directory: FilePath) -> Bool {
             current.appending("CLAUDE.md"),
             current.appending(".domocode").appending("commands"),
             current.appending(".domocode").appending("skills"),
+            current.appending(".domocode").appending("agents"),
             current.appending(".claude").appending("commands"),
             current.appending(".claude").appending("skills"),
+            current.appending(".claude").appending("agents"),
             current.appending(".agents").appending("commands"),
             current.appending(".agents").appending("skills"),
+            current.appending(".agents").appending("agents"),
         ]
         if candidates.contains(where: hasResource) { return true }
         let parent = current.removingLastComponent()

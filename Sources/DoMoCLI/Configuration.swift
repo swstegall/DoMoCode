@@ -5,6 +5,7 @@ import DoMoCore
 import DoMoHarness
 import DoMoLLM
 import DoMoMCP
+import DoMoPermissions
 import Foundation
 import Logging
 import SystemPackage
@@ -92,6 +93,10 @@ public struct Settings: Sendable, Hashable, Codable {
     /// fact about the model.
     public var contextWindow: Int?
 
+    /// Optional per-mode policy rules. Only deny rules are honored by the mode
+    /// hardening layer; a project may tighten a mode but never widen it.
+    public var agentModes: [String: Ruleset]?
+
     public init(
         baseURL: String? = nil,
         model: String? = nil,
@@ -111,7 +116,8 @@ public struct Settings: Sendable, Hashable, Codable {
         mcpServers: [String: MCPServerConfig]? = nil,
         modelOverrides: [String: ModelOverride]? = nil,
         compaction: CompactionOverrides? = nil,
-        contextWindow: Int? = nil
+        contextWindow: Int? = nil,
+        agentModes: [String: Ruleset]? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -132,6 +138,7 @@ public struct Settings: Sendable, Hashable, Codable {
         self.modelOverrides = modelOverrides
         self.compaction = compaction
         self.contextWindow = contextWindow
+        self.agentModes = agentModes
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -154,6 +161,7 @@ public struct Settings: Sendable, Hashable, Codable {
         case modelOverrides
         case compaction
         case contextWindow
+        case agentModes
     }
 
     /// Loads a settings file: `nil` when it is genuinely absent, a thrown error
@@ -755,6 +763,10 @@ public struct ResolvedConfiguration: Sendable {
     /// `nil` = genuinely unknown; see ``ModelRuntime/contextWindow``.
     public var contextWindow: Int?
 
+    /// Mode-specific rules carried through resolution. The mode policy filters
+    /// these to denials before applying them.
+    public var agentModes: [String: Ruleset]
+
     /// The *name* of the environment variable the API key was read from, when a
     /// settings file named one. Never the key.
     ///
@@ -796,6 +808,7 @@ public struct ResolvedConfiguration: Sendable {
         compaction: CompactionSettings = .default,
         compactionModel: String? = nil,
         contextWindow: Int? = nil,
+        agentModes: [String: Ruleset] = [:],
         apiKeyEnvName: String? = nil,
         warnings: [String] = []
     ) {
@@ -820,6 +833,7 @@ public struct ResolvedConfiguration: Sendable {
         self.compaction = compaction
         self.compactionModel = compactionModel
         self.contextWindow = contextWindow
+        self.agentModes = agentModes
         self.apiKeyEnvName = apiKeyEnvName
         self.warnings = warnings
     }
@@ -1083,6 +1097,11 @@ extension ResolvedConfiguration {
             project: project?.contextWindow, user: user?.contextWindow, key: "contextWindow"
         )
 
+        var agentModes = user?.agentModes ?? [:]
+        for (mode, rules) in project?.agentModes ?? [:] {
+            agentModes[mode] = merge(agentModes[mode] ?? [], rules)
+        }
+
         return ResolvedConfiguration(
             baseURL: baseURL,
             apiKey: apiKey,
@@ -1105,6 +1124,7 @@ extension ResolvedConfiguration {
             compaction: compactionOverrides.applied(to: .default),
             compactionModel: nonEmpty(compactionOverrides.model),
             contextWindow: contextWindow,
+            agentModes: agentModes,
             apiKeyEnvName: apiKeyEnvName,
             warnings: warnings
         )

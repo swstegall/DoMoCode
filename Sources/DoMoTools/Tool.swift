@@ -213,12 +213,17 @@ public struct ToolRegistry: Sendable {
     /// Builds the complete built-in set with state scoped to the supplied
     /// session. Keeping this factory beside the legacy property makes the
     /// lifetime choice explicit for servers that create one registry per run.
-    public static func builtin(todoStore: TodoStore) -> ToolRegistry {
-        ToolRegistry([
+    public static func builtin(
+        todoStore: TodoStore = TodoStore(),
+        includePlanExit: Bool = false
+    ) -> ToolRegistry {
+        var tools: [any Tool] = [
             ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
             TodoWriteTool(store: todoStore), GlobTool(), FinishTool(), QuestionTool(), WebFetchTool(),
             BackgroundProcessTool(),
-        ])
+        ]
+        if includePlanExit { tools.append(PlanExitTool()) }
+        return ToolRegistry(tools)
     }
 
     /// Dispatches by name. An unknown name is an error result rather than a
