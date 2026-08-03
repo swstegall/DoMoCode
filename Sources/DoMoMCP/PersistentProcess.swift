@@ -14,8 +14,11 @@ import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
+import DoMoCore
+import DoMoExec
 import Foundation
 import Subprocess
+import SystemPackage
 
 /// A single stdout line larger than this (before its `\n`) is treated as a protocol
 /// violation and tears the stream down — a backstop against a server that floods stdout
@@ -103,6 +106,8 @@ actor PersistentProcess {
         /// config diagnostic rather than a laundering route straight back through this
         /// overlay. Change either mechanism and the other stops being sufficient.
         var sensitiveEnvKeys: Set<String> = []
+        /// Optional OS-level confinement for the server and all of its descendants.
+        var sandbox: ProcessSandbox?
         /// Grace between SIGTERM and SIGKILL on teardown.
         var terminationGrace: Duration = .seconds(2)
     }
@@ -129,8 +134,11 @@ actor PersistentProcess {
 
     /// Launch the child and start pumping stdio. Returns immediately; the session runs
     /// in a retained Task. `lines` begins yielding as the child writes.
-    func start(_ spawn: Spawn) {
+    func start(_ spawn: Spawn) throws(DoMoError) {
         guard runTask == nil else { return }
+        guard !spawn.command.isEmpty, !spawn.command[0].isEmpty else {
+            throw DoMoError(.configuration, "MCP server command must not be empty")
+        }
 
         // A server is allowed to exit at any point, including between spawn and
         // the first JSON-RPC frame. On Linux, writing to its closed stdin would
@@ -152,23 +160,45 @@ actor PersistentProcess {
         // is the documented contract on `Spawn.sensitiveEnvKeys`, and it is what config
         // interpolation's env denylist is protecting — do not reverse it without reading
         // that note.
-        var overrides: [Subprocess.Environment.Key: String?] = [:]
+        var stringOverrides: [String: String?] = [:]
+        var subprocessOverrides: [Subprocess.Environment.Key: String?] = [:]
         for key in spawn.sensitiveEnvKeys {
-            overrides.updateValue(nil, forKey: Subprocess.Environment.Key(stringLiteral: key))
+            stringOverrides[key] = nil
+            subprocessOverrides.updateValue(nil, forKey: Subprocess.Environment.Key(stringLiteral: key))
         }
         for (key, value) in spawn.environment {
-            overrides.updateValue(value, forKey: Subprocess.Environment.Key(stringLiteral: key))
+            stringOverrides[key] = value
+            subprocessOverrides.updateValue(value, forKey: Subprocess.Environment.Key(stringLiteral: key))
+        }
+        let launch = try spawn.sandbox?.launch(
+            command: spawn.command,
+            workingDirectory: spawn.workingDirectory.map { FilePath($0) }
+        )
+        let subprocessEnvironment: Subprocess.Environment
+        if let sandbox = spawn.sandbox {
+            let inheritedEnvironment = ShellEnvironment.inherit(stringOverrides)
+            let childEnvironment = inheritedEnvironment.pinnedForSandbox(
+                workspace: sandbox.root,
+                alsoUnsetting: spawn.sensitiveEnvKeys
+            )
+            subprocessEnvironment = childEnvironment.subprocessEnvironment
+        } else {
+            // Keep the unsandboxed path byte-for-byte with the established MCP
+            // launcher behavior. The sandboxed path above additionally pins the
+            // environment; this branch only removes the requested sensitive keys
+            // and overlays the server's explicit values.
+            subprocessEnvironment = .inherit.updating(subprocessOverrides)
         }
         var configuration = Subprocess.Configuration(
-            executable: .name(spawn.command[0]),
-            arguments: Subprocess.Arguments(Array(spawn.command.dropFirst())),
-            environment: .inherit.updating(overrides),
+            executable: launch.map { .path(.init($0.executable.string)) } ?? .name(spawn.command[0]),
+            arguments: Subprocess.Arguments(launch?.arguments ?? Array(spawn.command.dropFirst())),
+            environment: subprocessEnvironment,
             platformOptions: platformOptions
         )
-        if let cwd = spawn.workingDirectory {
+        if let cwd = launch?.workingDirectory ?? spawn.workingDirectory.map({ FilePath($0) }) {
             // `.init` picks System.FilePath contextually (Subprocess re-exports it,
             // which would otherwise clash with SystemPackage.FilePath).
-            configuration.workingDirectory = .init(cwd)
+            configuration.workingDirectory = .init(cwd.string)
         }
 
         // Capture only Sendable values — never `self` or the execution handle.

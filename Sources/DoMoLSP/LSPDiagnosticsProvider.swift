@@ -97,17 +97,21 @@ public struct LSPServerConfiguration: Sendable, Hashable {
     public let languageID: String
     public let environment: ShellEnvironment
     public let timeout: Duration
+    /// Optional OS-level confinement for the language server and its descendants.
+    public let sandbox: ProcessSandbox?
 
     public init(
         command: [String],
         languageID: String,
         environment: ShellEnvironment = .inherit,
-        timeout: Duration = .seconds(30)
+        timeout: Duration = .seconds(30),
+        sandbox: ProcessSandbox? = nil
     ) {
         self.command = command
         self.languageID = languageID
         self.environment = environment
         self.timeout = timeout
+        self.sandbox = sandbox
     }
 }
 
@@ -150,6 +154,7 @@ public actor LSPClientPool {
         let root: String
         let command: [String]
         let languageID: String
+        let sandbox: ProcessSandbox?
     }
 
     private var clients: [Key: LSPClient] = [:]
@@ -171,7 +176,8 @@ public actor LSPClientPool {
         let key = Key(
             root: root.string,
             command: configuration.command,
-            languageID: configuration.languageID
+            languageID: configuration.languageID,
+            sandbox: configuration.sandbox
         )
         let client: LSPClient
         if let existing = clients[key] {
@@ -210,21 +216,29 @@ private actor PersistentLSPProcess {
     func start(
         command: [String],
         environment: ShellEnvironment,
-        workingDirectory: FilePath
-    ) {
+        workingDirectory: FilePath,
+        sandbox: ProcessSandbox?
+    ) throws(DoMoError) {
         guard runTask == nil, let executable = command.first else { return }
+        let launch = try sandbox?.launch(command: command, workingDirectory: workingDirectory)
         var platformOptions = PlatformOptions()
         platformOptions.createSession = true
         platformOptions.teardownSequence = [
             .send(signal: .terminate, toProcessGroup: true, allowedDurationToNextStep: .seconds(2))
         ]
-        let executableForm: Subprocess.Executable =
+        let executableForm: Subprocess.Executable = if let launch {
+            .path(.init(launch.executable.string))
+        } else {
             executable.hasPrefix("/") ? .path(.init(executable)) : .name(executable)
+        }
+        let childEnvironment = sandbox == nil
+            ? environment
+            : environment.pinnedForSandbox(workspace: sandbox?.root)
         let configuration = Subprocess.Configuration(
             executable: executableForm,
-            arguments: Subprocess.Arguments(Array(command.dropFirst())),
-            environment: Self.subprocessEnvironment(environment),
-            workingDirectory: .init(workingDirectory.string),
+            arguments: Subprocess.Arguments(launch?.arguments ?? Array(command.dropFirst())),
+            environment: childEnvironment.subprocessEnvironment,
+            workingDirectory: .init((launch?.workingDirectory ?? workingDirectory).string),
             platformOptions: platformOptions
         )
         let outgoing = self.outgoing
@@ -285,19 +299,6 @@ private actor PersistentLSPProcess {
         chunksContinuation.finish()
     }
 
-    private static func subprocessEnvironment(_ environment: ShellEnvironment) -> Subprocess.Environment {
-        let values = Dictionary(
-            uniqueKeysWithValues: environment.overrides.map {
-                (Subprocess.Environment.Key(stringLiteral: $0.key), $0.value)
-            }
-        )
-        switch environment.base {
-        case .inherited:
-            return Subprocess.Environment.inherit.updating(values)
-        case .empty:
-            return Subprocess.Environment.custom([:]).updating(values)
-        }
-    }
 }
 
 // MARK: - JSON-RPC client
@@ -409,10 +410,11 @@ private actor LSPClient {
     private func startIfNeeded() async throws {
         if initialized { return }
         guard !closed else { throw LSPError.closed }
-        await process.start(
+        try await process.start(
             command: configuration.command,
             environment: configuration.environment,
-            workingDirectory: root
+            workingDirectory: root,
+            sandbox: configuration.sandbox
         )
         readerTask = Task { [weak self] in
             await self?.readLoop()

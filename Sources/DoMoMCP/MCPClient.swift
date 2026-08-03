@@ -9,6 +9,7 @@
 // faithful hand-rolled port of the MCP 2025-06-18 spec — no SDK.
 
 import DoMoCore
+import DoMoExec
 import Foundation
 
 /// The MCP protocol version this client speaks.
@@ -48,6 +49,7 @@ public actor MCPClient {
     private let workspaceDirectory: String
     private let clientVersion: String
     private let sensitiveEnvKeys: Set<String>
+    private let sandbox: ProcessSandbox?
     private let log: (@Sendable (String) -> Void)?
     private let onToolsChanged: (@Sendable () async -> Void)?
 
@@ -73,6 +75,7 @@ public actor MCPClient {
         workspaceDirectory: String,
         clientVersion: String = "0.1.0",
         sensitiveEnvKeys: Set<String> = [],
+        sandbox: ProcessSandbox? = nil,
         log: (@Sendable (String) -> Void)? = nil,
         onToolsChanged: (@Sendable () async -> Void)? = nil
     ) {
@@ -81,6 +84,7 @@ public actor MCPClient {
         self.workspaceDirectory = workspaceDirectory
         self.clientVersion = clientVersion
         self.sensitiveEnvKeys = sensitiveEnvKeys
+        self.sandbox = sandbox
         self.log = log
         self.onToolsChanged = onToolsChanged
     }
@@ -91,11 +95,12 @@ public actor MCPClient {
     /// spawn/handshake failure so the manager can isolate this one server.
     public func connect() async throws {
         let cwd = config.cwd.map { resolveCwd($0) }
-        await process.start(PersistentProcess.Spawn(
+        try await process.start(PersistentProcess.Spawn(
             command: config.command,
             environment: config.environment ?? [:],
             workingDirectory: cwd,
-            sensitiveEnvKeys: sensitiveEnvKeys
+            sensitiveEnvKeys: sensitiveEnvKeys,
+            sandbox: sandbox
         ))
         readerTask = Task { [weak self] in await self?.readLoop() }
 

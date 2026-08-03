@@ -96,6 +96,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     )
     public var serve: Bool = false
 
+    @Flag(
+        name: .customLong("sandbox"),
+        help: "Require OS-level confinement for every local model-originated process; fail if the backend is unavailable."
+    )
+    public var sandbox: Bool = false
+
     @Option(
         name: .customLong("port"),
         help: "Port for --serve (default 4100; 0 asks the OS for an ephemeral port)."
@@ -363,6 +369,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             workingDirectory: workingDirectory
         )
 
+        if sandbox, serverURL != nil {
+            throw DoMoError(
+                .configuration,
+                "--sandbox cannot constrain a remote --url server; start that server with --sandbox"
+            )
+        }
+        let processSandbox: ProcessSandbox? = sandbox
+            ? try ProcessSandbox.automatic(root: workingDirectory)
+            : nil
+
         // Teach the redaction vault this process's ACTUAL secrets, at the one
         // moment they are all known and before anything can print a diagnostic.
         Self.registerProcessSecrets(configuration)
@@ -432,7 +448,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 maxCostPerRun: costLimit,
                 steeringMode: deliveryMode,
                 agentProfile: profile,
-                agentMode: selectedMode
+                agentMode: selectedMode,
+                sandbox: processSandbox
             )
             return
         }
@@ -478,6 +495,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     sessionSource: sessionSource,
                     mcpServers: configuration.mcpServers,
                     mcpLog: { Self.writeStderr($0 + "\n") },
+                    sandbox: processSandbox,
                     // The per-alias trio, and the reason `SurfaceWiringTests` drives
                     // this surface on a real pty. `InteractiveMode.make` defaults all
                     // three of them, so deleting them here still COMPILES while
@@ -514,18 +532,20 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     serverURL: serverURL,
                     serverToken: serverToken,
                     agentProfile: profile,
-                    agentMode: selectedMode
+                    agentMode: selectedMode,
+                    sandbox: processSandbox
                 )
             }
             return
         }
 
-        let shell = try SubprocessShell()
-        let toolEnvironment = Self.toolEnvironment(configuration)
+        let shell = try SubprocessShell(sandbox: processSandbox)
+        let toolEnvironment = Self.toolEnvironment(configuration, sandboxed: processSandbox != nil)
         let toolContext = try await ToolContext.rooted(
             at: workingDirectory,
             shell: shell,
             environment: toolEnvironment,
+            backgroundProcesses: BackgroundProcessManager(sandbox: processSandbox),
             diagnosticsProvider: CLIDiagnosticsProvider(
                 root: workingDirectory,
                 shell: shell,
@@ -534,7 +554,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             formatterProvider: Self.configuredFormatter(
                 configuration: configuration,
                 root: workingDirectory,
-                shell: shell
+                shell: shell,
+                environment: toolEnvironment
             ),
             sessionRecallProvider: SessionRecallIndex(
                 cwd: workingDirectory.string,
@@ -584,7 +605,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools. Torn down after the run — the servers run in their own process group,
         // so an un-shut-down server would be orphaned.
-        let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
+        let (mcpTools, mcpManager) = await Self.connectMCP(
+            configuration,
+            workingDirectory: workingDirectory,
+            sandbox: processSandbox
+        )
 
         // Hide any MCP tool a `deny` rule blocks (Phase 8d visibility). The ruleset is the
         // same one headlessHook resolves internally (resolvedRuleset is pure over the same
@@ -677,7 +702,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     /// spawn in their own process group and would otherwise be orphaned).
     static func connectMCP(
         _ configuration: ResolvedConfiguration,
-        workingDirectory: FilePath
+        workingDirectory: FilePath,
+        sandbox: ProcessSandbox? = nil
     ) async -> (tools: [any AgentTool], manager: MCPManager) {
         let manager = MCPManager()
         guard !configuration.mcpServers.isEmpty else { return ([], manager) }
@@ -691,6 +717,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // with `"apiKeyEnv": "MY_GATEWAY_KEY"` the key was handed intact to
             // every configured MCP server. See ``gatewayCredentialEnvNames(_:)``.
             sensitiveEnvKeys: Self.gatewayCredentialEnvNames(configuration),
+            sandbox: sandbox,
             // Reserve the built-in tool names so an MCP tool can never shadow one.
             reservedNames: Set(
                 ToolRegistry.builtin(
@@ -757,12 +784,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     /// `updateValue(_:forKey:)`, because subscript-assigning `nil` to a dictionary
     /// whose values are already `Optional` REMOVES the entry instead of storing a
     /// nil under it, which would silently leave the variable inherited.
-    static func toolEnvironment(_ configuration: ResolvedConfiguration) -> ShellEnvironment {
+    static func toolEnvironment(
+        _ configuration: ResolvedConfiguration,
+        sandboxed: Bool = false
+    ) -> ShellEnvironment {
         var overrides: [String: String?] = [:]
         for name in gatewayCredentialEnvNames(configuration) {
             overrides.updateValue(nil, forKey: name)
         }
-        return .inherit(overrides)
+        let environment = ShellEnvironment.inherit(overrides)
+        return sandboxed
+            ? environment.pinnedForSandbox(alsoUnsetting: gatewayCredentialEnvNames(configuration))
+            : environment
     }
 
     /// Builds the explicitly configured post-mutation formatter, if any.
@@ -774,7 +807,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     static func configuredFormatter(
         configuration: ResolvedConfiguration,
         root: FilePath,
-        shell: any Shell
+        shell: any Shell,
+        environment: ShellEnvironment? = nil
     ) -> (any FormatterProvider)? {
         guard let settings = configuration.autoFormat,
               settings.enabled == true,
@@ -786,7 +820,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             root: root,
             shell: shell,
             command: command,
-            environment: toolEnvironment(configuration),
+            environment: environment ?? toolEnvironment(configuration),
             timeout: .milliseconds(settings.timeoutMS ?? 30_000)
         )
     }
@@ -911,7 +945,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         maxCostPerRun: Decimal?,
         steeringMode: QueueDeliveryMode,
         agentProfile: AgentProfile,
-        agentMode: AgentMode
+        agentMode: AgentMode,
+        sandbox: ProcessSandbox?
     ) async throws {
         let (runtime, mcpManager, backgroundSessions) = try await Self.buildServerRuntime(
             configuration: configuration,
@@ -921,7 +956,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             maxCostPerRun: maxCostPerRun,
             steeringMode: steeringMode,
             agentProfile: agentProfile,
-            agentMode: agentMode
+            agentMode: agentMode,
+            sandbox: sandbox
         )
         let token = Self.generateToken()
         let server = DoMoServer(
@@ -965,14 +1001,15 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         maxCostPerRun: Decimal?,
         steeringMode: QueueDeliveryMode,
         agentProfile: AgentProfile,
-        agentMode: AgentMode
+        agentMode: AgentMode,
+        sandbox: ProcessSandbox? = nil
     ) async throws -> (
         runtime: ServerRuntime,
         mcpManager: MCPManager,
         backgroundSessions: BackgroundProcessSessions
     ) {
-        let shell = try SubprocessShell()
-        let toolEnvironment = Self.toolEnvironment(configuration)
+        let shell = try SubprocessShell(sandbox: sandbox)
+        let toolEnvironment = Self.toolEnvironment(configuration, sandboxed: sandbox != nil)
         let sessionStartHead = try? await DoMoGit(shell: shell).head(at: workingDirectory)
         let subagentCoordinator = SubagentCoordinator()
         let memoryStore = ProjectMemoryStore(
@@ -983,6 +1020,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             at: workingDirectory,
             shell: shell,
             environment: toolEnvironment,
+            backgroundProcesses: BackgroundProcessManager(sandbox: sandbox),
             diagnosticsProvider: CLIDiagnosticsProvider(
                 root: workingDirectory,
                 shell: shell,
@@ -991,7 +1029,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             formatterProvider: Self.configuredFormatter(
                 configuration: configuration,
                 root: workingDirectory,
-                shell: shell
+                shell: shell,
+                environment: toolEnvironment
             ),
             sessionRecallProvider: SessionRecallIndex(
                 cwd: workingDirectory.string,
@@ -1043,9 +1082,13 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // MCP tools (Phase 8c): the manager is returned so the caller tears the servers
         // down (they spawn in their own process group and would otherwise be orphaned).
         // Deny'd MCP tools are hidden from both the tool set and the system prompt.
-        let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
+        let (mcpTools, mcpManager) = await Self.connectMCP(
+            configuration,
+            workingDirectory: workingDirectory,
+            sandbox: sandbox
+        )
         let questionBroker = QuestionBroker()
-        let backgroundSessions = BackgroundProcessSessions()
+        let backgroundSessions = BackgroundProcessSessions(sandbox: sandbox)
         let initialPlanPath = AgentModePolicy.planPath(
             workingDirectory: workingDirectory.string,
             sessionID: "server"
@@ -1229,7 +1272,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         serverURL: String?,
         serverToken: String?,
         agentProfile: AgentProfile,
-        agentMode: AgentMode
+        agentMode: AgentMode,
+        sandbox: ProcessSandbox?
     ) async throws {
         let baseURL: String
         let token: String
@@ -1255,7 +1299,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 maxCostPerRun: maxCostPerRun,
                 steeringMode: steeringMode,
                 agentProfile: agentProfile,
-                agentMode: agentMode
+                agentMode: agentMode,
+                sandbox: sandbox
             )
             mcpManager = manager
             backgroundSessions = sessions

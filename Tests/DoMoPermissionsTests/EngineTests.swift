@@ -87,12 +87,21 @@ struct FactoryTests {
         #expect(spec.patterns == ["config/.env"])
     }
 
-    @Test("unknown/MCP tool name defaults to a * resource")
+    @Test("unknown/MCP tool names scope an always grant to their argument payload")
     func unknown() {
         let spec = factory.make(toolName: "myserver_dangerous", arguments: .object([:]))
         #expect(spec.permission == "myserver_dangerous")
-        #expect(spec.patterns == ["*"])
-        #expect(spec.always == ["*"])
+        #expect(spec.patterns.count == 1)
+        #expect(spec.patterns[0].hasPrefix("arguments:"))
+        #expect(spec.always == spec.patterns)
+        #expect(!spec.patterns[0].contains("*"))
+        #expect(!spec.patterns[0].contains("?"))
+
+        let different = factory.make(
+            toolName: "myserver_dangerous",
+            arguments: .object(["path": .string("other")])
+        )
+        #expect(different.patterns != spec.patterns)
     }
 
     @Test("write to a protected config file is flagged configProtected (incl. case variants)")

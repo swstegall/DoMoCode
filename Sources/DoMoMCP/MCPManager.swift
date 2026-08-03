@@ -9,6 +9,7 @@
 
 import DoMoAgent
 import DoMoCore
+import DoMoExec
 import Foundation
 
 /// Connects and owns the run's stdio MCP servers.
@@ -46,6 +47,7 @@ public actor MCPManager {
         workspaceDirectory: String,
         clientVersion: String = "0.1.0",
         sensitiveEnvKeys: Set<String> = [],
+        sandbox: ProcessSandbox? = nil,
         reservedNames: Set<String> = [],
         log: (@Sendable (String) -> Void)? = nil
     ) async -> [any AgentTool] {
@@ -64,7 +66,7 @@ public actor MCPManager {
             let client = MCPClient(
                 serverName: name, config: config,
                 workspaceDirectory: workspaceDirectory, clientVersion: clientVersion,
-                sensitiveEnvKeys: sensitiveEnvKeys, log: log,
+                sensitiveEnvKeys: sensitiveEnvKeys, sandbox: sandbox, log: log,
                 onToolsChanged: { [weak self] in
                     await self?.rebuildTools()
                 }

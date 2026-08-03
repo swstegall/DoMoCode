@@ -19,6 +19,22 @@ public enum PermissionAction: String, Sendable, Hashable, Codable {
     case allow
     case deny
     case ask
+
+    /// Restriction order used when a lower-trust layer is allowed to tighten a
+    /// higher-trust layer. `ask` is stricter than `allow`, and `deny` is strictest;
+    /// the enum's declaration order intentionally does not encode this order.
+    public var restrictionRank: Int {
+        switch self {
+        case .allow: return 0
+        case .ask: return 1
+        case .deny: return 2
+        }
+    }
+
+    /// The least permissive action in the lattice.
+    public static func moreRestrictive(_ lhs: Self, _ rhs: Self) -> Self {
+        lhs.restrictionRank >= rhs.restrictionRank ? lhs : rhs
+    }
 }
 
 /// One rule: `permission` (tool key / glob) and `pattern` (resource/command glob) are

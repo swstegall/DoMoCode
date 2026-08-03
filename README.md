@@ -153,18 +153,20 @@ Sources/
                     hooks, the system-prompt builder, and command/skill resource loading.
   DoMoMemory/       On-demand session recall plus typed, byte-budgeted project memory outside the
                     checkout, with one shared secret-redaction gate on every write.
-  DoMoExec/         FileSystem + Shell over swift-subprocess; gitignore walker; path sandboxing;
-                    per-path file mutation coordinator; image-attachment loading.
+  DoMoExec/         FileSystem + Shell over swift-subprocess; gitignore walker; path and OS-process
+                    sandboxing; per-path file mutation coordinator; image-attachment loading.
   DoMoGit/          The non-interactive Git facade, machine-oriented status/diff parsers, session-start
                     checkpoints, and the DiffSource boundary used by review and future shadow history.
   DoMoTools/        The built-in tools (read/write/edit/bash/grep/find/ls), headless by design.
   DoMoPermissions/  The granular allow/ask/deny engine: glob matching, last-match-wins evaluation,
                     the bash arity table, the .env guard, the config self-edit guard, an actor that
                     remembers and persists grants, and the beforeToolCall hook that gates the loop.
-  DoMoMCP/          MCP client: an MCPManager actor owning stdio server subprocesses, a JSON-RPC 2.0
-                    protocol actor, and an McpTool: AgentTool adapter. Hand-rolled, no SDK.
+  DoMoMCP/          MCP client: an MCPManager actor owning fail-closed, environment-scrubbed stdio
+                    server subprocesses, a JSON-RPC 2.0 protocol actor, and an McpTool: AgentTool
+                    adapter. Hand-rolled, no SDK.
   DoMoLSP/          Content-Length-framed LSP diagnostics: pooled per-root stdio clients, initialize/
-                    open/change notifications, pull diagnostics, and merged push diagnostics.
+                    open/change notifications, pull diagnostics, merged push diagnostics, and an
+                    optional OS-process sandbox.
 
   # The server — hosts the runtime behind a local socket
   DoMoServer/       Hummingbird HTTP+SSE. Write path drives the AgentHarness actor; read path is an
@@ -665,7 +667,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       both terminal surfaces and the remote client. Every title, ID, content, session ID, and tag is
       rejected if the shared Phase 5a redaction registry would change it. *Exit met:* a prior decision
       is searchable inside the session, and no secret-shaped input is accepted into a memory file.
-- [ ] **Phase 18 — Sandboxing and permission hardening.** The honest framing: `PathSandbox` confines
+- [x] **Phase 18 — Sandboxing and permission hardening.** The honest framing: `PathSandbox` confines
       the file tools and **bash is not confined at all**, so a reader could reasonably conclude the
       whole harness is sandboxed. This closes that and documents it. A pluggable OS backend with
       **fail-closed** selection — Seatbelt on macOS, bubblewrap on Linux, and a hard error rather than
@@ -679,6 +681,14 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       resolution already shipped in 8a: `resolvePermission` returns a config `deny` before it will
       honour any saved allow.) *Exit:* `--sandbox` confines
       every model-originated process or refuses to run and says which backend was unavailable.
+      **Complete:** `ProcessSandbox` now selects Seatbelt or bubblewrap fail-closed, passes the
+      workspace as data to a constant Seatbelt policy, binds only system trees plus the workspace on
+      bubblewrap, and pins/scrubs child environments. `--sandbox` reaches shell, background, MCP,
+      formatter, diagnostics, Git, shadow-Git, and LSP process paths. Trusted project permissions
+      can only tighten the upstream lattice; project MCP settings can disable an existing user
+      server but cannot introduce or replace one; and unknown/MCP tool grants are scoped to canonical,
+      glob-inert argument payloads. *Exit met:* `--sandbox` never silently falls back to an
+      unconfined model-originated process.
 - [ ] **Phase 19 — PTY and interactive terminal.** Harder here than in any surveyed harness, because
       of the client/server split. Control messages already flow client→server over REST
       (`/prompt`, `/abort`, `/permission`), but there is no *streaming* channel to carry keystrokes
@@ -1322,8 +1332,8 @@ real — each of these is now a property of the shipped system, not a forecast:
 
 ## Contributing
 
-All shipped phases through Phase 17 are implemented.
-**Phase 17 — Memory and recall — is complete**, followed by Phases 18–21. The [dependency spine](#the-dependency-spine)
+All shipped phases through Phase 18 are implemented.
+**Phase 18 — Sandboxing and permission hardening — is complete**, followed by Phases 19–21. The [dependency spine](#the-dependency-spine)
 is the useful map: six seams gate most of what is left, and a change that lands one of them is worth
 more than a change that ships a feature around it. Issues proposing scope changes — particularly anything in
 [Non-goals](#non-goals-and-known-gaps) or the

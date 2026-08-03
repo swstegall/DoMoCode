@@ -89,8 +89,11 @@ public actor BackgroundProcessManager {
     }
 
     private var jobs: [String: Job] = [:]
+    public let sandbox: ProcessSandbox?
 
-    public init() {}
+    public init(sandbox: ProcessSandbox? = nil) {
+        self.sandbox = sandbox
+    }
 
     /// Start `command` through bash in the supplied sandbox working directory.
     /// The returned snapshot is immediately `running`; output arrives through
@@ -108,6 +111,7 @@ public actor BackgroundProcessManager {
         let (outgoing, outgoingContinuation) = AsyncStream.makeStream(of: [UInt8].self)
         let job = Job(id: id, outgoing: outgoingContinuation)
         jobs[id] = job
+        let sandbox = self.sandbox
 
         let task = Task { [weak self] in
             let state: BackgroundProcessSnapshot.State
@@ -122,13 +126,22 @@ public actor BackgroundProcessManager {
                         allowedDurationToNextStep: BackgroundProcessManager.terminationGrace
                     )
                 ]
+                let launch = try sandbox?.launch(
+                    command: ["/bin/bash", "-c", command],
+                    workingDirectory: workingDirectory
+                )
+                let childEnvironment = sandbox == nil
+                    ? environment
+                    : environment.pinnedForSandbox(workspace: sandbox?.root)
                 var configuration = Subprocess.Configuration(
-                    executable: .name("bash"),
-                    arguments: ["-c", command],
-                    environment: environment.subprocessEnvironment,
+                    executable: launch.map { .path(.init($0.executable.string)) } ?? .name("bash"),
+                    arguments: Subprocess.Arguments(launch?.arguments ?? ["-c", command]),
+                    environment: childEnvironment.subprocessEnvironment,
                     platformOptions: platformOptions
                 )
-                configuration.workingDirectory = .init(workingDirectory.string)
+                configuration.workingDirectory = .init(
+                    (launch?.workingDirectory ?? workingDirectory).string
+                )
 
                 let result = try await Subprocess.run(
                     configuration,

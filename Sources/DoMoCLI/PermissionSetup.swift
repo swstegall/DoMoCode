@@ -108,8 +108,10 @@ enum PermissionSetup {
     }
 
     /// The resolved ruleset: baseline first, then the user's global permission,
-    /// then the project's (which wins — matching how every other setting layers
-    /// project over user, gated by project trust). The engine appends session grants.
+    /// then trusted profile/mode rules, with the project's permission block applied
+    /// through a restriction lattice. A project rule can raise a decision from
+    /// `allow` to `ask` or `deny`, but never lower `ask`/`deny` to `allow`; the
+    /// project layer is last so no downstream resolver can accidentally widen it.
     static func resolvedRuleset(
         workingDirectory: String,
         configDirectory: String,
@@ -122,15 +124,120 @@ enum PermissionSetup {
         let baseline = fromConfig(defaultBaselinePermissionConfig(), homeDirectory: homeDirectory)
         let user = fromConfig(loadConfig(userSettingsPath(configDirectory)), homeDirectory: homeDirectory)
         let project = fromConfig(loadConfig(projectSettingsPath(workingDirectory)), homeDirectory: homeDirectory)
-        let layered = merge(baseline, user, project, profileRules)
         let resolvedPlanPath = planPath ?? AgentModePolicy.planPath(
             workingDirectory: workingDirectory,
             sessionID: "current"
         )
-        return merge(
-            layered,
+        let upstream = merge(
+            baseline,
+            user,
+            profileRules,
             AgentModePolicy.rules(for: mode, planPath: resolvedPlanPath, additional: modeRules)
         )
+        return merge(upstream, tightenedProjectRules(project, against: upstream))
+    }
+
+    /// Apply project rules through the `allow < ask < deny` lattice. An `allow`
+    /// in a project file is retained only when the upstream policy already allows
+    /// the queried key; otherwise it becomes `ask`. Overlapping upstream denies
+    /// are re-emitted after the project rules, preserving a narrower deny without
+    /// promoting a broad project rule to `deny` for unrelated resources.
+    private static func tightenedProjectRules(_ project: Ruleset, against upstream: Ruleset) -> Ruleset {
+        let tightened = project.map { rule in
+            let upstreamAction = evaluate(rule.permission, rule.pattern, rulesets: [upstream]).action
+            let action = PermissionAction.moreRestrictive(rule.action, upstreamAction)
+            return PermissionRule(permission: rule.permission, pattern: rule.pattern, action: action)
+        }
+        let protectedDenies = upstream.filter { candidate in
+            candidate.action == .deny
+                && tightened.contains { rule in rulesOverlap(rule, candidate) }
+        }
+        return merge(
+            tightened,
+            protectedDenies,
+            tightened.filter { $0.action == .deny }
+        )
+    }
+
+    private enum GlobToken: Hashable {
+        case literal(Character)
+        case any
+        case star
+    }
+
+    /// Whether two permission rules can match one call. This is a small glob-NFA
+    /// intersection check (`*`, `?`, and literals), not a string-prefix heuristic;
+    /// the latter would miss a project `*` protecting a user `rm *` deny. The
+    /// wildcard engine's trailing `" *"` shorthand is represented as two language
+    /// variants (`prefix` and `prefix + " *"`).
+    private static func rulesOverlap(_ lhs: PermissionRule, _ rhs: PermissionRule) -> Bool {
+        globLanguagesOverlap(lhs.permission, rhs.permission)
+            && globLanguagesOverlap(lhs.pattern, rhs.pattern)
+    }
+
+    private static func globLanguagesOverlap(_ lhs: String, _ rhs: String) -> Bool {
+        for left in globVariants(lhs) {
+            for right in globVariants(rhs) where globTokensOverlap(left, right) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func globVariants(_ pattern: String) -> [[GlobToken]] {
+        let normalized = pattern.replacingOccurrences(of: "\\", with: "/")
+        let characters = Array(normalized)
+        let tokens = characters.map { character -> GlobToken in
+            switch character {
+            case "*": return .star
+            case "?": return .any
+            default: return .literal(character)
+            }
+        }
+        guard normalized.hasSuffix(" *") else { return [tokens] }
+        return [Array(tokens.dropLast(2)), tokens]
+    }
+
+    private static func globTokensOverlap(_ lhs: [GlobToken], _ rhs: [GlobToken]) -> Bool {
+        struct State: Hashable {
+            let lhs: Int
+            let rhs: Int
+        }
+
+        var pending = [State(lhs: 0, rhs: 0)]
+        var visited: Set<State> = []
+        while let state = pending.popLast() {
+            guard visited.insert(state).inserted else { continue }
+            if state.lhs == lhs.count, state.rhs == rhs.count { return true }
+
+            if state.lhs < lhs.count, lhs[state.lhs] == .star {
+                pending.append(State(lhs: state.lhs + 1, rhs: state.rhs))
+            }
+            if state.rhs < rhs.count, rhs[state.rhs] == .star {
+                pending.append(State(lhs: state.lhs, rhs: state.rhs + 1))
+            }
+
+            guard state.lhs < lhs.count, state.rhs < rhs.count else { continue }
+            let left = lhs[state.lhs]
+            let right = rhs[state.rhs]
+            switch (left, right) {
+            case (.star, .literal), (.star, .any):
+                pending.append(State(lhs: state.lhs, rhs: state.rhs + 1))
+            case (.literal, .star), (.any, .star):
+                pending.append(State(lhs: state.lhs + 1, rhs: state.rhs))
+            case (.star, .star):
+                break
+            case (.literal(let a), .literal(let b)) where a == b:
+                pending.append(State(lhs: state.lhs + 1, rhs: state.rhs + 1))
+            case (.literal, .any),
+                 (.any, .literal),
+                 (.any, .any):
+                pending.append(State(lhs: state.lhs + 1, rhs: state.rhs + 1))
+            default:
+                break
+            }
+        }
+        return false
     }
 
     /// The MCP tools the model should actually SEE, given the resolved ruleset: a tool

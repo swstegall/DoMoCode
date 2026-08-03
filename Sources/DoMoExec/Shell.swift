@@ -59,7 +59,7 @@ public struct ShellEnvironment: Sendable, Hashable {
 
     /// The swift-subprocess environment form used by both one-shot and
     /// session-scoped process runners in this module.
-    var subprocessEnvironment: Subprocess.Environment {
+    public var subprocessEnvironment: Subprocess.Environment {
         let mapped = Dictionary(
             uniqueKeysWithValues: overrides.map { (Subprocess.Environment.Key(stringLiteral: $0.key), $0.value) }
         )
@@ -320,6 +320,9 @@ public struct SubprocessShell: Shell {
     /// The shell binary. Invoked as `<shell> -c <command>`.
     public let shellPath: FilePath
 
+    /// The optional OS process sandbox applied to every shell invocation.
+    public let sandbox: ProcessSandbox?
+
     /// Resolves the shell the way pi's `getShellConfig` does: an explicit path
     /// if given and present, else `/bin/bash`, else `bash` on `PATH`, else
     /// `/bin/sh`.
@@ -334,7 +337,8 @@ public struct SubprocessShell: Shell {
     ///   does not exist. Falling back silently would run the user's command
     ///   under a shell they did not ask for, and their `shellPath` is usually
     ///   set precisely because the default shell is wrong for them.
-    public init(shellPath: FilePath? = nil) throws(DoMoError) {
+    public init(shellPath: FilePath? = nil, sandbox: ProcessSandbox? = nil) throws(DoMoError) {
+        self.sandbox = sandbox
         if let shellPath {
             guard Self.isExecutable(shellPath) else {
                 throw DoMoError(
@@ -388,14 +392,27 @@ extension SubprocessShell {
         // `SystemPackage.FilePath` this module's API and `DoMoError.file` speak.
         // Importing both would make every bare `FilePath` in this file
         // ambiguous, so the conversion rides on the contextual type instead.
+        let launch = try sandbox?.launch(
+            command: [shellPath.string, "-c", request.command],
+            workingDirectory: request.workingDirectory
+        )
+        let environment = sandbox == nil
+            ? request.environment
+            : request.environment.pinnedForSandbox(workspace: sandbox?.root)
         var configuration = Configuration(
-            executable: .path(.init(shellPath.string)),
-            arguments: ["-c", request.command],
-            environment: request.environment.subprocessEnvironment,
+            executable: .path(.init(launch?.executable.string ?? shellPath.string)),
+            arguments: Subprocess.Arguments(launch?.arguments ?? ["-c", request.command]),
+            environment: environment.subprocessEnvironment,
             platformOptions: platformOptions
         )
-        if let workingDirectory = request.workingDirectory {
-            configuration.workingDirectory = .init(workingDirectory.string)
+        if let workingDirectory = launch?.workingDirectory ?? request.workingDirectory {
+            configuration = Configuration(
+                executable: configuration.executable,
+                arguments: configuration.arguments,
+                environment: configuration.environment,
+                workingDirectory: .init(workingDirectory.string),
+                platformOptions: configuration.platformOptions
+            )
         }
 
         let started = ContinuousClock.now

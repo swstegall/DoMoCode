@@ -252,7 +252,7 @@ let package = Package(
         .target(
             name: "DoMoMCP",
             dependencies: [
-                "DoMoCore", "DoMoAgent", "DoMoLLM",
+                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoExec",
                 .product(name: "Subprocess", package: "swift-subprocess"),
                 .product(name: "SystemPackage", package: "swift-system"),
                 .product(name: "Logging", package: "swift-log"),

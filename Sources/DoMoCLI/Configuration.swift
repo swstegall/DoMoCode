@@ -789,7 +789,8 @@ public struct ResolvedConfiguration: Sendable {
     public var configDirectory: FilePath
     public var sessionDirectory: FilePath
     public var logLevel: Logger.Level
-    /// The enabled stdio MCP servers, project merged over user (Phase 8c).
+    /// The enabled stdio MCP servers. User settings own the server definitions;
+    /// a trusted project may only disable one of those existing names (Phase 18).
     public var mcpServers: [String: MCPServerConfig]
 
     /// Per-alias overrides, **merged per key with the whole entry replaced**,
@@ -1135,10 +1136,16 @@ extension ResolvedConfiguration {
         let apiKeyEnvName = nonEmpty(project?.apiKeyEnv) ?? nonEmpty(user?.apiKeyEnv)
         let apiKey = resolveAPIKey(environment: environment, apiKeyEnvName: apiKeyEnvName)
 
-        // MCP servers: project merged over user (project wins on a key collision,
-        // matching every other setting), then disabled entries dropped so the build
-        // sites never spawn them.
-        let mergedMCP = (user?.mcpServers ?? [:]).merging(project?.mcpServers ?? [:]) { _, projectValue in projectValue }
+        // MCP servers are a security policy, not an ordinary project-over-user
+        // setting. A project may turn off a server the user already configured,
+        // but it may not introduce a new executable or replace the user's command,
+        // environment, cwd, or timeout. This keeps project settings in the
+        // tightening direction even after the trust gate has admitted the file.
+        var mergedMCP: [String: MCPServerConfig] = [:]
+        for (name, userServer) in user?.mcpServers ?? [:] {
+            if project?.mcpServers?[name]?.enabled == false { continue }
+            mergedMCP[name] = userServer
+        }
         let mcpServers = mergedMCP.filter { $0.value.enabled != false }
 
         // Whole entry replaced per key — see `override(for:)` for why this and

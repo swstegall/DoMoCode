@@ -2179,6 +2179,7 @@ public struct InteractiveMode: Sendable {
         toolTheme: ToolRenderTheme = .ansi,
         mcpServers: [String: MCPServerConfig] = [:],
         mcpLog: (@Sendable (String) -> Void)? = nil,
+        sandbox: ProcessSandbox? = nil,
         // The resolved model, when the caller has one. Added ALONGSIDE
         // `model`/`reasoningEffort` rather than replacing them, because those two
         // are what every existing caller passes; a runtime supersedes both when
@@ -2208,11 +2209,11 @@ public struct InteractiveMode: Sendable {
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
+        let shell = try SubprocessShell(sandbox: sandbox)
         let sessionStartHead: String?
         switch sessionSource {
         case .new, .fork:
-            let git = try? DoMoGit()
-            sessionStartHead = if let git { try? await git.head(at: workDirectory) } else { nil }
+            sessionStartHead = try? await DoMoGit(shell: shell).head(at: workDirectory)
         case .resume:
             sessionStartHead = nil
         }
@@ -2223,9 +2224,12 @@ public struct InteractiveMode: Sendable {
         let runtime = modelRuntime ?? ModelRuntime(model: model, reasoningEffort: reasoningEffort)
 
         let client = LiteLLMClient(configuration: clientConfiguration)
-        let shell = try SubprocessShell()
         let questionBox = QuestionBox()
-        let toolEnvironment = ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+        let baseEnvironment = ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+        let toolEnvironment = sandbox == nil
+            ? baseEnvironment
+            : baseEnvironment.pinnedForSandbox(alsoUnsetting: credentialEnvNames)
+        let backgroundProcesses = BackgroundProcessManager(sandbox: sandbox)
         let memoryStore = ProjectMemoryStore(
             configDirectory: FilePath(configDirectory),
             cwd: workingDirectory
@@ -2235,6 +2239,7 @@ public struct InteractiveMode: Sendable {
             shell: shell,
             environment: toolEnvironment,
             questionHandler: { await questionBox.ask($0) },
+            backgroundProcesses: backgroundProcesses,
             diagnosticsProvider: CLIDiagnosticsProvider(
                 root: workDirectory,
                 shell: shell,
@@ -2273,6 +2278,7 @@ public struct InteractiveMode: Sendable {
                 // env — including the one a user named through `apiKeyEnv`, which
                 // the old hardcoded three-name list handed to every server.
                 sensitiveEnvKeys: Redaction.secretEnvironmentNames.union(credentialEnvNames),
+                sandbox: sandbox,
                 // Reserve the built-in tool names so an MCP tool can't shadow one.
                 reservedNames: Set(registry.names),
                 log: mcpLog ?? { _ in }

@@ -4,6 +4,7 @@
 import DoMoCLI
 import DoMoCore
 import DoMoLLM
+import DoMoMCP
 import DoMoPermissions
 import Foundation
 import Testing
@@ -53,6 +54,31 @@ struct ConfigurationTests {
         let encoded = #"{"agentModes":{"plan":[{"permission":"write","pattern":"*","action":"deny"}]}}"#
         let decoded = try JSONDecoder().decode(Settings.self, from: Data(encoded.utf8))
         #expect(decoded.agentModes?["plan"]?.first?.action == .deny)
+    }
+
+    @Test("project MCP settings can disable a user server but cannot add or replace one")
+    func projectMCPOnlyTightensUserServers() throws {
+        let userServer = MCPServerConfig(
+            command: ["user-server"],
+            environment: ["USER_VALUE": "kept"],
+            cwd: "user-cwd",
+            timeout: 1_000
+        )
+        let user = Settings(mcpServers: [
+            "kept": userServer,
+            "disabled": MCPServerConfig(command: ["disabled-server"]),
+        ])
+        let project = Settings(mcpServers: [
+            // A project cannot replace the executable or re-enable a user server.
+            "kept": MCPServerConfig(command: ["project-server"], enabled: true, timeout: 2_000),
+            "disabled": MCPServerConfig(command: ["anything"], enabled: false),
+            // Project-only servers are never introduced into the resolved set.
+            "added": MCPServerConfig(command: ["project-only-server"]),
+        ])
+
+        let resolved = try resolve(project: project, user: user)
+        #expect(Set(resolved.mcpServers.keys) == ["kept"])
+        #expect(resolved.mcpServers["kept"] == userServer)
     }
 
     @Test

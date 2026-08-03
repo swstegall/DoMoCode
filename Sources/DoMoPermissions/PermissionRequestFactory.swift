@@ -5,9 +5,9 @@
 // Turns a raw tool call into a ``PermissionRequestSpec``. Tool-aware: bash is split
 // per sub-command (including nested substitutions) with an arity-prefix "always" glob;
 // read/write/edit key on the file path (so the `.env` guard sees a real path and the
-// config self-edit guard can fire); an unknown name (an MCP tool) defaults to `*` so it
-// is treated like any untrusted call. Reads arguments defensively (the `file_path`/
-// `path` alias, string values).
+// config self-edit guard can fire); an unknown name (normally an MCP tool) is scoped
+// to the exact canonical argument payload rather than a blanket `*` grant. Reads
+// arguments defensively (the `file_path`/`path` alias, string values).
 
 import DoMoCore
 import Foundation
@@ -103,11 +103,28 @@ public struct PermissionRequestFactory: Sendable {
                 always: ["*"]
             )
         default:
-            // find/grep/todo/etc. and every MCP tool: a coarse `*` resource. Known
-            // read-only tools are auto-allowed by the baseline; an unknown MCP name is
-            // gated exactly like an untrusted call (default `ask`).
-            return PermissionRequestSpec(permission: toolName, patterns: ["*"], always: ["*"])
+            // Known read-only tools are auto-allowed by the baseline. Unknown names
+            // (including namespaced MCP tools) are gated exactly like an untrusted
+            // call, but an "allow always" grant is for this exact argument payload,
+            // not the whole tool. The encoded form is opaque to glob matching: a model
+            // supplied `*` or `?` can never turn the saved rule into a wildcard.
+            let pattern = argumentGrant(arguments)
+            return PermissionRequestSpec(permission: toolName, patterns: [pattern], always: [pattern])
         }
+    }
+
+    /// A stable, glob-inert resource for an unknown/MCP tool invocation. JSONValue's
+    /// encoder sorts object keys, so the same semantic arguments produce the same
+    /// grant across processes; base64url keeps wildcard metacharacters out of the
+    /// persisted permission pattern.
+    private func argumentGrant(_ arguments: JSONValue) -> String {
+        let canonical = (try? arguments.encodedString()) ?? "null"
+        let encoded = Data(canonical.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        return "arguments:" + encoded
     }
 
     /// Returns the primary tool request plus one external-directory request for

@@ -665,8 +665,7 @@ public struct PrintMode: Sendable {
         let sessionStartHead: String?
         switch sessionSource {
         case .new, .fork:
-            let git = try? DoMoGit()
-            sessionStartHead = if let git { try? await git.head(at: workingDirectory) } else { nil }
+            sessionStartHead = try? await DoMoGit(shell: toolContext.shell).head(at: workingDirectory)
         case .resume:
             sessionStartHead = nil
         }
@@ -741,7 +740,8 @@ public struct PrintMode: Sendable {
             maxCostPerRun: maxCostPerRun,
             sessionStartHead: sessionStartHead
         )
-        configuration.workspaceSnapshots = try? DoMoShadowGit(
+        configuration.workspaceSnapshots = DoMoShadowGit(
+            shell: toolContext.shell,
             workspace: workingDirectory,
             gitDirectory: sessionDirectory
                 .appending(JSONLSessionStore.sanitizedDirectoryName(forCwd: workingDirectory.string))
