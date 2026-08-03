@@ -275,10 +275,18 @@ public actor AgentHarness {
         /// return `[]` when none.
         public var getSteeringMessages: (@Sendable () async -> [Message])?
 
+        /// A thread-safe queue used when no explicit ``getSteeringMessages`` hook
+        /// is supplied. Transports can enqueue while the loop is awaiting the
+        /// model, and the loop drains the box at its next boundary.
+        public var steeringBox: SteeringBox?
+
         /// Polled after the agent would otherwise stop; a non-empty return resumes
         /// the run with another turn. Forwarded into
         /// ``AgentLoopConfig/getFollowUpMessages``. Contract: must not throw.
         public var getFollowUpMessages: (@Sendable () async -> [Message])?
+
+        /// A queue-backed fallback for ``getFollowUpMessages``.
+        public var followUpBox: FollowUpBox?
 
         /// Consulted after each turn; returning `true` ends the run early.
         /// Forwarded into ``AgentLoopConfig/shouldStopAfterTurn``.
@@ -308,7 +316,9 @@ public actor AgentHarness {
             monotonicNow: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
             entryIDFactory: @escaping @Sendable () -> String = { UUIDv7.generate().description },
             getSteeringMessages: (@Sendable () async -> [Message])? = nil,
+            steeringBox: SteeringBox? = nil,
             getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
+            followUpBox: FollowUpBox? = nil,
             shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil,
             beforeToolCall: BeforeToolCallHook? = nil
         ) {
@@ -334,7 +344,9 @@ public actor AgentHarness {
             self.monotonicNow = monotonicNow
             self.entryIDFactory = entryIDFactory
             self.getSteeringMessages = getSteeringMessages
+            self.steeringBox = steeringBox
             self.getFollowUpMessages = getFollowUpMessages
+            self.followUpBox = followUpBox
             self.shouldStopAfterTurn = shouldStopAfterTurn
             self.beforeToolCall = beforeToolCall
         }
@@ -905,6 +917,26 @@ public actor AgentHarness {
         sink: (any AgentEventSink)? = nil,
         runOverride: RunOverride? = nil
     ) async throws -> AgentRunResult {
+        let promptMessage = Message.user(
+            UserMessage(content: [.text(prompt)] + attachments.map { .image($0) })
+        )
+        return try await run(messages: [promptMessage], sink: sink, runOverride: runOverride)
+    }
+
+    /// Runs a sequence of already-constructed messages to completion.
+    ///
+    /// This is the hand-off used when a server run finishes at the same moment
+    /// that a steering message arrives: the queued message can become the first
+    /// prompt of the next run without being converted back into lossy text.
+    @discardableResult
+    public func run(
+        messages: [Message],
+        sink: (any AgentEventSink)? = nil,
+        runOverride: RunOverride? = nil
+    ) async throws -> AgentRunResult {
+        guard !messages.isEmpty else {
+            throw DoMoError(.configuration, "AgentHarness cannot run an empty message list")
+        }
         guard !isRunning else {
             throw DoMoError(.configuration, "AgentHarness is already running a turn")
         }
@@ -913,9 +945,32 @@ public actor AgentHarness {
 
         try await compactIfNeeded()
 
+        let systemPromptInput = messages.compactMap { message -> String? in
+            guard case .user(let user) = message else { return nil }
+            return user.text
+        }.first ?? ""
+
+        let steeringMessages: (@Sendable () async -> [Message])?
+        if let configured = configuration.getSteeringMessages {
+            steeringMessages = configured
+        } else if let box = configuration.steeringBox {
+            steeringMessages = { @Sendable in box.drain() }
+        } else {
+            steeringMessages = nil
+        }
+
+        let followUpMessages: (@Sendable () async -> [Message])?
+        if let configured = configuration.getFollowUpMessages {
+            followUpMessages = configured
+        } else if let box = configuration.followUpBox {
+            followUpMessages = { @Sendable in box.drain() }
+        } else {
+            followUpMessages = nil
+        }
+
         let context = AgentContext(
             systemPrompt: runOverride?.systemPrompt
-                ?? configuration.systemPromptForPrompt?(prompt)
+                ?? configuration.systemPromptForPrompt?(systemPromptInput)
                 ?? configuration.systemPrompt,
             messages: try buildContextMessages(),
             tools: configuration.tools
@@ -925,8 +980,8 @@ public actor AgentHarness {
             toolExecution: configuration.toolExecution,
             maxTurns: configuration.maxTurns,
             beforeToolCall: configuration.beforeToolCall,
-            getSteeringMessages: configuration.getSteeringMessages,
-            getFollowUpMessages: configuration.getFollowUpMessages,
+            getSteeringMessages: steeringMessages,
+            getFollowUpMessages: followUpMessages,
             shouldStopAfterTurn: configuration.shouldStopAfterTurn
         )
         let errorBox = PersistenceErrorBox()
@@ -937,13 +992,8 @@ public actor AgentHarness {
             monotonicNow: configuration.monotonicNow
         )
 
-        // The turn's user message carries the typed prompt plus any image
-        // attachments (Phase 5.5). A text-only turn is byte-for-byte what it was.
-        let promptMessage = Message.user(
-            UserMessage(content: [.text(prompt)] + attachments.map { .image($0) })
-        )
         let result = await runAgentLoop(
-            prompts: [promptMessage],
+            prompts: messages,
             context: context,
             config: config,
             sink: persistenceSink,

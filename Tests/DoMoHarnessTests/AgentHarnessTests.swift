@@ -68,21 +68,6 @@ private final class RecordingSink: AgentEventSink {
     var events: [AgentEvent] { storage.withLock { $0 } }
 }
 
-/// A `Sendable`, lock-guarded message queue standing in for the interactive
-/// steering box: a test appends to it from a streamFn (simulating a user typing
-/// mid-run) and the harness's `getSteeringMessages` hook drains it.
-private final class MessageQueue: Sendable {
-    private let storage = Mutex<[Message]>([])
-    func append(_ message: Message) { storage.withLock { $0.append(message) } }
-    func drain() -> [Message] {
-        storage.withLock { queued in
-            let taken = queued
-            queued.removeAll()
-            return taken
-        }
-    }
-}
-
 /// Captures the context message list handed to `streamFn` on each turn, so a test
 /// can assert which turn a steering message first appears in.
 private final class ContextRecorder: Sendable {
@@ -252,7 +237,7 @@ struct AgentHarnessTests {
         // shape of a user typing mid-run. The loop drains the queue at the turn
         // boundary and must inject it before turn 2's request, so turn 2's context
         // carries the steering message and turn 1's does not.
-        let queue = MessageQueue()
+        let queue = SteeringBox()
         let contexts = ContextRecorder()
         let turn = Mutex<Int>(0)
         let streamFn: AgentStreamFn = { context in
@@ -263,7 +248,7 @@ struct AgentHarnessTests {
             }
             contexts.record(context.messages)
             if i == 0 {
-                queue.append(.user("also check the tests"))
+                queue.enqueue(.user("also check the tests"))
                 let message = AssistantMessage(
                     content: [.toolCall(ToolCallBlock(id: "c1", name: "echo"))],
                     model: "test-model",
@@ -278,7 +263,7 @@ struct AgentHarnessTests {
 
         let ids = SequentialIDs(prefix: "steer")
         var config = configuration(streamFn: streamFn, tools: [EchoTool()], ids: ids)
-        config.getSteeringMessages = { queue.drain() }
+        config.steeringBox = queue
 
         let harness = try AgentHarness.start(
             cwd: "/work/project",
