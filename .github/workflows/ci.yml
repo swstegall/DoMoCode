@@ -54,7 +54,7 @@ jobs:
       # Swift Testing process lets unrelated suites overlap even when its worker
       # count is one; that is enough for a full-screen @MainActor client to starve
       # and for release subprocess fixtures to collide. Keep process/PTY targets
-      # serial, while ordinary targets retain limited case-level parallelism.
+      # serial, while ordinary targets retain case-level parallelism.
       - name: Test
         env:
           # Keep optimized runtime assertions actionable: child-process stderr carries
@@ -143,5 +143,7 @@ jobs:
           done
 
           for target in "${parallel_targets[@]}"; do
-            swift test --configuration ${{ matrix.configuration }} --parallel --num-workers 2 --filter "^${target}\."
+            # Swift 6.3.3 rejects --num-workers when the target uses Swift
+            # Testing; --parallel is the supported scheduler control.
+            swift test --configuration ${{ matrix.configuration }} --parallel --filter "^${target}\."
           done

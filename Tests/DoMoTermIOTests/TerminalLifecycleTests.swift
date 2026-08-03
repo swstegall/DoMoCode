@@ -22,17 +22,20 @@ struct TerminalLifecycleTests {
     private let showCursor = Array("\u{1b}[?25h".utf8)
     private let disablePaste = Array("\u{1b}[?2004l".utf8)
     private let leaveAlternateScreen = Array("\u{1b}[?1049l".utf8)
+    private let resetKeyboard = Array("\u{1b}[>4;0m\u{1b}[<u".utf8)
+    private let disableFocus = Array("\u{1b}[?1004l".utf8)
+    private let clearPresentation = Array("\u{1b}]9;4;0;\u{07}\u{1b}]0;\u{07}".utf8)
 
-    @Test("Inline teardown disables paste then shows cursor, with no alt-screen switch")
+    @Test("Inline teardown restores native modes after paste and cursor")
     func inlineTeardown() {
         let bytes = TerminalLifecycle.teardownSequence(useAlternateScreen: false)
-        #expect(bytes == disablePaste + showCursor)
+        #expect(bytes == disablePaste + showCursor + resetKeyboard + disableFocus + clearPresentation)
     }
 
     @Test("Full-screen teardown leaves the alternate screen LAST, after paste and cursor")
     func alternateScreenTeardownLeavesAltScreenLast() {
         let bytes = TerminalLifecycle.teardownSequence(useAlternateScreen: true)
-        #expect(bytes == disablePaste + showCursor + leaveAlternateScreen)
+        #expect(bytes == disablePaste + showCursor + resetKeyboard + disableFocus + clearPresentation + leaveAlternateScreen)
         // ?1049l is the final run of bytes: a crash restores the normal buffer only
         // after the cursor is shown and paste is disabled, never stranding the user
         // on a blank alternate screen with an invisible cursor.
@@ -45,7 +48,7 @@ struct TerminalLifecycleTests {
     @Test("Mouse teardown releases the mouse FIRST, and still leaves the alt screen last")
     func mouseTeardownOrdering() {
         let bytes = TerminalLifecycle.teardownSequence(useAlternateScreen: true, enableMouse: true)
-        #expect(bytes == disableMouse + disablePaste + showCursor + leaveAlternateScreen)
+        #expect(bytes == disableMouse + disablePaste + showCursor + resetKeyboard + disableFocus + clearPresentation + leaveAlternateScreen)
         // A terminal left in `?1000h`/`?1002h` after a crash types raw mouse escapes
         // into the user's shell, so releasing it is part of the crash-safe restore —
         // and it goes first, exactly reversing an enter that took the mouse last.

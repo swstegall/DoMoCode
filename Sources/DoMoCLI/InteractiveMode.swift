@@ -39,6 +39,7 @@
 //     as before, simply starts a new run through the submissions stream.
 
 import DoMoAgent
+import DoMoClient
 import DoMoCore
 import DoMoExec
 import DoMoHarness
@@ -219,10 +220,10 @@ final class StatusLine: @MainActor Component {
 ///
 /// The segment vocabulary — `tok`, `$`, `ctx N (P%)`, and `?` for "unknown" —
 /// deliberately matches the full-screen client's footer, so a user who moves
-/// between the two surfaces reads the same row. It is a SECOND implementation of
-/// that vocabulary only because DoMoCLI does not depend on DoMoClient; if a third
-/// surface ever needs it, the formatting belongs in a module both can import
-/// rather than a third copy.
+/// between the two surfaces reads the same row. It remains a small inline-local
+/// formatter because the two surfaces own different layout and refresh lifecycles;
+/// if a third surface ever needs it, the vocabulary belongs in a module both can
+/// import rather than a third copy.
 public enum InlineAccountingSummary {
 
     /// `"tok 12.3k · $0.0031 · ctx 4.2k (2%)"`, or `""` when nothing is known yet.
@@ -403,6 +404,10 @@ final class InteractiveCoordinator {
     /// (a cleared session must not carry invisible attachments forward).
     private var stagedImages: [LoadedImage] = []
 
+    /// The local clipboard reader. The CLI supplies the subprocess-backed
+    /// implementation; tests and remote callers can leave the no-op default.
+    private let clipboardPaste: any ClipboardPasteSource
+
     // Run state.
     private var running = false
     private var currentRunTask: Task<RunStopReason, Never>?
@@ -484,7 +489,8 @@ final class InteractiveCoordinator {
         terminalRows: @escaping () -> Int,
         keybindings: Keybindings = Keybindings(),
         imageCapabilities: TerminalCapabilities = TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false),
-        cell: CellDimensions = .default
+        cell: CellDimensions = .default,
+        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource()
     ) {
         self.tui = tui
         self.driver = driver
@@ -501,6 +507,7 @@ final class InteractiveCoordinator {
         self.keybindings = keybindings
         self.imageCapabilities = imageCapabilities
         self.cell = cell
+        self.clipboardPaste = clipboardPaste
 
         self.editor = Editor(
             keybindings: keybindings,
@@ -626,8 +633,94 @@ final class InteractiveCoordinator {
             }
         }
 
+        if kb.matches(data, .inputPasteImage) {
+            pasteClipboard()
+            return
+        }
+
         editor.handleInput(data)
         refreshCompletion(force: false)
+        render()
+    }
+
+    /// Read Ctrl-V from the injected local clipboard source. Images stay in the
+    /// same in-memory staging queue as file drops; text is sanitized before it is
+    /// appended to the editor, so clipboard control bytes can never reach the tty.
+    private func pasteClipboard() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let image = await self.clipboardPaste.readImage() {
+                self.stageClipboardImage(image)
+                return
+            }
+            if let text = await self.clipboardPaste.readText() {
+                let clean = Self.sanitizedForInsertion(text)
+                if !clean.isEmpty {
+                    let existing = self.editor.getExpandedText()
+                    self.editor.setText(existing.isEmpty ? clean : existing + "\n" + clean)
+                    self.refreshCompletion(force: false)
+                    self.render()
+                }
+                return
+            }
+            self.appendAttachmentNotice("📋 clipboard has no readable image or text")
+            self.render()
+        }
+    }
+
+    private func stageClipboardImage(_ clipboardImage: ClipboardImage) {
+        let data = clipboardImage.data
+        let limits = ImageAttachmentLimits.default
+        guard !data.isEmpty else {
+            appendAttachmentNotice("📋 clipboard image is empty")
+            render()
+            return
+        }
+        guard data.count <= limits.maximumBytesPerImage else {
+            appendAttachmentNotice(
+                "📋 clipboard image is over the \(LoadedImage.formattedByteCount(limits.maximumBytesPerImage)) limit"
+            )
+            render()
+            return
+        }
+        guard stagedImages.count < limits.maximumCount else {
+            appendAttachmentNotice("📋 at most \(limits.maximumCount) images per message")
+            render()
+            return
+        }
+        let currentBytes = stagedImages.reduce(0) { $0 + $1.byteCount }
+        guard currentBytes <= limits.maximumTotalBytes,
+              data.count <= limits.maximumTotalBytes - currentBytes
+        else {
+            appendAttachmentNotice(
+                "📋 clipboard image would exceed the \(LoadedImage.formattedByteCount(limits.maximumTotalBytes)) total limit"
+            )
+            render()
+            return
+        }
+        guard let mediaType = FileContentProbe.imageMediaType(data) else {
+            appendAttachmentNotice("📋 clipboard does not contain a supported image")
+            render()
+            return
+        }
+
+        let extensionName: String
+        switch mediaType {
+        case "image/jpeg": extensionName = "jpg"
+        case "image/gif": extensionName = "gif"
+        case "image/webp": extensionName = "webp"
+        case "image/bmp": extensionName = "bmp"
+        default: extensionName = "png"
+        }
+        stagedImages.append(
+            LoadedImage(
+                path: FilePath("/tmp/domocode-clipboard-\(UUID().uuidString).\(extensionName)"),
+                displayName: "clipboard.\(extensionName)",
+                mediaType: mediaType,
+                data: data
+            )
+        )
+        appendAttachmentNotice("📎 attached clipboard image")
         render()
     }
 
@@ -1367,7 +1460,8 @@ final class InteractiveCoordinator {
 
     /// The SGR sequences the transcript's non-content rows use. Spelled here
     /// rather than reached for across a module boundary: `DoMoClient`'s `dim` and
-    /// `sgrReset` are internal to that target, and DoMoCLI does not depend on it.
+    /// `sgrReset` are internal to that target and its transcript styling is not
+    /// interchangeable with the inline surface's compact rows.
     private static let sgrReset = "\u{1b}[0m"
     private static func dim(_ text: String) -> String { "\u{1b}[2m" + text + sgrReset }
 
@@ -1893,7 +1987,8 @@ public struct InteractiveMode: Sendable {
         resize: AsyncStream<TerminalSize>,
         lifecycle: any TerminalLifecycleControl,
         imageCapabilities: TerminalCapabilities? = nil,
-        cell: CellDimensions? = nil
+        cell: CellDimensions? = nil,
+        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource()
     ) async throws {
         let quit = QuitSignal()
         let tui = TUI(target: target, showHardwareCursor: true)
@@ -1929,7 +2024,8 @@ public struct InteractiveMode: Sendable {
             fileSystem: fileSystem,
             terminalRows: { target.rows },
             imageCapabilities: resolvedCapabilities,
-            cell: resolvedCell
+            cell: resolvedCell,
+            clipboardPaste: clipboardPaste
         )
         coordinator.install()
         // Now that the approval UI exists, point the engine's prompter at it. Until

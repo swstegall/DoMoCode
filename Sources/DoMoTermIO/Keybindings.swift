@@ -38,6 +38,7 @@ public enum Keybinding: String, CaseIterable, Sendable, Hashable {
     case inputSubmit = "tui.input.submit"
     case inputTab = "tui.input.tab"
     case inputCopy = "tui.input.copy"
+    case inputPasteImage = "tui.input.pasteImage"
     case selectUp = "tui.select.up"
     case selectDown = "tui.select.down"
     case selectPageUp = "tui.select.pageUp"
@@ -148,15 +149,10 @@ public struct Keybindings: Sendable {
         .editorYank: [Key.ctrl("y")],
         .editorYankPop: [Key.alt("y")],
         .editorUndo: [Key.ctrl("-")],
-        // Alt+Enter is a DELIBERATE divergence from pi's table, and it is the
-        // binding that actually works. Shift+Enter is undecodable unless the Kitty
-        // keyboard protocol (or xterm's modifyOtherKeys) is negotiated, and this
-        // package never negotiates either — `TerminalLifecycle` writes no `CSI > 1 u`
-        // and `kittyProtocolActive: true` is passed at zero call sites. So on every
-        // terminal we run on, pi's first entry can never match and Shift+Enter is
-        // byte-identical to Enter, i.e. it SUBMITS. `ESC \r` decodes as
-        // `KeyId(base: .enter, alt: true)` and is what iTerm2, xterm, alacritty,
-        // wezterm, kitty and GNOME Terminal send for Option/Alt+Enter. Plain Enter is
+        // Alt+Enter remains the portable fallback. Shift+Enter is recognized from
+        // explicit Kitty CSI-u or xterm modifyOtherKeys frames; the terminal driver
+        // negotiates one of those modes at session start and normalizes the two
+        // legacy ambiguous byte forms when Kitty is active. Plain Enter is
         // unaffected: the alt match requires the ESC prefix.
         .inputNewLine: [
             KeyId(base: .enter, shift: true),
@@ -166,6 +162,7 @@ public struct Keybindings: Sendable {
         .inputSubmit: [Key.enter],
         .inputTab: [Key.tab],
         .inputCopy: [Key.ctrl("c")],
+        .inputPasteImage: [Key.ctrl("v")],
         .selectUp: [Key.up],
         .selectDown: [Key.down],
         .selectPageUp: [Key.pageUp],

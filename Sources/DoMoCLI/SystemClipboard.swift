@@ -92,3 +92,134 @@ struct SystemClipboard: ClipboardSink {
         return false
     }
 }
+
+/// Reads the local clipboard through fixed platform helpers. The command line
+/// never contains clipboard data; the only dynamic token is one of the small,
+/// hard-coded image MIME strings below.
+struct SystemClipboardPasteSource: ClipboardPasteSource {
+    private enum Reader: Sendable, Hashable {
+        case pngpaste
+        case wayland
+        case xclip
+        case pbpaste
+        case xsel
+    }
+
+    private static let imageTypes = [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+    ]
+    private static let timeout: Duration = .seconds(5)
+    private static let imageOutputLimit = ShellOutputLimits(head: 5 << 20, tail: 0)
+    private static let textOutputLimit = ShellOutputLimits(head: 1 << 20, tail: 0)
+
+    let shell: any Shell
+    private let readers: [Reader]
+
+    func readImage() async -> ClipboardImage? {
+        for reader in readers {
+            switch reader {
+            case .pngpaste:
+                if let bytes = await capture("pngpaste -", limits: Self.imageOutputLimit),
+                   let image = validatedImage(bytes) {
+                    return image
+                }
+            case .wayland:
+                guard let types = await capture("wl-paste --list-types", limits: Self.textOutputLimit)
+                    .map({ String(decoding: $0, as: UTF8.self) })
+                else { continue }
+                let advertised = Set(types.split(whereSeparator: \.isNewline).map(String.init))
+                for mediaType in Self.imageTypes where advertised.contains(mediaType) {
+                    let command = "wl-paste --no-newline --type \(Self.shellQuote(mediaType))"
+                    if let bytes = await capture(command, limits: Self.imageOutputLimit),
+                       let image = validatedImage(bytes) {
+                        return image
+                    }
+                }
+            case .xclip:
+                for mediaType in Self.imageTypes {
+                    let command = "xclip -selection clipboard -t \(Self.shellQuote(mediaType)) -o"
+                    if let bytes = await capture(command, limits: Self.imageOutputLimit),
+                       let image = validatedImage(bytes) {
+                        return image
+                    }
+                }
+            case .pbpaste:
+                if let bytes = await capture("pbpaste -Prefer png", limits: Self.imageOutputLimit),
+                   let image = validatedImage(bytes) {
+                    return image
+                }
+            case .xsel:
+                continue
+            }
+        }
+        return nil
+    }
+
+    func readText() async -> String? {
+        for reader in readers {
+            let command: String
+            switch reader {
+            case .pngpaste, .wayland:
+                command = reader == .wayland ? "wl-paste --no-newline" : ""
+            case .xclip:
+                command = "xclip -selection clipboard -o"
+            case .pbpaste:
+                command = "pbpaste"
+            case .xsel:
+                command = "xsel --clipboard --output"
+            }
+            guard !command.isEmpty,
+                  let bytes = await capture(command, limits: Self.textOutputLimit)
+            else { continue }
+            return String(decoding: bytes, as: UTF8.self)
+        }
+        return nil
+    }
+
+    /// Resolve all available read helpers once at launch, matching the write
+    /// sink's no-surprises PATH policy.
+    static func make(environment: [String: String]) -> any ClipboardPasteSource {
+        let names = ["pngpaste", "wl-paste", "xclip", "pbpaste", "xsel"]
+        let available = Set(names.filter {
+            SystemClipboard.isExecutableOnPath($0, environment: environment)
+        })
+        guard !available.isEmpty, let shell = try? SubprocessShell() else {
+            return NoClipboardPasteSource()
+        }
+
+        var readers: [Reader] = []
+        if available.contains("pngpaste") { readers.append(.pngpaste) }
+        if available.contains("wl-paste") { readers.append(.wayland) }
+        if available.contains("xclip") { readers.append(.xclip) }
+        if available.contains("pbpaste") { readers.append(.pbpaste) }
+        if available.contains("xsel") { readers.append(.xsel) }
+        return SystemClipboardPasteSource(shell: shell, readers: readers)
+    }
+
+    private func capture(_ command: String, limits: ShellOutputLimits) async -> [UInt8]? {
+        let request = ShellRequest(
+            command,
+            standardInput: .none,
+            timeout: Self.timeout,
+            limits: limits
+        )
+        guard let result = try? await shell.run(request), result.isSuccess, !result.stdout.isTruncated else {
+            return nil
+        }
+        return result.stdout.bytes
+    }
+
+    private func validatedImage(_ bytes: [UInt8]) -> ClipboardImage? {
+        let data = Data(bytes)
+        guard let mediaType = FileContentProbe.imageMediaType(data) else { return nil }
+        return ClipboardImage(mediaType: mediaType, data: data)
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}

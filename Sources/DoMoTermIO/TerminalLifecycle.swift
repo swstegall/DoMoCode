@@ -75,13 +75,32 @@ private let enableMouseSequence: [UInt8] = Array("\u{1b}[?1000h\u{1b}[?1002h\u{1
 /// so this is part of the crash-safe restore, not merely of `stop()`.
 private let disableMouseSequence: [UInt8] = Array("\u{1b}[?1006l\u{1b}[?1002l\u{1b}[?1000l".utf8)
 
-/// The teardown bytes for the inline model: disable paste, then show cursor —
-/// the exact reverse of the enter order. Preallocated so the restore path, which
-/// may run from a signal or `atexit`, allocates nothing. Full-screen instances
-/// register a longer sequence (see ``enterAlternateScreenSequence``); the exact
-/// bytes to replay now travel inside ``RestoreRegistration`` rather than living
-/// here, so `performRestore` needs no branch on the mode.
-private let inlineExitSequence: [UInt8] = disableBracketedPasteSequence + showCursorSequence
+/// Disable focus reports before handing stdin back to the shell.
+private let disableFocusReportingSequence = TerminalNativeSequence.focusReportingSequence(enabled: false)
+/// Reset both keyboard protocols. Terminals ignore a reset for a mode they did
+/// not enable, while a crash after a successful handshake must not leak Kitty or
+/// modifyOtherKeys encodings into the parent shell.
+private let resetKeyboardProtocolSequence =
+    TerminalNativeSequence.modifyOtherKeysSequence(enabled: false)
+    + TerminalNativeSequence.disableKittyKeyboardProtocol()
+/// Clear progress and the client-owned title on every exit path.
+private let clearTerminalPresentationSequence =
+    TerminalNativeSequence.progressSequence(.clear)
+    + TerminalNativeSequence.clearTitleSequence()
+
+/// The teardown bytes for the inline model: disable paste, show the cursor, reset
+/// negotiated keyboard/focus modes, and clear client-owned presentation state.
+/// Preallocated so the restore path, which may run from a signal or `atexit`,
+/// allocates nothing. Full-screen instances register a longer sequence (see
+/// ``enterAlternateScreenSequence``); the exact bytes to replay travel inside
+/// ``RestoreRegistration`` rather than living here, so `performRestore` needs no
+/// branch on the mode.
+private let inlineExitSequence: [UInt8] =
+    disableBracketedPasteSequence
+    + showCursorSequence
+    + resetKeyboardProtocolSequence
+    + disableFocusReportingSequence
+    + clearTerminalPresentationSequence
 /// The teardown bytes for full-screen mode: the inline sequence, then leave the
 /// alternate screen (`?1049l` LAST — the exact reverse of enter, whose alt-screen
 /// switch came first). Preallocated for the same allocation-free-restore reason.
@@ -255,6 +274,86 @@ public final class TerminalLifecycle: Sendable {
         enabled ? enableMouseSequence : disableMouseSequence
     }
 
+    /// The bytes used to negotiate Kitty keyboard reporting.
+    public static func keyboardProtocolQuery() -> [UInt8] {
+        TerminalNativeSequence.keyboardProtocolQuery()
+    }
+
+    /// The bytes used to select or clear xterm `modifyOtherKeys` mode 2.
+    public static func modifyOtherKeysSequence(enabled: Bool) -> [UInt8] {
+        TerminalNativeSequence.modifyOtherKeysSequence(enabled: enabled)
+    }
+
+    /// The bytes used to enable or disable focus-in/focus-out reports.
+    public static func focusReportingSequence(enabled: Bool) -> [UInt8] {
+        TerminalNativeSequence.focusReportingSequence(enabled: enabled)
+    }
+
+    /// Write the keyboard query to the live tty. The driver consumes the
+    /// response and never forwards it to the focused app.
+    public func beginKeyboardProtocolNegotiation() {
+        writeIfActive(TerminalNativeSequence.keyboardProtocolQuery())
+    }
+
+    /// Select xterm `modifyOtherKeys` mode 2 as the keyboard fallback.
+    public func setModifyOtherKeys(_ enabled: Bool) {
+        writeIfActive(TerminalNativeSequence.modifyOtherKeysSequence(enabled: enabled))
+    }
+
+    /// Set the terminal title through OSC 0.
+    public func setTitle(_ title: String) {
+        writeIfActive(TerminalNativeSequence.titleSequence(title))
+    }
+
+    /// Update the terminal's progress indicator through OSC 9;4.
+    public func setProgress(_ progress: TerminalProgress) {
+        writeIfActive(TerminalNativeSequence.progressSequence(progress))
+    }
+
+    /// Show a desktop/terminal notification using the requested OSC format.
+    public func notify(
+        title: String,
+        message: String,
+        protocol: TerminalNotificationProtocol = .osc777
+    ) {
+        writeIfActive(
+            TerminalNativeSequence.notificationSequence(
+                title: title,
+                message: message,
+                protocol: `protocol`
+            )
+        )
+    }
+
+    /// Give the terminal a short quiet period after the input reader is stopped,
+    /// so queued key-release/focus bytes cannot become shell input. The descriptor
+    /// is made nonblocking for the drain and restored exactly as it was found.
+    public func drainInput(maxMilliseconds: Int = 1_000, idleMilliseconds: Int = 50) {
+        guard maxMilliseconds > 0, idleMilliseconds >= 0 else { return }
+        guard let flags = NonblockingFileDescriptor.makeNonblocking(inputDescriptor) else { return }
+        defer { flags.restore() }
+
+        let started = DispatchTime.now().uptimeNanoseconds
+        let deadline = started + UInt64(maxMilliseconds) * 1_000_000
+        var lastByte = started
+        writeIfActive(resetKeyboardProtocolSequence + disableFocusReportingSequence)
+
+        while true {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now >= deadline { return }
+            switch NonblockingFileDescriptor.read(inputDescriptor) {
+            case .bytes:
+                lastByte = now
+            case .wouldBlock:
+                let idle = now >= lastByte ? (now - lastByte) / 1_000_000 : 0
+                if idle >= UInt64(idleMilliseconds) { return }
+                usleep(1_000)
+            case .endOfFile, .error:
+                return
+            }
+        }
+    }
+
     /// Take or release mouse reporting *after* ``enter()``.
     ///
     /// This is the escape hatch behind an in-app selection: while the app owns
@@ -322,6 +421,9 @@ public final class TerminalLifecycle: Sendable {
         if enableMouse, isatty(outputDescriptor) == 1 {
             writeAll(outputDescriptor, enableMouseSequence)
         }
+        if isatty(outputDescriptor) == 1 {
+            writeAll(outputDescriptor, TerminalNativeSequence.focusReportingSequence(enabled: true))
+        }
 
         let exitSequence = Self.teardownSequence(useAlternateScreen: useAlternateScreen, enableMouse: enableMouse)
         restoreRegistration.withLock { slot in
@@ -334,11 +436,22 @@ public final class TerminalLifecycle: Sendable {
         installHandlers()
     }
 
-    /// Leave: show the cursor, disable bracketed paste, restore the discipline.
-    /// Idempotent — safe to call after a signal already restored, and safe to
-    /// call twice.
+    /// Leave: restore every terminal mode and presentation state, then restore the
+    /// line discipline. Idempotent — safe to call after a signal already restored,
+    /// and safe to call twice.
     public func stop() {
         performRestore()
+    }
+
+    /// Write a native sequence only while this lifecycle still owns an armed
+    /// restore registration. Holding the registry lock across the write closes
+    /// the small race in which a late task could emit after `stop()`.
+    private func writeIfActive(_ bytes: [UInt8]) {
+        guard isatty(outputDescriptor) == 1 else { return }
+        restoreRegistration.withLock { slot in
+            guard slot != nil else { return }
+            writeAll(outputDescriptor, bytes)
+        }
     }
 
     /// Install the `SIGINT`/`SIGTERM`/`SIGHUP` and `atexit` restores, once per

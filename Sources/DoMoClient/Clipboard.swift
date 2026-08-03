@@ -12,6 +12,8 @@
 // no seam at all: it is bytes written to the tty the UI already owns, built by
 // `osc52CopySequence` in DoMoTermIO.
 
+import Foundation
+
 /// What a clipboard write did.
 ///
 /// A result rather than a `throws`, because a failed copy is a status-line notice,
@@ -50,4 +52,32 @@ public struct NoClipboardSink: ClipboardSink {
     public init() {}
 
     public func copy(_ text: String) async -> ClipboardOutcome { .unavailable }
+}
+
+/// Binary image data read from the local clipboard. The media type is advisory;
+/// the client sniffs the bytes again before staging them.
+public struct ClipboardImage: Sendable, Hashable {
+    public let mediaType: String
+    public let data: Data
+
+    public init(mediaType: String, data: Data) {
+        self.mediaType = mediaType
+        self.data = data
+    }
+}
+
+/// The read half of the system clipboard. It lives beside ``ClipboardSink`` so
+/// the client target still knows nothing about subprocesses; the CLI supplies a
+/// platform implementation and tests can inject deterministic bytes.
+public protocol ClipboardPasteSource: Sendable {
+    func readImage() async -> ClipboardImage?
+    func readText() async -> String?
+}
+
+/// The source for headless/remote sessions without a local clipboard helper.
+public struct NoClipboardPasteSource: ClipboardPasteSource {
+    public init() {}
+
+    public func readImage() async -> ClipboardImage? { nil }
+    public func readText() async -> String? { nil }
 }

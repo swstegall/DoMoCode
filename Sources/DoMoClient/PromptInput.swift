@@ -73,6 +73,10 @@ final class PromptInput: @MainActor Focusable {
     /// same completion cursor arithmetic is used by every client surface.
     var onAutocomplete: ((AutocompleteSuggestions?) -> Void)?
 
+    /// Fired by the image-paste keybinding. Clipboard IO belongs to the app/CLI
+    /// boundary, so the prompt only exposes the synchronous gesture hook.
+    var onPasteImage: (() -> Void)?
+
     private(set) var attachments: [PromptAttachment] = []
 
     /// Drops handed to the app and not yet answered, each holding the RAW pasted
@@ -423,6 +427,10 @@ final class PromptInput: @MainActor Focusable {
     }
 
     func handleInput(_ data: [UInt8]) {
+        if keybindings.matches(data, .inputPasteImage) {
+            onPasteImage?()
+            return
+        }
         // Backspace on an empty document pops the newest chip before the keystroke
         // can reach the editor, where it would do nothing at all.
         if !attachments.isEmpty, editor.getText().isEmpty,

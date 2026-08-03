@@ -8,6 +8,7 @@
 
 import DoMoLLM
 import DoMoServer
+import DoMoTermGraphics
 import DoMoTUI
 import Foundation
 import Testing
@@ -78,6 +79,43 @@ struct ClientViewTests {
         #expect(lines.contains { $0.contains("✓") && $0.contains("bash") })
         // Every line fits the width budget.
         #expect(lines.allSatisfy { visibleWidth($0) <= 40 })
+    }
+
+    @Test("Assistant markdown emits OSC 8 only on a hyperlink-capable terminal")
+    func assistantHyperlinks() {
+        let view = TranscriptView()
+        view.items = [.assistant("Visit [DoMoCode](https://example.com).")]
+        let capable = view.visualRows(
+            width: 60,
+            capabilities: TerminalCapabilities(images: nil, trueColor: true, hyperlinks: true),
+            cell: .default
+        )
+        let capableText = capable.compactMap { row -> String? in
+            if case .text(let value) = row { return value }
+            return nil
+        }.joined()
+        #expect(capableText.contains("\u{1b}]8;;https://example.com\u{07}"))
+
+        let conservative = view.visualRows(
+            width: 60,
+            capabilities: TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false),
+            cell: .default
+        )
+        let conservativeText = conservative.compactMap { row -> String? in
+            if case .text(let value) = row { return value }
+            return nil
+        }.joined()
+        #expect(!conservativeText.contains("\u{1b}]8;;"))
+        #expect(conservativeText.contains("[DoMoCode](https://example.com)"))
+    }
+
+    @Test("Ctrl-V is exposed as an asynchronous clipboard-paste gesture")
+    func clipboardPasteGesture() {
+        let input = PromptInput()
+        var called = false
+        input.onPasteImage = { called = true }
+        input.handleInput([0x16])
+        #expect(called)
     }
 
     @Test("The prompt input accepts typing, shows a caret when focused, and submits on Enter")

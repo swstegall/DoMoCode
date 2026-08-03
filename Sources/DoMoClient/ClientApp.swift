@@ -147,12 +147,21 @@ public final class ClientApp {
     /// Where a copy goes. `NoClipboardSink` is a real answer, not a fallback: over
     /// ssh there may genuinely be no clipboard to write to.
     private let clipboard: any ClipboardSink
+    /// Where Ctrl-V reads image/text data from. The CLI owns the subprocess
+    /// implementation; the client only consumes this asynchronous seam.
+    private let clipboardPaste: any ClipboardPasteSource
     /// The multiplexer wrapping this terminal, which decides how an OSC 52 must be
     /// escaped to reach the outer terminal at all.
     private let multiplexer: TerminalMultiplexer
     /// Whether the app currently owns mouse reporting. Toggling it off hands
     /// drag-select back to the terminal's own selection.
     private var mouseOwned: Bool
+    /// The live lifecycle's terminal-native output seam. It is optional so the
+    /// client remains fully driveable with the existing headless lifecycle fakes.
+    private var terminalNative: (any TerminalNativeControl)?
+    /// `nil` until the terminal reports focus. A completion notification is only
+    /// emitted for an explicit focus-out, never merely because no report arrived.
+    private var terminalFocused: Bool?
     /// The live text selection over the painted page, and the rules for when it
     /// stops being live.
     private let selection = SelectionController()
@@ -256,12 +265,14 @@ public final class ClientApp {
         client: ServerClient,
         historyStore: PromptHistoryStore? = nil,
         clipboard: any ClipboardSink = NoClipboardSink(),
+        clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
         multiplexer: TerminalMultiplexer = .none,
         mouseOwned: Bool = true
     ) {
         self.client = client
         self.historyStore = historyStore
         self.clipboard = clipboard
+        self.clipboardPaste = clipboardPaste
         self.multiplexer = multiplexer
         self.mouseOwned = mouseOwned
     }
@@ -295,6 +306,8 @@ public final class ClientApp {
         // Held for F8. The app can flip its own `mouseOwned` flag all it likes;
         // only the lifecycle can actually write `?1000l` at the terminal.
         self.lifecycle = lifecycle
+        self.terminalNative = lifecycle as? any TerminalNativeControl
+        self.terminalFocused = nil
         // The selection is not part of the layout tree — it is a function of where
         // the pointer has been, and the tree is rebuilt from scratch every frame —
         // so it is painted here, after the page is composed and before it is
@@ -323,6 +336,7 @@ public final class ClientApp {
         // that reason.
         store.onNotice = { [weak self] notice in self?.show(notice) }
         promptInput.onSubmit = { [weak self] text, attachments in self?.submit(text, attachments) }
+        promptInput.onPasteImage = { [weak self] in self?.pasteClipboard() }
         // Persist off the render loop. The store is an actor, so the write cannot
         // race the startup load and cannot stall the frame that just accepted the
         // keystroke.
@@ -656,10 +670,29 @@ public final class ClientApp {
         guard observedRunSessionID == sessionID else {
             observedRunSessionID = sessionID
             observedRunState = store.runState
+            terminalNative?.setProgress(store.runState == .running ? .indeterminate : .clear)
             return
         }
         let previous = observedRunState
         observedRunState = store.runState
+
+        if previous != store.runState {
+            if store.runState == .running {
+                terminalNative?.setProgress(.indeterminate)
+            } else if previous == .running {
+                terminalNative?.setProgress(.clear)
+                if store.runState == .idle,
+                   store.lastStopReason == "completed",
+                   terminalFocused == false {
+                    terminalNative?.notify(
+                        title: "DoMoCode",
+                        message: "Run finished",
+                        protocol: .osc777
+                    )
+                }
+            }
+        }
+
         guard previous == .running,
               store.runState == .idle,
               store.lastStopReason == "completed",
@@ -1103,6 +1136,76 @@ public final class ClientApp {
             }
         }
         actionTasks.append(task)
+    }
+
+    /// Read Ctrl-V from the injected local clipboard source. Image bytes are
+    /// sniffed again before staging, bounded by the same per-turn limits as file
+    /// drops, and kept in the attachment chip rather than written to a durable
+    /// temporary file.
+    private func pasteClipboard() {
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let image = await self.clipboardPaste.readImage() {
+                self.stageClipboardImage(image)
+                return
+            }
+            if let text = await self.clipboardPaste.readText() {
+                let clean = PromptInput.sanitizedForInsertion(text)
+                if !clean.isEmpty {
+                    self.promptInput.restore(clean)
+                    self.surface?.requestRender()
+                }
+                return
+            }
+            self.post(notice: "clipboard has no readable image or text")
+        }
+        actionTasks.append(task)
+    }
+
+    private func stageClipboardImage(_ clipboardImage: ClipboardImage) {
+        let data = clipboardImage.data
+        guard !data.isEmpty else {
+            post(notice: "clipboard image is empty")
+            return
+        }
+        guard data.count <= Self.attachmentLimits.maximumBytesPerImage else {
+            post(notice: "clipboard image is over the \(LoadedImage.formattedByteCount(Self.attachmentLimits.maximumBytesPerImage)) limit")
+            return
+        }
+        guard promptInput.attachments.count < Self.attachmentLimits.maximumCount else {
+            post(notice: "at most \(Self.attachmentLimits.maximumCount) images per message")
+            return
+        }
+        let currentBytes = promptInput.attachments.reduce(0) { $0 + $1.byteCount }
+        guard currentBytes <= Self.attachmentLimits.maximumTotalBytes,
+              data.count <= Self.attachmentLimits.maximumTotalBytes - currentBytes else {
+            post(notice: "clipboard image would exceed the \(LoadedImage.formattedByteCount(Self.attachmentLimits.maximumTotalBytes)) total limit")
+            return
+        }
+        guard let mediaType = FileContentProbe.imageMediaType(data) else {
+            post(notice: "clipboard does not contain a supported image")
+            return
+        }
+
+        let extensionName: String
+        switch mediaType {
+        case "image/jpeg": extensionName = "jpg"
+        case "image/gif": extensionName = "gif"
+        case "image/webp": extensionName = "webp"
+        case "image/bmp": extensionName = "bmp"
+        default: extensionName = "png"
+        }
+        let path = FilePath("/tmp/domocode-clipboard-\(UUID().uuidString).\(extensionName)")
+        let loaded = LoadedImage(
+            path: path,
+            displayName: "clipboard.\(extensionName)",
+            mediaType: mediaType,
+            data: data
+        )
+        guard let attachment = stage([loaded]).first else { return }
+        promptInput.addAttachment(attachment)
+        post(notice: "attached clipboard image")
+        surface?.requestRender()
     }
 
     /// F8: hand the mouse back to the terminal, or take it again.
@@ -2781,6 +2884,15 @@ extension ClientApp: TerminalApp {
         rebuildPermissionOverlayIfResized()
         rebuildDiagnosticsOverlayIfResized()
         try surface?.renderSync()
+    }
+
+    public func terminalDidEnter() {
+        terminalNative?.setTitle("DoMoCode")
+        terminalNative?.setProgress(store.runState == .running ? .indeterminate : .clear)
+    }
+
+    public func handleFocusChange(_ focused: Bool) {
+        terminalFocused = focused
     }
 
     public func handleInput(_ data: [UInt8]) {

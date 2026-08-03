@@ -56,8 +56,8 @@ nonisolated func isCJKBreak(_ character: Character) -> Bool {
 ///
 /// Ported from `utils.ts`'s `AnsiCodeTracker`, minus its OSC 8 hyperlink state.
 /// The renderer's per-line reset (`\x1b[0m\x1b]8;;\x07`) already closes any open
-/// hyperlink at every line end, and no component in this phase emits hyperlinks;
-/// carrying hyperlink continuation across wraps is deferred with the component
+/// hyperlink at every line end. Markdown emits complete hyperlinks on each line;
+/// carrying hyperlink continuation across wraps remains deferred to a component
 /// that needs it. Everything else — the individual attribute flags, 256/RGB
 /// colour parsing, `getActiveCodes` reconstruction, and the underline-off line
 /// reset — matches pi so wrapped styled text renders identically.
