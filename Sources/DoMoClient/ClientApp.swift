@@ -13,6 +13,7 @@ import DoMoExec
 import DoMoGit
 import DoMoHarness
 import DoMoLLM
+import DoMoMemory
 import DoMoPermissions
 import Foundation
 import DoMoServer
@@ -2730,6 +2731,16 @@ public final class ClientApp {
             case .help:
                 let names = commandRegistry.commands.map { "/\($0.name)" }.joined(separator: " · ")
                 post(notice: names, seconds: 8)
+            case .memory:
+                let task = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        self.post(notice: Self.memoryNotice(try await self.client.memory()), seconds: 8)
+                    } catch {
+                        self.postError("Could not load durable project memory", error)
+                    }
+                }
+                actionTasks.append(task)
             case .tree:
                 openTreePicker()
             case .timeline:
@@ -2873,6 +2884,19 @@ public final class ClientApp {
             entry.entryType.rawValue + "#" + String(entry.id.prefix(8))
         }.joined(separator: " · ")
         return "timeline: " + String(entries.count) + " entries" + (tail.isEmpty ? "" : " · " + tail)
+    }
+
+    private static func memoryNotice(_ records: [ProjectMemoryRecord]) -> String {
+        guard !records.isEmpty else { return "memory: no durable project memory" }
+        let shown = records.prefix(8).map { record in
+            let body = sanitizeUntrustedText(
+                SessionRecallIndex.elideMiddle(record.content, limit: 160)
+                    .replacingOccurrences(of: "\n", with: " ")
+            )
+            return "\(record.kind.rawValue): \(sanitizeUntrustedText(record.title)) — \(body)"
+        }
+        let suffix = records.count > 8 ? " · \(records.count - 8) more" : ""
+        return "memory: " + shown.joined(separator: " · ") + suffix
     }
 
     private static func historyNotice(_ result: WorkspaceHistoryResult) -> String {

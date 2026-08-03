@@ -15,15 +15,17 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 
 **The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine,
 the MCP client, the Phase 5b command layer, Phase 5c client polish, Phase 5d terminal-native polish,
-Phase 10 context engineering, Phase 11's mutable tool suite, and Phase 12's Git review surface are
-implemented, with focused coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8, 8.5, 9, 10,
-11, and 12 are complete. The Swift 6.3.3 debug matrix is green for the focused Phase 12 suites;
+Phase 10 context engineering, Phase 11's mutable tool suite, Phase 12's Git review surface, and
+Phases 13–17's checkpoints, agents, subagents, diagnostics, and memory are implemented, with focused
+coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8, 8.5, and 9–17 are complete. The Swift
+6.3.3 debug matrix is green for the focused Phase 17 suites;
 the full macOS run remains subject to the repository's documented `DoMoCLITests` child-process runtime
 exception.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
-**Every phase of the pi port has shipped through Phase 12 Git review.**
+**Every phase of the pi port has shipped through Phase 12 Git review; the harness build-out is complete
+through Phase 17 memory and recall.**
 Phases 5a–5d — truth and plumbing, the command layer, client polish, and terminal-native polish — are
 complete. The default client now receives the same command registry as the inline surface,
 `/review`, `/init`, and `/tree` are available through that registry, trusted project instructions and
@@ -36,8 +38,8 @@ and starts automatic titling only after a completed first turn. **Phase 5d now c
 polish gap.**
 Beyond it,
 [a second survey of the sibling harnesses](#sibling-harnesses-and-prior-art) found a broad set of
-capabilities DoMoCode did not have — subagents, checkpoints and undo, plan mode, LSP diagnostics, and
-sandboxing remain on the roadmap. The [roadmap](#roadmap) now sequences them.
+capabilities DoMoCode did not have — sandboxing, PTY access, export/replay, and split-footer rendering
+remain on the roadmap. The [roadmap](#roadmap) now sequences them.
 
 The goal has changed accordingly. DoMoCode began as a deliberately **narrowed** port; the
 [first scope expansion](#what-expanded-and-what-did-not) widened it in four directions, all of which
@@ -149,6 +151,8 @@ Sources/
                     queues, the awaited event sink. No I/O, no persistence — so it is cheap to test.
   DoMoHarness/      Session tree, JSONL storage, context building, compaction, branch summaries,
                     hooks, the system-prompt builder, and command/skill resource loading.
+  DoMoMemory/       On-demand session recall plus typed, byte-budgeted project memory outside the
+                    checkout, with one shared secret-redaction gate on every write.
   DoMoExec/         FileSystem + Shell over swift-subprocess; gitignore walker; path sandboxing;
                     per-path file mutation coordinator; image-attachment loading.
   DoMoGit/          The non-interactive Git facade, machine-oriented status/diff parsers, session-start
@@ -276,7 +280,7 @@ swap is mechanical when the floor eventually reaches macOS 26.
 
 Ordered strictly by dependency. Each phase ends with something runnable and tested.
 
-- [x] **Phase 0 — Skeleton.** `Package.swift` with the pin table, all eleven targets declared, the
+- [x] **Phase 0 — Skeleton.** `Package.swift` with the pin table, all package targets declared, the
       per-target isolation and safety settings from
       [Concurrency](#concurrency-and-isolation), CI on macOS and Ubuntu at the floor toolchain building in both
       debug and `-c release`. `DoMoCore`: `JSONValue`, JSON Schema, the tolerant JSON parser,
@@ -646,15 +650,21 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       results with pushed diagnostics; and `autoFormat` is a trusted, opt-in setting whose command
       runs only after the mutation has passed its permission decision. *Exit met:* an edit that breaks
       the build comes back with the compiler's own error attached.
-- [ ] **Phase 17 — Memory and recall.** The best value-to-cost ratio left after Phase 5, and it needs
+- [x] **Phase 17 — Memory and recall.** The best value-to-cost ratio left after Phase 5, and it needs
       no new storage and no network. `session_recall` searches and reads this project's own past
       sessions, ranked over user text, assistant text, file references and tool *errors* while
       excluding reasoning and successful tool output — with recalled content labelled untrusted and
       elided in the middle rather than the tail. Then durable typed project memory outside the repo
       (project / environment / corrections / per-session digests) with a byte-budgeted index,
       `/memory`, and the secret-redaction gate from 5a on every write so there is exactly one
-      definition of what counts as a secret. *Exit:* "what did we decide about X last week" is
-      answerable inside the session, and nothing secret-shaped ever reaches a memory file.
+      definition of what counts as a secret. **Complete:** `session_recall` is available to the model
+      in inline, headless, and server-backed sessions; historical excerpts are ranked and middle-
+      elided inside an explicit untrusted boundary; `ProjectMemoryStore` persists typed records in a
+      locked, atomic, owner-only file outside the checkout with upsert/delete semantics and a total
+      byte budget; the model-facing `memory` tool asks before writes while `/memory` is available in
+      both terminal surfaces and the remote client. Every title, ID, content, session ID, and tag is
+      rejected if the shared Phase 5a redaction registry would change it. *Exit met:* a prior decision
+      is searchable inside the session, and no secret-shaped input is accepted into a memory file.
 - [ ] **Phase 18 — Sandboxing and permission hardening.** The honest framing: `PathSandbox` confines
       the file tools and **bash is not confined at all**, so a reader could reasonably conclude the
       whole harness is sandboxed. This closes that and documents it. A pluggable OS backend with
@@ -834,15 +844,16 @@ ones — each addition still forces a tool-vs-prompt-injection and in-process-vs
 |---|---|---|---|
 | Granular permission engine (allow/ask/deny globs, last-match-wins, inline once/always/reject) | all three | yes | **Shipped** (Phase 8) |
 | Headless run (prompt in, streamed/JSON out, exit codes, auto-approve) | kilocode, opencode | yes | **Shipped**, as flags rather than a subcommand: `-p` / `--json` / `--yolo`, exit codes 0–4 |
-| Git-shadow snapshot checkpoints + undo/redo + fork-from-any-message | kilocode, opencode | yes | Phase 13 |
-| Config-driven agent/persona profiles + a read-only plan mode | all three | yes | Phase 14 |
+| Git-shadow snapshot checkpoints + undo/redo + fork-from-any-message | kilocode, opencode | yes | **Shipped** (Phase 13) |
+| Config-driven agent/persona profiles + a read-only plan mode | all three | yes | **Shipped** (Phase 14) |
 | Auto-format-after-edit hook; repo `.setup.sh` session-init hook | all three | yes | **Shipped** (Phase 16 format); hooks await the [extensibility decision](#decisions-that-reverse-a-stated-non-goal) |
 | Hard per-task budget cap (abort the loop on a cost ceiling) | OpenHands | yes | **Shipped** (Phase 9; enforced when usage is priced by gateway or configured rates) |
 | Trusted-config `{env:}`/`{file:}` interpolation gated by the trust boundary | kilocode | yes | Phase 5a |
 | Local `/review` of a diff, branch, or commit | kilocode, OpenHands | yes | Phase 5b |
 | Skill refinements: keyword auto-injection, task-input `{VAR}` templates | all three | yes | Phase 5b |
 | Slash-command polish: `$ARGUMENTS`/`$N`, inline `` !`shell` ``, per-command overrides, ANSI-index / `none`=inherit theming | opencode, kilocode | yes | Phase 5b (commands) + 5c (themes) |
-| First-party tool additions: `question`/`suggest`, todo checklist, `webfetch` (+ gated `apply_patch`, notebook-edit, `recall`) | all three | adaptable | Phase 11; `recall` in Phase 17. `websearch` needs a second vendor and stays out |
+| First-party tool additions: `question`/`suggest`, todo checklist, `webfetch` (+ gated `apply_patch`, notebook-edit, `recall`) | all three | adaptable | Phase 11; `recall` shipped in Phase 17. `websearch` needs a second vendor and stays out |
+| Untrusted session recall plus typed durable project memory | all three | yes | **Shipped** (Phase 17; JSONL recall and an atomic, byte-budgeted memory file) |
 | Selectable/tunable history condensers (observation-masking, recent-window, LLM-summarizing) | OpenHands | adaptable | **Shipped** (Phase 10) |
 | Local conveniences: prompt stash, `/btw` side-branch, background jobs, file watcher, JSONL replay, local secrets + env injection, out-of-process notify/sound | opencode, kilocode, OpenHands | yes/adaptable | Scattered: stash in Phase 9, background jobs in 11, replay in 20, notify/sound in 5d, secrets in 5a. Prompt *history* shipped in 8.5; a file watcher remains unscheduled |
 | Out-of-process research items: ACP single-session stdio subcommand, LSP post-edit diagnostics, Seatbelt/bubblewrap bash sandbox, local semantic index | all three | adaptable | LSP **shipped in Phase 16**, the sandbox Phase 18; ACP awaits a [decision](#decisions-that-reverse-a-stated-non-goal); the semantic index is [not planned](#non-goals-and-known-gaps) |
@@ -1043,7 +1054,7 @@ default.**
 | `DOMOCODE_RETRY_BASE_MS` | `1000` | First backoff; each further attempt doubles it before jitter. |
 | `DOMOCODE_RETRY_MAX_MS` | `60000` | Backoff ceiling, which also caps a server-supplied `Retry-After`. |
 | `DOMOCODE_RETRY_BUDGET_MS` | `300000` | Total time one request may spend asleep between attempts. `0` means no budget. |
-| `DOMOCODE_CONFIG_DIR` | `~/.domocode` | Settings, trust store, user commands, and user skills. (The default client theme surface shipped in Phase 5c.) |
+| `DOMOCODE_CONFIG_DIR` | `~/.domocode` | Settings, trust store, user commands, user skills, and durable project memory. (The default client theme surface shipped in Phase 5c.) |
 | `DOMOCODE_SESSION_DIR` | `$CONFIG_DIR/sessions` | Session JSONL root, and the per-workspace prompt history beside it. Point this elsewhere and both move. |
 | `DOMOCODE_LOG_LEVEL` | `warning` | Logs go to stderr; stdout is reserved for the JSON protocol channel. |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | — | **Not honored.** Nothing reads them, and the default transport is `HTTPClient.shared`, which cannot be given a proxy configuration. Behind a proxy, point `DOMOCODE_BASE_URL` at it directly. |
@@ -1311,8 +1322,8 @@ real — each of these is now a property of the shipped system, not a forecast:
 
 ## Contributing
 
-All shipped phases through 8.5, plus Phase 5, are implemented.
-**Phase 5d — Terminal-native polish — is complete**, followed by Phases 9–21. The [dependency spine](#the-dependency-spine)
+All shipped phases through Phase 17 are implemented.
+**Phase 17 — Memory and recall — is complete**, followed by Phases 18–21. The [dependency spine](#the-dependency-spine)
 is the useful map: six seams gate most of what is left, and a change that lands one of them is worth
 more than a change that ships a feature around it. Issues proposing scope changes — particularly anything in
 [Non-goals](#non-goals-and-known-gaps) or the

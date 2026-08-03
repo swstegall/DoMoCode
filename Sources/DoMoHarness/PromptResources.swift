@@ -118,6 +118,7 @@ public enum LocalCommand: String, Codable, Hashable, Sendable {
     case exit
     case fork
     case help
+    case memory
     case redo
     case review
     case timeline
@@ -367,6 +368,12 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             description: "Show available commands",
             kind: .local,
             action: .help
+        ),
+        CommandDescriptor(
+            name: "memory",
+            description: "Show durable project memory",
+            kind: .local,
+            action: .memory
         ),
         CommandDescriptor(
             name: "redo",

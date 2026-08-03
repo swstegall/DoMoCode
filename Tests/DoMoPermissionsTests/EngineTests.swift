@@ -149,6 +149,26 @@ struct FactoryTests {
         #expect(spec.patterns == ["https://example.test/a"])
         #expect(spec.always.isEmpty)
     }
+
+    @Test("memory separates read permission from write permission")
+    func memory() {
+        let read = factory.make(toolName: "memory", arguments: .object(["action": .string("list")]))
+        #expect(read.permission == "memory.read")
+        #expect(read.patterns == ["*"])
+        #expect(read.always == ["*"])
+
+        let write = factory.make(toolName: "memory", arguments: .object(["action": .string("remember")]))
+        #expect(write.permission == "memory.write")
+        #expect(write.patterns == ["*"])
+        #expect(write.always == ["*"])
+    }
+
+    @Test("the baseline allows memory reads but asks for writes")
+    func memoryBaseline() {
+        let rules = fromConfig(defaultBaselinePermissionConfig(), homeDirectory: HOME)
+        #expect(evaluate("memory.read", "*", rules).action == .allow)
+        #expect(evaluate("memory.write", "*", rules).action == .ask)
+    }
 }
 
 @Suite("Shell command decomposition")

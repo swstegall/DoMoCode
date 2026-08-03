@@ -88,6 +88,20 @@ public struct PermissionRequestFactory: Sendable {
                     "id": arguments["id"] ?? .null,
                 ]
             )
+        case "memory":
+            let action = arguments["action"]?.stringValue?.lowercased() ?? ""
+            if action == "list" {
+                return PermissionRequestSpec(
+                    permission: "memory.read",
+                    patterns: ["*"],
+                    always: ["*"]
+                )
+            }
+            return PermissionRequestSpec(
+                permission: "memory.write",
+                patterns: ["*"],
+                always: ["*"]
+            )
         default:
             // find/grep/todo/etc. and every MCP tool: a coarse `*` resource. Known
             // read-only tools are auto-allowed by the baseline; an unknown MCP name is
@@ -350,6 +364,7 @@ public func defaultBaselinePermissionConfig() -> PermissionConfig {
         PermissionConfigEntry(permission: "todowrite", value: .action(.allow)),
         PermissionConfigEntry(permission: "finish", value: .action(.allow)),
         PermissionConfigEntry(permission: "session_recall", value: .action(.allow)),
+        PermissionConfigEntry(permission: "memory.read", value: .action(.allow)),
         PermissionConfigEntry(permission: "question", value: .action(.ask)),
         PermissionConfigEntry(permission: "webfetch", value: .action(.ask)),
         PermissionConfigEntry(permission: "doom_loop", value: .action(.ask)),

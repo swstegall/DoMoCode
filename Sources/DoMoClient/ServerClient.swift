@@ -16,6 +16,7 @@ import DoMoCore
 import DoMoHarness
 import DoMoGit
 import DoMoLLM
+import DoMoMemory
 import DoMoPermissions
 import DoMoServer
 import Foundation
@@ -160,6 +161,14 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode(CommandRegistry.self, from: data)
+    }
+
+    /// Fetch durable project memory for the remote memory command.
+    public func memory() async throws -> [ProjectMemoryRecord] {
+        let path = "/memory"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([ProjectMemoryRecord].self, from: data)
     }
 
     /// Fetch aliases available to the runtime's model picker.

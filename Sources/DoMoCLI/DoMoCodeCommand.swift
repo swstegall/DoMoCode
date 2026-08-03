@@ -204,7 +204,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         try SystemPromptBuilder(
             workingDirectory: workingDirectory,
             configDirectory: configDirectory,
-            toolNames: ToolRegistry.builtin(includeSessionRecall: true).names,
+            toolNames: ToolRegistry.builtin(
+                includeSessionRecall: true,
+                includeProjectMemory: true
+            ).names,
             projectTrusted: true
         ).build()
     }
@@ -536,12 +539,17 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionRecallProvider: SessionRecallIndex(
                 cwd: workingDirectory.string,
                 sessionDirectory: configuration.sessionDirectory
+            ),
+            projectMemoryProvider: ProjectMemoryStore(
+                configDirectory: configuration.configDirectory,
+                cwd: workingDirectory.string
             )
         )
         let registry = ToolRegistry.builtin(
             includePlanExit: selectedMode == .plan,
             includeSubagent: selectedMode == .plan,
-            includeSessionRecall: true
+            includeSessionRecall: true,
+            includeProjectMemory: true
         )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
 
@@ -684,7 +692,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // every configured MCP server. See ``gatewayCredentialEnvNames(_:)``.
             sensitiveEnvKeys: Self.gatewayCredentialEnvNames(configuration),
             // Reserve the built-in tool names so an MCP tool can never shadow one.
-            reservedNames: Set(ToolRegistry.builtin(includeSessionRecall: true).names),
+            reservedNames: Set(
+                ToolRegistry.builtin(
+                    includeSessionRecall: true,
+                    includeProjectMemory: true
+                ).names
+            ),
             log: { Self.writeStderr($0 + "\n") }
         )
         return (tools, manager)
@@ -962,6 +975,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let toolEnvironment = Self.toolEnvironment(configuration)
         let sessionStartHead = try? await DoMoGit(shell: shell).head(at: workingDirectory)
         let subagentCoordinator = SubagentCoordinator()
+        let memoryStore = ProjectMemoryStore(
+            configDirectory: configuration.configDirectory,
+            cwd: workingDirectory.string
+        )
         let toolContext = try await ToolContext.rooted(
             at: workingDirectory,
             shell: shell,
@@ -980,6 +997,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 cwd: workingDirectory.string,
                 sessionDirectory: configuration.sessionDirectory
             ),
+            projectMemoryProvider: memoryStore,
             subagentCoordinator: subagentCoordinator
         )
         // Keep plan_exit in the server registry even when the default mode is build;
@@ -988,7 +1006,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let registry = ToolRegistry.builtin(
             includePlanExit: true,
             includeSubagent: true,
-            includeSessionRecall: true
+            includeSessionRecall: true,
+            includeProjectMemory: true
         )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
@@ -1048,7 +1067,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 todoStore: resources.todoStore,
                 includePlanExit: true,
                 includeSubagent: true,
-                includeSessionRecall: true
+                includeSessionRecall: true,
+                includeProjectMemory: true
             )
             let sessionContext = toolContext.withQuestionHandler({ prompts in
                 let wirePrompts = prompts.map { prompt in
@@ -1164,7 +1184,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             questionBroker: questionBroker,
             sessionStartHead: sessionStartHead,
             diffSource: DoMoGit(shell: shell),
-            subagentCoordinator: subagentCoordinator
+            subagentCoordinator: subagentCoordinator,
+            projectMemoryProvider: memoryStore
         )
         runtimeConfiguration.agentProfile = agentProfile
         runtimeConfiguration.agentMode = agentMode

@@ -204,6 +204,12 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        router.get("/memory") { _, _ in
+            try await self.mapErrors {
+                try Self.json(try await self.runtime.memory())
+            }
+        }
+
         router.get("/models") { _, _ in
             try await self.mapErrors {
                 try Self.json(await self.runtime.models())

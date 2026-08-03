@@ -10,6 +10,7 @@ struct PromptResourcesTests {
     func builtInContextCommands() {
         #expect(CommandRegistry.builtIn.command(named: "compact")?.action == .compact)
         #expect(CommandRegistry.builtIn.command(named: "context")?.action == .context)
+        #expect(CommandRegistry.builtIn.command(named: "memory")?.action == .memory)
     }
 
     private func makeDirectory() throws -> FilePath {

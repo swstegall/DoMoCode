@@ -6,6 +6,7 @@ import DoMoCore
 import DoMoHarness
 import DoMoGit
 import DoMoLLM
+import DoMoMemory
 import DoMoPermissions
 import Foundation
 import Synchronization
@@ -323,6 +324,9 @@ public actor ServerRuntime {
         /// The coordinator shared by session tool contexts. The server installs
         /// its runner after construction so the context can be built first.
         public var subagentCoordinator: SubagentCoordinator?
+        /// The project-scoped durable memory file, exposed to the remote memory
+        /// command as well as the model-facing memory tool.
+        public var projectMemoryProvider: (any ProjectMemoryProvider)?
         /// Root depth is zero. A child at this depth may not create another
         /// child once the next depth would exceed this cap.
         public var maxSubagentDepth: Int
@@ -365,7 +369,8 @@ public actor ServerRuntime {
             git: DoMoGit? = nil,
             diffSource: (any DiffSource)? = nil,
             subagentCoordinator: SubagentCoordinator? = nil,
-            maxSubagentDepth: Int = 2
+            maxSubagentDepth: Int = 2,
+            projectMemoryProvider: (any ProjectMemoryProvider)? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -398,6 +403,7 @@ public actor ServerRuntime {
             self.questionBroker = questionBroker
             self.subagentCoordinator = subagentCoordinator
             self.maxSubagentDepth = max(0, maxSubagentDepth)
+            self.projectMemoryProvider = projectMemoryProvider
         }
     }
 
@@ -572,6 +578,12 @@ public actor ServerRuntime {
     /// the authority that expands them.
     public func commands() -> CommandRegistry {
         config.promptWorkspace?.commands ?? .builtIn
+    }
+
+    /// The durable memory shared by the serving workspace.
+    public func memory() async throws -> [ProjectMemoryRecord] {
+        guard let provider = config.projectMemoryProvider else { return [] }
+        return try await provider.list()
     }
 
     public func models() -> [ModelOption] {

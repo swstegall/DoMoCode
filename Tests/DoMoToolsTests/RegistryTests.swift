@@ -67,6 +67,41 @@ struct RegistryTests {
         #expect(result.details["count"]?.intValue == 1)
     }
 
+    @Test("the memory tool lists and writes through its provider")
+    func projectMemorySet() async throws {
+        let registry = ToolRegistry.builtin(includeProjectMemory: true)
+        #expect(registry.names.last == "memory")
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        let context = fixture.context.withQuestionHandler(
+            nil,
+            backgroundProcesses: fixture.context.backgroundProcesses,
+            projectMemoryProvider: StubMemoryProvider()
+        )
+
+        let list = try await registry.execute(
+            "memory",
+            arguments: ["action": "list"],
+            in: context
+        )
+        #expect(!list.isError)
+        #expect(list.text.contains("project-memory"))
+        #expect(list.text.contains("existing memory"))
+
+        let saved = try await registry.execute(
+            "memory",
+            arguments: [
+                "action": "remember",
+                "kind": "correction",
+                "title": "style",
+                "content": "Prefer focused tests.",
+            ],
+            in: context
+        )
+        #expect(!saved.isError)
+        #expect(saved.text.contains("Saved correction memory"))
+    }
+
     @Test("task forwards a focused request to its coordinator")
     func taskDispatch() async throws {
         let fixture = try await ToolFixture.make()
@@ -172,4 +207,41 @@ private struct StubRecallProvider: SessionRecallProvider {
             )
         ]
     }
+}
+
+private struct StubMemoryProvider: ProjectMemoryProvider {
+    func list() async throws -> [ProjectMemoryRecord] {
+        [
+            ProjectMemoryRecord(
+                id: "memory-1",
+                kind: .project,
+                title: "existing",
+                content: "existing memory",
+                createdAt: "2026-08-03T12:00:00Z",
+                updatedAt: "2026-08-03T12:00:00Z"
+            )
+        ]
+    }
+
+    func remember(
+        kind: ProjectMemoryKind,
+        title: String,
+        content: String,
+        sourceSessionID: String?,
+        tags: [String],
+        id: String?
+    ) async throws -> ProjectMemoryRecord {
+        ProjectMemoryRecord(
+            id: id ?? "memory-2",
+            kind: kind,
+            title: title,
+            content: content,
+            createdAt: "2026-08-03T12:00:00Z",
+            updatedAt: "2026-08-03T12:00:00Z",
+            sourceSessionID: sourceSessionID,
+            tags: tags
+        )
+    }
+
+    func forget(id: String) async throws -> Bool { true }
 }

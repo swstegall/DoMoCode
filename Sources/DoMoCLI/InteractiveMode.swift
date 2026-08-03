@@ -437,6 +437,7 @@ final class InteractiveCoordinator {
     private let submissionsContinuation: AsyncStream<PendingSubmission>.Continuation
     private let steering: SteeringBox
     private let questionBox: QuestionBox
+    private let memoryStore: (any ProjectMemoryProvider)?
 
     /// Images dropped onto the prompt and not yet sent.
     ///
@@ -542,6 +543,7 @@ final class InteractiveCoordinator {
         sessionDirectory: FilePath,
         steering: SteeringBox,
         questionBox: QuestionBox,
+        memoryStore: (any ProjectMemoryProvider)? = nil,
         fileSystem: SandboxedFileSystem? = nil,
         terminalRows: @escaping () -> Int,
         keybindings: Keybindings = Keybindings(),
@@ -555,6 +557,7 @@ final class InteractiveCoordinator {
         self.harness = harness
         self.steering = steering
         self.questionBox = questionBox
+        self.memoryStore = memoryStore
         self.fileSystem = fileSystem
         self.provider = provider
         self.commandProcessor = commandProcessor
@@ -928,6 +931,10 @@ final class InteractiveCoordinator {
                 .joined(separator: " · ")
             appendStopNotice("commands: \(names)")
             render()
+            return
+        case .some(.memory):
+            stagedImages = []
+            showMemory()
             return
         case .some(.tree):
             appendStopNotice("/tree is available in the full-screen client")
@@ -1794,6 +1801,25 @@ final class InteractiveCoordinator {
         }
     }
 
+    /// Display recent durable memory without starting a model turn.
+    private func showMemory() {
+        guard !running else {
+            appendStopNotice("/memory is unavailable while a turn is running")
+            render()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let records = try await self.memoryStore?.list() ?? []
+                self.appendStopNotice(Self.memoryNotice(records))
+            } catch {
+                self.appendError(error)
+            }
+            self.render()
+        }
+    }
+
     /// Move the active conversation and shadow workspace as one append-only
     /// operation. The transcript already contains the old branch, so the notice
     /// names the durable move; the next turn is seeded from the adopted branch.
@@ -1873,6 +1899,19 @@ final class InteractiveCoordinator {
             entry.entryType.rawValue + "#" + String(entry.id.prefix(8))
         }.joined(separator: " · ")
         return "timeline: " + String(entries.count) + " entries" + (tail.isEmpty ? "" : " · " + tail)
+    }
+
+    private static func memoryNotice(_ records: [ProjectMemoryRecord]) -> String {
+        guard !records.isEmpty else { return "memory: no durable project memory" }
+        let summary = records.prefix(8).map { record in
+            let content = sanitizeUntrustedText(
+                SessionRecallIndex.elideMiddle(record.content, limit: 180)
+                    .replacingOccurrences(of: "\n", with: " ")
+            )
+            return "\(record.kind.rawValue): \(sanitizeUntrustedText(record.title)) — \(content)"
+        }
+        let suffix = records.count > 8 ? " · \(records.count - 8) more" : ""
+        return "memory: " + summary.joined(separator: " · ") + suffix
     }
 
     private static func historyNotice(_ result: WorkspaceHistoryResult) -> String {
@@ -2048,6 +2087,8 @@ public struct InteractiveMode: Sendable {
     private let prompterBox: PrompterBox
     /// The late-bound structured-question handler for the built-in question tool.
     private let questionBox: QuestionBox
+    /// Durable project memory, shared with the context bound to the model tools.
+    private let memoryStore: (any ProjectMemoryProvider)?
     /// Children started by `background_process`; all are stopped when this
     /// interactive session returns.
     private let backgroundProcesses: BackgroundProcessManager
@@ -2076,6 +2117,7 @@ public struct InteractiveMode: Sendable {
         steering: SteeringBox,
         prompterBox: PrompterBox,
         questionBox: QuestionBox,
+        memoryStore: (any ProjectMemoryProvider)? = nil,
         backgroundProcesses: BackgroundProcessManager,
         metadataRelay: ResponseMetadataRelay,
         requestedModel: String,
@@ -2094,6 +2136,7 @@ public struct InteractiveMode: Sendable {
         self.steering = steering
         self.prompterBox = prompterBox
         self.questionBox = questionBox
+        self.memoryStore = memoryStore
         self.backgroundProcesses = backgroundProcesses
         self.metadataRelay = metadataRelay
         self.requestedModel = requestedModel
@@ -2183,6 +2226,10 @@ public struct InteractiveMode: Sendable {
         let shell = try SubprocessShell()
         let questionBox = QuestionBox()
         let toolEnvironment = ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+        let memoryStore = ProjectMemoryStore(
+            configDirectory: FilePath(configDirectory),
+            cwd: workingDirectory
+        )
         let toolContext = try await ToolContext.rooted(
             at: workDirectory,
             shell: shell,
@@ -2202,12 +2249,14 @@ public struct InteractiveMode: Sendable {
             sessionRecallProvider: SessionRecallIndex(
                 cwd: workingDirectory,
                 sessionDirectory: sessionDir
-            )
+            ),
+            projectMemoryProvider: memoryStore
         )
         let registry = ToolRegistry.builtin(
             includePlanExit: agentMode == .plan,
             includeSubagent: agentMode == .plan,
-            includeSessionRecall: true
+            includeSessionRecall: true,
+            includeProjectMemory: true
         )
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools to the built-ins. The manager is held on the session and torn down in
@@ -2399,6 +2448,7 @@ public struct InteractiveMode: Sendable {
             steering: steering,
             prompterBox: prompterBox,
             questionBox: questionBox,
+            memoryStore: memoryStore,
             backgroundProcesses: toolContext.backgroundProcesses,
             metadataRelay: metadataRelay,
             requestedModel: runtime.model,
@@ -2490,6 +2540,7 @@ public struct InteractiveMode: Sendable {
             sessionDirectory: sessionDirectory,
             steering: steering,
             questionBox: questionBox,
+            memoryStore: memoryStore,
             fileSystem: fileSystem,
             terminalRows: { target.rows },
             imageCapabilities: resolvedCapabilities,

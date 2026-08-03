@@ -218,7 +218,8 @@ public struct ToolRegistry: Sendable {
         todoStore: TodoStore = TodoStore(),
         includePlanExit: Bool = false,
         includeSubagent: Bool = false,
-        includeSessionRecall: Bool = false
+        includeSessionRecall: Bool = false,
+        includeProjectMemory: Bool = false
     ) -> ToolRegistry {
         var tools: [any Tool] = [
             ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
@@ -228,6 +229,7 @@ public struct ToolRegistry: Sendable {
         if includePlanExit { tools.append(PlanExitTool()) }
         if includeSubagent { tools.append(TaskTool()) }
         if includeSessionRecall { tools.append(SessionRecallTool()) }
+        if includeProjectMemory { tools.append(ProjectMemoryTool()) }
         return ToolRegistry(tools)
     }
 
@@ -356,6 +358,7 @@ public struct ToolContext: Sendable {
     public let diagnosticsProvider: (any DiagnosticsProvider)?
     public let formatterProvider: (any FormatterProvider)?
     public let sessionRecallProvider: (any SessionRecallProvider)?
+    public let projectMemoryProvider: (any ProjectMemoryProvider)?
 
     /// The runtime bridge used by ``TaskTool``. It is optional so the ordinary
     /// CLI and library contexts keep the same tool surface and behavior.
@@ -389,6 +392,7 @@ public struct ToolContext: Sendable {
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
         sessionRecallProvider: (any SessionRecallProvider)? = nil,
+        projectMemoryProvider: (any ProjectMemoryProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) {
@@ -403,6 +407,7 @@ public struct ToolContext: Sendable {
         self.diagnosticsProvider = diagnosticsProvider
         self.formatterProvider = formatterProvider
         self.sessionRecallProvider = sessionRecallProvider
+        self.projectMemoryProvider = projectMemoryProvider
         self.subagentCoordinator = subagentCoordinator
         self.sessionID = sessionID
     }
@@ -422,6 +427,7 @@ public struct ToolContext: Sendable {
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
         sessionRecallProvider: (any SessionRecallProvider)? = nil,
+        projectMemoryProvider: (any ProjectMemoryProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) async throws(DoMoError) -> ToolContext {
@@ -437,6 +443,7 @@ public struct ToolContext: Sendable {
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
             sessionRecallProvider: sessionRecallProvider,
+            projectMemoryProvider: projectMemoryProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -452,6 +459,7 @@ public struct ToolContext: Sendable {
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
             sessionRecallProvider: sessionRecallProvider,
+            projectMemoryProvider: projectMemoryProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -467,6 +475,7 @@ public struct ToolContext: Sendable {
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
         sessionRecallProvider: (any SessionRecallProvider)? = nil,
+        projectMemoryProvider: (any ProjectMemoryProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) -> ToolContext {
@@ -482,6 +491,7 @@ public struct ToolContext: Sendable {
             diagnosticsProvider: diagnosticsProvider ?? self.diagnosticsProvider,
             formatterProvider: formatterProvider ?? self.formatterProvider,
             sessionRecallProvider: sessionRecallProvider ?? self.sessionRecallProvider,
+            projectMemoryProvider: projectMemoryProvider ?? self.projectMemoryProvider,
             subagentCoordinator: subagentCoordinator ?? self.subagentCoordinator,
             sessionID: sessionID ?? self.sessionID
         )
