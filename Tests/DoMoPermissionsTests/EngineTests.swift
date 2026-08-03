@@ -273,6 +273,35 @@ struct EngineTests {
         #expect(allowed == .allow)
     }
 
+    @Test("a live policy provider changes the permission boundary between calls")
+    func liveRulesetProvider() async {
+        let planPath = "/work/.domocode/plans/session.md"
+        let current = Mutex(AgentModePolicy.rules(for: .build, planPath: planPath))
+        let engine = PermissionEngine(
+            rulesetProvider: { current.withLock { $0 } },
+            prompt: { _ in .reject(message: "not in this mode") }
+        )
+
+        let before = await engine.ask(
+            PermissionRequestSpec(permission: "write", patterns: [planPath], always: []),
+            sessionID: "s"
+        )
+        if case .deny = before {} else { Issue.record("build mode should not write the plan") }
+
+        current.withLock { $0 = AgentModePolicy.rules(for: .plan, planPath: planPath) }
+        #expect(await engine.ask(
+            PermissionRequestSpec(permission: "write", patterns: [planPath], always: []),
+            sessionID: "s"
+        ) == .allow)
+
+        current.withLock { $0 = AgentModePolicy.rules(for: .build, planPath: planPath) }
+        let after = await engine.ask(
+            PermissionRequestSpec(permission: "write", patterns: [planPath], always: []),
+            sessionID: "s"
+        )
+        if case .deny = after {} else { Issue.record("returning to build should remove plan-only write access") }
+    }
+
     @Test("reject with a message denies with that message as the reason")
     func rejectMessage() async {
         let engine = PermissionEngine(ruleset: baseline(), prompt: { _ in .reject(message: "not now") })

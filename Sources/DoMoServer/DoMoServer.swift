@@ -72,6 +72,7 @@ private struct QuestionReplyBody: Decodable {
 }
 
 private struct ModelBody: Decodable { var modelID: String }
+private struct ModeBody: Decodable { var mode: String }
 private struct RenameBody: Decodable { var name: String? }
 private struct LabelBody: Decodable { var targetID: String; var label: String? }
 private struct LeafBody: Decodable { var targetID: String? }
@@ -308,6 +309,18 @@ public struct DoMoServer: Sendable {
                 let id = try context.parameters.require("id")
                 let body = try await Self.requiredBody(ModelBody.self, request)
                 try await self.runtime.changeModel(sessionID: id, modelID: body.modelID)
+                return Response(status: .ok)
+            }
+        }
+
+        router.post("/session/:id/mode") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(ModeBody.self, request)
+                guard let mode = AgentMode(rawValue: body.mode.lowercased()) else {
+                    throw HTTPError(.badRequest)
+                }
+                try await self.runtime.changeMode(sessionID: id, mode: mode)
                 return Response(status: .ok)
             }
         }

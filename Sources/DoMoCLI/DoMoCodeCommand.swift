@@ -10,6 +10,7 @@ import DoMoGit
 import DoMoHarness
 import DoMoLLM
 import DoMoMCP
+import DoMoPermissions
 import DoMoServer
 import DoMoTermIO
 import DoMoTUI
@@ -103,6 +104,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     @Option(name: .customLong("model"), help: "Public model alias as configured on the proxy.")
     public var model: String?
 
+    @Option(
+        name: .customLong("agent"),
+        help: "Select an inert Markdown agent profile (default: build)."
+    )
+    public var agent: String?
+
+    @Option(
+        name: .customLong("mode"),
+        help: "Start in build or plan mode (Tab toggles modes in the full-screen client)."
+    )
+    public var agentMode: String?
+
     @Option(name: .customLong("base-url"), help: "LiteLLM proxy base URL (default http://localhost:4000/v1).")
     public var baseURL: String?
 
@@ -174,6 +187,25 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 "--steering-mode must be all or one-at-a-time (got \(raw))."
             )
         }
+    }
+
+    private static func parseAgentMode(_ raw: String) throws -> AgentMode {
+        guard let mode = AgentMode(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+            throw DoMoError(.configuration, "--mode must be build or plan (got \(raw)).")
+        }
+        return mode
+    }
+
+    private static func loadAgentWorkspace(
+        workingDirectory: FilePath,
+        configDirectory: FilePath
+    ) throws -> PromptWorkspace {
+        try SystemPromptBuilder(
+            workingDirectory: workingDirectory,
+            configDirectory: configDirectory,
+            toolNames: ToolRegistry.builtin.names,
+            projectTrusted: true
+        ).build()
     }
 
     @Flag(
@@ -356,10 +388,25 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             Self.writeStderr("warning: \(Redaction.diagnostic(warning))\n")
         }
 
-        guard let model = configuration.model, !model.isEmpty else {
+        let profileWorkspace = try Self.loadAgentWorkspace(
+            workingDirectory: workingDirectory,
+            configDirectory: configuration.configDirectory
+        )
+        let requestedProfileName = agent
+            ?? (agentMode?.lowercased() == AgentMode.plan.rawValue ? AgentMode.plan.rawValue : AgentMode.build.rawValue)
+        guard let profile = profileWorkspace.agents.profile(named: requestedProfileName) else {
+            let available = profileWorkspace.agents.profiles.map(\.name).joined(separator: ", ")
             throw DoMoError(
                 .configuration,
-                "No model configured. Set --model, \(EnvName.model), or \"model\" in settings.json."
+                "Unknown agent profile \(requestedProfileName). Available profiles: \(available)."
+            )
+        }
+        let selectedMode = try agentMode.map(Self.parseAgentMode) ?? profile.mode
+        let model = profile.model ?? configuration.model
+        guard let model, !model.isEmpty else {
+            throw DoMoError(
+                .configuration,
+                "No model configured. Set --model, \(EnvName.model), or an agent profile model."
             )
         }
         // 0 is accepted and means unlimited (see ``turnLimit``); only a negative
@@ -379,7 +426,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 model: model,
                 workingDirectory: workingDirectory,
                 maxCostPerRun: costLimit,
-                steeringMode: deliveryMode
+                steeringMode: deliveryMode,
+                agentProfile: profile,
+                agentMode: selectedMode
             )
             return
         }
@@ -420,7 +469,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     sessionDirectory: configuration.sessionDirectory.string,
                     configDirectory: configuration.configDirectory.string,
                     homeDirectory: environment["HOME"],
-                    reasoningEffort: configuration.reasoningEffort,
+                    reasoningEffort: profile.reasoningEffort ?? configuration.reasoningEffort,
                     maxTurns: turnLimit,
                     sessionSource: sessionSource,
                     mcpServers: configuration.mcpServers,
@@ -438,7 +487,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     summarizer: Self.compactionSummarizer(configuration, model: model),
                     credentialEnvNames: Self.gatewayCredentialEnvNames(configuration),
                     maxCostPerRun: costLimit,
-                    steeringMode: deliveryMode
+                    steeringMode: deliveryMode,
+                    agentProfile: profile,
+                    agentMode: selectedMode,
+                    modeRules: configuration.agentModes[selectedMode.rawValue] ?? []
                 )
                 try await Self.runInteractive(
                     mode,
@@ -455,7 +507,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     environment: environment,
                     noMouse: noMouse,
                     serverURL: serverURL,
-                    serverToken: serverToken
+                    serverToken: serverToken,
+                    agentProfile: profile,
+                    agentMode: selectedMode
                 )
             }
             return
@@ -467,7 +521,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             shell: shell,
             environment: Self.toolEnvironment(configuration)
         )
-        let registry = ToolRegistry.builtin
+        let registry = ToolRegistry.builtin(includePlanExit: selectedMode == .plan)
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
 
         // The permission gate (Phase 8). Headless has no human to prompt, so a tool
@@ -478,13 +532,19 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             workingDirectory: workingDirectory.string,
             configDirectory: configuration.configDirectory.string,
             homeDirectory: homeDirectory,
-            yolo: yolo
+            yolo: yolo,
+            mode: selectedMode,
+            profileRules: profile.permissionRules,
+            modeRules: configuration.agentModes[selectedMode.rawValue] ?? []
         )
         let noProgressHook = PermissionSetup.headlessNoProgressHook(
             workingDirectory: workingDirectory.string,
             configDirectory: configuration.configDirectory.string,
             homeDirectory: homeDirectory,
-            yolo: yolo
+            yolo: yolo,
+            mode: selectedMode,
+            profileRules: profile.permissionRules,
+            modeRules: configuration.agentModes[selectedMode.rawValue] ?? []
         )
 
         // Load image attachments BEFORE connecting MCP: loadImageAttachments can throw on
@@ -503,7 +563,14 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let resolvedPermissionRules = PermissionSetup.resolvedRuleset(
             workingDirectory: workingDirectory.string,
             configDirectory: configuration.configDirectory.string,
-            homeDirectory: homeDirectory
+            homeDirectory: homeDirectory,
+            mode: selectedMode,
+            planPath: AgentModePolicy.planPath(
+                workingDirectory: workingDirectory.string,
+                sessionID: "print"
+            ),
+            profileRules: profile.permissionRules,
+            modeRules: configuration.agentModes[selectedMode.rawValue] ?? []
         )
         let visibleMcp = PermissionSetup.visibleMCPTools(
             mcpTools,
@@ -513,7 +580,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             workingDirectory: workingDirectory,
             configDirectory: configuration.configDirectory,
             toolNames: registry.names + visibleMcp.map(\.definition.name),
-            projectTrusted: true
+            projectTrusted: true,
+            agentName: profile.name
         )
         let promptWorkspace = try promptBuilder.build()
         let mcpToolResolver: @Sendable () async -> [any AgentTool] = {
@@ -542,7 +610,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             beforeToolCall: permissionHook,
             mcpTools: visibleMcp,
             mcpToolResolver: mcpToolResolver,
-            modelRuntime: configuration.modelRuntime(for: model),
+            modelRuntime: {
+                var runtime = configuration.modelRuntime(for: model)
+                runtime.reasoningEffort = profile.reasoningEffort ?? runtime.reasoningEffort
+                return runtime
+            }(),
             compaction: configuration.compaction,
             summarizer: Self.compactionSummarizer(configuration, model: model, client: client),
             promptWorkspace: promptWorkspace,
@@ -550,7 +622,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             commandProcessor: commandProcessor,
             commandRuntimeFactory: { commandModel, effort in
                 var selected = configuration.modelRuntime(for: commandModel ?? model)
-                if let effort { selected.reasoningEffort = effort }
+                selected.reasoningEffort = effort ?? profile.reasoningEffort ?? selected.reasoningEffort
                 return selected
             },
             maxCostPerRun: costLimit,
@@ -776,7 +848,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         model: String,
         workingDirectory: FilePath,
         maxCostPerRun: Decimal?,
-        steeringMode: QueueDeliveryMode
+        steeringMode: QueueDeliveryMode,
+        agentProfile: AgentProfile,
+        agentMode: AgentMode
     ) async throws {
         let (runtime, mcpManager, backgroundSessions) = try await Self.buildServerRuntime(
             configuration: configuration,
@@ -784,7 +858,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             workingDirectory: workingDirectory,
             maxTurns: turnLimit,
             maxCostPerRun: maxCostPerRun,
-            steeringMode: steeringMode
+            steeringMode: steeringMode,
+            agentProfile: agentProfile,
+            agentMode: agentMode
         )
         let token = Self.generateToken()
         let server = DoMoServer(
@@ -826,7 +902,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         workingDirectory: FilePath,
         maxTurns: Int?,
         maxCostPerRun: Decimal?,
-        steeringMode: QueueDeliveryMode
+        steeringMode: QueueDeliveryMode,
+        agentProfile: AgentProfile,
+        agentMode: AgentMode
     ) async throws -> (
         runtime: ServerRuntime,
         mcpManager: MCPManager,
@@ -839,7 +917,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             shell: shell,
             environment: Self.toolEnvironment(configuration)
         )
-        let registry = ToolRegistry.builtin
+        // Keep plan_exit in the server registry even when the default mode is build;
+        // ServerRuntime filters it from build sessions and reveals it when a session
+        // switches to plan mode without rebuilding the process.
+        let registry = ToolRegistry.builtin(includePlanExit: true)
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
         // persist the local surfaces use. This gates BOTH `--serve` and the loopback
@@ -850,24 +931,45 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let permission = PermissionSetup.runtime(
             workingDirectory: workingDirectory.string,
             configDirectory: configuration.configDirectory.string,
-            homeDirectory: home
+            homeDirectory: home,
+            profileRules: agentProfile.permissionRules
         )
+        let baseRuleset = permission.ruleset
+        let configuredModeRules = configuration.agentModes
+        let rulesetForMode: @Sendable (AgentMode, String) -> Ruleset = { mode, planPath in
+            merge(
+                baseRuleset,
+                AgentModePolicy.rules(
+                    for: mode,
+                    planPath: planPath,
+                    additional: configuredModeRules[mode.rawValue] ?? []
+                )
+            )
+        }
         // MCP tools (Phase 8c): the manager is returned so the caller tears the servers
         // down (they spawn in their own process group and would otherwise be orphaned).
         // Deny'd MCP tools are hidden from both the tool set and the system prompt.
         let (mcpTools, mcpManager) = await Self.connectMCP(configuration, workingDirectory: workingDirectory)
         let questionBroker = QuestionBroker()
         let backgroundSessions = BackgroundProcessSessions()
-        let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
+        let initialPlanPath = AgentModePolicy.planPath(
+            workingDirectory: workingDirectory.string,
+            sessionID: "server"
+        )
+        let initialRuleset = rulesetForMode(agentMode, initialPlanPath)
+        let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: initialRuleset)
         let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
         let toolResolver: @Sendable (String) async -> [any AgentTool] = { _ in
             let currentMcp = await mcpManager.tools()
-            let visible = PermissionSetup.visibleMCPTools(currentMcp, ruleset: permission.ruleset)
-            return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visible
+            // ServerRuntime applies the per-session mode filter after this resolver.
+            // Returning the complete current MCP set lets a session that starts in
+            // plan mode regain project-approved MCP tools if it later switches back
+            // to build mode.
+            return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + currentMcp
         }
         let sessionToolResolver: @Sendable (String, String) async -> [any AgentTool] = { sessionID, _ in
             let resources = await backgroundSessions.resources(for: sessionID)
-            let sessionRegistry = ToolRegistry.builtin(todoStore: resources.todoStore)
+            let sessionRegistry = ToolRegistry.builtin(todoStore: resources.todoStore, includePlanExit: true)
             let sessionContext = toolContext.withQuestionHandler({ prompts in
                 let wirePrompts = prompts.map { prompt in
                     ServerQuestionPrompt(
@@ -883,21 +985,27 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 return answers.map { QuestionAnswer(selectedLabels: $0.selectedLabels) }
             }, backgroundProcesses: resources.backgroundProcesses)
             let currentMcp = await mcpManager.tools()
-            let visible = PermissionSetup.visibleMCPTools(currentMcp, ruleset: permission.ruleset)
-            return sessionRegistry.all.map { RegistryTool(tool: $0, context: sessionContext) } + visible
+            // The mode-aware filter in ServerRuntime owns visibility for the live
+            // session; keep the resolver's MCP snapshot complete so mode changes
+            // can widen only back to the ordinary build policy.
+            return sessionRegistry.all.map { RegistryTool(tool: $0, context: sessionContext) } + currentMcp
         }
+        let promptToolNames = registry.names.filter { agentMode == .plan || $0 != "plan_exit" }
+            + visibleMcp.map(\.definition.name)
         let promptWorkspace = try SystemPromptBuilder(
             workingDirectory: workingDirectory,
             configDirectory: configuration.configDirectory,
-            toolNames: registry.names + visibleMcp.map(\.definition.name),
-            projectTrusted: true
+            toolNames: promptToolNames,
+            projectTrusted: true,
+            agentName: agentProfile.name
         ).build()
         let promptForTools: @Sendable (String, [String]) -> String = { prompt, toolNames in
             (try? SystemPromptBuilder(
                 workingDirectory: workingDirectory,
                 configDirectory: configuration.configDirectory,
                 toolNames: toolNames,
-                projectTrusted: true
+                projectTrusted: true,
+                agentName: agentProfile.name
             ).build().systemPrompt(for: prompt)) ?? promptWorkspace.systemPrompt(for: prompt)
         }
         let commandProcessor = PromptCommandProcessor(
@@ -909,7 +1017,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // One resolved runtime for the alias — reasoning effort, per-alias rates and
         // the declared context window — built once and shared by the stream function
         // and the accounting the client's footer reads.
-        let modelRuntime = configuration.modelRuntime(for: model)
+        var modelRuntime = configuration.modelRuntime(for: model)
+        modelRuntime.reasoningEffort = agentProfile.reasoningEffort ?? modelRuntime.reasoningEffort
         let streamFn = makeStreamFn(client: client, runtime: modelRuntime)
         var modelAliases = Set(configuration.modelOverrides.keys)
         modelAliases.insert(model)
@@ -931,9 +1040,10 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionDirectory: configuration.sessionDirectory,
             cwd: workingDirectory.string,
             permissions: ServerRuntime.PermissionRuntime(
-                ruleset: permission.ruleset,
+                ruleset: baseRuleset,
                 factory: permission.factory,
-                persist: permission.persist
+                persist: permission.persist,
+                rulesetForMode: rulesetForMode
             ),
             // `nil` when nothing declared a window for this alias. It travels as
             // `nil` all the way to the footer, which renders "?" — never a
@@ -945,12 +1055,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             commandProcessor: commandProcessor,
             commandStreamFactory: { commandModel, effort in
                 var selected = configuration.modelRuntime(for: commandModel ?? model)
-                if let effort { selected.reasoningEffort = effort }
+                selected.reasoningEffort = effort
+                    ?? agentProfile.reasoningEffort
+                    ?? selected.reasoningEffort
                 return makeStreamFn(client: client, runtime: selected)
             },
             modelOptions: modelOptions,
             modelStreamFactory: { alias in
-                makeStreamFn(client: client, runtime: configuration.modelRuntime(for: alias))
+                var selected = configuration.modelRuntime(for: alias)
+                if alias == model {
+                    selected.reasoningEffort = agentProfile.reasoningEffort ?? selected.reasoningEffort
+                }
+                return makeStreamFn(client: client, runtime: selected)
             },
             modelContextWindow: { alias in configuration.modelRuntime(for: alias).contextWindow },
             steeringMode: steeringMode,
@@ -962,6 +1078,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionStartHead: sessionStartHead,
             diffSource: DoMoGit(shell: shell)
         )
+        runtimeConfiguration.agentProfile = agentProfile
+        runtimeConfiguration.agentMode = agentMode
         runtimeConfiguration.workspaceSnapshotsForSession = { sessionID in
             DoMoShadowGit(
                 shell: shell,
@@ -994,7 +1112,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         environment: [String: String],
         noMouse: Bool,
         serverURL: String?,
-        serverToken: String?
+        serverToken: String?,
+        agentProfile: AgentProfile,
+        agentMode: AgentMode
     ) async throws {
         let baseURL: String
         let token: String
@@ -1018,7 +1138,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 workingDirectory: workingDirectory,
                 maxTurns: maxTurns,
                 maxCostPerRun: maxCostPerRun,
-                steeringMode: steeringMode
+                steeringMode: steeringMode,
+                agentProfile: agentProfile,
+                agentMode: agentMode
             )
             mcpManager = manager
             backgroundSessions = sessions

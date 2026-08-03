@@ -12,8 +12,9 @@
 /// Evaluates tool calls against policy and prompts a surface when a call is unresolved.
 public actor PermissionEngine {
     /// The built-in defaults merged with the user's config, in precedence order
-    /// (later wins). Static for the engine's lifetime.
-    private let baseRuleset: Ruleset
+    /// (later wins). A provider lets a long-lived server session switch between
+    /// build and plan modes without replacing its harness or losing its prompt.
+    private let rulesetProvider: @Sendable () -> Ruleset
     /// Runtime "allow always" grants, appended after `baseRuleset` so they win.
     private var sessionApproved: Ruleset
     private let prompt: PermissionPrompter
@@ -27,7 +28,22 @@ public actor PermissionEngine {
         prompt: @escaping PermissionPrompter,
         persist: (@Sendable (Ruleset) async -> Void)? = nil
     ) {
-        self.baseRuleset = ruleset
+        self.rulesetProvider = { ruleset }
+        self.sessionApproved = approved
+        self.prompt = prompt
+        self.persist = persist
+    }
+
+    /// Creates an engine whose policy can change between tool calls. The
+    /// provider is synchronous so a server can read a lock-protected mode value
+    /// without introducing an await between permission checks.
+    public init(
+        rulesetProvider: @escaping @Sendable () -> Ruleset,
+        approved: Ruleset = [],
+        prompt: @escaping PermissionPrompter,
+        persist: (@Sendable (Ruleset) async -> Void)? = nil
+    ) {
+        self.rulesetProvider = rulesetProvider
         self.sessionApproved = approved
         self.prompt = prompt
         self.persist = persist
@@ -100,6 +116,7 @@ public actor PermissionEngine {
     /// config `deny` beats a broad in-session "allow always" grant, which
     /// last-match-wins would not.
     private func resolvedAction(_ permission: String, _ spellings: [String]) -> PermissionAction {
+        let baseRuleset = rulesetProvider()
         var sawAllow = false
         for spelling in spellings {
             switch resolvePermission(permission, spelling, config: baseRuleset, saved: sessionApproved).action {

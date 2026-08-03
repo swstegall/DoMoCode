@@ -151,6 +151,37 @@ struct ServerClientIntegrationTests {
         _ = try? await serverTask.value
     }
 
+    @Test("build and plan mode round-trip through the server and client")
+    func modeRoundTrip() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let server = makeServer(dirs, answer: "unused")
+        let (ports, continuation) = AsyncStream<Int>.makeStream()
+        let serverTask = Task {
+            try await server.run(onReady: { port in
+                continuation.yield(port)
+                continuation.finish()
+            })
+        }
+        var iterator = ports.makeAsyncIterator()
+        let port = await iterator.next() ?? 0
+        #expect(port > 0)
+
+        let http = HTTPClient(eventLoopGroupProvider: .singleton)
+        let client = ServerClient(baseURL: "http://127.0.0.1:\(port)", token: Self.token, http: http)
+        let ref = try await client.createSession()
+
+        #expect(try await client.status(sessionID: ref.id).mode == AgentMode.build.rawValue)
+        try await client.changeMode(sessionID: ref.id, mode: .plan)
+        #expect(try await client.status(sessionID: ref.id).mode == AgentMode.plan.rawValue)
+        try await client.changeMode(sessionID: ref.id, mode: .build)
+        #expect(try await client.status(sessionID: ref.id).mode == AgentMode.build.rawValue)
+
+        try await http.shutdown()
+        serverTask.cancel()
+        _ = try? await serverTask.value
+    }
+
     @Test("workspace status, timeline, undo, redo, and clone round-trip through ServerClient")
     func workspaceHistoryFlow() async throws {
         let dirs = try Dirs()

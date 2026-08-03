@@ -12,6 +12,7 @@
 // the `data: ` prefix stripped before decoding a `ServerEvent`.
 
 import AsyncHTTPClient
+import DoMoCore
 import DoMoHarness
 import DoMoGit
 import DoMoLLM
@@ -122,6 +123,7 @@ public struct ServerClient: Sendable {
     private struct PermissionReplyBody: Encodable { let requestID: String; let reply: String; let message: String? }
     private struct QuestionReplyBody: Encodable { let requestID: String; let answers: [ServerQuestionAnswer]? }
     private struct ModelBody: Encodable { let modelID: String }
+    private struct ModeBody: Encodable { let mode: String }
     private struct RenameBody: Encodable { let name: String? }
     private struct LabelBody: Encodable { let targetID: String; let label: String? }
     private struct LeafBody: Encodable { let targetID: String? }
@@ -279,6 +281,14 @@ public struct ServerClient: Sendable {
     public func changeModel(sessionID: String, modelID: String) async throws {
         let path = "/session/\(sessionID)/model"
         let body = try JSONEncoder().encode(ModelBody(modelID: modelID))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+    }
+
+    /// Change the active build/plan policy for an idle session.
+    public func changeMode(sessionID: String, mode: AgentMode) async throws {
+        let path = "/session/\(sessionID)/mode"
+        let body = try JSONEncoder().encode(ModeBody(mode: mode.rawValue))
         let (status, data) = try await send(.post, path, body: body)
         try expect(status, 200, path, body: data)
     }

@@ -106,6 +106,10 @@ public struct SessionStatus: Sendable, Codable, Hashable {
     public var queuedMessageCount: Int?
     /// The server's steering delivery mode, when reported.
     public var steeringMode: String?
+    /// The active agent mode, when reported.
+    public var mode: String?
+    /// The selected inert agent profile, when reported.
+    public var agent: String?
 
     /// - Parameter accounting: Defaulted and **last**, so every existing
     ///   construction of this type keeps compiling untouched.
@@ -118,7 +122,9 @@ public struct SessionStatus: Sendable, Codable, Hashable {
         accounting: SessionAccounting? = nil,
         queuedMessageCount: Int? = nil,
         steeringMode: String? = nil,
-        pendingQuestionIDs: [String]? = nil
+        pendingQuestionIDs: [String]? = nil,
+        mode: String? = nil,
+        agent: String? = nil
     ) {
         self.sessionID = sessionID
         self.running = running
@@ -129,6 +135,8 @@ public struct SessionStatus: Sendable, Codable, Hashable {
         self.accounting = accounting
         self.queuedMessageCount = queuedMessageCount
         self.steeringMode = steeringMode
+        self.mode = mode
+        self.agent = agent
     }
 }
 
@@ -197,14 +205,19 @@ public actor ServerRuntime {
         public let ruleset: Ruleset
         public let factory: PermissionRequestFactory
         public let persist: @Sendable (Ruleset) async -> Void
+        /// Rebuilds the mode-specific policy for a session's current mode and
+        /// exact plan path. The base ruleset remains useful for older embedders.
+        public let rulesetForMode: (@Sendable (AgentMode, String) -> Ruleset)?
         public init(
             ruleset: Ruleset,
             factory: PermissionRequestFactory,
-            persist: @escaping @Sendable (Ruleset) async -> Void
+            persist: @escaping @Sendable (Ruleset) async -> Void,
+            rulesetForMode: (@Sendable (AgentMode, String) -> Ruleset)? = nil
         ) {
             self.ruleset = ruleset
             self.factory = factory
             self.persist = persist
+            self.rulesetForMode = rulesetForMode
         }
     }
 
@@ -288,6 +301,9 @@ public actor ServerRuntime {
         /// Late-bound bridge used by a tool context to suspend the owning
         /// session on a structured question.
         public var questionBroker: QuestionBroker?
+        /// The selected inert profile and default mode for newly opened sessions.
+        public var agentProfile: AgentProfile?
+        public var agentMode: AgentMode = .build
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -408,6 +424,26 @@ public actor ServerRuntime {
         }
     }
 
+    /// Synchronously readable mode state shared by the runtime actor and the
+    /// per-session permission/prompt closures. A reference box avoids rebuilding
+    /// a harness when Tab changes mode, while the mutex keeps reads outside the
+    /// runtime actor honest.
+    private final class AgentModeState: Sendable {
+        private let value: Mutex<AgentMode>
+
+        init(_ mode: AgentMode) {
+            value = Mutex(mode)
+        }
+
+        func get() -> AgentMode {
+            value.withLock { $0 }
+        }
+
+        func set(_ mode: AgentMode) {
+            value.withLock { $0 = mode }
+        }
+    }
+
     /// One live session's mutable state. A reference type held only inside the
     /// actor, so its `runTask` mutation is serialized by the actor, not shared.
     ///
@@ -420,6 +456,7 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let sink: BroadcastEventSink
         let steeringBox: SteeringBox
+        let modeState: AgentModeState
         var runTask: Task<Void, Never>?
         /// The gate on the current run's output. Retained beside `runTask` so
         /// ``forceClearRun(sessionID:)`` can silence a run it is abandoning.
@@ -434,11 +471,18 @@ public actor ServerRuntime {
         /// Structured questions awaiting an answer from the client.
         var pendingQuestions: [String: PendingQuestion] = [:]
 
-        init(token: Int, harness: AgentHarness, sink: BroadcastEventSink, steeringBox: SteeringBox) {
+        init(
+            token: Int,
+            harness: AgentHarness,
+            sink: BroadcastEventSink,
+            steeringBox: SteeringBox,
+            modeState: AgentModeState
+        ) {
             self.token = token
             self.harness = harness
             self.sink = sink
             self.steeringBox = steeringBox
+            self.modeState = modeState
         }
     }
 
@@ -484,11 +528,18 @@ public actor ServerRuntime {
     private func makeState(
         harness: AgentHarness,
         sink: BroadcastEventSink,
-        steeringBox: SteeringBox
+        steeringBox: SteeringBox,
+        modeState: AgentModeState
     ) -> SessionState {
         let token = nextToken
         nextToken += 1
-        return SessionState(token: token, harness: harness, sink: sink, steeringBox: steeringBox)
+        return SessionState(
+            token: token,
+            harness: harness,
+            sink: sink,
+            steeringBox: steeringBox,
+            modeState: modeState
+        )
     }
 
     private func makeSteeringBox() -> SteeringBox {
@@ -501,7 +552,8 @@ public actor ServerRuntime {
     /// that owns the pending map already exists, so no `PrompterBox` is needed.
     private func harnessConfiguration(
         sessionID: String,
-        steeringBox: SteeringBox
+        steeringBox: SteeringBox,
+        modeState: AgentModeState
     ) -> AgentHarness.Configuration {
         let steeringReader: @Sendable () async -> [Message] = { [weak self, steeringBox] in
             guard let self else { return steeringBox.drain() }
@@ -509,9 +561,18 @@ public actor ServerRuntime {
         }
         var beforeToolCall: BeforeToolCallHook?
         var onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil
-        if let permissions = config.permissions {
+        let permissions = config.permissions
+        let planPath = AgentModePolicy.planPath(
+            workingDirectory: config.cwd,
+            sessionID: sessionID
+        )
+        let rulesetForCurrentMode: @Sendable () -> Ruleset = {
+            guard let permissions else { return [] }
+            return permissions.rulesetForMode?(modeState.get(), planPath) ?? permissions.ruleset
+        }
+        if let permissions {
             let engine = PermissionEngine(
-                ruleset: permissions.ruleset,
+                rulesetProvider: rulesetForCurrentMode,
                 prompt: { [weak self] request in
                     guard let self else { return .reject(message: "The server is shutting down.") }
                     return await self.awaitPermission(request)
@@ -523,20 +584,44 @@ public actor ServerRuntime {
         }
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         if let workspace = config.promptWorkspace {
-            systemPromptForPrompt = { prompt in workspace.systemPrompt(for: prompt) }
+            systemPromptForPrompt = { prompt in
+                let base = workspace.systemPrompt(for: prompt)
+                guard modeState.get() == .plan else { return base }
+                return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+            }
+        }
+        let filterTools: @Sendable ([any AgentTool]) -> [any AgentTool] = { tools in
+            let mode = modeState.get()
+            let hidden = disabledTools(tools.map(\.definition.name), rulesetForCurrentMode())
+            return tools.filter { tool in
+                (mode == .plan || tool.definition.name != "plan_exit")
+                    && !hidden.contains(tool.definition.name)
+            }
         }
         let toolsForTurn: (@Sendable (String) async -> [any AgentTool])?
         if let resolver = config.toolsForSession {
-            toolsForTurn = { model in await resolver(sessionID, model) }
+            toolsForTurn = { model in filterTools(await resolver(sessionID, model)) }
+        } else if let resolver = config.getTools {
+            toolsForTurn = { model in filterTools(await resolver(model)) }
         } else {
-            toolsForTurn = config.getTools
+            toolsForTurn = nil
+        }
+        let promptForTools: (@Sendable (String, [String]) -> String)?
+        if let configured = config.systemPromptForPromptAndTools {
+            promptForTools = { prompt, names in
+                let base = configured(prompt, names)
+                guard modeState.get() == .plan else { return base }
+                return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+            }
+        } else {
+            promptForTools = nil
         }
         var configuration = AgentHarness.Configuration(
             systemPrompt: config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
-            tools: config.tools,
+            tools: filterTools(config.tools),
             getTools: toolsForTurn,
-            systemPromptForPromptAndTools: config.systemPromptForPromptAndTools,
+            systemPromptForPromptAndTools: promptForTools,
             model: config.model,
             streamFn: config.streamFn,
             streamFnForModel: config.modelStreamFactory,
@@ -687,6 +772,7 @@ public actor ServerRuntime {
         // permission hook can be bound to it (a prompt routes its answer by sessionID).
         let harness: AgentHarness
         let steeringBox: SteeringBox
+        let modeState: AgentModeState
         let id: String
         if let resume {
             let path = try await resolveResume(resume)
@@ -698,18 +784,28 @@ public actor ServerRuntime {
                 return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
             }
             steeringBox = makeSteeringBox()
+            modeState = AgentModeState(config.agentMode)
             harness = try await Self.reopen(
                 path: path,
-                configuration: harnessConfiguration(sessionID: resumedID, steeringBox: steeringBox)
+                configuration: harnessConfiguration(
+                    sessionID: resumedID,
+                    steeringBox: steeringBox,
+                    modeState: modeState
+                )
             )
             id = resumedID
         } else {
             id = UUIDv7.generate().description
             steeringBox = makeSteeringBox()
+            modeState = AgentModeState(config.agentMode)
             harness = try AgentHarness.start(
                 cwd: config.cwd,
                 sessionDirectory: config.sessionDirectory,
-                configuration: harnessConfiguration(sessionID: id, steeringBox: steeringBox),
+                configuration: harnessConfiguration(
+                    sessionID: id,
+                    steeringBox: steeringBox,
+                    modeState: modeState
+                ),
                 sessionID: id
             )
         }
@@ -718,7 +814,12 @@ public actor ServerRuntime {
         // check: a concurrent resume of the same id must not replace a live session
         // and strand its run and its subscribers. `harness` is dropped unused.
         if sessions[id] != nil { return SessionRef(id: id, path: path.string) }
-        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink(), steeringBox: steeringBox)
+        sessions[id] = makeState(
+            harness: harness,
+            sink: BroadcastEventSink(),
+            steeringBox: steeringBox,
+            modeState: modeState
+        )
         return SessionRef(id: id, path: path.string)
     }
 
@@ -732,11 +833,21 @@ public actor ServerRuntime {
         // steering box are both bound to the parent. Re-open the forked file with
         // fresh per-session state even when permissions are disabled.
         let steeringBox = makeSteeringBox()
+        let modeState = AgentModeState(config.agentMode)
         let harness = try await Self.reopen(
             path: path,
-            configuration: harnessConfiguration(sessionID: id, steeringBox: steeringBox)
+            configuration: harnessConfiguration(
+                sessionID: id,
+                steeringBox: steeringBox,
+                modeState: modeState
+            )
         )
-        sessions[id] = makeState(harness: harness, sink: BroadcastEventSink(), steeringBox: steeringBox)
+        sessions[id] = makeState(
+            harness: harness,
+            sink: BroadcastEventSink(),
+            steeringBox: steeringBox,
+            modeState: modeState
+        )
         return SessionRef(id: id, path: path.string)
     }
 
@@ -806,6 +917,15 @@ public actor ServerRuntime {
         let commandStreamFactory = config.commandStreamFactory
         let promptWorkspace = config.promptWorkspace
         let baseSystemPrompt = config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt
+        let modeState = session.modeState
+        let planPath = AgentModePolicy.planPath(
+            workingDirectory: config.cwd,
+            sessionID: sessionID
+        )
+        let addModePrompt: @Sendable (String) -> String = { prompt in
+            guard modeState.get() == .plan else { return prompt }
+            return prompt + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+        }
         session.runSink = sink
         session.runStartedAt = Date()
         session.runTask = Task { [weak self] in
@@ -841,10 +961,10 @@ public actor ServerRuntime {
                             runOverride = AgentHarness.RunOverride(
                                 model: commandModel,
                                 streamFn: stream,
-                                systemPrompt: systemPrompt
+                                systemPrompt: addModePrompt(systemPrompt)
                             )
                         } else {
-                            runOverride = AgentHarness.RunOverride(systemPrompt: systemPrompt)
+                            runOverride = AgentHarness.RunOverride(systemPrompt: addModePrompt(systemPrompt))
                         }
                         _ = try await harness.run(
                             prompt: rendered,
@@ -858,7 +978,9 @@ public actor ServerRuntime {
                         guard case .user(let user) = message else { return nil }
                         return user.text
                     }.first ?? ""
-                    let systemPrompt = promptWorkspace?.systemPrompt(for: promptForSystem) ?? baseSystemPrompt
+                    let systemPrompt = addModePrompt(
+                        promptWorkspace?.systemPrompt(for: promptForSystem) ?? baseSystemPrompt
+                    )
                     _ = try await harness.run(
                         messages: messages,
                         sink: sink,
@@ -1134,7 +1256,11 @@ public actor ServerRuntime {
         let steeringBox = makeSteeringBox()
         let fresh = try await Self.reopen(
             path: path,
-            configuration: harnessConfiguration(sessionID: sessionID, steeringBox: steeringBox),
+            configuration: harnessConfiguration(
+                sessionID: sessionID,
+                steeringBox: steeringBox,
+                modeState: session.modeState
+            ),
             preferring: liveBranch
         )
         // The branch this lever adopts ends, by the nature of what it is for, on an
@@ -1168,7 +1294,12 @@ public actor ServerRuntime {
         session.runTask?.cancel()
         drainPending(session, reason: Self.clearedReason)
         session.steeringBox.clear()
-        sessions[sessionID] = makeState(harness: fresh, sink: session.sink, steeringBox: steeringBox)
+        sessions[sessionID] = makeState(
+            harness: fresh,
+            sink: session.sink,
+            steeringBox: steeringBox,
+            modeState: session.modeState
+        )
         session.sink.broadcast(.queueUpdate(count: 0, mode: steeringBox.mode.rawValue))
         // Terminal frame for anyone still attached: the client's run state is
         // edge-triggered, so without this it stays pinned on "thinking…". Sent on
@@ -1234,7 +1365,9 @@ public actor ServerRuntime {
             accounting: try? await session.harness.accounting(),
             queuedMessageCount: session.steeringBox.count,
             steeringMode: session.steeringBox.mode.rawValue,
-            pendingQuestionIDs: pendingQuestionIDs
+            pendingQuestionIDs: pendingQuestionIDs,
+            mode: session.modeState.get().rawValue,
+            agent: config.agentProfile?.name
         )
     }
 
@@ -1344,6 +1477,19 @@ public actor ServerRuntime {
             streamFn: config.modelStreamFactory?(option.id),
             contextWindow: option.contextWindow ?? config.modelContextWindow?(option.id) ?? config.contextWindow
         )
+    }
+
+    /// Switch the policy/prompt mode for an idle session. The harness stays in
+    /// place, so context and the append-only history remain continuous.
+    @discardableResult
+    public func changeMode(sessionID: String, mode: AgentMode) throws -> AgentMode {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        session.modeState.set(mode)
+        session.sink.broadcast(
+            .notice(ServerNotice(level: .info, code: "mode", text: "mode: \(mode.rawValue)", ttlMilliseconds: 2500))
+        )
+        return mode
     }
 
     public func renameSession(sessionID: String, name: String?) async throws {

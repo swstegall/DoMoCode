@@ -53,6 +53,9 @@ public final class ClientApp {
     /// uses local actions immediately and forwards prompt commands unchanged so
     /// the server remains the authority for template expansion.
     private var commandRegistry = CommandRegistry.builtIn
+    /// The level-triggered policy mode of the selected server session. Tab changes
+    /// this through the runtime; the local value is only a render cache.
+    private var agentMode: AgentMode = .build
 
     /// The terminal's inline-image capability and cell pixel size, detected once at
     /// startup (the client owns the tty; the remote runtime has none).
@@ -567,6 +570,7 @@ public final class ClientApp {
             parts.append("queued \(store.queuedMessageCount)")
         }
         if store.selectedSessionID != nil {
+            parts.append("mode " + agentMode.rawValue)
             parts.append("ws " + workspaceSnapshotStatus.rawValue)
         }
         // Contextual controls come before transient notices. The status row is
@@ -647,7 +651,7 @@ public final class ClientApp {
             // the always-available tail would otherwise disappear before the
             // user can see how to stop a run.
             parts.append("Esc: abort")
-            parts.append("Tab: pane")
+            parts.append("Tab: mode")
             parts.append("Enter: send")
             // The working newline bindings, not the one a user will reach for first.
             // Shift+Enter is byte-identical to Enter unless the terminal volunteers a
@@ -931,6 +935,7 @@ public final class ClientApp {
         }
         guard store.selectedSessionID == id else { return }
         let wasRunning = store.runState == .running
+        adoptAgentMode(status.mode)
         store.adopt(status)
         if wasRunning, !status.running {
             // Said out loud, because from the user's side nothing visibly happened:
@@ -1563,6 +1568,10 @@ public final class ClientApp {
         // scroll position into it would open it part-way up at an arbitrary row.
         transcriptView.scrollToBottom()
         store.select(sessionID)
+        // The status request below is authoritative for this session. Reset the
+        // render cache while it is in flight so a previous session's plan marker
+        // cannot briefly describe the newly selected conversation.
+        agentMode = .build
 
         // Make the session LIVE on the server before touching its live endpoints.
         //
@@ -1663,7 +1672,13 @@ public final class ClientApp {
             return
         }
         guard store.selectedSessionID == id else { return }
+        adoptAgentMode(status.mode)
         store.adoptAccounting(status)
+    }
+
+    private func adoptAgentMode(_ raw: String?) {
+        guard let raw, let mode = AgentMode(rawValue: raw.lowercased()) else { return }
+        agentMode = mode
     }
 
     private func seedWorkspaceStatus(_ id: String) async {
@@ -1914,6 +1929,7 @@ public final class ClientApp {
             SelectItem(value: "rename", label: "Rename session", description: "Persist a display name"),
             SelectItem(value: "title", label: "Auto-title session", description: "Ask the active model for a short name"),
             SelectItem(value: "model", label: "Switch model", description: "Write a model_change entry"),
+            SelectItem(value: "mode", label: "Toggle build/plan mode", description: "Tab also toggles the active policy"),
             SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
             SelectItem(value: "timeline", label: "Show session timeline", description: "Inspect checkpoints and history moves"),
             SelectItem(value: "undo", label: "Undo conversation and workspace", description: "Restore the previous checkpoint"),
@@ -1950,6 +1966,7 @@ public final class ClientApp {
         case "rename": openRenameDialog()
         case "title": autoTitleSession()
         case "model": openModelPicker()
+        case "mode": toggleAgentMode()
         case "tree": openTreePicker()
         case "timeline": showTimeline()
         case "undo": moveWorkspaceHistory(.undo)
@@ -2043,6 +2060,37 @@ public final class ClientApp {
                 self.store.markAccountingStale()
             } catch {
                 self.postError("Could not change model", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    /// Change the selected session's policy boundary. The runtime refuses a
+    /// mid-turn switch, because changing the permission set under an active tool
+    /// call would make one turn observe two different policies.
+    private func toggleAgentMode() {
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        let next: AgentMode = agentMode == .build ? .plan : .build
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.changeMode(sessionID: id, mode: next)
+                guard self.store.selectedSessionID == id else { return }
+                self.agentMode = next
+                self.post(notice: "mode: \(next.rawValue)")
+                self.surface?.requestRender()
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                self.refuseAsBusy()
+                await self.reconcileWithServer(id)
+            } catch {
+                self.postError("Could not change mode", error)
             }
         }
         actionTasks.append(task)
@@ -2993,6 +3041,7 @@ public final class ClientApp {
             do {
                 let status = try await self.client.status(sessionID: id)
                 guard self.store.selectedSessionID == id else { return }
+                self.adoptAgentMode(status.mode)
                 self.diagnosticsStatus = status
             } catch {
                 // Named, not swallowed: "unavailable" and "the token is wrong" are
@@ -3565,6 +3614,13 @@ extension ClientApp: TerminalApp {
                 // triggered by a timing race.
                 selectRejectRow()
             }
+            return
+        }
+        // Tab is the phase-14 mode switch on the main surface. Modal dialogs keep
+        // Tab for their own controls through the branches above; the runtime remains
+        // authoritative and rejects a switch while a turn is running.
+        if data == [0x09] {
+            toggleAgentMode()
             return
         }
         surface?.handleInput(data)

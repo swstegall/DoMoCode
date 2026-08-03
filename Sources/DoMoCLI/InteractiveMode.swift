@@ -2150,7 +2150,10 @@ public struct InteractiveMode: Sendable {
         // configured a credential wants.
         credentialEnvNames: Set<String> = [],
         maxCostPerRun: Decimal? = nil,
-        steeringMode: QueueDeliveryMode = .oneAtATime
+        steeringMode: QueueDeliveryMode = .oneAtATime,
+        agentProfile: AgentProfile? = nil,
+        agentMode: AgentMode = .build,
+        modeRules: Ruleset = []
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
@@ -2177,7 +2180,7 @@ public struct InteractiveMode: Sendable {
             environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames),
             questionHandler: { await questionBox.ask($0) }
         )
-        let registry = ToolRegistry.builtin
+        let registry = ToolRegistry.builtin(includePlanExit: agentMode == .plan)
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools to the built-ins. The manager is held on the session and torn down in
         // ``run`` — the servers spawn in their own process group and would otherwise be
@@ -2194,7 +2197,7 @@ public struct InteractiveMode: Sendable {
                 // the old hardcoded three-name list handed to every server.
                 sensitiveEnvKeys: Redaction.secretEnvironmentNames.union(credentialEnvNames),
                 // Reserve the built-in tool names so an MCP tool can't shadow one.
-                reservedNames: Set(ToolRegistry.builtin.names),
+                reservedNames: Set(registry.names),
                 log: mcpLog ?? { _ in }
             )
             mcpManager = manager
@@ -2210,7 +2213,14 @@ public struct InteractiveMode: Sendable {
             configDirectory: configDirectory,
             // Fall back to the real home, never "": a `~`/`$HOME` deny rule must not
             // expand to a bogus root and fail open when $HOME is unset.
-            homeDirectory: homeDirectory ?? NSHomeDirectory()
+            homeDirectory: homeDirectory ?? NSHomeDirectory(),
+            mode: agentMode,
+            planPath: AgentModePolicy.planPath(
+                workingDirectory: workingDirectory,
+                sessionID: "interactive"
+            ),
+            profileRules: agentProfile?.permissionRules ?? [],
+            modeRules: modeRules
         )
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
         let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
@@ -2222,19 +2232,27 @@ public struct InteractiveMode: Sendable {
             return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visible
         }
 
+        let planPath = AgentModePolicy.planPath(
+            workingDirectory: workingDirectory,
+            sessionID: "interactive"
+        )
         let promptWorkspace = try SystemPromptBuilder(
             workingDirectory: workDirectory,
             configDirectory: FilePath(configDirectory),
             toolNames: registry.names + visibleMcp.map(\.definition.name),
-            projectTrusted: true
+            projectTrusted: true,
+            agentName: agentProfile?.name
         ).build()
         let promptForTools: @Sendable (String, [String]) -> String = { prompt, toolNames in
-            (try? SystemPromptBuilder(
+            let base = (try? SystemPromptBuilder(
                 workingDirectory: workDirectory,
                 configDirectory: FilePath(configDirectory),
                 toolNames: toolNames,
-                projectTrusted: true
+                projectTrusted: true,
+                agentName: agentProfile?.name
             ).build().systemPrompt(for: prompt)) ?? promptWorkspace.systemPrompt(for: prompt)
+            guard agentMode == .plan else { return base }
+            return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
         }
         let commandProcessor = PromptCommandProcessor(
             workspace: promptWorkspace,
@@ -2268,7 +2286,11 @@ public struct InteractiveMode: Sendable {
         let noProgress = doomLoopHook(engine: engine, sessionID: "interactive")
 
         var systemPromptForPrompt: (@Sendable (String) -> String)?
-        systemPromptForPrompt = { prompt in promptWorkspace.systemPrompt(for: prompt) }
+        systemPromptForPrompt = { prompt in
+            let base = promptWorkspace.systemPrompt(for: prompt)
+            guard agentMode == .plan else { return base }
+            return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+        }
         var configuration = AgentHarness.Configuration(
             systemPrompt: promptWorkspace.baseSystemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
@@ -2334,7 +2356,9 @@ public struct InteractiveMode: Sendable {
             commandStreamFactory: { commandModel, effort in
                 var selected = (modelRuntimeFor?(commandModel ?? runtime.model))
                     ?? ModelRuntime(model: commandModel ?? runtime.model)
-                if let effort { selected.reasoningEffort = effort }
+                selected.reasoningEffort = effort
+                    ?? agentProfile?.reasoningEffort
+                    ?? selected.reasoningEffort
                 return makeStreamFn(
                     client: client,
                     runtime: selected,
