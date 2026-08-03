@@ -139,7 +139,15 @@ jobs:
           fi
 
           for target in "${serial_targets[@]}"; do
-            swift test --configuration ${{ matrix.configuration }} --no-parallel --filter "^${target}\."
+            # Server suites own HTTP listeners and async broadcast streams. Swift
+            # Testing's `--no-parallel` still overlaps suites inside one process,
+            # which can leave the optimized server target waiting forever after a
+            # neighboring fixture has torn down its event loop.
+            if [[ "$target" == "DoMoServerTests" ]]; then
+              run_target_suites_serially "$target"
+            else
+              swift test --configuration ${{ matrix.configuration }} --no-parallel --filter "^${target}\."
+            fi
           done
 
           for target in "${parallel_targets[@]}"; do
