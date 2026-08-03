@@ -80,6 +80,10 @@ struct FullScreenClientPTYTests {
     static let alternateScreen = "\u{1b}[?1049h"
     /// Button-event mouse tracking — the sequence `--no-mouse` exists to suppress.
     static let mouseTracking = "\u{1b}[?1002h"
+    /// Every isolated end-to-end workspace is rooted at a `work` directory. The
+    /// session row is rendered only after bootstrap has selected that session, so
+    /// it is the stable readiness signal between the first frame and prompt input.
+    static let openedSessionRow = "work  "
 
     /// Launch the full-screen client on a pty and return everything it wrote
     /// before it was stopped.
@@ -215,20 +219,21 @@ struct FullScreenClientPTYTests {
 
         var captured: [UInt8] = []
         // Wait for the UI to exist before typing at it.
-        let started = Self.poll(timeout: .seconds(20)) {
+        let ready = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            return String(decoding: captured, as: UTF8.self).contains(Self.alternateScreen)
+            let output = String(decoding: captured, as: UTF8.self)
+            return output.contains(Self.alternateScreen) && output.contains(Self.openedSessionRow)
         }
-        #expect(started, "the full-screen client never started")
+        #expect(ready, "the full-screen client never opened its session")
 
-        // The session is created asynchronously after the first frame, so the
-        // submit is re-sent until a request actually reaches the gateway.
-        pty.type("walk every directory")
+        // The pty buffers the line until the client is ready to read it, so write
+        // the prompt and submit exactly once. Re-sending Enter while the first
+        // request is still in flight can queue a second copy of the prompt on a
+        // slower runner, making this test count input timing instead of turns.
+        pty.type("walk every directory\r")
         let accepted = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            if gateway.requestCount > 0 { return true }
-            pty.type("\r")
-            return false
+            return gateway.requestCount > 0
         }
         #expect(accepted, "the prompt was never accepted")
 
@@ -280,18 +285,17 @@ struct FullScreenClientPTYTests {
         }
 
         var captured: [UInt8] = []
-        let started = Self.poll(timeout: .seconds(20)) {
+        let ready = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            return String(decoding: captured, as: UTF8.self).contains(Self.alternateScreen)
+            let output = String(decoding: captured, as: UTF8.self)
+            return output.contains(Self.alternateScreen) && output.contains(Self.openedSessionRow)
         }
-        #expect(started, "the full-screen client never started")
+        #expect(ready, "the full-screen client never opened its session")
 
-        pty.type("keep listing")
+        pty.type("keep listing\r")
         let accepted = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            if gateway.requestCount > 0 { return true }
-            pty.type("\r")
-            return false
+            return gateway.requestCount > 0
         }
         #expect(accepted, "the prompt was never accepted")
 
