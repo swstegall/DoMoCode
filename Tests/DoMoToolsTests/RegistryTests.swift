@@ -14,6 +14,7 @@ struct RegistryTests {
         #expect(registry.names == [
             "read", "bash", "edit", "write", "grep", "find", "ls",
             "todowrite", "glob", "finish", "question", "webfetch", "background_process",
+            "interactive_terminal",
         ])
     }
 

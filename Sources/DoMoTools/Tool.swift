@@ -14,6 +14,7 @@
 import DoMoCore
 import DoMoExec
 import DoMoMemory
+import DoMoTermIO
 import Foundation
 import SystemPackage
 #if canImport(FoundationNetworking)
@@ -224,7 +225,7 @@ public struct ToolRegistry: Sendable {
         var tools: [any Tool] = [
             ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
             TodoWriteTool(store: todoStore), GlobTool(), FinishTool(), QuestionTool(), WebFetchTool(),
-            BackgroundProcessTool(),
+            BackgroundProcessTool(), InteractiveTerminalTool(),
         ]
         if includePlanExit { tools.append(PlanExitTool()) }
         if includeSubagent { tools.append(TaskTool()) }
@@ -355,6 +356,13 @@ public struct ToolContext: Sendable {
     /// The manager is created with the context so one session can poll a process
     /// from a later tool call without sharing it with another session.
     public let backgroundProcesses: BackgroundProcessManager
+    /// The OS-level boundary applied to model-originated child processes. The
+    /// inline PTY provider uses the same launch plan as the shell and background
+    /// process tools; nil means this context is intentionally unsandboxed.
+    public let processSandbox: ProcessSandbox?
+    /// The surface-owned PTY capability. Nil is intentional for print and remote
+    /// sessions, where a child must not be started without a client input channel.
+    public let interactiveTerminal: (any InteractiveTerminalProvider)?
     public let diagnosticsProvider: (any DiagnosticsProvider)?
     public let formatterProvider: (any FormatterProvider)?
     public let sessionRecallProvider: (any SessionRecallProvider)?
@@ -389,6 +397,8 @@ public struct ToolContext: Sendable {
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
+        processSandbox: ProcessSandbox? = nil,
+        interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
         sessionRecallProvider: (any SessionRecallProvider)? = nil,
@@ -404,6 +414,8 @@ public struct ToolContext: Sendable {
         self.questionHandler = questionHandler
         self.webFetch = webFetch
         self.backgroundProcesses = backgroundProcesses
+        self.processSandbox = processSandbox
+        self.interactiveTerminal = interactiveTerminal
         self.diagnosticsProvider = diagnosticsProvider
         self.formatterProvider = formatterProvider
         self.sessionRecallProvider = sessionRecallProvider
@@ -424,6 +436,8 @@ public struct ToolContext: Sendable {
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
+        processSandbox: ProcessSandbox? = nil,
+        interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
         sessionRecallProvider: (any SessionRecallProvider)? = nil,
@@ -440,6 +454,8 @@ public struct ToolContext: Sendable {
             questionHandler: questionHandler,
             webFetch: webFetch,
             backgroundProcesses: backgroundProcesses,
+            processSandbox: processSandbox,
+            interactiveTerminal: interactiveTerminal,
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
             sessionRecallProvider: sessionRecallProvider,
@@ -456,6 +472,7 @@ public struct ToolContext: Sendable {
         withQuestionHandler(
             handler,
             backgroundProcesses: backgroundProcesses,
+            processSandbox: processSandbox,
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
             sessionRecallProvider: sessionRecallProvider,
@@ -472,6 +489,8 @@ public struct ToolContext: Sendable {
     public func withQuestionHandler(
         _ handler: QuestionHandler?,
         backgroundProcesses: BackgroundProcessManager,
+        processSandbox: ProcessSandbox? = nil,
+        interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         formatterProvider: (any FormatterProvider)? = nil,
         sessionRecallProvider: (any SessionRecallProvider)? = nil,
@@ -488,6 +507,8 @@ public struct ToolContext: Sendable {
             questionHandler: handler,
             webFetch: webFetch,
             backgroundProcesses: backgroundProcesses,
+            processSandbox: processSandbox ?? self.processSandbox,
+            interactiveTerminal: interactiveTerminal ?? self.interactiveTerminal,
             diagnosticsProvider: diagnosticsProvider ?? self.diagnosticsProvider,
             formatterProvider: formatterProvider ?? self.formatterProvider,
             sessionRecallProvider: sessionRecallProvider ?? self.sessionRecallProvider,

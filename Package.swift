@@ -219,7 +219,7 @@ let package = Package(
         .target(
             name: "DoMoTools",
             dependencies: [
-                "DoMoCore", "DoMoExec", "DoMoMemory",
+                "DoMoCore", "DoMoExec", "DoMoMemory", "DoMoTermIO",
                 .product(name: "JSONSchema", package: "swift-json-schema"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -367,7 +367,7 @@ let package = Package(
 
         .testTarget(
             name: "DoMoToolsTests",
-            dependencies: ["DoMoTools", "DoMoMemory", "DoMoExec", "DoMoCore"],
+            dependencies: ["DoMoTools", "DoMoMemory", "DoMoExec", "DoMoTermIO", "DoMoCore"],
             swiftSettings: safeSettings
         ),
 
