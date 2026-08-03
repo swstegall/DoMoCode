@@ -29,6 +29,7 @@ struct SubagentTests {
             childSessionID: "child",
             parentSessionID: request.parentSessionID,
             description: request.prompt,
+            agent: request.agent,
             status: .completed,
             output: result.output,
             depth: 1

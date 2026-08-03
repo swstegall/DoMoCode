@@ -355,7 +355,13 @@ public final class ClientApp {
         // emits, the server projects, the store folds — and nothing renders. A
         // retry is the only producer today, and it stayed invisible for exactly
         // that reason.
-        store.onNotice = { [weak self] notice in self?.show(notice) }
+        store.onNotice = { [weak self] notice in
+            self?.show(notice)
+            // Child sessions are created while the parent stream is already open.
+            // Refresh the disk-backed sidebar when the lifecycle event arrives so
+            // the new row is immediately walkable from the client.
+            if notice.code == "subagent" { self?.refreshSessions() }
+        }
         promptInput.onSubmit = { [weak self] text, attachments in self?.submit(text, attachments) }
         promptInput.onPasteImage = { [weak self] in self?.pasteClipboard() }
         // Persist off the render loop. The store is an actor, so the write cannot
@@ -386,6 +392,7 @@ public final class ClientApp {
         footerBar.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
         sidebar.onSelect = { [weak self] id in self?.openSession(id) }
         sidebar.onNew = { [weak self] in self?.newSession() }
+        sidebar.onBack = { [weak self] id in self?.openSession(id) }
 
         // Load sessions/history as the driver's background job — i.e. AFTER the
         // terminal is entered and the first (empty) frame is painted — so the store
@@ -2661,6 +2668,24 @@ public final class ClientApp {
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.open(id)
+        }
+        actionTasks.append(task)
+    }
+
+    /// Refresh the sidebar's disk-backed session list without changing the
+    /// selected transcript. Delegated children are born during a live parent run,
+    /// so their creation is the natural moment to make them visible to a client
+    /// that is already attached to that parent.
+    private func refreshSessions() {
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                self.store.setSessions(try await self.client.listSessions())
+            } catch {
+                // The lifecycle notice is still useful even if this optional
+                // refresh races a runtime restart; the next open or reconnect
+                // will refresh the same list again.
+            }
         }
         actionTasks.append(task)
     }

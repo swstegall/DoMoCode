@@ -206,6 +206,13 @@ public struct AgentProfileRegistry: Codable, Hashable, Sendable {
             source: .builtin
         ),
         AgentProfile(
+            name: "explore",
+            description: "Read-only exploration of the workspace for a parent agent.",
+            systemPrompt: "Inspect the workspace carefully and report findings to the parent agent. Do not modify files or run mutating commands.",
+            mode: .plan,
+            source: .builtin
+        ),
+        AgentProfile(
             name: "plan",
             description: "Reason about the task and write only the session plan.",
             systemPrompt: """

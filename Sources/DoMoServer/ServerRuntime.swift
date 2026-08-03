@@ -147,12 +147,23 @@ public struct SessionSummary: Sendable, Codable, Hashable {
     public let cwd: String
     public let timestamp: String
     public let name: String?
-    public init(id: String, path: String, cwd: String, timestamp: String, name: String? = nil) {
+    /// The parent session file path for a delegated child, or `nil` for a root.
+    /// This is additive so older clients can continue decoding listings.
+    public let parentSession: String?
+    public init(
+        id: String,
+        path: String,
+        cwd: String,
+        timestamp: String,
+        name: String? = nil,
+        parentSession: String? = nil
+    ) {
         self.id = id
         self.path = path
         self.cwd = cwd
         self.timestamp = timestamp
         self.name = name
+        self.parentSession = parentSession
     }
 }
 
@@ -208,16 +219,21 @@ public actor ServerRuntime {
         /// Rebuilds the mode-specific policy for a session's current mode and
         /// exact plan path. The base ruleset remains useful for older embedders.
         public let rulesetForMode: (@Sendable (AgentMode, String) -> Ruleset)?
+        /// The deny-only portion inherited by a child session. Allows and
+        /// session approvals deliberately do not cross the parent boundary.
+        public let inheritedDenyRulesForMode: (@Sendable (AgentMode, String) -> Ruleset)?
         public init(
             ruleset: Ruleset,
             factory: PermissionRequestFactory,
             persist: @escaping @Sendable (Ruleset) async -> Void,
-            rulesetForMode: (@Sendable (AgentMode, String) -> Ruleset)? = nil
+            rulesetForMode: (@Sendable (AgentMode, String) -> Ruleset)? = nil,
+            inheritedDenyRulesForMode: (@Sendable (AgentMode, String) -> Ruleset)? = nil
         ) {
             self.ruleset = ruleset
             self.factory = factory
             self.persist = persist
             self.rulesetForMode = rulesetForMode
+            self.inheritedDenyRulesForMode = inheritedDenyRulesForMode
         }
     }
 
@@ -304,6 +320,12 @@ public actor ServerRuntime {
         /// The selected inert profile and default mode for newly opened sessions.
         public var agentProfile: AgentProfile?
         public var agentMode: AgentMode = .build
+        /// The coordinator shared by session tool contexts. The server installs
+        /// its runner after construction so the context can be built first.
+        public var subagentCoordinator: SubagentCoordinator?
+        /// Root depth is zero. A child at this depth may not create another
+        /// child once the next depth would exceed this cap.
+        public var maxSubagentDepth: Int
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -341,7 +363,9 @@ public actor ServerRuntime {
             questionBroker: QuestionBroker? = nil,
             sessionStartHead: String? = nil,
             git: DoMoGit? = nil,
-            diffSource: (any DiffSource)? = nil
+            diffSource: (any DiffSource)? = nil,
+            subagentCoordinator: SubagentCoordinator? = nil,
+            maxSubagentDepth: Int = 2
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -372,6 +396,8 @@ public actor ServerRuntime {
             self.workspaceSnapshotsForSession = nil
             self.diffSource = diffSource
             self.questionBroker = questionBroker
+            self.subagentCoordinator = subagentCoordinator
+            self.maxSubagentDepth = max(0, maxSubagentDepth)
         }
     }
 
@@ -457,7 +483,15 @@ public actor ServerRuntime {
         let sink: BroadcastEventSink
         let steeringBox: SteeringBox
         let modeState: AgentModeState
+        let depth: Int
+        let parentSessionID: String?
+        let taskID: String?
+        let agent: String?
         var runTask: Task<Void, Never>?
+        /// The typed result task for a delegated child. The ordinary `runTask`
+        /// remains a `Task<Void, Never>` so abort/status keep one invariant for
+        /// every session, while foreground callers can await this value.
+        var subagentResultTask: Task<SubagentTaskResult, Never>?
         /// The gate on the current run's output. Retained beside `runTask` so
         /// ``forceClearRun(sessionID:)`` can silence a run it is abandoning.
         var runSink: RunSink?
@@ -476,14 +510,35 @@ public actor ServerRuntime {
             harness: AgentHarness,
             sink: BroadcastEventSink,
             steeringBox: SteeringBox,
-            modeState: AgentModeState
+            modeState: AgentModeState,
+            depth: Int = 0,
+            parentSessionID: String? = nil,
+            taskID: String? = nil,
+            agent: String? = nil
         ) {
             self.token = token
             self.harness = harness
             self.sink = sink
             self.steeringBox = steeringBox
             self.modeState = modeState
+            self.depth = depth
+            self.parentSessionID = parentSessionID
+            self.taskID = taskID
+            self.agent = agent
         }
+    }
+
+    /// The in-memory index for a task id. The child session itself is durable;
+    /// this record only makes repeated `task_id` calls cheap while the runtime
+    /// is alive and gives the completion path its parent and delivery mode.
+    private struct SubagentRecord {
+        let taskID: String
+        let childSessionID: String
+        let parentSessionID: String
+        let depth: Int
+        var agent: String?
+        var description: String
+        var background: Bool
     }
 
     /// A suspended permission prompt: the original request (so a re-attaching client
@@ -501,6 +556,7 @@ public actor ServerRuntime {
 
     private let config: Config
     private var sessions: [String: SessionState] = [:]
+    private var subagents: [String: SubagentRecord] = [:]
     private var nextToken = 0
 
     public init(config: Config) {
@@ -529,7 +585,11 @@ public actor ServerRuntime {
         harness: AgentHarness,
         sink: BroadcastEventSink,
         steeringBox: SteeringBox,
-        modeState: AgentModeState
+        modeState: AgentModeState,
+        depth: Int = 0,
+        parentSessionID: String? = nil,
+        taskID: String? = nil,
+        agent: String? = nil
     ) -> SessionState {
         let token = nextToken
         nextToken += 1
@@ -538,7 +598,11 @@ public actor ServerRuntime {
             harness: harness,
             sink: sink,
             steeringBox: steeringBox,
-            modeState: modeState
+            modeState: modeState,
+            depth: depth,
+            parentSessionID: parentSessionID,
+            taskID: taskID,
+            agent: agent
         )
     }
 
@@ -553,7 +617,11 @@ public actor ServerRuntime {
     private func harnessConfiguration(
         sessionID: String,
         steeringBox: SteeringBox,
-        modeState: AgentModeState
+        modeState: AgentModeState,
+        permissionSessionID: String? = nil,
+        derivedPermissions: Bool = false,
+        profileRules: Ruleset = [],
+        promptWorkspaceOverride: PromptWorkspace? = nil
     ) -> AgentHarness.Configuration {
         let steeringReader: @Sendable () async -> [Message] = { [weak self, steeringBox] in
             guard let self else { return steeringBox.drain() }
@@ -566,9 +634,21 @@ public actor ServerRuntime {
             workingDirectory: config.cwd,
             sessionID: sessionID
         )
+        let promptWorkspace = promptWorkspaceOverride ?? config.promptWorkspace
         let rulesetForCurrentMode: @Sendable () -> Ruleset = {
             guard let permissions else { return [] }
-            return permissions.rulesetForMode?(modeState.get(), planPath) ?? permissions.ruleset
+            let mode = modeState.get()
+            if derivedPermissions {
+                let childPolicy = AgentModePolicy.rules(
+                    for: mode,
+                    planPath: planPath,
+                    additional: AgentModePolicy.denyOnly(profileRules)
+                )
+                let inherited = permissions.inheritedDenyRulesForMode?(mode, planPath)
+                    ?? permissions.ruleset.filter { $0.action == .deny }
+                return merge(childPolicy, inherited)
+            }
+            return permissions.rulesetForMode?(mode, planPath) ?? permissions.ruleset
         }
         if let permissions {
             let engine = PermissionEngine(
@@ -579,11 +659,12 @@ public actor ServerRuntime {
                 },
                 persist: permissions.persist
             )
-            beforeToolCall = permissionHook(engine: engine, factory: permissions.factory, sessionID: sessionID)
-            onNoProgress = doomLoopHook(engine: engine, sessionID: sessionID)
+            let routedSessionID = permissionSessionID ?? sessionID
+            beforeToolCall = permissionHook(engine: engine, factory: permissions.factory, sessionID: routedSessionID)
+            onNoProgress = doomLoopHook(engine: engine, sessionID: routedSessionID)
         }
         var systemPromptForPrompt: (@Sendable (String) -> String)?
-        if let workspace = config.promptWorkspace {
+        if let workspace = promptWorkspace {
             systemPromptForPrompt = { prompt in
                 let base = workspace.systemPrompt(for: prompt)
                 guard modeState.get() == .plan else { return base }
@@ -617,7 +698,7 @@ public actor ServerRuntime {
             promptForTools = nil
         }
         var configuration = AgentHarness.Configuration(
-            systemPrompt: config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
+            systemPrompt: promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
             tools: filterTools(config.tools),
             getTools: toolsForTurn,
@@ -763,6 +844,63 @@ public actor ServerRuntime {
         }
     }
 
+    private struct DelegationMetadata: Sendable {
+        let header: SessionHeader
+        let latestEvent: SubagentTaskEvent?
+    }
+
+    /// Read the durable relationship and its latest lifecycle event together.
+    /// Reopening a child must restore its plan profile and task identity, not just
+    /// its message branch; keeping this off the runtime actor also avoids making a
+    /// large JSONL read block unrelated session requests.
+    @concurrent
+    private static func loadDelegationMetadata(at path: FilePath) async throws -> DelegationMetadata {
+        let store = JSONLSessionStore(path: path)
+        let header = try store.readHeader()
+        let latestEvent = try SessionTree.load(from: store).entries.reversed().compactMap { entry -> SubagentTaskEvent? in
+            guard case .subagent(let event) = entry.payload else { return nil }
+            return event
+        }.first
+        return DelegationMetadata(header: header, latestEvent: latestEvent)
+    }
+
+    @concurrent
+    private static func loadDelegationEvent(
+        at path: FilePath,
+        taskID: String
+    ) async throws -> SubagentTaskEvent? {
+        try SessionTree.load(from: JSONLSessionStore(path: path)).entries.reversed().compactMap { entry -> SubagentTaskEvent? in
+            guard case .subagent(let event) = entry.payload, event.taskID == taskID else { return nil }
+            return event
+        }.first
+    }
+
+    private func subagentProfile(named name: String?) -> AgentProfile? {
+        guard let name else { return AgentProfileRegistry.builtIn.profile(named: "explore") }
+        return config.promptWorkspace?.agents.profile(named: name)
+            ?? AgentProfileRegistry.builtIn.profile(named: name)
+    }
+
+    private func subagentWorkspace(named name: String?) -> PromptWorkspace? {
+        guard let profile = subagentProfile(named: name) else { return config.promptWorkspace }
+        if let workspace = config.promptWorkspace {
+            return PromptWorkspace(
+                baseSystemPrompt: workspace.baseSystemPrompt,
+                commands: workspace.commands,
+                skills: workspace.skills,
+                agents: workspace.agents,
+                activeAgent: profile
+            )
+        }
+        return PromptWorkspace(
+            baseSystemPrompt: config.systemPrompt,
+            commands: .builtIn,
+            skills: [],
+            agents: AgentProfileRegistry.builtIn,
+            activeAgent: profile
+        )
+    }
+
     // MARK: Lifecycle
 
     /// Create a fresh session, or open an existing one when `resume` names a
@@ -774,6 +912,10 @@ public actor ServerRuntime {
         let steeringBox: SteeringBox
         let modeState: AgentModeState
         let id: String
+        var depth = 0
+        var parentSessionID: String?
+        var taskID: String?
+        var agent: String?
         if let resume {
             let path = try await resolveResume(resume)
             let resumedID = try await Self.readSessionID(at: path)
@@ -783,14 +925,31 @@ public actor ServerRuntime {
             if let existing = sessions[resumedID] {
                 return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
             }
+            let metadata = try? await Self.loadDelegationMetadata(at: path)
+            let latestEvent = metadata?.latestEvent
+            let child = metadata?.header.parentSession != nil
+            if child {
+                depth = max(1, latestEvent?.depth ?? 1)
+                taskID = latestEvent?.taskID
+                agent = latestEvent?.agent ?? "explore"
+                if let parentPath = metadata?.header.parentSession {
+                    parentSessionID = try? await Self.readSessionID(at: FilePath(parentPath))
+                }
+            }
             steeringBox = makeSteeringBox()
-            modeState = AgentModeState(config.agentMode)
+            let profileName = latestEvent?.agent ?? "explore"
+            let profile = child ? subagentProfile(named: profileName) : nil
+            modeState = AgentModeState(child ? .plan : config.agentMode)
             harness = try await Self.reopen(
                 path: path,
                 configuration: harnessConfiguration(
                     sessionID: resumedID,
                     steeringBox: steeringBox,
-                    modeState: modeState
+                    modeState: modeState,
+                    permissionSessionID: child ? parentSessionID : nil,
+                    derivedPermissions: child,
+                    profileRules: profile?.permissionRules ?? [],
+                    promptWorkspaceOverride: child ? subagentWorkspace(named: profileName) : nil
                 )
             )
             id = resumedID
@@ -818,7 +977,11 @@ public actor ServerRuntime {
             harness: harness,
             sink: BroadcastEventSink(),
             steeringBox: steeringBox,
-            modeState: modeState
+            modeState: modeState,
+            depth: depth,
+            parentSessionID: parentSessionID,
+            taskID: taskID,
+            agent: agent
         )
         return SessionRef(id: id, path: path.string)
     }
@@ -857,6 +1020,372 @@ public actor ServerRuntime {
         // preserves the append-only branch; clone is a separate entry point for
         // surfaces that want copy semantics without tree-navigation terminology.
         try await fork(sessionID: sessionID)
+    }
+
+    // MARK: Subagents
+
+    /// Runs a delegated task in a real child session.
+    ///
+    /// The child is a separate harness because ``AgentHarness`` deliberately
+    /// rejects concurrent runs on one instance. Foreground tasks await that
+    /// child's result; background tasks return an accepted result and deliver
+    /// completion through the parent's steering queue when it is still running,
+    /// or start a new parent run when it is idle.
+    public func runSubagent(_ request: SubagentTaskRequest) async -> SubagentTaskResult {
+        guard let parent = sessions[request.parentSessionID] else {
+            return .failure(taskID: request.taskID, "Parent session is unavailable")
+        }
+        let childDepth = parent.depth + 1
+        guard childDepth <= config.maxSubagentDepth else {
+            return .failure(
+                taskID: request.taskID,
+                "Subagent depth limit reached (maximum \(config.maxSubagentDepth))"
+            )
+        }
+
+        if let record = subagents[request.taskID] {
+            guard record.parentSessionID == request.parentSessionID else {
+                return .failure(taskID: request.taskID, "task_id belongs to another parent session")
+            }
+            guard let child = sessions[record.childSessionID] else {
+                return .failure(taskID: request.taskID, "The child session for this task is unavailable")
+            }
+            if let resultTask = child.subagentResultTask {
+                if request.background {
+                    return SubagentTaskResult(
+                        taskID: request.taskID,
+                        childSessionID: record.childSessionID,
+                        status: .accepted
+                    )
+                }
+                return await resultTask.value
+            }
+            let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resumedPrompt = prompt.isEmpty ? record.description : prompt
+            let updated = SubagentRecord(
+                taskID: record.taskID,
+                childSessionID: record.childSessionID,
+                parentSessionID: record.parentSessionID,
+                depth: record.depth,
+                agent: request.agent ?? record.agent,
+                description: resumedPrompt,
+                background: request.background
+            )
+            subagents[request.taskID] = updated
+            await publishSubagentEvent(
+                SubagentTaskEvent(
+                    taskID: request.taskID,
+                    childSessionID: record.childSessionID,
+                    parentSessionID: request.parentSessionID,
+                    description: resumedPrompt,
+                    agent: updated.agent,
+                    status: .started,
+                    depth: record.depth
+                )
+            )
+            return await launchSubagentRun(request: request, record: updated, child: child, prompt: resumedPrompt)
+        }
+
+        // The in-memory index is intentionally disposable. After a runtime
+        // restart, recover the task from the parent's persisted lifecycle event
+        // and reopen the same child file instead of creating a duplicate session.
+        let parentPath = await parent.harness.sessionFilePath
+        if let event = try? await Self.loadDelegationEvent(at: parentPath, taskID: request.taskID),
+           event.parentSessionID == request.parentSessionID {
+            do {
+                if sessions[event.childSessionID] == nil {
+                    _ = try await createSession(resume: event.childSessionID)
+                }
+                guard let child = sessions[event.childSessionID] else {
+                    return .failure(taskID: request.taskID, childSessionID: event.childSessionID, "The child session is unavailable")
+                }
+                let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                let resumedPrompt = prompt.isEmpty ? event.description : prompt
+                let record = SubagentRecord(
+                    taskID: request.taskID,
+                    childSessionID: event.childSessionID,
+                    parentSessionID: request.parentSessionID,
+                    depth: event.depth,
+                    agent: request.agent ?? event.agent,
+                    description: resumedPrompt,
+                    background: request.background
+                )
+                subagents[request.taskID] = record
+                await publishSubagentEvent(
+                    SubagentTaskEvent(
+                        taskID: request.taskID,
+                        childSessionID: event.childSessionID,
+                        parentSessionID: request.parentSessionID,
+                        description: resumedPrompt,
+                        agent: record.agent,
+                        status: .started,
+                        depth: event.depth
+                    )
+                )
+                return await launchSubagentRun(request: request, record: record, child: child, prompt: resumedPrompt)
+            } catch {
+                return .failure(taskID: request.taskID, childSessionID: event.childSessionID, "The child session could not be resumed")
+            }
+        }
+
+        let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else {
+            return .failure(taskID: request.taskID, "A new task needs a prompt")
+        }
+        let profile: AgentProfile?
+        if let requestedAgent = request.agent {
+            profile = config.promptWorkspace?.agents.profile(named: requestedAgent)
+                ?? AgentProfileRegistry.builtIn.profile(named: requestedAgent)
+            guard profile != nil else {
+                return .failure(taskID: request.taskID, "Unknown subagent profile: \(requestedAgent)")
+            }
+        } else {
+            profile = AgentProfileRegistry.builtIn.profile(named: "explore")
+        }
+        let childID = UUIDv7.generate().description
+        let childMode = AgentModeState(.plan)
+        let childSteering = makeSteeringBox()
+        let childAgent = request.agent ?? profile?.name
+        let childWorkspace = subagentWorkspace(named: childAgent)
+        let childConfiguration = harnessConfiguration(
+            sessionID: childID,
+            steeringBox: childSteering,
+            modeState: childMode,
+            permissionSessionID: request.parentSessionID,
+            derivedPermissions: true,
+            profileRules: profile?.permissionRules ?? [],
+            promptWorkspaceOverride: childWorkspace
+        )
+        do {
+            let parentPath = await parent.harness.sessionFilePath
+            let childHarness = try AgentHarness.start(
+                cwd: config.cwd,
+                sessionDirectory: config.sessionDirectory,
+                configuration: childConfiguration,
+                sessionID: childID,
+                parentSession: parentPath.string
+            )
+            let childSink = BroadcastEventSink()
+            let child = makeState(
+                harness: childHarness,
+                sink: childSink,
+                steeringBox: childSteering,
+                modeState: childMode,
+                depth: childDepth,
+                parentSessionID: request.parentSessionID,
+                taskID: request.taskID,
+                agent: childAgent
+            )
+            sessions[childID] = child
+            let record = SubagentRecord(
+                taskID: request.taskID,
+                childSessionID: childID,
+                parentSessionID: request.parentSessionID,
+                depth: childDepth,
+                agent: request.agent ?? profile?.name,
+                description: prompt,
+                background: request.background
+            )
+            subagents[request.taskID] = record
+            await publishSubagentEvent(
+                SubagentTaskEvent(
+                    taskID: request.taskID,
+                    childSessionID: childID,
+                    parentSessionID: request.parentSessionID,
+                    description: prompt,
+                    agent: record.agent,
+                    status: .started,
+                    depth: childDepth
+                )
+            )
+            return await launchSubagentRun(request: request, record: record, child: child, prompt: prompt)
+        } catch {
+            let message = (error as? DoMoError)?.description ?? "Could not create child session"
+            return .failure(taskID: request.taskID, message)
+        }
+    }
+
+    /// Persist and broadcast a delegation event to both sides of the parent/child
+    /// relationship. The parent stream is the important one for UI delivery; the
+    /// child stream makes a session opened directly after creation self-describing.
+    public func recordSubagentEvent(_ event: SubagentTaskEvent) async {
+        let parent = sessions[event.parentSessionID]
+        if let parent {
+            try? await parent.harness.recordSubagentEvent(event)
+            parent.sink.broadcast(.subagent(event))
+        }
+        if let child = sessions[event.childSessionID], child !== parent {
+            try? await child.harness.recordSubagentEvent(event)
+            child.sink.broadcast(.subagent(event))
+        }
+    }
+
+    private func publishSubagentEvent(_ event: SubagentTaskEvent) async {
+        await recordSubagentEvent(event)
+    }
+
+    private func launchSubagentRun(
+        request: SubagentTaskRequest,
+        record: SubagentRecord,
+        child: SessionState,
+        prompt: String
+    ) async -> SubagentTaskResult {
+        if let resultTask = child.subagentResultTask {
+            if request.background {
+                return SubagentTaskResult(
+                    taskID: request.taskID,
+                    childSessionID: record.childSessionID,
+                    status: .accepted
+                )
+            }
+            return await resultTask.value
+        }
+        guard child.runTask == nil else {
+            return .failure(taskID: request.taskID, childSessionID: record.childSessionID, "The child session is busy")
+        }
+
+        let childHarness = child.harness
+        let childSink = RunSink(child.sink)
+        let childToken = child.token
+        let childID = record.childSessionID
+        let parentID = record.parentSessionID
+        let depth = record.depth
+        let description = record.description
+        let background = request.background
+        child.runSink = childSink
+        child.runStartedAt = Date()
+        let resultTask = Task { [weak self] () -> SubagentTaskResult in
+            let result: SubagentTaskResult
+            do {
+                let run = try await childHarness.run(prompt: prompt, sink: childSink)
+                let output = run.messages.reversed().compactMap { message -> String? in
+                    guard case .assistant(let assistant) = message else { return nil }
+                    let text = assistant.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return text.isEmpty ? nil : text
+                }.first
+                switch run.stopReason {
+                case .aborted:
+                    result = SubagentTaskResult(
+                        taskID: request.taskID,
+                        childSessionID: childID,
+                        status: .cancelled,
+                        output: output,
+                        error: "The child run was cancelled"
+                    )
+                case .errored:
+                    result = .failure(
+                        taskID: request.taskID,
+                        childSessionID: childID,
+                        run.failure?.description ?? "The child run failed"
+                    )
+                default:
+                    result = SubagentTaskResult(
+                        taskID: request.taskID,
+                        childSessionID: childID,
+                        status: .completed,
+                        output: output
+                    )
+                }
+            } catch is CancellationError {
+                result = SubagentTaskResult(
+                    taskID: request.taskID,
+                    childSessionID: childID,
+                    status: .cancelled,
+                    error: "The child run was cancelled"
+                )
+            } catch let error as DoMoError {
+                result = error.isCancellation
+                    ? SubagentTaskResult(
+                        taskID: request.taskID,
+                        childSessionID: childID,
+                        status: .cancelled,
+                        error: error.description
+                    )
+                    : .failure(taskID: request.taskID, childSessionID: childID, error.description)
+            } catch {
+                result = .failure(taskID: request.taskID, childSessionID: childID, "The child run failed")
+            }
+            await self?.finishSubagent(
+                taskID: request.taskID,
+                childSessionID: childID,
+                parentSessionID: parentID,
+                token: childToken,
+                depth: depth,
+                description: description,
+                background: background,
+                result: result
+            )
+            return result
+        }
+        child.subagentResultTask = resultTask
+        child.runTask = Task { _ = await resultTask.value }
+        if request.background {
+            return SubagentTaskResult(
+                taskID: request.taskID,
+                childSessionID: record.childSessionID,
+                status: .accepted
+            )
+        }
+        return await resultTask.value
+    }
+
+    private func finishSubagent(
+        taskID: String,
+        childSessionID: String,
+        parentSessionID: String,
+        token: Int,
+        depth: Int,
+        description: String,
+        background: Bool,
+        result: SubagentTaskResult
+    ) async {
+        guard let child = sessions[childSessionID], child.token == token else { return }
+        child.runTask = nil
+        child.subagentResultTask = nil
+        child.runSink = nil
+        child.runStartedAt = nil
+        subagents[taskID]?.description = description
+        subagents[taskID]?.background = background
+
+        let event = SubagentTaskEvent(
+            taskID: taskID,
+            childSessionID: childSessionID,
+            parentSessionID: parentSessionID,
+            description: description,
+            agent: subagents[taskID]?.agent,
+            status: result.status,
+            output: result.output,
+            error: result.error,
+            depth: depth
+        )
+        await publishSubagentEvent(event)
+        guard background, let parent = sessions[parentSessionID] else { return }
+
+        let output = result.output ?? result.error ?? "No result was returned."
+        let message = Message.user(
+            "Subagent task \(taskID) \(result.status.rawValue) in child session \(childSessionID).\n\n\(output)"
+        )
+        if parent.runTask != nil {
+            parent.steeringBox.enqueue(message)
+            parent.sink.broadcast(
+                .queueUpdate(count: parent.steeringBox.count, mode: parent.steeringBox.mode.rawValue)
+            )
+            return
+        }
+        do {
+            try startRun(
+                sessionID: parentSessionID,
+                messages: [message],
+                commandPrompt: nil,
+                attachments: [],
+                drainSteeringBeforeFirstTurn: false
+            )
+        } catch {
+            parent.steeringBox.enqueue(message)
+            parent.sink.broadcast(
+                .queueUpdate(count: parent.steeringBox.count, mode: parent.steeringBox.mode.rawValue)
+            )
+        }
     }
 
     // MARK: Runs
@@ -1116,6 +1645,13 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         let wasRunning = session.runTask != nil
         session.runTask?.cancel()
+        session.subagentResultTask?.cancel()
+        // A foreground child is part of the parent's tool call and must not
+        // outlive an aborted parent. Background children intentionally survive
+        // so their results can still arrive through the Phase 9 queue.
+        for record in subagents.values where record.parentSessionID == sessionID && !record.background {
+            sessions[record.childSessionID]?.subagentResultTask?.cancel()
+        }
         drainPending(session, reason: "The tool call was aborted.")
         return wasRunning
     }
@@ -1292,13 +1828,21 @@ public actor ServerRuntime {
         // can emit into a sink the replacement state already owns.
         session.runSink?.detach()
         session.runTask?.cancel()
+        session.subagentResultTask?.cancel()
+        for record in subagents.values where record.parentSessionID == sessionID && !record.background {
+            sessions[record.childSessionID]?.subagentResultTask?.cancel()
+        }
         drainPending(session, reason: Self.clearedReason)
         session.steeringBox.clear()
         sessions[sessionID] = makeState(
             harness: fresh,
             sink: session.sink,
             steeringBox: steeringBox,
-            modeState: session.modeState
+            modeState: session.modeState,
+            depth: session.depth,
+            parentSessionID: session.parentSessionID,
+            taskID: session.taskID,
+            agent: session.agent
         )
         session.sink.broadcast(.queueUpdate(count: 0, mode: steeringBox.mode.rawValue))
         // Terminal frame for anyone still attached: the client's run state is
@@ -1367,7 +1911,7 @@ public actor ServerRuntime {
             steeringMode: session.steeringBox.mode.rawValue,
             pendingQuestionIDs: pendingQuestionIDs,
             mode: session.modeState.get().rawValue,
-            agent: config.agentProfile?.name
+            agent: session.agent ?? config.agentProfile?.name
         )
     }
 
@@ -1724,7 +2268,8 @@ public actor ServerRuntime {
                 path: $0.path.string,
                 cwd: $0.header.cwd,
                 timestamp: $0.header.timestamp,
-                name: name
+                name: name,
+                parentSession: $0.header.parentSession
             )
         }
     }
@@ -1747,6 +2292,7 @@ public actor ServerRuntime {
     public func shutdown() {
         for session in sessions.values {
             session.runTask?.cancel()
+            session.subagentResultTask?.cancel()
             drainPending(session, reason: "The server is shutting down.")
             session.sink.closeAll()
         }

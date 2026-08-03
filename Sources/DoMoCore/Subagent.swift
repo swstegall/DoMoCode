@@ -85,6 +85,9 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
     public let childSessionID: String
     public let parentSessionID: String
     public let description: String
+    /// The inert profile selected for the child, when one was requested.
+    /// Optional so older session metadata and wire clients remain readable.
+    public let agent: String?
     public let status: SubagentTaskStatus
     public let output: String?
     public let error: String?
@@ -95,6 +98,7 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         childSessionID: String,
         parentSessionID: String,
         description: String,
+        agent: String? = nil,
         status: SubagentTaskStatus,
         output: String? = nil,
         error: String? = nil,
@@ -104,6 +108,7 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         self.childSessionID = childSessionID
         self.parentSessionID = parentSessionID
         self.description = description
+        self.agent = agent
         self.status = status
         self.output = output
         self.error = error

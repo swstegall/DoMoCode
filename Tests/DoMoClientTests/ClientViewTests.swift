@@ -65,6 +65,29 @@ struct ClientViewTests {
         #expect(newed)
     }
 
+    @Test("Sidebar marks a child and returns to its parent")
+    func sidebarBackToParent() {
+        let parent = summary("parent01")
+        let child = SessionSummary(
+            id: "child02",
+            path: "/sessions/child02.jsonl",
+            cwd: "/home/proj",
+            timestamp: "2026",
+            parentSession: parent.path
+        )
+        let sidebar = SessionSidebar()
+        sidebar.sessions = [parent, child]
+        sidebar.openID = child.id
+        var returned: String?
+        sidebar.onBack = { returned = $0 }
+
+        let lines = sidebar.render(width: 40)
+        sidebar.handleInput([0x62])   // 'b'
+
+        #expect(lines.contains { $0.contains("↳") })
+        #expect(returned == parent.id)
+    }
+
     @Test("The transcript marks roles and renders a tool header")
     func transcriptFormatting() {
         let view = TranscriptView()

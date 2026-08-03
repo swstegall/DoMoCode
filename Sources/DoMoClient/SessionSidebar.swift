@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 //
 // The sidebar: a focusable session list. Up/down (arrows or j/k) move a cursor,
-// Enter opens the cursor's session, `n` starts a new one. The open session is
-// marked; the cursor row is highlighted only while the sidebar holds focus, so
-// the user can see which pane is active.
+// Enter opens the cursor's session, `n` starts a new one, and `b` returns from a
+// delegated child to its parent. The open session is marked; the cursor row is
+// highlighted only while the sidebar holds focus, so the user can see which pane
+// is active.
 
 import DoMoServer
 import DoMoTUI
@@ -23,6 +24,8 @@ final class SessionSidebar: @MainActor Focusable {
     var onSelect: ((String) -> Void)?
     /// Start a new session.
     var onNew: (() -> Void)?
+    /// Open the current session's parent, when it is a delegated child.
+    var onBack: ((String) -> Void)?
 
     private var cursor = 0
 
@@ -48,7 +51,7 @@ final class SessionSidebar: @MainActor Focusable {
     func render(width: Int) -> [String] {
         guard width > 0 else { return [] }
         var lines: [String] = []
-        lines.append(truncateToWidth(dim("Sessions (n: new)"), width))
+        lines.append(truncateToWidth(dim("Sessions (n: new · b: parent)"), width))
         lines.append(String(repeating: "─", count: width))
 
         if sessions.isEmpty {
@@ -81,6 +84,13 @@ final class SessionSidebar: @MainActor Focusable {
             onSelect?(sessions[index].id)
         case [0x6e]:                                     // 'n' — new session
             onNew?()
+        case [0x62]:                                     // 'b' — parent session
+            guard let currentID = openID,
+                  let current = sessions.first(where: { $0.id == currentID }),
+                  let parentPath = current.parentSession,
+                  let parent = sessions.first(where: { $0.path == parentPath })
+            else { return }
+            onBack?(parent.id)
         default:
             break
         }
@@ -95,9 +105,10 @@ final class SessionSidebar: @MainActor Focusable {
     private func sessionLabel(_ session: SessionSummary) -> String {
         let shortID = String(session.id.suffix(6))
         let cwdName = session.cwd.split(separator: "/").last.map(String.init) ?? session.cwd
+        let childMarker = session.parentSession == nil ? "" : "↳ "
         if let name = session.name, !name.isEmpty {
-            return "\(sanitizeUntrustedText(name))  ·  \(sanitizeUntrustedText(cwdName))  \(shortID)"
+            return "\(childMarker)\(sanitizeUntrustedText(name))  ·  \(sanitizeUntrustedText(cwdName))  \(shortID)"
         }
-        return "\(sanitizeUntrustedText(cwdName))  \(shortID)"
+        return "\(childMarker)\(sanitizeUntrustedText(cwdName))  \(shortID)"
     }
 }

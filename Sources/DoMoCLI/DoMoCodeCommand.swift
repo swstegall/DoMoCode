@@ -916,10 +916,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     ) {
         let shell = try SubprocessShell()
         let sessionStartHead = try? await DoMoGit(shell: shell).head(at: workingDirectory)
+        let subagentCoordinator = SubagentCoordinator()
         let toolContext = try await ToolContext.rooted(
             at: workingDirectory,
             shell: shell,
-            environment: Self.toolEnvironment(configuration)
+            environment: Self.toolEnvironment(configuration),
+            subagentCoordinator: subagentCoordinator
         )
         // Keep plan_exit in the server registry even when the default mode is build;
         // ServerRuntime filters it from build sessions and reveals it when a session
@@ -948,6 +950,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     planPath: planPath,
                     additional: configuredModeRules[mode.rawValue] ?? []
                 )
+            )
+        }
+        let inheritedDenyRulesForMode: @Sendable (AgentMode, String) -> Ruleset = { mode, _ in
+            merge(
+                baseRuleset.filter { $0.action == .deny },
+                AgentModePolicy.denyOnly(configuredModeRules[mode.rawValue] ?? [])
             )
         }
         // MCP tools (Phase 8c): the manager is returned so the caller tears the servers
@@ -991,7 +999,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     return nil
                 }
                 return answers.map { QuestionAnswer(selectedLabels: $0.selectedLabels) }
-            }, backgroundProcesses: resources.backgroundProcesses)
+            },
+            backgroundProcesses: resources.backgroundProcesses,
+            subagentCoordinator: subagentCoordinator,
+            sessionID: sessionID
+            )
             let currentMcp = await mcpManager.tools()
             // The mode-aware filter in ServerRuntime owns visibility for the live
             // session; keep the resolver's MCP snapshot complete so mode changes
@@ -1053,7 +1065,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 ruleset: baseRuleset,
                 factory: permission.factory,
                 persist: permission.persist,
-                rulesetForMode: rulesetForMode
+                rulesetForMode: rulesetForMode,
+                inheritedDenyRulesForMode: inheritedDenyRulesForMode
             ),
             // `nil` when nothing declared a window for this alias. It travels as
             // `nil` all the way to the footer, which renders "?" — never a
@@ -1086,7 +1099,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             toolsForSession: sessionToolResolver,
             questionBroker: questionBroker,
             sessionStartHead: sessionStartHead,
-            diffSource: DoMoGit(shell: shell)
+            diffSource: DoMoGit(shell: shell),
+            subagentCoordinator: subagentCoordinator
         )
         runtimeConfiguration.agentProfile = agentProfile
         runtimeConfiguration.agentMode = agentMode
@@ -1098,6 +1112,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             )
         }
         let runtime = ServerRuntime(config: runtimeConfiguration)
+        subagentCoordinator.setRunner { [weak runtime] request in
+            guard let runtime else {
+                return .failure(taskID: request.taskID, "Subagent runtime is unavailable")
+            }
+            return await runtime.runSubagent(request)
+        }
         return (runtime, mcpManager, backgroundSessions)
     }
 
