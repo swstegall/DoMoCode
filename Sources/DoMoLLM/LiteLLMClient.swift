@@ -1276,3 +1276,35 @@ enum LiteLLMErrorPatterns {
 
     static func isRetryableBody(_ text: String) -> Bool { matches(text, retryable) }
 }
+
+// MARK: - Context overflow detection
+
+/// Whether an assistant message means that the request did not fit the model's
+/// context window.
+///
+/// Providers disagree about how they report this. Most return an error string,
+/// some accept the request and report an input count beyond the configured
+/// window, and a few truncate the input and return `length` with no output. The
+/// three signals are deliberately kept together so the harness does not have to
+/// rediscover provider wording or duplicate token arithmetic.
+public func isContextOverflow(_ message: AssistantMessage, contextWindow: Int? = nil) -> Bool {
+    if message.stopReason == .error, let errorMessage = message.errorMessage {
+        if LiteLLMErrorPatterns.isContextOverflow(errorMessage) { return true }
+    }
+
+    guard let contextWindow, contextWindow > 0 else { return false }
+    let inputTokens = message.usage.input.saturatingAdding(message.usage.cacheRead)
+
+    // Silent overflow: the provider accepted the request but says the prompt
+    // itself was larger than the model's window.
+    if message.stopReason == .stop, inputTokens > contextWindow { return true }
+
+    // Truncation overflow: the provider filled its window with the input and
+    // had no room to produce output. `window - window / 100` is the same 99%
+    // threshold as `window * 0.99` without an overflow-prone multiplication.
+    if message.stopReason == .length, message.usage.output == 0 {
+        let almostFull = contextWindow - contextWindow / 100
+        return inputTokens >= almostFull
+    }
+    return false
+}

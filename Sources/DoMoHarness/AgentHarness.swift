@@ -987,14 +987,10 @@ public actor AgentHarness {
             followUpMessages = nil
         }
 
-        let context = AgentContext(
-            systemPrompt: runOverride?.systemPrompt
-                ?? configuration.systemPromptForPrompt?(systemPromptInput)
-                ?? configuration.systemPrompt,
-            messages: try buildContextMessages(),
-            tools: configuration.tools
-        )
-        let config = AgentLoopConfig(
+        let systemPrompt = runOverride?.systemPrompt
+            ?? configuration.systemPromptForPrompt?(systemPromptInput)
+            ?? configuration.systemPrompt
+        let loopConfig = AgentLoopConfig(
             model: runOverride?.model ?? activeModel,
             toolExecution: configuration.toolExecution,
             maxTurns: configuration.maxTurns,
@@ -1007,25 +1003,85 @@ public actor AgentHarness {
             maxCostPerRun: configuration.maxCostPerRun
         )
         let errorBox = PersistenceErrorBox()
-        let persistenceSink = SessionPersistenceSink(
-            persister: self,
-            forward: sink,
-            errorBox: errorBox,
-            monotonicNow: configuration.monotonicNow
+        let streamFn = runOverride?.streamFn ?? activeStreamFn
+
+        /// Run the loop against a supplied context. The overflow retry calls
+        /// this with no prompts after it has written a compaction checkpoint;
+        /// replaying the original prompt there would duplicate it in the next
+        /// model request and in the session file.
+        func executeLoop(prompts: [Message], contextMessages: [Message]) async -> AgentRunResult {
+            let context = AgentContext(
+                systemPrompt: systemPrompt,
+                messages: contextMessages,
+                tools: configuration.tools
+            )
+            let persistenceSink = SessionPersistenceSink(
+                persister: self,
+                forward: sink,
+                errorBox: errorBox,
+                monotonicNow: configuration.monotonicNow
+            )
+            return await runAgentLoop(
+                prompts: prompts,
+                context: context,
+                config: loopConfig,
+                sink: persistenceSink,
+                streamFn: streamFn
+            )
+        }
+
+        var result = await executeLoop(
+            prompts: messages,
+            contextMessages: try buildContextMessages()
         )
 
-        let result = await runAgentLoop(
-            prompts: messages,
-            context: context,
-            config: config,
-            sink: persistenceSink,
-            streamFn: runOverride?.streamFn ?? activeStreamFn
-        )
+        // An explicit provider overflow is the common case. The message helper
+        // also catches providers that silently accept an oversized input or
+        // truncate it to a length-stop with no output. The latch is deliberately
+        // scoped to this run: if the compacted request overflows again, the
+        // second result is returned and no recovery loop can form.
+        if needsOverflowRecovery(result), errorBox.first == nil {
+            do {
+                if try await compactAfterOverflow() {
+                    let retry = await executeLoop(
+                        prompts: [],
+                        contextMessages: try buildContextMessages()
+                    )
+                    result = AgentRunResult(
+                        messages: result.messages + retry.messages,
+                        stopReason: retry.stopReason,
+                        failure: retry.failure
+                    )
+                }
+            } catch {
+                // Preserve the provider failure that caused recovery. A
+                // summarizer failure is not allowed to masquerade as a new
+                // successful turn, and the original transcript remains intact.
+            }
+        }
 
         if let error = errorBox.first {
             throw DoMoError(.file(path: store.path, errno: nil), "Failed to persist session transcript", cause: error)
         }
         return result
+    }
+
+    /// Whether a settled loop result is recoverable by compacting the branch
+    /// immediately before its final assistant entry.
+    private func needsOverflowRecovery(_ result: AgentRunResult) -> Bool {
+        if case .contextOverflow = result.failure?.kind { return true }
+        guard result.stopReason == .errored || result.stopReason == .completed,
+              let assistant = result.messages.reversed().compactMap({ message -> AssistantMessage? in
+                  guard case .assistant(let assistant) = message else { return nil }
+                  return assistant
+              }).first
+        else { return false }
+
+        // A successful stop with an over-window input is compacted before the
+        // next prompt, but it already contains a usable answer and must not be
+        // replayed. A length-stop with no output is the provider's truncation
+        // form of overflow and does need the one recovery request.
+        return isContextOverflow(assistant, contextWindow: activeContextWindow)
     }
 
     // MARK: - Persistence
@@ -1138,6 +1194,56 @@ public actor AgentHarness {
         if case .compaction(let compaction) = entry.payload, let usage = compaction.usage {
             accumulatedUsage = accumulatedUsage + usage
         }
+    }
+
+    /// Compact the active branch after an overflow that happened during a
+    /// request. The failed assistant entry is already useful history, so it is
+    /// left on disk, but the new checkpoint is parented to the entry before it
+    /// and becomes the active leaf. This keeps the retry context free of the
+    /// provider's error message without requiring destructive edits to JSONL.
+    ///
+    /// Returns `false` when there is no complete turn boundary to summarize.
+    /// A single oversized prompt cannot be made smaller by this compactor; the
+    /// caller then returns the original overflow rather than retrying unchanged.
+    private func compactAfterOverflow() async throws -> Bool {
+        let window = activeContextWindow ?? Configuration.fallbackContextWindow
+        let settings = configuration.compaction.clamped(toContextWindow: window)
+        guard settings.enabled, let failedID = leaf else { return false }
+
+        let tree = try SessionTree.load(from: store)
+        guard let failed = tree.entry(withID: failedID),
+              case .message(.assistant) = failed.payload,
+              let parentID = failed.parentId
+        else { return false }
+
+        let pathEntries = try tree.pathToRootOrCompaction(from: parentID)
+        guard let preparation = prepareCompaction(pathEntries: pathEntries, settings: settings) else {
+            return false
+        }
+
+        let startedAt = configuration.monotonicNow()
+        var entry = try await compact(
+            preparation,
+            id: store.createEntryID(),
+            parentId: parentID,
+            timestamp: timestamp(),
+            summarize: effectiveSummarizer
+        )
+        entry.elapsedMs = elapsedMilliseconds(from: startedAt, to: configuration.monotonicNow())
+        entry.seq = nextSeq
+        try store.appendEntry(entry)
+        nextSeq += 1
+
+        // The physical append makes this checkpoint the file's leaf even though
+        // its parent intentionally skips the failed assistant entry. Rebuild the
+        // in-memory lineage from the checkpoint so the next message follows the
+        // same active branch that a reopened harness will see.
+        let activeTree = try SessionTree.load(from: store)
+        leafChain = try activeTree.branch(from: entry.id).map(\.id)
+        if case .compaction(let compaction) = entry.payload, let usage = compaction.usage {
+            accumulatedUsage = accumulatedUsage + usage
+        }
+        return true
     }
 }
 

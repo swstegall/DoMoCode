@@ -477,6 +477,37 @@ struct ErrorTests {
             Issue.record("expected rateLimit, got \(String(describing: error?.kind))")
         }
     }
+
+    @Test("overflow detection covers explicit, silent, and truncated provider responses")
+    func messageOverflowForms() {
+        let explicit = AssistantMessage(
+            model: "m",
+            stopReason: .error,
+            errorMessage: "input token count exceeds the maximum"
+        )
+        #expect(isContextOverflow(explicit))
+
+        let silent = AssistantMessage(
+            model: "m",
+            usage: Usage(input: 10_001),
+            stopReason: .stop
+        )
+        #expect(isContextOverflow(silent, contextWindow: 10_000))
+
+        let truncated = AssistantMessage(
+            model: "m",
+            usage: Usage(input: 9_950),
+            stopReason: .length
+        )
+        #expect(isContextOverflow(truncated, contextWindow: 10_000))
+
+        let throttled = AssistantMessage(
+            model: "m",
+            stopReason: .error,
+            errorMessage: "rate limit: too many tokens"
+        )
+        #expect(!isContextOverflow(throttled))
+    }
 }
 
 // MARK: - Cancellation

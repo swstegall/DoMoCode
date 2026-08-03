@@ -960,6 +960,60 @@ struct AgentHarnessTests {
         #expect(compaction.usage?.input == 777, "the default summarizer reported no usage for its own call")
     }
 
+    @Test("a context overflow compacts the pre-failure branch and retries once")
+    func overflowCompactsAndRetriesWithoutDuplicatingPrompt() async throws {
+        let calls = Mutex<Int>(0)
+        let streamFn: AgentStreamFn = { _ in
+            let call = calls.withLock { value -> Int in
+                let taken = value
+                value += 1
+                return taken
+            }
+            if call == 30 {
+                return AsyncThrowingStream { continuation in
+                    continuation.finish(throwing: DoMoError(.contextOverflow, "context length exceeded"))
+                }
+            }
+            return terminalStream(AssistantMessage(
+                content: [.text(String(repeating: "x", count: 4_000))],
+                model: "test-model",
+                stopReason: .stop
+            ))
+        }
+        let spy = SummarizerSpy(text: "COMPACTED")
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: streamFn,
+                summarizer: spy.fn(),
+                compaction: .default,
+                contextWindow: nil,
+                ids: SequentialIDs(prefix: "overflow")
+            )
+        )
+
+        for index in 0..<30 {
+            _ = try await harness.run(prompt: "turn-\(index)")
+        }
+        let result = try await harness.run(prompt: "turn-30")
+
+        #expect(result.stopReason == .completed)
+        #expect(result.failure == nil)
+        #expect(calls.withLock { $0 } == 32, "one failed request plus one recovery request")
+        #expect(spy.recorded.count == 1)
+
+        let context = try await harness.contextMessages()
+        #expect(!context.contains { message in
+            guard case .assistant(let assistant) = message else { return false }
+            return assistant.stopReason == .error
+        })
+        #expect(context.contains(.user("turn-30")), "the original prompt must be retained once")
+
+        let recorded = try entries(of: await harness.sessionFilePath)
+        #expect(recorded.contains { if case .compaction = $0.payload { true } else { false } })
+    }
+
     /// `nil` means "genuinely unknown", and an unknown window is not a reason to
     /// let a context grow without limit — an unknown small alias would run until the
     /// provider rejected the request. The fallback is a compaction-only safety net,
