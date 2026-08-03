@@ -1101,7 +1101,14 @@ public actor AgentHarness {
         // that could exist before ``open(path:configuration:leaf:)`` (a `nil` tip
         // only ever came with an empty file); load-bearing for the ones that can now.
         guard let leaf else { return [] }
-        return try ContextBuilder.buildContext(SessionTree.load(from: store), from: leaf)
+        let outputPolicy = ContextOutputPolicy(
+            spillDirectory: "\(store.path.string).context-output"
+        )
+        return try ContextBuilder.buildContext(
+            SessionTree.load(from: store),
+            from: leaf,
+            outputPolicy: outputPolicy
+        )
     }
 
     // MARK: - Compaction
@@ -1166,7 +1173,12 @@ public actor AgentHarness {
         guard let tip = leaf else { return }
         let tree = try SessionTree.load(from: store)
         let pathEntries = try tree.pathToRootOrCompaction(from: tip)
-        let messages = ContextBuilder.messages(for: pathEntries)
+        let messages = try ContextBuilder.messages(
+            for: pathEntries,
+            outputPolicy: ContextOutputPolicy(
+                spillDirectory: "\(store.path.string).context-output"
+            )
+        )
         let estimate = estimateContextTokens(messages)
         guard shouldCompact(contextTokens: estimate.tokens, contextWindow: window, settings: settings) else { return }
         guard let preparation = prepareCompaction(pathEntries: pathEntries, settings: settings) else {

@@ -800,7 +800,7 @@ struct AgentHarnessTests {
         // The summarizer saw the older messages, not the retained recent tail.
         #expect(spy.recorded.count == 1)
         let summarized = try #require(spy.recorded.first)
-        #expect(summarized.count == 2)
+        #expect(summarized.count == 1)
 
         // The rebuilt context begins with the wrapped summary and then the tail.
         let context = try await harness.contextMessages()

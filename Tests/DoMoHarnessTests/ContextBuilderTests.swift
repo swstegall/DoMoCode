@@ -20,6 +20,17 @@ struct ContextBuilderTests {
         return SessionTreeEntry(id: id, parentId: parent, timestamp: ts(n), payload: .message(message))
     }
 
+    private func toolEntry(
+        _ id: String,
+        parent: String?,
+        _ n: Int,
+        callID: String,
+        output: String
+    ) -> SessionTreeEntry {
+        let result = ToolResultBlock(toolCallID: callID, toolName: "bash", output: output)
+        return SessionTreeEntry(id: id, parentId: parent, timestamp: ts(n), payload: .message(.tool(result)))
+    }
+
     private func userText(_ message: Message) -> String? {
         if case .user(let user) = message { return user.text }
         return nil
@@ -117,6 +128,49 @@ struct ContextBuilderTests {
         )
         let treeEmpty = SessionTree(entries: [userEntry("a", parent: nil, 1, "root"), empty])
         #expect(try ContextBuilder.buildContext(treeEmpty).count == 1)
+    }
+
+    @Test("context projection prunes old tool output and spills oversized text")
+    func toolOutputProjection() throws {
+        let firstOutput = String(repeating: "old-", count: 40)
+        let secondOutput = "recent result"
+        let tree = SessionTree(entries: [
+            userEntry("u1", parent: nil, 1, "first"),
+            assistantEntry("a1", parent: "u1", 2, "calling"),
+            toolEntry("r1", parent: "a1", 3, callID: "old-call", output: firstOutput),
+            userEntry("u2", parent: "r1", 4, "second"),
+            assistantEntry("a2", parent: "u2", 5, "done"),
+            toolEntry("r2", parent: "a2", 6, callID: "new-call", output: secondOutput),
+        ])
+        let spillDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("domocode-context-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: spillDirectory) }
+
+        let messages = try ContextBuilder.buildContext(
+            tree,
+            outputPolicy: ContextOutputPolicy(
+                maximumToolOutputCharacters: 20,
+                recentToolOutputTurns: 1,
+                spillDirectory: spillDirectory.path
+            )
+        )
+        let results = messages.compactMap { message -> ToolResultBlock? in
+            guard case .tool(let result) = message else { return nil }
+            return result
+        }
+        #expect(results.count == 2)
+        #expect(results[0].output.contains("Full output:"))
+        #expect(results[0].output != firstOutput)
+        #expect(results[1].output == secondOutput)
+
+        let spilled = try #require(
+            FileManager.default.contentsOfDirectory(atPath: spillDirectory.path).first
+        )
+        let spilledText = try String(
+            contentsOf: spillDirectory.appendingPathComponent(spilled),
+            encoding: .utf8
+        )
+        #expect(spilledText == firstOutput)
     }
 
     // MARK: - Failure surfacing

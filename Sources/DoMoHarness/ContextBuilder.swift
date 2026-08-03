@@ -10,6 +10,41 @@ import DoMoLLM
 
 // MARK: - Context building
 
+/// Controls how persisted tool results are projected into a model context.
+///
+/// The session JSONL remains the source of truth. This policy only changes the
+/// transient messages sent to the model, so a later context inspection or a
+/// resumed session can still inspect the complete result. Older tool results
+/// are replaced by a short marker; oversized results also spill their full text
+/// to a mode-restricted sidecar file and include its path in that marker.
+public struct ContextOutputPolicy: Sendable, Hashable {
+    /// The maximum number of characters retained from one tool result in the
+    /// model-facing context.
+    public var maximumToolOutputCharacters: Int
+
+    /// Number of most-recent user turns whose tool results remain verbatim.
+    /// Zero prunes every tool result; a negative value is clamped to zero.
+    public var recentToolOutputTurns: Int
+
+    /// Directory for full oversized results. Nil keeps the projection
+    /// in-memory and reports that the omitted tail is unavailable from this
+    /// context build.
+    public var spillDirectory: String?
+
+    public init(
+        maximumToolOutputCharacters: Int = 20_000,
+        recentToolOutputTurns: Int = 4,
+        spillDirectory: String? = nil
+    ) {
+        self.maximumToolOutputCharacters = max(1, maximumToolOutputCharacters)
+        self.recentToolOutputTurns = max(0, recentToolOutputTurns)
+        self.spillDirectory = spillDirectory
+    }
+
+    public static let `default` = ContextOutputPolicy()
+    public static let standard = ContextOutputPolicy()
+}
+
 /// Projects a resolved session path into the `[Message]` list an agent run is
 /// seeded with.
 ///
@@ -119,6 +154,20 @@ public enum ContextBuilder {
         contextEntries(for: pathEntries).flatMap(messages(for:))
     }
 
+    /// Build the model-facing context and apply a transient tool-output policy.
+    ///
+    /// The unqualified messages(for:) overload intentionally remains the
+    /// lossless projection used by compaction and tree tests. Callers that are
+    /// about to send a context to a provider use this overload so pruning never
+    /// mutates the append-only session history.
+    public static func messages(
+        for pathEntries: [SessionTreeEntry],
+        outputPolicy: ContextOutputPolicy
+    ) throws -> [Message] {
+        let messages = contextEntries(for: pathEntries).flatMap(messages(for:))
+        return try pruneToolOutputs(messages, policy: outputPolicy)
+    }
+
     /// The messages for a session's active branch: resolve the path from the leaf
     /// to the root or nearest compaction, then project.
     ///
@@ -130,4 +179,124 @@ public enum ContextBuilder {
     public static func buildContext(_ tree: SessionTree, from leafID: String? = nil) throws -> [Message] {
         messages(for: try tree.pathToRootOrCompaction(from: leafID))
     }
+
+    /// Resolve and project a session path with transient tool-output pruning.
+    public static func buildContext(
+        _ tree: SessionTree,
+        from leafID: String? = nil,
+        outputPolicy: ContextOutputPolicy
+    ) throws -> [Message] {
+        try messages(
+            for: tree.pathToRootOrCompaction(from: leafID),
+            outputPolicy: outputPolicy
+        )
+    }
+
+    // MARK: - Tool-output projection
+
+    private static func pruneToolOutputs(
+        _ messages: [Message],
+        policy: ContextOutputPolicy
+    ) throws -> [Message] {
+        let userTurnCount = messages.reduce(into: 0) { count, message in
+            if case .user = message { count += 1 }
+        }
+        var currentUserTurn = 0
+        var projected: [Message] = []
+        projected.reserveCapacity(messages.count)
+
+        for (index, message) in messages.enumerated() {
+            switch message {
+            case .user:
+                currentUserTurn += 1
+                projected.append(message)
+            case .tool(let result):
+                let age = userTurnCount - currentUserTurn
+                let recent = age < policy.recentToolOutputTurns
+                let oversized = result.output.count > policy.maximumToolOutputCharacters
+                guard !recent || oversized || !result.images.isEmpty else {
+                    projected.append(message)
+                    continue
+                }
+                projected.append(
+                    .tool(
+                        try projectedToolResult(
+                            result,
+                            index: index,
+                            keepRecent: recent,
+                            policy: policy
+                        )
+                    )
+                )
+            default:
+                projected.append(message)
+            }
+        }
+        return projected
+    }
+
+    private static func projectedToolResult(
+        _ result: ToolResultBlock,
+        index: Int,
+        keepRecent: Bool,
+        policy: ContextOutputPolicy
+    ) throws -> ToolResultBlock {
+        let oversized = result.output.count > policy.maximumToolOutputCharacters
+        var spillPath: String?
+        if oversized, let directory = policy.spillDirectory {
+            let path = "\(directory)/\(spillFileName(toolCallID: result.toolCallID, index: index))"
+            try AtomicFileWrite.replace(at: path, with: result.output)
+            spillPath = path
+        }
+
+        let marker: String
+        if let spillPath {
+            marker = "[Tool output pruned from context. Full output: \(spillPath)]"
+        } else if oversized {
+            marker = "[Tool output pruned from context; the full \(result.output.count)-character result was not spilled]"
+        } else {
+            marker = "[Tool output pruned from older context (\(result.output.count) characters)]"
+        }
+
+        let output: String
+        if keepRecent {
+            output = boundedPreview(result.output, maximumCharacters: policy.maximumToolOutputCharacters)
+                + "\n\n"
+                + marker
+        } else {
+            output = marker
+        }
+
+        return ToolResultBlock(
+            toolCallID: result.toolCallID,
+            toolName: result.toolName,
+            output: output,
+            isError: result.isError,
+            // An old image can be as expensive as its text. It remains in the
+            // durable entry, but only recent image-bearing results are sent.
+            images: keepRecent ? result.images : []
+        )
+    }
+
+    private static func boundedPreview(_ text: String, maximumCharacters: Int) -> String {
+        guard text.count > maximumCharacters else { return text }
+        let headCount = max(1, maximumCharacters / 2)
+        let tailCount = max(0, maximumCharacters - headCount)
+        let head = String(text.prefix(headCount))
+        let tail = tailCount == 0 ? "" : String(text.suffix(tailCount))
+        return head + "\n\n[... middle omitted from context ...]\n\n" + tail
+    }
+
+    private static func spillFileName(toolCallID: String, index: Int) -> String {
+        let safeID = toolCallID
+            .map { character in
+                character.isLetter || character.isNumber || character == "-" || character == "_"
+                    ? String(character)
+                    : "-"
+            }
+            .joined()
+        let trimmed = String(safeID.prefix(64))
+        return "tool-\(index)-\(trimmed.isEmpty ? "output" : trimmed).txt"
+    }
+
 }
