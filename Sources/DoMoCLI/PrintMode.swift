@@ -27,6 +27,7 @@
 
 import DoMoAgent
 import DoMoCore
+import DoMoGit
 import DoMoHarness
 import DoMoLLM
 import DoMoMCP
@@ -639,6 +640,14 @@ public struct PrintMode: Sendable {
     /// success.
     public func run(prompt: String, attachments: [ImageBlock] = []) async throws -> Int32 {
         let tools = agentTools
+        let sessionStartHead: String?
+        switch sessionSource {
+        case .new, .fork:
+            let git = try? DoMoGit()
+            sessionStartHead = if let git { try? await git.head(at: workingDirectory) } else { nil }
+        case .resume:
+            sessionStartHead = nil
+        }
 
         // One shared counter across the run's LLM calls, and one guard that lets
         // the stream seam refuse a turn after a failing one (the harness has no
@@ -695,7 +704,8 @@ public struct PrintMode: Sendable {
             contextWindow: modelRuntime.contextWindow,
             beforeToolCall: beforeToolCall,
             onNoProgress: onNoProgress,
-            maxCostPerRun: maxCostPerRun
+            maxCostPerRun: maxCostPerRun,
+            sessionStartHead: sessionStartHead
         )
 
         let harness = try await makeHarness(configuration: configuration)

@@ -134,6 +134,7 @@ struct AgentHarnessTests {
         summarizer: Summarizer? = nil,
         compaction: CompactionSettings = CompactionSettings(enabled: false),
         contextWindow: Int? = nil,
+        sessionStartHead: String? = nil,
         ids: SequentialIDs
     ) -> AgentHarness.Configuration {
         AgentHarness.Configuration(
@@ -145,7 +146,8 @@ struct AgentHarnessTests {
             compaction: compaction,
             contextWindow: contextWindow,
             now: { self.fixedDate },
-            entryIDFactory: ids.factory()
+            entryIDFactory: ids.factory(),
+            sessionStartHead: sessionStartHead
         )
     }
 
@@ -155,6 +157,36 @@ struct AgentHarnessTests {
     }
 
     // MARK: - Persistence & resumability
+
+    @Test("a new session records its Git start HEAD before conversation entries")
+    func recordsSessionStartHead() async throws {
+        let responder = ScriptedResponder([assistant("hi")])
+        let ids = SequentialIDs(prefix: "git")
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: responder.fn(),
+                sessionStartHead: "abc123",
+                ids: ids
+            )
+        )
+
+        let beforeRun = try entries(of: await harness.sessionFilePath)
+        #expect(beforeRun.count == 1)
+        guard case .sessionStart(let head) = beforeRun[0].payload else {
+            Issue.record("first entry is not the session-start checkpoint")
+            return
+        }
+        #expect(head == "abc123")
+        #expect(beforeRun[0].parentId == nil)
+        #expect(beforeRun[0].seq == 0)
+
+        _ = try await harness.run(prompt: "hello")
+        let afterRun = try entries(of: await harness.sessionFilePath)
+        #expect(afterRun.count == 3)
+        #expect(afterRun[1].parentId == afterRun[0].id)
+    }
 
     @Test("a run persists the user prompt and each assistant turn in transcript order")
     func runPersistsTranscript() async throws {

@@ -205,7 +205,8 @@ public struct BranchSummary: Sendable, Hashable, Codable {
 /// rely on.
 ///
 /// The load-bearing set for Phase 3 is `message`, `compaction`, `branch_summary`,
-/// `label`, `session_info` and `model_change`; `leaf` is included because tree
+/// `label`, `session_info` and `model_change`; `session_start` records the Git
+/// checkpoint for Phase 12, and `leaf` is included because tree
 /// navigation records the active tip as a `leaf` entry and it is cheap. The
 /// extension-facing entries (`custom`, `custom_message`) and the settings
 /// entries pi has for thinking level and dynamic tool sets are deliberately not
@@ -302,6 +303,10 @@ public struct SessionTreeEntry: Sendable, Hashable {
         case label(targetId: String, label: String?)
         /// Session metadata such as a user-chosen display name.
         case sessionInfo(name: String?)
+        /// The repository commit at which this session began. It is metadata,
+        /// not conversation context, and is present only when the caller found
+        /// a committed Git HEAD at session creation time.
+        case sessionStart(head: String)
         /// A record that the active leaf moved to `targetId` (`nil` = before the
         /// first entry). Written by tree navigation, not by the conversation.
         case leaf(targetId: String?)
@@ -317,6 +322,7 @@ extension SessionTreeEntry {
         case branchSummary = "branch_summary"
         case label
         case sessionInfo = "session_info"
+        case sessionStart = "session_start"
         case leaf
     }
 
@@ -328,6 +334,7 @@ extension SessionTreeEntry {
         case .branchSummary: return .branchSummary
         case .label: return .label
         case .sessionInfo: return .sessionInfo
+        case .sessionStart: return .sessionStart
         case .leaf: return .leaf
         }
     }
@@ -360,7 +367,7 @@ extension SessionTreeEntry: Codable {
         case parentId
         case timestamp
         // Envelope, added after the format shipped. This is ONE FLAT namespace
-        // shared by all seven payload shapes (`summary` and `usage` are each
+        // shared by all eight payload shapes (`summary` and `usage` are each
         // used by two of them, `targetId` by two), so a new envelope key has to
         // be checked against every payload's fields, not just the envelope's:
         // neither `seq` nor `elapsedMs` appears in any payload below. `usage`
@@ -382,6 +389,7 @@ extension SessionTreeEntry: Codable {
         case targetId
         case label
         case name
+        case head
     }
 
     public init(from decoder: any Decoder) throws {
@@ -443,6 +451,8 @@ extension SessionTreeEntry: Codable {
         case .sessionInfo:
             self.payload = .sessionInfo(name: try container.decodeIfPresent(String.self, forKey: .name))
             self.metadataUsage = try container.decodeIfPresent(Usage.self, forKey: .usage)
+        case .sessionStart:
+            self.payload = .sessionStart(head: try container.decode(String.self, forKey: .head))
         case .leaf:
             self.payload = .leaf(targetId: try container.decodeIfPresent(String.self, forKey: .targetId))
         }
@@ -490,6 +500,8 @@ extension SessionTreeEntry: Codable {
         case .sessionInfo(let name):
             try container.encodeIfPresent(name, forKey: .name)
             try container.encodeIfPresent(metadataUsage, forKey: .usage)
+        case .sessionStart(let head):
+            try container.encode(head, forKey: .head)
         case .leaf(let targetId):
             // Present as `null` when the leaf is reset to before the first entry,
             // which is a distinct state from "no targetId field".

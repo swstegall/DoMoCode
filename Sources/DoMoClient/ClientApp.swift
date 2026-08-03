@@ -2091,6 +2091,10 @@ public final class ClientApp {
                 kind = .metadata
                 label = "session  \(name ?? "(unnamed)")"
                 description = entry.id
+            case .sessionStart(let head):
+                kind = .metadata
+                label = "git  session start"
+                description = head
             case .leaf(let targetID):
                 kind = .branch
                 label = "branch  \(targetID ?? "root")"

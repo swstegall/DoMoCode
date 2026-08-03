@@ -42,6 +42,7 @@ import DoMoAgent
 import DoMoClient
 import DoMoCore
 import DoMoExec
+import DoMoGit
 import DoMoHarness
 import DoMoLLM
 import DoMoMCP
@@ -2026,6 +2027,14 @@ public struct InteractiveMode: Sendable {
     ) async throws -> InteractiveMode {
         let workDirectory = FilePath(workingDirectory)
         let sessionDir = FilePath(sessionDirectory)
+        let sessionStartHead: String?
+        switch sessionSource {
+        case .new, .fork:
+            let git = try? DoMoGit()
+            sessionStartHead = if let git { try? await git.head(at: workDirectory) } else { nil }
+        case .resume:
+            sessionStartHead = nil
+        }
         // One resolved model for the whole session. A caller that supplied a runtime
         // has already applied its own precedence (an alias-level `reasoningEffort`
         // outranks the global one), so it wins outright rather than being merged
@@ -2157,7 +2166,8 @@ public struct InteractiveMode: Sendable {
             getSteeringMessages: { steering.drain() },
             beforeToolCall: gate,
             onNoProgress: noProgress,
-            maxCostPerRun: maxCostPerRun
+            maxCostPerRun: maxCostPerRun,
+            sessionStartHead: sessionStartHead
         )
 
         // MCP is already connected by here; if harness construction fails, tear the

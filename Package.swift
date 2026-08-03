@@ -181,6 +181,17 @@ let package = Package(
             swiftSettings: safeSettings
         ),
 
+        // The Git policy seam (Phase 12). Git is deliberately its own target:
+        // session persistence receives only the resolved start HEAD, while the
+        // CLI and later review surfaces depend on this facade for all repository
+        // operations. Keeping the command policy here prevents a future caller
+        // from quietly reintroducing interactive prompts or unsafe ref arguments.
+        .target(
+            name: "DoMoGit",
+            dependencies: ["DoMoCore", "DoMoExec"],
+            swiftSettings: safeSettings
+        ),
+
         .target(
             name: "DoMoHarness",
             dependencies: [
@@ -287,7 +298,7 @@ let package = Package(
             name: "DoMoCLI",
             dependencies: [
                 "DoMoCore", "DoMoTUI", "DoMoTermIO", "DoMoTermGraphics", "DoMoLLM", "DoMoAgent",
-                "DoMoHarness", "DoMoExec", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoMCP", "DoMoServer", "DoMoClient",
+                "DoMoHarness", "DoMoExec", "DoMoGit", "DoMoTools", "DoMoToolsUI", "DoMoPermissions", "DoMoMCP", "DoMoServer", "DoMoClient",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -323,6 +334,12 @@ let package = Package(
         .testTarget(
             name: "DoMoExecTests",
             dependencies: ["DoMoExec", "DoMoCore"],
+            swiftSettings: safeSettings
+        ),
+
+        .testTarget(
+            name: "DoMoGitTests",
+            dependencies: ["DoMoGit", "DoMoExec", "DoMoCore"],
             swiftSettings: safeSettings
         ),
 

@@ -6,6 +6,7 @@ import DoMoAgent
 import DoMoClient
 import DoMoCore
 import DoMoExec
+import DoMoGit
 import DoMoHarness
 import DoMoLLM
 import DoMoMCP
@@ -814,6 +815,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         backgroundSessions: BackgroundProcessSessions
     ) {
         let shell = try SubprocessShell()
+        let sessionStartHead = try? await DoMoGit(shell: shell).head(at: workingDirectory)
         let toolContext = try await ToolContext.rooted(
             at: workingDirectory,
             shell: shell,
@@ -935,7 +937,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             getTools: toolResolver,
             systemPromptForPromptAndTools: promptForTools,
             toolsForSession: sessionToolResolver,
-            questionBroker: questionBroker
+            questionBroker: questionBroker,
+            sessionStartHead: sessionStartHead
         ))
         return (runtime, mcpManager, backgroundSessions)
     }

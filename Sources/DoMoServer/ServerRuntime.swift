@@ -269,6 +269,9 @@ public actor ServerRuntime {
 
         /// Optional hard USD ceiling for each assistant run.
         public var maxCostPerRun: Decimal?
+        /// The committed HEAD recorded for each new session, when the serving
+        /// process started inside a repository with a commit.
+        public var sessionStartHead: String?
         /// Late-bound bridge used by a tool context to suspend the owning
         /// session on a structured question.
         public var questionBroker: QuestionBroker?
@@ -306,7 +309,8 @@ public actor ServerRuntime {
             getTools: (@Sendable (String) async -> [any AgentTool])? = nil,
             systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)? = nil,
             toolsForSession: (@Sendable (String, String) async -> [any AgentTool])? = nil,
-            questionBroker: QuestionBroker? = nil
+            questionBroker: QuestionBroker? = nil,
+            sessionStartHead: String? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -331,6 +335,7 @@ public actor ServerRuntime {
             self.summarizer = summarizer
             self.steeringMode = steeringMode
             self.maxCostPerRun = maxCostPerRun
+            self.sessionStartHead = sessionStartHead
             self.questionBroker = questionBroker
         }
     }
@@ -530,7 +535,8 @@ public actor ServerRuntime {
             steeringBox: steeringBox,
             beforeToolCall: beforeToolCall,
             onNoProgress: onNoProgress,
-            maxCostPerRun: config.maxCostPerRun
+            maxCostPerRun: config.maxCostPerRun,
+            sessionStartHead: config.sessionStartHead
         )
     }
 

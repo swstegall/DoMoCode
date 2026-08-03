@@ -96,6 +96,22 @@ struct SessionEntryTests {
         #expect(decoded.entryType == .message)
     }
 
+    @Test("session start entry round-trips the Git HEAD")
+    func sessionStartRoundTrips() throws {
+        let entry = SessionTreeEntry(
+            id: "git1",
+            parentId: nil,
+            timestamp: "2026-07-23T12:00:02.500Z",
+            payload: .sessionStart(head: "abc123")
+        )
+        let decoded = try roundTrip(entry)
+        #expect(decoded == entry)
+        #expect(decoded.entryType == .sessionStart)
+        let json = String(decoding: try encoder.encode(entry), as: UTF8.self)
+        #expect(json.contains(#""type":"session_start""#))
+        #expect(json.contains(#""head":"abc123""#))
+    }
+
     @Test("message entry round-trips an assistant message with tool calls and usage")
     func messageAssistantRoundTrips() throws {
         let assistant = AssistantMessage(

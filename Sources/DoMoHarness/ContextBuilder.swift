@@ -126,7 +126,7 @@ public enum ContextBuilder {
     ///   checkpoint), if any.
     /// - `branch_summary` becomes its wrapped summary message, but only when it
     ///   carries text — an empty summary contributes nothing.
-    /// - `model_change`, `label`, `session_info` and `leaf` are metadata: they
+    /// - `model_change`, `label`, `session_info`, `session_start` and `leaf` are metadata: they
     ///   steer the harness or the UI and are never shown to the model, so they
     ///   contribute no message. This is pi's `sessionEntryToContextMessages`.
     ///
@@ -143,7 +143,7 @@ public enum ContextBuilder {
             return [summary] + (compaction.retainedTail ?? [])
         case .branchSummary(let branch) where !branch.summary.isEmpty:
             return [Message.user(branchSummaryPrefix + branch.summary + branchSummarySuffix)]
-        case .branchSummary, .modelChange, .label, .sessionInfo, .leaf:
+        case .branchSummary, .modelChange, .label, .sessionInfo, .sessionStart, .leaf:
             return []
         }
     }

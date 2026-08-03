@@ -176,7 +176,7 @@ public actor AgentHarness {
                 if let branchUsage = branch.usage { usage = usage + branchUsage }
             case .message, .modelChange, .label, .leaf:
                 break
-            case .sessionInfo:
+            case .sessionInfo, .sessionStart:
                 if let metadataUsage = entry.metadataUsage { usage = usage + metadataUsage }
                 break
             }
@@ -281,6 +281,11 @@ public actor AgentHarness {
 
         public var entryIDFactory: @Sendable () -> String
 
+        /// The committed Git HEAD visible when a new session starts. The harness
+        /// stores it as a metadata entry without depending on the Git facade;
+        /// `nil` means the caller found no repository or no commit.
+        public var sessionStartHead: String?
+
         /// Polled by the loop at each turn boundary for messages to inject before
         /// the next assistant response — pi's "steering". A message a caller
         /// enqueues while a run is in flight reaches the *current* run's next turn.
@@ -342,7 +347,8 @@ public actor AgentHarness {
             shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil,
             beforeToolCall: BeforeToolCallHook? = nil,
             onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
-            maxCostPerRun: Decimal? = nil
+            maxCostPerRun: Decimal? = nil,
+            sessionStartHead: String? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.systemPromptForPrompt = systemPromptForPrompt
@@ -368,6 +374,7 @@ public actor AgentHarness {
             self.now = now
             self.monotonicNow = monotonicNow
             self.entryIDFactory = entryIDFactory
+            self.sessionStartHead = sessionStartHead
             self.getSteeringMessages = getSteeringMessages
             self.steeringBox = steeringBox
             self.getFollowUpMessages = getFollowUpMessages
@@ -410,8 +417,8 @@ public actor AgentHarness {
     // MARK: - Lifecycle
 
     /// Starts a brand-new session: creates the file, writes its header, and holds a
-    /// harness whose tip is empty. The first ``run(prompt:sink:)`` appends the
-    /// first entries.
+    /// harness whose tip is at the optional session-start checkpoint. The first
+    /// ``run(prompt:sink:)`` appends the first conversation entries.
     public static func start(
         cwd: String,
         sessionDirectory: FilePath,
@@ -425,7 +432,26 @@ public actor AgentHarness {
             now: configuration.now,
             entryIDFactory: configuration.entryIDFactory
         )
-        return AgentHarness(store: store, leaf: nil, configuration: configuration, seed: .fresh)
+        var leaf: String?
+        var nextSeq = 0
+        if let head = configuration.sessionStartHead {
+            let entry = SessionTreeEntry(
+                id: configuration.entryIDFactory(),
+                parentId: nil,
+                timestamp: JSONLSessionStore.iso8601(configuration.now()),
+                payload: .sessionStart(head: head),
+                seq: 0
+            )
+            try store.appendEntry(entry)
+            leaf = entry.id
+            nextSeq = 1
+        }
+        return AgentHarness(
+            store: store,
+            leaf: leaf,
+            configuration: configuration,
+            seed: Seed(nextSeq: nextSeq, usage: .zero, turns: 0, model: nil)
+        )
     }
 
     /// Opens an existing session file and reconstructs the tip.
@@ -611,13 +637,24 @@ public actor AgentHarness {
         // in, so what it already contains is the only authority on where its
         // numbering and its totals stand.
         let forkedTree = try SessionTree.load(from: forked)
+        if let head = configuration.sessionStartHead {
+            let checkpoint = SessionTreeEntry(
+                id: configuration.entryIDFactory(),
+                parentId: forkedTree.leafID,
+                timestamp: JSONLSessionStore.iso8601(configuration.now()),
+                payload: .sessionStart(head: head),
+                seq: try forked.nextSequenceNumber()
+            )
+            try forked.appendEntry(checkpoint)
+        }
+        let updatedForkedTree = try SessionTree.load(from: forked)
         let seed = try Self.seed(
             store: forked,
-            entries: forkedTree.entries,
+            entries: updatedForkedTree.entries,
             defaultModel: configuration.model,
-            leafID: forkedTree.leafID
+            leafID: updatedForkedTree.leafID
         )
-        return AgentHarness(store: forked, leaf: forkedTree.leafID, configuration: configuration, seed: seed)
+        return AgentHarness(store: forked, leaf: updatedForkedTree.leafID, configuration: configuration, seed: seed)
     }
 
     // MARK: - Inspection
