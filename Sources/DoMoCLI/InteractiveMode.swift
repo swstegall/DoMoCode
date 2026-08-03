@@ -300,6 +300,78 @@ final class PromptComponent: @MainActor Focusable {
     }
 }
 
+// MARK: - Question selection
+
+/// A question-specific selector. ``SelectList`` models one highlighted item and
+/// calls back on Enter; a question with `multiple` needs a second bit of state
+/// for checked rows, so that state stays local instead of changing the generic
+/// command picker’s answer contract.
+@MainActor
+private final class InteractiveQuestionList: @MainActor Component {
+    private let prompt: QuestionPrompt
+    private let keybindings: Keybindings
+    private var selectedIndex = 0
+    private var checked: Set<Int> = []
+
+    var onConfirm: ((QuestionAnswer) -> Void)?
+    var onCancel: (() -> Void)?
+
+    init(prompt: QuestionPrompt, keybindings: Keybindings) {
+        self.prompt = prompt
+        self.keybindings = keybindings
+    }
+
+    func render(width: Int) -> [String] {
+        guard width > 0 else { return [""] }
+        return prompt.options.enumerated().map { index, option in
+            let active = index == selectedIndex
+            let marker: String
+            if prompt.allowsMultiple {
+                marker = checked.contains(index) ? "→ [x] " : "  [ ] "
+            } else {
+                marker = active ? "→ " : "  "
+            }
+            let label = sanitizeUntrustedText(collapseToOneLine(option.label))
+            let description = option.description.map { sanitizeUntrustedText(collapseToOneLine($0)) }
+            let text: String
+            if let description, !description.isEmpty {
+                text = "(marker)(label) — (description)"
+            } else {
+                text = marker + label
+            }
+            return truncateToWidth(text, width, ellipsis: "")
+        }
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        guard !prompt.options.isEmpty, !isKeyRelease(data) else { return }
+        if keybindings.matches(data, .selectUp) {
+            selectedIndex = selectedIndex == 0 ? prompt.options.count - 1 : selectedIndex - 1
+            return
+        }
+        if keybindings.matches(data, .selectDown) {
+            selectedIndex = selectedIndex == prompt.options.count - 1 ? 0 : selectedIndex + 1
+            return
+        }
+        if prompt.allowsMultiple, data == [0x20] {
+            if checked.contains(selectedIndex) {
+                checked.remove(selectedIndex)
+            } else {
+                checked.insert(selectedIndex)
+            }
+            return
+        }
+        if keybindings.matches(data, .selectConfirm) {
+            let indexes = prompt.allowsMultiple ? checked.sorted() : [selectedIndex]
+            onConfirm?(QuestionAnswer(selectedLabels: indexes.map { prompt.options[$0].label }))
+            return
+        }
+        if keybindings.matches(data, .selectCancel) {
+            onCancel?()
+        }
+    }
+}
+
 // MARK: - Event sink
 
 /// Bridges the agent's ``AgentEvent`` stream onto the main-actor coordinator.
@@ -361,6 +433,7 @@ final class InteractiveCoordinator {
     private let submissions: AsyncStream<PendingSubmission>
     private let submissionsContinuation: AsyncStream<PendingSubmission>.Continuation
     private let steering: SteeringBox
+    private let questionBox: QuestionBox
 
     /// Images dropped onto the prompt and not yet sent.
     ///
@@ -422,6 +495,15 @@ final class InteractiveCoordinator {
     /// The modal's row values in order, so Escape can find "Reject" without assuming
     /// a fixed layout (the "always" row is conditional).
     private var permissionItemValues: [String] = []
+    /// A question batch is answered one prompt at a time. The continuation stays
+    /// parked while the current selector owns input, and is resumed only after the
+    /// whole batch is complete or cancelled.
+    private var questionHandle: OverlayHandle?
+    private var questionList: InteractiveQuestionList?
+    private var pendingQuestion: CheckedContinuation<[QuestionAnswer]?, Never>?
+    private var questionPrompts: [QuestionPrompt] = []
+    private var questionAnswers: [QuestionAnswer] = []
+    private var questionIndex = 0
     private static let progressFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     /// The status line while a turn is in flight — animated, and distinct while a
@@ -431,6 +513,9 @@ final class InteractiveCoordinator {
         let glyph = Self.progressFrames[((progressFrame % 10) + 10) % 10]
         if pendingPermission != nil {
             return "  \(glyph) waiting for your approval — choose above"
+        }
+        if pendingQuestion != nil {
+            return "  \(glyph) waiting for your answer — choose above"
         }
         return "  \(glyph) working — esc to interrupt"
     }
@@ -452,6 +537,7 @@ final class InteractiveCoordinator {
         toolTheme: ToolRenderTheme,
         homeDirectory: String?,
         steering: SteeringBox,
+        questionBox: QuestionBox,
         fileSystem: SandboxedFileSystem? = nil,
         terminalRows: @escaping () -> Int,
         keybindings: Keybindings = Keybindings(),
@@ -464,6 +550,7 @@ final class InteractiveCoordinator {
         self.quit = quit
         self.harness = harness
         self.steering = steering
+        self.questionBox = questionBox
         self.fileSystem = fileSystem
         self.provider = provider
         self.commandProcessor = commandProcessor
@@ -555,6 +642,16 @@ final class InteractiveCoordinator {
                 list.setSelectedIndex(permissionItemValues.firstIndex(of: "reject") ?? 0)
                 render()
             }
+            return
+        }
+
+        // A structured question captures the rest of the keyboard. The selector
+        // owns its arrow/checkbox state; this branch keeps the editor and popup
+        // from seeing any of those bytes while the tool is suspended.
+        if let list = questionList {
+            if isKeyRelease(data) { return }
+            list.handleInput(data)
+            render()
             return
         }
 
@@ -698,6 +795,10 @@ final class InteractiveCoordinator {
         if permissionList != nil {
             resolvePermission(.reject(message: nil))
             render()
+            return
+        }
+        if questionList != nil {
+            cancelQuestionPrompt()
             return
         }
         if popupList != nil {
@@ -1072,7 +1173,7 @@ final class InteractiveCoordinator {
     /// cancelled run — Escape while running from another path, EOF, quit — resumes it
     /// with a reject so the tool fiber never leaks.
     func showPermissionPrompt(_ request: PermissionRequest) async -> PermissionReply {
-        await withTaskCancellationHandler {
+        return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<PermissionReply, Never>) in
                 pendingPermission = continuation
                 presentPermissionOverlay(request)
@@ -1172,6 +1273,113 @@ final class InteractiveCoordinator {
             lines.append("  " + truncateToWidth(sanitizeUntrustedText(collapseToOneLine(target)), 60))
         }
         return lines
+    }
+
+    // MARK: Structured questions
+
+    /// Present a question batch without blocking the main actor. The handler is
+    /// shaped like the tool's batch API, while the UI advances through prompts one
+    /// by one so each answer is unambiguous.
+    func showQuestionPrompt(_ prompts: [QuestionPrompt]) async -> [QuestionAnswer]? {
+        guard !prompts.isEmpty else { return [] }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<[QuestionAnswer]?, Never>) in
+                guard pendingQuestion == nil else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                pendingQuestion = continuation
+                questionPrompts = prompts
+                questionAnswers = []
+                questionIndex = 0
+                presentQuestionOverlay()
+                statusLine.text = runningStatus
+                render()
+            }
+        } onCancel: {
+            Task { @MainActor in self.cancelQuestionPrompt() }
+        }
+    }
+
+    private func presentQuestionOverlay() {
+        questionHandle?.hide()
+        questionHandle = nil
+        questionList = nil
+        guard questionIndex < questionPrompts.count else {
+            finishQuestionPrompt()
+            return
+        }
+
+        let prompt = questionPrompts[questionIndex]
+        let list = InteractiveQuestionList(prompt: prompt, keybindings: keybindings)
+        list.onConfirm = { [weak self] answer in self?.acceptQuestion(answer) }
+        list.onCancel = { [weak self] in self?.cancelQuestionPrompt() }
+        let title = prompt.header.map { sanitizeUntrustedText(collapseToOneLine($0)) }
+            ?? "Question \(questionIndex + 1) of \(questionPrompts.count)"
+        let question = sanitizeUntrustedText(collapseToOneLine(prompt.question))
+        let inner = Container()
+        inner.addChild(Text("? \(title)", wrap: false))
+        inner.addChild(Text(truncateToWidth(question, 60, ellipsis: ""), wrap: false))
+        inner.addChild(Spacer(lines: 1))
+        inner.addChild(list)
+        let hint = prompt.allowsMultiple
+            ? "space toggle · enter confirm · esc cancel"
+            : "↑/↓ choose · enter confirm · esc cancel"
+        inner.addChild(Text("\u{1b}[2m\(hint)\u{1b}[0m", wrap: false))
+
+        let rowCount = max(1, inner.render(width: 64).count)
+        questionHandle = tui.showOverlay(
+            inner,
+            options: OverlayOptions(
+                width: .absolute(64),
+                minWidth: 30,
+                maxHeight: .absolute(rowCount),
+                anchor: .center,
+                nonCapturing: true
+            )
+        )
+        questionList = list
+    }
+
+    private func acceptQuestion(_ answer: QuestionAnswer) {
+        guard pendingQuestion != nil else { return }
+        questionAnswers.append(answer)
+        questionIndex += 1
+        if questionIndex < questionPrompts.count {
+            presentQuestionOverlay()
+            render()
+        } else {
+            finishQuestionPrompt()
+        }
+    }
+
+    private func finishQuestionPrompt() {
+        guard let continuation = pendingQuestion else { return }
+        pendingQuestion = nil
+        questionHandle?.hide()
+        questionHandle = nil
+        questionList = nil
+        questionPrompts = []
+        questionIndex = 0
+        let answers = questionAnswers
+        questionAnswers = []
+        if running { statusLine.text = runningStatus }
+        continuation.resume(returning: answers)
+        render()
+    }
+
+    private func cancelQuestionPrompt() {
+        guard let continuation = pendingQuestion else { return }
+        pendingQuestion = nil
+        questionHandle?.hide()
+        questionHandle = nil
+        questionList = nil
+        questionPrompts = []
+        questionAnswers = []
+        questionIndex = 0
+        if running { statusLine.text = runningStatus }
+        continuation.resume(returning: nil)
+        render()
     }
 
     // MARK: Agent loop
@@ -1705,6 +1913,8 @@ public struct InteractiveMode: Sendable {
     /// alongside the harness whose `beforeToolCall` gate the engine drives, then set
     /// in ``run`` to the coordinator's approval overlay once the UI exists.
     private let prompterBox: PrompterBox
+    /// The late-bound structured-question handler for the built-in question tool.
+    private let questionBox: QuestionBox
     /// The MCP servers backing this session's MCP tools (Phase 8c), held so ``run``
     /// can tear them down on exit — they spawn in their own process group and would
     /// otherwise be orphaned. `nil` when no MCP servers are configured.
@@ -1728,6 +1938,7 @@ public struct InteractiveMode: Sendable {
         toolTheme: ToolRenderTheme,
         steering: SteeringBox,
         prompterBox: PrompterBox,
+        questionBox: QuestionBox,
         metadataRelay: ResponseMetadataRelay,
         requestedModel: String,
         fileSystem: SandboxedFileSystem? = nil,
@@ -1743,6 +1954,7 @@ public struct InteractiveMode: Sendable {
         self.toolTheme = toolTheme
         self.steering = steering
         self.prompterBox = prompterBox
+        self.questionBox = questionBox
         self.metadataRelay = metadataRelay
         self.requestedModel = requestedModel
         self.fileSystem = fileSystem
@@ -1817,10 +2029,12 @@ public struct InteractiveMode: Sendable {
 
         let client = LiteLLMClient(configuration: clientConfiguration)
         let shell = try SubprocessShell()
+        let questionBox = QuestionBox()
         let toolContext = try await ToolContext.rooted(
             at: workDirectory,
             shell: shell,
-            environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+            environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames),
+            questionHandler: { await questionBox.ask($0) }
         )
         let registry = ToolRegistry.builtin
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
@@ -1965,6 +2179,7 @@ public struct InteractiveMode: Sendable {
             toolTheme: toolTheme,
             steering: steering,
             prompterBox: prompterBox,
+            questionBox: questionBox,
             metadataRelay: metadataRelay,
             requestedModel: runtime.model,
             fileSystem: toolContext.fileSystem,
@@ -2053,6 +2268,7 @@ public struct InteractiveMode: Sendable {
             toolTheme: toolTheme,
             homeDirectory: homeDirectory,
             steering: steering,
+            questionBox: questionBox,
             fileSystem: fileSystem,
             terminalRows: { target.rows },
             imageCapabilities: resolvedCapabilities,
@@ -2063,6 +2279,7 @@ public struct InteractiveMode: Sendable {
         // Now that the approval UI exists, point the engine's prompter at it. Until
         // this runs (it cannot fire before the first frame), the box refuses.
         prompterBox.set { await coordinator.showPermissionPrompt($0) }
+        questionBox.set { await coordinator.showQuestionPrompt($0) }
         // And point the response-header relay at the transcript, so a fallback the
         // gateway performed is reported instead of swallowed. The head arrives on
         // the streaming client's task, off the main actor, so the hop is explicit.

@@ -346,6 +346,21 @@ struct InteractiveModeEndToEndTests {
 
         """#
 
+    /// Turn 1: the assistant asks the interactive question tool for one choice.
+    static let questionTurn = #"""
+        data: {"id":"q1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_question_1","type":"function","function":{"name":"question","arguments":""}}]},"finish_reason":null}]}
+
+        data: {"id":"q1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"questions\":[{\"header\":\"Database\",\"question\":\"Choose a database\",\"options\":[{\"label\":\"SQLite\",\"description\":\"Local and simple\"},{\"label\":\"Postgres\",\"description\":\"Runs as a service\"}]}]}"}}]},"finish_reason":null}]}
+
+        data: {"id":"q1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+        data: {"id":"q1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":8,"total_tokens":50}}
+
+        data: [DONE]
+
+
+        """#
+
     /// The content of the first tool-role message in a chat-completions body — the
     /// tool result fed back to the model.
     private static func toolResult(_ body: String) -> String {
@@ -445,6 +460,52 @@ struct InteractiveModeEndToEndTests {
         #expect(finished, "the run never completed after rejection")
         #expect(gateway.requestCount == 2)
         #expect(Self.toolResult(gateway.requests[1].body).contains("rejected"), "the tool should have been refused")
+
+        inputCont.finish()
+        try await runTask.value
+    }
+
+    /// PHASE 11 — the structured question tool uses the same late-bound terminal
+    /// continuation as permissions: approve the tool, answer its selector, and
+    /// return the selected label to the model as a normal tool result.
+    @Test
+    func questionToolUsesInteractiveDialog() async throws {
+        let gateway = try MockGateway(chatCompletionBodies: [Self.questionTurn, Self.singleTextTurn])
+        gateway.start()
+        defer { gateway.stop() }
+        let tree = try TempTree()
+        defer { tree.cleanUp() }
+
+        let mode = try await InteractiveMode.make(
+            clientConfiguration: LiteLLMClient.Configuration(baseURL: gateway.baseURL, apiKey: "sk-test"),
+            model: "mock-model",
+            workingDirectory: tree.work.path,
+            sessionDirectory: tree.sessions.path,
+            configDirectory: tree.root.path
+        )
+
+        let cols = 70, rows = 22
+        let target = CaptureTarget(columns: cols, rows: rows)
+        let (input, inputCont) = AsyncStream.makeStream(of: [UInt8].self)
+        let (resize, _) = AsyncStream.makeStream(of: TerminalSize.self)
+        let runTask = Task { @MainActor in
+            try await mode.run(target: target, input: input, resize: resize, lifecycle: NoopLifecycle())
+        }
+
+        inputCont.yield(bytes("pick a database"))
+        inputCont.yield(bytes("\r"))
+        let approval = await waitUntil { screenContains(target, rows: rows, cols: cols, "Allow question") }
+        #expect(approval, "the question permission prompt never appeared")
+        inputCont.yield(bytes("\r"))
+
+        let dialog = await waitUntil { screenContains(target, rows: rows, cols: cols, "Choose a database") }
+        #expect(dialog, "the structured question dialog never appeared")
+        inputCont.yield(bytes("\r"))
+
+        let finished = await waitUntil { screenContains(target, rows: rows, cols: cols, "Hello from the agent") }
+        #expect(finished, "the run never completed after answering the question")
+        #expect(gateway.requestCount == 2)
+        #expect(Self.toolResult(gateway.requests[1].body).contains("SQLite"), "selected label was not returned")
 
         inputCont.finish()
         try await runTask.value
