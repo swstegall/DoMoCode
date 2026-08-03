@@ -350,6 +350,7 @@ public struct ToolContext: Sendable {
     /// The manager is created with the context so one session can poll a process
     /// from a later tool call without sharing it with another session.
     public let backgroundProcesses: BackgroundProcessManager
+    public let diagnosticsProvider: (any DiagnosticsProvider)?
 
     /// The runtime bridge used by ``TaskTool``. It is optional so the ordinary
     /// CLI and library contexts keep the same tool surface and behavior.
@@ -380,6 +381,7 @@ public struct ToolContext: Sendable {
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
+        diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) {
@@ -391,6 +393,7 @@ public struct ToolContext: Sendable {
         self.questionHandler = questionHandler
         self.webFetch = webFetch
         self.backgroundProcesses = backgroundProcesses
+        self.diagnosticsProvider = diagnosticsProvider
         self.subagentCoordinator = subagentCoordinator
         self.sessionID = sessionID
     }
@@ -407,6 +410,7 @@ public struct ToolContext: Sendable {
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
+        diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) async throws(DoMoError) -> ToolContext {
@@ -419,6 +423,7 @@ public struct ToolContext: Sendable {
             questionHandler: questionHandler,
             webFetch: webFetch,
             backgroundProcesses: backgroundProcesses,
+            diagnosticsProvider: diagnosticsProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -431,6 +436,7 @@ public struct ToolContext: Sendable {
         withQuestionHandler(
             handler,
             backgroundProcesses: backgroundProcesses,
+            diagnosticsProvider: diagnosticsProvider,
             subagentCoordinator: subagentCoordinator,
             sessionID: sessionID
         )
@@ -443,6 +449,7 @@ public struct ToolContext: Sendable {
     public func withQuestionHandler(
         _ handler: QuestionHandler?,
         backgroundProcesses: BackgroundProcessManager,
+        diagnosticsProvider: (any DiagnosticsProvider)? = nil,
         subagentCoordinator: SubagentCoordinator? = nil,
         sessionID: String? = nil
     ) -> ToolContext {
@@ -455,9 +462,33 @@ public struct ToolContext: Sendable {
             questionHandler: handler,
             webFetch: webFetch,
             backgroundProcesses: backgroundProcesses,
+            diagnosticsProvider: diagnosticsProvider ?? self.diagnosticsProvider,
             subagentCoordinator: subagentCoordinator ?? self.subagentCoordinator,
             sessionID: sessionID ?? self.sessionID
         )
+    }
+
+    func addingDiagnostics(
+        to result: ToolResult,
+        changedPath: FilePath
+    ) async -> ToolResult {
+        guard !result.isError, let diagnosticsProvider else { return result }
+        let report = await diagnosticsProvider.check(changedPath: changedPath)
+        guard let modelText = report.modelText else { return result }
+
+        var enriched = result
+        enriched.content.append(.text(modelText))
+        switch enriched.details {
+        case .object(var object):
+            object["diagnostics"] = report.details
+            enriched.details = .object(object)
+        default:
+            enriched.details = .object([
+                "tool": enriched.details,
+                "diagnostics": report.details,
+            ])
+        }
+        return enriched
     }
 
     public var sandbox: PathSandbox { fileSystem.sandbox }

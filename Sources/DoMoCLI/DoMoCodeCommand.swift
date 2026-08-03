@@ -516,10 +516,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         }
 
         let shell = try SubprocessShell()
+        let toolEnvironment = Self.toolEnvironment(configuration)
         let toolContext = try await ToolContext.rooted(
             at: workingDirectory,
             shell: shell,
-            environment: Self.toolEnvironment(configuration)
+            environment: toolEnvironment,
+            diagnosticsProvider: CLIDiagnosticsProvider(
+                root: workingDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            )
         )
         let registry = ToolRegistry.builtin(
             includePlanExit: selectedMode == .plan,
@@ -915,12 +921,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         backgroundSessions: BackgroundProcessSessions
     ) {
         let shell = try SubprocessShell()
+        let toolEnvironment = Self.toolEnvironment(configuration)
         let sessionStartHead = try? await DoMoGit(shell: shell).head(at: workingDirectory)
         let subagentCoordinator = SubagentCoordinator()
         let toolContext = try await ToolContext.rooted(
             at: workingDirectory,
             shell: shell,
-            environment: Self.toolEnvironment(configuration),
+            environment: toolEnvironment,
+            diagnosticsProvider: CLIDiagnosticsProvider(
+                root: workingDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            ),
             subagentCoordinator: subagentCoordinator
         )
         // Keep plan_exit in the server registry even when the default mode is build;

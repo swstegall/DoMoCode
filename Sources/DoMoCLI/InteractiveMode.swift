@@ -2184,7 +2184,12 @@ public struct InteractiveMode: Sendable {
             at: workDirectory,
             shell: shell,
             environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames),
-            questionHandler: { await questionBox.ask($0) }
+            questionHandler: { await questionBox.ask($0) },
+            diagnosticsProvider: CLIDiagnosticsProvider(
+                root: workDirectory,
+                shell: shell,
+                environment: ToolContext.scrubbedEnvironment(alsoUnsetting: credentialEnvNames)
+            )
         )
         let registry = ToolRegistry.builtin(
             includePlanExit: agentMode == .plan,

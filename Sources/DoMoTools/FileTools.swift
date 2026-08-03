@@ -365,12 +365,13 @@ public struct WriteTool: Tool {
             let filePath = FilePath(path)
             let data = Data(content.utf8)
 
-            return try await context.mutations.serialize(filePath, tool: name) {
+            let result = try await context.mutations.serialize(filePath, tool: name) {
                 try await context.fileSystem.write(filePath, data)
                 // pi reports `content.length`, a UTF-16 count mislabeled "bytes";
                 // the actual byte count is both correct and identical for ASCII.
                 return ToolResult.text("Successfully wrote \(data.count) bytes to \(path)")
             }
+            return await context.addingDiagnostics(to: result, changedPath: filePath)
         }
     }
 }
@@ -468,7 +469,7 @@ public struct EditTool: Tool {
         context: ToolContext
     ) async throws(DoMoError) -> ToolResult {
         let filePath = FilePath(path)
-        return try await context.mutations.serialize(filePath, tool: name) {
+        let result = try await context.mutations.serialize(filePath, tool: name) {
             let bytes: Data
             do {
                 bytes = try await context.fileSystem.read(filePath)
@@ -502,6 +503,7 @@ public struct EditTool: Tool {
             ])
             return ToolResult.text("Successfully replaced \(edits.count) block(s) in \(path).", details: details)
         }
+        return await context.addingDiagnostics(to: result, changedPath: filePath)
     }
 }
 
