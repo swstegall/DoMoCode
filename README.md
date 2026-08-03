@@ -579,7 +579,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       file tree, hunk navigation, reviewed marks, live refresh, destructive restore confirmation, and
       LLM-generated subjects. The inline surface names the full-screen affordance rather than sending
       `/diff` to the model.
-- [ ] **Phase 13 — Checkpoints and undo.** The single highest-value absent capability in the survey.
+- [x] **Phase 13 — Checkpoints and undo.** The single highest-value absent capability in the survey.
       Today a bad edit is permanent unless the user's own VCS happened to have it staged. Shadow git —
       a second `GIT_DIR` in the data directory whose work-tree is the user's project, capturing
       `write-tree` objects with no commits, branches or reflog — gives real undo without touching the
@@ -593,9 +593,13 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       worst outcome in this domain. Plus `/timeline`, and a `/fork` command over plumbing that exists but has
       no interactive entry point: `AgentHarness.fork` is reachable today only through the `--fork`
       launch flag, while `POST /session/:id/fork` and `ServerClient.fork` have no caller outside
-      tests. `/clone` has no plumbing at all — no harness method, no route — and is new work. *Exit:* `/undo`
-      rolls back conversation and files together; `/redo` puts them back; the banner never claims a
-      file was restored when it was not.
+      tests. `/clone` has no plumbing at all — no harness method, no route — and is new work. *Exit met:*
+      `DoMoShadowGit` records commitless shadow-index snapshots without touching the user's repository;
+      append-only checkpoint and history-action entries drive a pure, earliest-writer-wins revert planner;
+      `/undo` and `/redo` move conversation and files together with truthful restore/skipped/failed
+      reporting; `restored` / `snapshots-disabled` / `unavailable` reaches the banner and REST client;
+      and `/timeline`, `/fork`, and `/clone` are wired through the inline REPL, full-screen client,
+      server, and client APIs.
 - [ ] **Phase 14 — Agents, personas, and plan mode.** An agent is a value — a name, a system prompt, a
       model, a permission ruleset, a mode. Under one gateway this is unusually cheap: a per-agent
       model is another alias on the same endpoint, with no provider resolution and no second
