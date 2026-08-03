@@ -159,6 +159,8 @@ Sources/
                     remembers and persists grants, and the beforeToolCall hook that gates the loop.
   DoMoMCP/          MCP client: an MCPManager actor owning stdio server subprocesses, a JSON-RPC 2.0
                     protocol actor, and an McpTool: AgentTool adapter. Hand-rolled, no SDK.
+  DoMoLSP/          Content-Length-framed LSP diagnostics: pooled per-root stdio clients, initialize/
+                    open/change notifications, pull diagnostics, and merged push diagnostics.
 
   # The server — hosts the runtime behind a local socket
   DoMoServer/       Hummingbird HTTP+SSE. Write path drives the AgentHarness actor; read path is an
@@ -629,17 +631,21 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       JSONL and `-p` JSON projections. **Complete:** plan-mode delegation creates real `explore` child
       sessions, foreground and background runs are supported, task ids recover after restart, and the
       client sidebar can enter a child and press `b` to return to its parent.
-- [ ] **Phase 16 — LSP and code intelligence.** Independent of 14 and 15; can run in parallel. The
+- [x] **Phase 16 — LSP and code intelligence.** Independent of 14 and 15; can run in parallel. The
       cheap version ships first behind the same protocol as the expensive one, so nothing is thrown
       away: a `DiagnosticsProvider` implemented by a **CLI provider** (`swift build`, `tsc --noEmit`,
       `cargo check --message-format=json`) has no server lifecycle, no resident memory, and real value
-      in a week. Then a real LSP client, reusing `PersistentProcess` and the JSON-RPC correlator
-      extracted out of `DoMoMCP` (plus Content-Length framing), with per-root pooling and push+pull
+      in a week. Then a real LSP client using the same persistent-process and JSON-RPC correlation
+      contract as `DoMoMCP` (plus Content-Length framing), with per-root pooling and push+pull
       diagnostics merged. Post-edit diagnostics are appended to `edit`/`write` results as
       `<diagnostics>` blocks the model reads — errors only, capped. Auto-format after write lands here
       too, and needs **an explicit decision about its permission story**: running a project-configured
       binary after every write is an execution path the permission engine currently never sees.
-      *Exit:* an edit that breaks the build comes back with the compiler's own error attached.
+      **Complete:** CLI compiler diagnostics attach capped, error-only `<diagnostics>` blocks after
+      successful mutations; the pooled LSP provider handles Content-Length framing and merges pull
+      results with pushed diagnostics; and `autoFormat` is a trusted, opt-in setting whose command
+      runs only after the mutation has passed its permission decision. *Exit met:* an edit that breaks
+      the build comes back with the compiler's own error attached.
 - [ ] **Phase 17 — Memory and recall.** The best value-to-cost ratio left after Phase 5, and it needs
       no new storage and no network. `session_recall` searches and reads this project's own past
       sessions, ranked over user text, assistant text, file references and tool *errors* while
@@ -830,7 +836,7 @@ ones — each addition still forces a tool-vs-prompt-injection and in-process-vs
 | Headless run (prompt in, streamed/JSON out, exit codes, auto-approve) | kilocode, opencode | yes | **Shipped**, as flags rather than a subcommand: `-p` / `--json` / `--yolo`, exit codes 0–4 |
 | Git-shadow snapshot checkpoints + undo/redo + fork-from-any-message | kilocode, opencode | yes | Phase 13 |
 | Config-driven agent/persona profiles + a read-only plan mode | all three | yes | Phase 14 |
-| Auto-format-after-edit hook; repo `.setup.sh` session-init hook | all three | yes | Phase 16 (format); hooks await the [extensibility decision](#decisions-that-reverse-a-stated-non-goal) |
+| Auto-format-after-edit hook; repo `.setup.sh` session-init hook | all three | yes | **Shipped** (Phase 16 format); hooks await the [extensibility decision](#decisions-that-reverse-a-stated-non-goal) |
 | Hard per-task budget cap (abort the loop on a cost ceiling) | OpenHands | yes | **Shipped** (Phase 9; enforced when usage is priced by gateway or configured rates) |
 | Trusted-config `{env:}`/`{file:}` interpolation gated by the trust boundary | kilocode | yes | Phase 5a |
 | Local `/review` of a diff, branch, or commit | kilocode, OpenHands | yes | Phase 5b |
@@ -839,7 +845,7 @@ ones — each addition still forces a tool-vs-prompt-injection and in-process-vs
 | First-party tool additions: `question`/`suggest`, todo checklist, `webfetch` (+ gated `apply_patch`, notebook-edit, `recall`) | all three | adaptable | Phase 11; `recall` in Phase 17. `websearch` needs a second vendor and stays out |
 | Selectable/tunable history condensers (observation-masking, recent-window, LLM-summarizing) | OpenHands | adaptable | **Shipped** (Phase 10) |
 | Local conveniences: prompt stash, `/btw` side-branch, background jobs, file watcher, JSONL replay, local secrets + env injection, out-of-process notify/sound | opencode, kilocode, OpenHands | yes/adaptable | Scattered: stash in Phase 9, background jobs in 11, replay in 20, notify/sound in 5d, secrets in 5a. Prompt *history* shipped in 8.5; a file watcher remains unscheduled |
-| Out-of-process research items: ACP single-session stdio subcommand, LSP post-edit diagnostics, Seatbelt/bubblewrap bash sandbox, local semantic index | all three | adaptable | LSP is Phase 16, the sandbox Phase 18; ACP awaits a [decision](#decisions-that-reverse-a-stated-non-goal); the semantic index is [not planned](#non-goals-and-known-gaps) |
+| Out-of-process research items: ACP single-session stdio subcommand, LSP post-edit diagnostics, Seatbelt/bubblewrap bash sandbox, local semantic index | all three | adaptable | LSP **shipped in Phase 16**, the sandbox Phase 18; ACP awaits a [decision](#decisions-that-reverse-a-stated-non-goal); the semantic index is [not planned](#non-goals-and-known-gaps) |
 
 The semantic-index row is the sharpest example of "adapt, don't adopt": the idea ports only if
 embeddings come from the single LiteLLM gateway's OpenAI-compatible `/embeddings` into an
@@ -1045,7 +1051,7 @@ default.**
 Secrets are never written to `settings.json` — `Settings` has no API-key field at all. `apiKeyEnv`
 holds only the *name* of the environment variable to read, so the key value never touches disk.
 
-### settings.json (Phase 5a keys)
+### settings.json keys
 
 ```jsonc
 {
@@ -1054,6 +1060,7 @@ holds only the *name* of the environment variable to read, so the key value neve
   },
   "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000, "model": "cheap-alias" },
   "contextWindow": 200000,
+  "autoFormat": { "enabled": true, "command": "swift-format {file}", "timeoutMs": 30000 },
   "mcpServers": { "gh": { "command": ["npx", "-y", "server"], "environment": { "TOKEN": "{env:GH_PAT}" } } }
 }
 ```
@@ -1068,6 +1075,14 @@ platforms. An alias-level `reasoningEffort` outranks the global one. An alias wi
 The two dictionaries merge differently, deliberately: `modelOverrides` replaces a **whole entry** per
 key (project over user, the `mcpServers` rule), while `compaction` merges **field by field** (the
 rule every other numeric knob follows).
+
+`autoFormat` also merges field by field, project over user. It is disabled unless `enabled` is true and
+`command` is non-empty. `{file}` becomes the changed file's shell-quoted absolute path; without the
+placeholder, that path is appended. The command runs under the same scrubbed environment as other
+tool subprocesses, only after `write` or `edit` has passed the mutation permission decision, and a
+formatter failure is reported to the model without turning the successful mutation into an error.
+Because it executes a project-configured binary, a project value is available only after the normal
+project-trust gate.
 
 **Value interpolation.** Any string field above, plus `mcpServers.*.command`, `.environment` values
 and `.cwd`, may contain `{env:NAME}` or `{file:PATH}`. Write `{{env:NAME}}` for a literal. The rules
