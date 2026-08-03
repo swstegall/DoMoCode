@@ -85,6 +85,15 @@ struct FullScreenClientPTYTests {
     /// it is the stable readiness signal between the first frame and prompt input.
     static let openedSessionRow = "work  "
 
+    /// Bootstrap may query the model catalog, and that request is not a turn.
+    static func completionCount(_ gateway: MockGateway) -> Int {
+        gateway.requests.reduce(into: 0) { count, request in
+            if request.method == "POST", request.path.contains("chat/completions") {
+                count += 1
+            }
+        }
+    }
+
     /// Launch the full-screen client on a pty and return everything it wrote
     /// before it was stopped.
     static func captureClientOutput(extraArguments: [String]) throws -> String {
@@ -233,17 +242,17 @@ struct FullScreenClientPTYTests {
         pty.type("walk every directory\r")
         let accepted = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            return gateway.requestCount > 0
+            return Self.completionCount(gateway) > 0
         }
         #expect(accepted, "the prompt was never accepted")
 
         // 25 tool turns plus the final text turn. The old default stopped at 20.
         let finished = Self.poll(timeout: .seconds(60)) {
             pty.drain(into: &captured)
-            return gateway.requestCount >= turns + 1
+            return Self.completionCount(gateway) >= turns + 1
         }
-        #expect(finished, "the run stopped after \(gateway.requestCount) turns")
-        #expect(gateway.requestCount == turns + 1)
+        #expect(finished, "the run stopped after \(Self.completionCount(gateway)) turns")
+        #expect(Self.completionCount(gateway) == turns + 1)
     }
 
     /// …and a genuinely stuck run in that same UI still stops.
@@ -295,19 +304,19 @@ struct FullScreenClientPTYTests {
         pty.type("keep listing\r")
         let accepted = Self.poll(timeout: .seconds(20)) {
             pty.drain(into: &captured)
-            return gateway.requestCount > 0
+            return Self.completionCount(gateway) > 0
         }
         #expect(accepted, "the prompt was never accepted")
 
         let stopped = Self.poll(timeout: .seconds(30)) {
             pty.drain(into: &captured)
-            return gateway.requestCount >= 12
+            return Self.completionCount(gateway) >= 12
         }
-        #expect(stopped, "the stuck run never reached the guard (\(gateway.requestCount) turns)")
+        #expect(stopped, "the stuck run never reached the guard (\(Self.completionCount(gateway)) turns)")
         // And it STAYS stopped — the guard ended the run rather than merely slowing
         // it, so the remaining three scripted turns are never asked for.
         _ = Self.poll(timeout: .seconds(3)) { pty.drain(into: &captured); return false }
-        #expect(gateway.requestCount == 12, "the run did not stop at the guard")
+        #expect(Self.completionCount(gateway) == 12, "the run did not stop at the guard")
     }
 
     /// Poll `condition` until it holds or the deadline passes.
