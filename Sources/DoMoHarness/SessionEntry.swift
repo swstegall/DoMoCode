@@ -6,6 +6,7 @@
 // Ported to Swift from the Pi Agent Harness.
 
 import DoMoCore
+import DoMoGit
 import DoMoLLM
 import Foundation
 
@@ -193,6 +194,59 @@ public struct BranchSummary: Sendable, Hashable, Codable {
     }
 }
 
+// MARK: - Workspace history payloads
+
+/// The append-only operation recorded when conversation and workspace history
+/// move together.
+public enum SessionHistoryOperation: String, Sendable, Hashable, Codable {
+    case undo
+    case redo
+}
+
+/// A durable record of a workspace history move.
+///
+/// `fromEntryID` and `targetEntryID` are workspace-checkpoint entry ids, not
+/// arbitrary message ids. The entry itself is physically appended after
+/// `fromEntryID`, while ``SessionTreeEntry/leafIdAfterEntry`` points the active
+/// branch at `targetEntryID`; that is what makes navigation append-only without
+/// leaving a synthetic action message in the model context.
+public struct SessionHistoryAction: Sendable, Hashable, Codable {
+    public let operation: SessionHistoryOperation
+    public let fromEntryID: String
+    public let targetEntryID: String
+    public let fromSnapshotID: String
+    public let targetSnapshotID: String
+    public let paths: [String]
+    public let restoredPaths: [String]
+    public let skippedPaths: [String]
+    public let failedPaths: [String]
+    public let status: WorkspaceSnapshotStatus
+
+    public init(
+        operation: SessionHistoryOperation,
+        fromEntryID: String,
+        targetEntryID: String,
+        fromSnapshotID: String,
+        targetSnapshotID: String,
+        paths: [String],
+        restoredPaths: [String] = [],
+        skippedPaths: [String] = [],
+        failedPaths: [String] = [],
+        status: WorkspaceSnapshotStatus
+    ) {
+        self.operation = operation
+        self.fromEntryID = fromEntryID
+        self.targetEntryID = targetEntryID
+        self.fromSnapshotID = fromSnapshotID
+        self.targetSnapshotID = targetSnapshotID
+        self.paths = paths
+        self.restoredPaths = restoredPaths
+        self.skippedPaths = skippedPaths
+        self.failedPaths = failedPaths
+        self.status = status
+    }
+}
+
 // MARK: - Tree entry
 
 /// One node in the append-only session DAG.
@@ -206,13 +260,14 @@ public struct BranchSummary: Sendable, Hashable, Codable {
 ///
 /// The load-bearing set for Phase 3 is `message`, `compaction`, `branch_summary`,
 /// `label`, `session_info` and `model_change`; `session_start` records the Git
-/// checkpoint for Phase 12, and `leaf` is included because tree
-/// navigation records the active tip as a `leaf` entry and it is cheap. The
-/// extension-facing entries (`custom`, `custom_message`) and the settings
-/// entries pi has for thinking level and dynamic tool sets are deliberately not
-/// modeled: DoMoCode has no extension host and no thinking-level or dynamic-tool
-/// feature, so a case for each would be a wire shape nothing writes and every
-/// switch still has to handle.
+/// checkpoint for Phase 12, `workspace_checkpoint` and `history_action` carry
+/// Phase 13's append-only file/conversation history, and `leaf` is included
+/// because tree navigation records the active tip as a `leaf` entry and it is
+/// cheap. The extension-facing entries (`custom`, `custom_message`) and the
+/// settings entries pi has for thinking level and dynamic tool sets are
+/// deliberately not modeled: DoMoCode has no extension host and no
+/// thinking-level or dynamic-tool feature, so a case for each would be a wire
+/// shape nothing writes and every switch still has to handle.
 public struct SessionTreeEntry: Sendable, Hashable {
     public var id: String
 
@@ -307,6 +362,10 @@ public struct SessionTreeEntry: Sendable, Hashable {
         /// not conversation context, and is present only when the caller found
         /// a committed Git HEAD at session creation time.
         case sessionStart(head: String)
+        /// A shadow-Git tree captured at a conversation boundary.
+        case workspaceCheckpoint(WorkspaceSnapshot)
+        /// An undo or redo operation that moved the active branch.
+        case historyAction(SessionHistoryAction)
         /// A record that the active leaf moved to `targetId` (`nil` = before the
         /// first entry). Written by tree navigation, not by the conversation.
         case leaf(targetId: String?)
@@ -323,6 +382,8 @@ extension SessionTreeEntry {
         case label
         case sessionInfo = "session_info"
         case sessionStart = "session_start"
+        case workspaceCheckpoint = "workspace_checkpoint"
+        case historyAction = "history_action"
         case leaf
     }
 
@@ -335,6 +396,8 @@ extension SessionTreeEntry {
         case .label: return .label
         case .sessionInfo: return .sessionInfo
         case .sessionStart: return .sessionStart
+        case .workspaceCheckpoint: return .workspaceCheckpoint
+        case .historyAction: return .historyAction
         case .leaf: return .leaf
         }
     }
@@ -347,6 +410,7 @@ extension SessionTreeEntry {
     /// entry, without replaying navigation.
     public var leafIdAfterEntry: String? {
         if case .leaf(let targetId) = payload { return targetId }
+        if case .historyAction(let action) = payload { return action.targetEntryID }
         return id
     }
 }
@@ -390,6 +454,16 @@ extension SessionTreeEntry: Codable {
         case label
         case name
         case head
+        case snapshotId
+        case previousSnapshotId
+        case files
+        case operation
+        case fromSnapshotId
+        case targetSnapshotId
+        case restoredPaths
+        case skippedPaths
+        case failedPaths
+        case status
     }
 
     public init(from decoder: any Decoder) throws {
@@ -453,6 +527,45 @@ extension SessionTreeEntry: Codable {
             self.metadataUsage = try container.decodeIfPresent(Usage.self, forKey: .usage)
         case .sessionStart:
             self.payload = .sessionStart(head: try container.decode(String.self, forKey: .head))
+        case .workspaceCheckpoint:
+            self.payload = .workspaceCheckpoint(
+                WorkspaceSnapshot(
+                    id: try container.decode(String.self, forKey: .snapshotId),
+                    previousID: try container.decodeIfPresent(String.self, forKey: .previousSnapshotId),
+                    files: try container.decode([String].self, forKey: .files)
+                )
+            )
+        case .historyAction:
+            let rawOperation = try container.decode(String.self, forKey: .operation)
+            guard let operation = SessionHistoryOperation(rawValue: rawOperation) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .operation,
+                    in: container,
+                    debugDescription: "Unknown session history operation: \(rawOperation)"
+                )
+            }
+            let rawStatus = try container.decode(String.self, forKey: .status)
+            guard let status = WorkspaceSnapshotStatus(rawValue: rawStatus) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .status,
+                    in: container,
+                    debugDescription: "Unknown workspace snapshot status: \(rawStatus)"
+                )
+            }
+            self.payload = .historyAction(
+                SessionHistoryAction(
+                    operation: operation,
+                    fromEntryID: try container.decode(String.self, forKey: .fromId),
+                    targetEntryID: try container.decode(String.self, forKey: .targetId),
+                    fromSnapshotID: try container.decode(String.self, forKey: .fromSnapshotId),
+                    targetSnapshotID: try container.decode(String.self, forKey: .targetSnapshotId),
+                    paths: try container.decode([String].self, forKey: .files),
+                    restoredPaths: try container.decode([String].self, forKey: .restoredPaths),
+                    skippedPaths: try container.decode([String].self, forKey: .skippedPaths),
+                    failedPaths: try container.decode([String].self, forKey: .failedPaths),
+                    status: status
+                )
+            )
         case .leaf:
             self.payload = .leaf(targetId: try container.decodeIfPresent(String.self, forKey: .targetId))
         }
@@ -502,6 +615,21 @@ extension SessionTreeEntry: Codable {
             try container.encodeIfPresent(metadataUsage, forKey: .usage)
         case .sessionStart(let head):
             try container.encode(head, forKey: .head)
+        case .workspaceCheckpoint(let snapshot):
+            try container.encode(snapshot.id, forKey: .snapshotId)
+            try container.encodeIfPresent(snapshot.previousID, forKey: .previousSnapshotId)
+            try container.encode(snapshot.files, forKey: .files)
+        case .historyAction(let action):
+            try container.encode(action.operation.rawValue, forKey: .operation)
+            try container.encode(action.fromEntryID, forKey: .fromId)
+            try container.encode(action.targetEntryID, forKey: .targetId)
+            try container.encode(action.fromSnapshotID, forKey: .fromSnapshotId)
+            try container.encode(action.targetSnapshotID, forKey: .targetSnapshotId)
+            try container.encode(action.paths, forKey: .files)
+            try container.encode(action.restoredPaths, forKey: .restoredPaths)
+            try container.encode(action.skippedPaths, forKey: .skippedPaths)
+            try container.encode(action.failedPaths, forKey: .failedPaths)
+            try container.encode(action.status.rawValue, forKey: .status)
         case .leaf(let targetId):
             // Present as `null` when the leaf is reset to before the first entry,
             // which is a distinct state from "no targetId field".

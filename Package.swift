@@ -195,7 +195,7 @@ let package = Package(
         .target(
             name: "DoMoHarness",
             dependencies: [
-                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoExec",
+                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoExec", "DoMoGit",
                 .product(name: "Yams", package: "Yams"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -369,7 +369,7 @@ let package = Package(
 
         .testTarget(
             name: "DoMoHarnessTests",
-            dependencies: ["DoMoHarness", "DoMoAgent", "DoMoLLM", "DoMoExec", "DoMoCore"],
+            dependencies: ["DoMoHarness", "DoMoAgent", "DoMoLLM", "DoMoExec", "DoMoCore", "DoMoGit"],
             swiftSettings: safeSettings
         ),
 

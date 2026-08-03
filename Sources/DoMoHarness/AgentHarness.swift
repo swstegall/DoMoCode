@@ -7,6 +7,7 @@
 
 import DoMoAgent
 import DoMoCore
+import DoMoGit
 import DoMoLLM
 import Foundation
 import SystemPackage
@@ -68,6 +69,12 @@ public actor AgentHarness {
     private var activeStreamFn: AgentStreamFn
     private var activeContextWindow: Int?
 
+    /// The latest shadow tree on the active conversation branch. A checkpoint
+    /// entry is still written when this id repeats: a conversation-only turn
+    /// must remain undoable even when it did not edit a file.
+    private var workspaceSnapshotID: String?
+    private var workspaceStatusValue: WorkspaceSnapshotStatus
+
     /// Guards against a second concurrent ``run(prompt:sink:)``. Set and read only
     /// in the synchronous prologue of an actor method, so a re-entrant call sees it
     /// before its first await — pi's `phase !== "idle"` busy check.
@@ -101,6 +108,8 @@ public actor AgentHarness {
         self.activeStreamFn = configuration.streamFnForModel?(seed.model ?? configuration.model) ?? configuration.streamFn
         self.activeContextWindow = configuration.contextWindowForModel?(seed.model ?? configuration.model)
             ?? configuration.contextWindow
+        self.workspaceSnapshotID = seed.workspaceSnapshotID
+        self.workspaceStatusValue = configuration.workspaceSnapshots == nil ? .snapshotsDisabled : .restored
         self.nextSeq = seed.nextSeq
         self.accumulatedUsage = seed.usage
         self.recordedTurns = seed.turns
@@ -114,9 +123,16 @@ public actor AgentHarness {
         var usage: Usage
         var turns: Int
         var model: String?
+        var workspaceSnapshotID: String?
 
         /// A brand-new file: numbering starts at zero and nothing has been spent.
-        static let fresh = Seed(nextSeq: 0, usage: .zero, turns: 0, model: nil)
+        static let fresh = Seed(
+            nextSeq: 0,
+            usage: .zero,
+            turns: 0,
+            model: nil,
+            workspaceSnapshotID: nil
+        )
     }
 
     /// Everything a harness resumes with: the file's running totals, plus the
@@ -146,11 +162,16 @@ public actor AgentHarness {
             if case .modelChange(_, let modelID) = entry.payload { return modelID }
             return nil
         }.first ?? defaultModel
+        let workspaceSnapshotID = activeEntries.reversed().compactMap { entry -> String? in
+            if case .workspaceCheckpoint(let snapshot) = entry.payload { return snapshot.id }
+            return nil
+        }.first
         return Seed(
             nextSeq: try store.nextSequenceNumber(),
             usage: recovered.usage,
             turns: recovered.turns,
-            model: model
+            model: model,
+            workspaceSnapshotID: workspaceSnapshotID
         )
     }
 
@@ -174,7 +195,7 @@ public actor AgentHarness {
                 if let compactionUsage = compaction.usage { usage = usage + compactionUsage }
             case .branchSummary(let branch):
                 if let branchUsage = branch.usage { usage = usage + branchUsage }
-            case .message, .modelChange, .label, .leaf:
+            case .message, .modelChange, .label, .leaf, .workspaceCheckpoint, .historyAction:
                 break
             case .sessionInfo, .sessionStart:
                 if let metadataUsage = entry.metadataUsage { usage = usage + metadataUsage }
@@ -286,6 +307,11 @@ public actor AgentHarness {
         /// `nil` means the caller found no repository or no commit.
         public var sessionStartHead: String?
 
+        /// The private workspace snapshot source. `nil` disables snapshots and
+        /// makes undo/redo report `snapshots-disabled` instead of claiming a
+        /// file operation happened.
+        public var workspaceSnapshots: (any WorkspaceSnapshotSource)?
+
         /// Polled by the loop at each turn boundary for messages to inject before
         /// the next assistant response — pi's "steering". A message a caller
         /// enqueues while a run is in flight reaches the *current* run's next turn.
@@ -382,6 +408,7 @@ public actor AgentHarness {
             self.shouldStopAfterTurn = shouldStopAfterTurn
             self.beforeToolCall = beforeToolCall
             self.onNoProgress = onNoProgress
+            self.workspaceSnapshots = nil
         }
 
         /// The window compaction assumes when ``contextWindow`` is `nil`.
@@ -450,7 +477,13 @@ public actor AgentHarness {
             store: store,
             leaf: leaf,
             configuration: configuration,
-            seed: Seed(nextSeq: nextSeq, usage: .zero, turns: 0, model: nil)
+            seed: Seed(
+                nextSeq: nextSeq,
+                usage: .zero,
+                turns: 0,
+                model: nil,
+                workspaceSnapshotID: nil
+            )
         )
     }
 
@@ -695,6 +728,27 @@ public actor AgentHarness {
     /// The list is what ``open(path:configuration:preferring:)`` consumes; it is
     /// empty exactly when the tip is.
     public var leafLineage: [String] { leafChain.reversed() }
+
+    /// The current truth about workspace snapshot support. This is deliberately
+    /// an async probe: a configured source may become unavailable after launch,
+    /// and the UI must not keep showing a stale success state.
+    public func workspaceStatus() async -> WorkspaceSnapshotStatus {
+        guard let source = configuration.workspaceSnapshots else {
+            workspaceStatusValue = .snapshotsDisabled
+            return .snapshotsDisabled
+        }
+        guard workspaceStatusValue != .unavailable else { return .unavailable }
+        let status = await source.availability()
+        workspaceStatusValue = status
+        return status
+    }
+
+    /// The append-only timeline, including metadata, workspace checkpoints, and
+    /// history actions. A caller can render this without projecting it into model
+    /// messages or mistaking a file snapshot for an assistant response.
+    public func timeline() throws -> [SessionTreeEntry] {
+        try SessionTree.load(from: store).entries
+    }
 
     /// The messages the next turn would be seeded with, resolved from the current
     /// path exactly as ``run(prompt:sink:)`` resolves them.
@@ -1083,6 +1137,11 @@ public actor AgentHarness {
         isRunning = true
         defer { isRunning = false }
 
+        // Capture the pre-prompt workspace before compaction or any transcript
+        // entry can move the active tip. Failure disables workspace history for
+        // this runtime but does not turn an otherwise usable coding run into a
+        // provider failure.
+        await ensureWorkspaceBaseline()
         _ = try await compactIfNeeded()
 
         let systemPromptInput = messages.compactMap { message -> String? in
@@ -1242,6 +1301,43 @@ public actor AgentHarness {
             from: leaf,
             outputPolicy: outputPolicy
         )
+    }
+
+    // MARK: - Workspace checkpoints
+
+    /// Captures the worktree before the first prompt of a run. This entry is
+    /// separate from the prompt message so undo can return to the exact
+    /// conversation/file pair that existed before the run began.
+    private func ensureWorkspaceBaseline() async {
+        guard let source = configuration.workspaceSnapshots else {
+            workspaceStatusValue = .snapshotsDisabled
+            return
+        }
+        guard workspaceSnapshotID == nil else { return }
+        do {
+            let snapshot = try await source.track(from: nil)
+            try appendWorkspaceCheckpoint(snapshot)
+            workspaceSnapshotID = snapshot.id
+            workspaceStatusValue = .restored
+        } catch {
+            // Snapshot support is an enhancement around the core transcript. A
+            // missing Git worktree or an unreadable shadow directory disables the
+            // enhancement for this run; it must not discard the user's prompt.
+            workspaceStatusValue = .unavailable
+        }
+    }
+
+    private func appendWorkspaceCheckpoint(_ snapshot: WorkspaceSnapshot) throws {
+        let entry = SessionTreeEntry(
+            id: store.createEntryID(),
+            parentId: leaf,
+            timestamp: timestamp(),
+            payload: .workspaceCheckpoint(snapshot),
+            seq: nextSeq
+        )
+        try store.appendEntry(entry)
+        nextSeq += 1
+        leafChain.append(entry.id)
     }
 
     // MARK: - Compaction
@@ -1519,6 +1615,42 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
 
 // MARK: - Persistence conformance
 
+/// The explicit outcome shown by `/undo` and `/redo` surfaces.
+public struct WorkspaceHistoryResult: Sendable, Hashable, Codable {
+    public let operation: SessionHistoryOperation
+    public let status: WorkspaceSnapshotStatus
+    public let moved: Bool
+    public let fromEntryID: String?
+    public let targetEntryID: String?
+    public let restoredPaths: [String]
+    public let skippedPaths: [String]
+    public let failedPaths: [String]
+
+    public init(
+        operation: SessionHistoryOperation,
+        status: WorkspaceSnapshotStatus,
+        moved: Bool,
+        fromEntryID: String? = nil,
+        targetEntryID: String? = nil,
+        restoredPaths: [String] = [],
+        skippedPaths: [String] = [],
+        failedPaths: [String] = []
+    ) {
+        self.operation = operation
+        self.status = status
+        self.moved = moved
+        self.fromEntryID = fromEntryID
+        self.targetEntryID = targetEntryID
+        self.restoredPaths = restoredPaths
+        self.skippedPaths = skippedPaths
+        self.failedPaths = failedPaths
+    }
+
+    public var isComplete: Bool {
+        moved && status == .restored && skippedPaths.isEmpty && failedPaths.isEmpty
+    }
+}
+
 extension AgentHarness: SessionMessagePersisting {
     /// Appends `message` as a child of the current tip and advances the tip to it.
     ///
@@ -1550,5 +1682,252 @@ extension AgentHarness: SessionMessagePersisting {
             accumulatedUsage = accumulatedUsage + assistant.usage
             recordedTurns += 1
         }
+    }
+}
+
+extension AgentHarness: SessionWorkspaceCheckpointing {
+    /// Append a private shadow-Git observation after each settled agent turn.
+    ///
+    /// Source failures become an explicit `unavailable` status and leave the
+    /// conversation usable. A JSONL append failure remains throwing because it
+    /// is transcript loss, not an optional workspace enhancement.
+    public func persistWorkspaceCheckpoint() async throws {
+        guard let source = configuration.workspaceSnapshots else {
+            workspaceStatusValue = .snapshotsDisabled
+            return
+        }
+
+        let snapshot: WorkspaceSnapshot
+        do {
+            snapshot = try await source.track(from: workspaceSnapshotID)
+        } catch {
+            workspaceStatusValue = .unavailable
+            return
+        }
+
+        do {
+            try appendWorkspaceCheckpoint(snapshot)
+        } catch {
+            workspaceStatusValue = .unavailable
+            throw error
+        }
+        workspaceSnapshotID = snapshot.id
+        workspaceStatusValue = .restored
+    }
+}
+
+// MARK: - Workspace undo and redo
+
+extension AgentHarness {
+    /// Restore the previous checkpoint and move the active conversation tip to
+    /// the same checkpoint. The operation is append-only: the history action is
+    /// written physically at the current tip, then the recovered leaf points at
+    /// the target ancestor.
+    public func undo() async throws -> WorkspaceHistoryResult {
+        try await moveWorkspaceHistory(.undo)
+    }
+
+    /// Reapply the most recent undo when no new conversation or navigation entry
+    /// has superseded it.
+    public func redo() async throws -> WorkspaceHistoryResult {
+        try await moveWorkspaceHistory(.redo)
+    }
+
+    private func moveWorkspaceHistory(_ operation: SessionHistoryOperation) async throws -> WorkspaceHistoryResult {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot change workspace history while a turn is running")
+        }
+        guard let source = configuration.workspaceSnapshots else {
+            return WorkspaceHistoryResult(operation: operation, status: .snapshotsDisabled, moved: false)
+        }
+
+        let available = await workspaceStatus()
+        guard available != .unavailable else {
+            return WorkspaceHistoryResult(operation: operation, status: .unavailable, moved: false)
+        }
+
+        let tree = try SessionTree.load(from: store)
+        switch operation {
+        case .undo:
+            return try await undo(in: tree, source: source, status: available)
+        case .redo:
+            return try await redo(in: tree, source: source, status: available)
+        }
+    }
+
+    private func checkpointBranch(
+        in tree: SessionTree,
+        from leafID: String?
+    ) throws -> [(entry: SessionTreeEntry, snapshot: WorkspaceSnapshot)] {
+        try tree.branch(from: leafID).compactMap { entry in
+            guard case .workspaceCheckpoint(let snapshot) = entry.payload else { return nil }
+            return (entry: entry, snapshot: snapshot)
+        }
+    }
+
+    private func undo(
+        in tree: SessionTree,
+        source: any WorkspaceSnapshotSource,
+        status: WorkspaceSnapshotStatus
+    ) async throws -> WorkspaceHistoryResult {
+        let checkpoints = try checkpointBranch(in: tree, from: leaf)
+        guard checkpoints.count >= 2,
+              let current = checkpoints.last,
+              let target = checkpoints.dropLast().last
+        else {
+            return WorkspaceHistoryResult(operation: .undo, status: status, moved: false)
+        }
+
+        let targetIndex = checkpoints.count - 2
+        let intervening = Array(checkpoints.dropFirst(targetIndex + 1).map(\.snapshot))
+        let plan = WorkspaceRevertPlanner.plan(
+            current: current.snapshot,
+            target: target.snapshot,
+            intervening: intervening
+        )
+        let restored: WorkspaceRestoreResult
+        do {
+            restored = try await source.restore(plan)
+        } catch {
+            workspaceStatusValue = .unavailable
+            return WorkspaceHistoryResult(operation: .undo, status: .unavailable, moved: false)
+        }
+        guard restored.status == .restored, restored.failedPaths.isEmpty else {
+            workspaceStatusValue = restored.status
+            return WorkspaceHistoryResult(
+                operation: .undo,
+                status: restored.status,
+                moved: false,
+                fromEntryID: current.entry.id,
+                targetEntryID: target.entry.id,
+                restoredPaths: restored.restoredPaths,
+                skippedPaths: restored.skippedPaths,
+                failedPaths: restored.failedPaths
+            )
+        }
+
+        let action = SessionHistoryAction(
+            operation: .undo,
+            fromEntryID: current.entry.id,
+            targetEntryID: target.entry.id,
+            fromSnapshotID: current.snapshot.id,
+            targetSnapshotID: target.snapshot.id,
+            paths: plan.paths,
+            restoredPaths: restored.restoredPaths,
+            skippedPaths: restored.skippedPaths,
+            failedPaths: restored.failedPaths,
+            status: restored.status
+        )
+        try appendHistoryAction(action)
+        workspaceSnapshotID = target.snapshot.id
+        let movedTree = try SessionTree.load(from: store)
+        try adoptBranch(in: movedTree, targetID: target.entry.id)
+        workspaceStatusValue = restored.status
+        return WorkspaceHistoryResult(
+            operation: .undo,
+            status: restored.status,
+            moved: true,
+            fromEntryID: current.entry.id,
+            targetEntryID: target.entry.id,
+            restoredPaths: restored.restoredPaths,
+            skippedPaths: restored.skippedPaths,
+            failedPaths: restored.failedPaths
+        )
+    }
+
+    private func redo(
+        in tree: SessionTree,
+        source: any WorkspaceSnapshotSource,
+        status: WorkspaceSnapshotStatus
+    ) async throws -> WorkspaceHistoryResult {
+        guard let last = tree.entries.last,
+              case .historyAction(let previous) = last.payload,
+              previous.operation == .undo,
+              tree.leafID == previous.targetEntryID,
+              let fromEntry = tree.entry(withID: previous.fromEntryID),
+              let targetEntry = tree.entry(withID: previous.targetEntryID),
+              case .workspaceCheckpoint(let fromSnapshot) = fromEntry.payload,
+              case .workspaceCheckpoint(let targetSnapshot) = targetEntry.payload
+        else {
+            return WorkspaceHistoryResult(operation: .redo, status: status, moved: false)
+        }
+
+        let plan = WorkspaceRevertPlan(
+            expectedCurrentID: targetSnapshot.id,
+            targetID: fromSnapshot.id,
+            paths: previous.paths
+        )
+        let restored: WorkspaceRestoreResult
+        do {
+            restored = try await source.restore(plan)
+        } catch {
+            workspaceStatusValue = .unavailable
+            return WorkspaceHistoryResult(operation: .redo, status: .unavailable, moved: false)
+        }
+        guard restored.status == .restored, restored.failedPaths.isEmpty else {
+            workspaceStatusValue = restored.status
+            return WorkspaceHistoryResult(
+                operation: .redo,
+                status: restored.status,
+                moved: false,
+                fromEntryID: targetEntry.id,
+                targetEntryID: fromEntry.id,
+                restoredPaths: restored.restoredPaths,
+                skippedPaths: restored.skippedPaths,
+                failedPaths: restored.failedPaths
+            )
+        }
+
+        let action = SessionHistoryAction(
+            operation: .redo,
+            fromEntryID: targetEntry.id,
+            targetEntryID: fromEntry.id,
+            fromSnapshotID: targetSnapshot.id,
+            targetSnapshotID: fromSnapshot.id,
+            paths: previous.paths,
+            restoredPaths: restored.restoredPaths,
+            skippedPaths: restored.skippedPaths,
+            failedPaths: restored.failedPaths,
+            status: restored.status
+        )
+        try appendHistoryAction(action)
+        workspaceSnapshotID = fromSnapshot.id
+        let movedTree = try SessionTree.load(from: store)
+        try adoptBranch(in: movedTree, targetID: fromEntry.id)
+        workspaceStatusValue = restored.status
+        return WorkspaceHistoryResult(
+            operation: .redo,
+            status: restored.status,
+            moved: true,
+            fromEntryID: targetEntry.id,
+            targetEntryID: fromEntry.id,
+            restoredPaths: restored.restoredPaths,
+            skippedPaths: restored.skippedPaths,
+            failedPaths: restored.failedPaths
+        )
+    }
+
+    private func appendHistoryAction(_ action: SessionHistoryAction) throws {
+        let entry = SessionTreeEntry(
+            id: store.createEntryID(),
+            parentId: leaf,
+            timestamp: timestamp(),
+            payload: .historyAction(action),
+            seq: nextSeq
+        )
+        try store.appendEntry(entry)
+        nextSeq += 1
+    }
+
+    private func adoptBranch(in tree: SessionTree, targetID: String?) throws {
+        let path = try targetID.map { try tree.branch(from: $0) } ?? []
+        leafChain = path.map(\.id)
+        let model = path.reversed().compactMap { entry -> String? in
+            if case .modelChange(_, let modelID) = entry.payload { return modelID }
+            return nil
+        }.first ?? configuration.model
+        activeModel = model
+        activeStreamFn = configuration.streamFnForModel?(model) ?? configuration.streamFn
+        activeContextWindow = configuration.contextWindowForModel?(model) ?? configuration.contextWindow
     }
 }

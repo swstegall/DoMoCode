@@ -58,6 +58,16 @@ public protocol SessionMessagePersisting: Sendable {
     // call site.
 }
 
+/// Optional persistence hook for a turn-boundary workspace snapshot.
+///
+/// It is separate from ``SessionMessagePersisting`` so test sinks and other
+/// message-only embedders do not acquire a filesystem concern. The concrete
+/// harness conforms to both protocols; the sink discovers this capability at
+/// the `turnEnd` boundary and keeps the checkpoint as its own JSONL entry.
+public protocol SessionWorkspaceCheckpointing: Sendable {
+    func persistWorkspaceCheckpoint() async throws
+}
+
 // MARK: - Monotonic elapsed time
 
 /// Whole milliseconds between two monotonic instants, or `nil` when the interval
@@ -289,7 +299,15 @@ public struct SessionPersistenceSink: AgentEventSink {
             } catch {
                 errorBox.recordIfFirst(error)
             }
-        case .agentStart, .agentEnd, .turnStart, .turnEnd, .messageUpdate,
+        case .turnEnd:
+            if let checkpointing = persister as? any SessionWorkspaceCheckpointing {
+                do {
+                    try await checkpointing.persistWorkspaceCheckpoint()
+                } catch {
+                    errorBox.recordIfFirst(error)
+                }
+            }
+        case .agentStart, .agentEnd, .turnStart, .messageUpdate,
             .toolExecutionStart, .toolExecutionEnd, .notice:
             break
         }

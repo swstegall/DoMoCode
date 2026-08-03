@@ -2109,6 +2109,14 @@ public final class ClientApp {
                 kind = .metadata
                 label = "git  session start"
                 description = head
+            case .workspaceCheckpoint(let snapshot):
+                kind = .metadata
+                label = "workspace  checkpoint"
+                description = String(snapshot.files.count) + " changed path(s)  " + snapshot.id
+            case .historyAction(let action):
+                kind = .branch
+                label = "workspace  " + action.operation.rawValue
+                description = action.status.rawValue + ", " + String(action.paths.count) + " path(s)"
             case .leaf(let targetID):
                 kind = .branch
                 label = "branch  \(targetID ?? "root")"
