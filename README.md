@@ -616,7 +616,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       reasoning, mode, and permissions, server sessions switch build/plan policy with Tab, and the
       hardened plan rules allow writes only to the session's `.domocode/plans/<session>.md` while
       `plan_exit` terminates the loop.
-- [ ] **Phase 15 — Subagents.** Transformative, and the most expensive item here. Requires 14, 11, 9
+- [x] **Phase 15 — Subagents.** Transformative, and the most expensive item here. Requires 14, 11, 9
       and 5c. It disturbs a real invariant: `AgentHarness.run` throws if already running and the
       server allows one run per session, so a background child must be a separate harness instance and
       a result arriving while the parent is idle must be able to *start* a run. Child sessions are
@@ -625,10 +625,10 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       capabilities do not), a `subagent_depth` cap, and background children whose results arrive
       through the Phase 9 queue. Child permission prompts bubble to the parent's UI by constructing
       the child's engine with the *root* session id — one argument, and the whole feature. Delegation
-      must be modelled as a typed event across `AgentEvent`, `ServerEvent` and the session payload
-      **before** three closed enums calcify: retrofitting it re-cuts the JSONL format, the SSE wire
-      and the `-p` JSON contract simultaneously. *Exit:* plan mode launches parallel `explore`
-      subagents; you can walk into a child session and back out.
+      is modelled as a typed event across `AgentEvent`, `ServerEvent` and the session payload, including
+      JSONL and `-p` JSON projections. **Complete:** plan-mode delegation creates real `explore` child
+      sessions, foreground and background runs are supported, task ids recover after restart, and the
+      client sidebar can enter a child and press `b` to return to its parent.
 - [ ] **Phase 16 — LSP and code intelligence.** Independent of 14 and 15; can run in parallel. The
       cheap version ships first behind the same protocol as the expensive one, so nothing is thrown
       away: a `DiagnosticsProvider` implemented by a **CLI provider** (`swift build`, `tsc --noEmit`,
