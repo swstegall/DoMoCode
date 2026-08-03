@@ -20,13 +20,15 @@ public func permissionHook(
         // The loop re-checks cancellation after the hook returns, but bailing here
         // avoids prompting for a call that is already being aborted.
         if Task.isCancelled { return .reject("The tool call was aborted.") }
-        let spec = factory.make(toolName: context.toolCall.name, arguments: context.arguments)
-        switch await engine.ask(spec, sessionID: sessionID) {
-        case .allow:
-            return .proceed
-        case .deny(let reason):
-            return .reject(reason)
+        for spec in factory.makeAll(toolName: context.toolCall.name, arguments: context.arguments) {
+            switch await engine.ask(spec, sessionID: sessionID) {
+            case .allow:
+                continue
+            case .deny(let reason):
+                return .reject(reason)
+            }
         }
+        return .proceed
     }
 }
 

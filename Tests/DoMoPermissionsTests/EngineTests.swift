@@ -119,6 +119,36 @@ struct FactoryTests {
         let spec = factory.make(toolName: "bash", arguments: .object(["command": .string("FOO=bar rm x")]))
         #expect(spec.always == ["rm *"])
     }
+
+    @Test("bash external paths become separate permission requests")
+    func bashExternalPaths() {
+        let specs = factory.makeAll(
+            toolName: "bash",
+            arguments: .object(["command": .string("cat /tmp/outside > /tmp/result")])
+        )
+        #expect(specs.map(\.permission) == ["bash", "external_directory", "external_directory"])
+        #expect(specs[1].patterns == ["/tmp/outside"])
+        #expect(specs[2].patterns == ["/tmp/result"])
+        #expect(specs[1].always == ["/tmp/outside"])
+        #expect(specs[2].always == ["/tmp/result"])
+    }
+
+    @Test("workspace-relative bash paths do not request external access")
+    func bashWorkspacePaths() {
+        let specs = factory.makeAll(
+            toolName: "bash",
+            arguments: .object(["command": .string("cat src/input.txt > ./output.txt")])
+        )
+        #expect(specs.count == 1)
+    }
+
+    @Test("webfetch has its own URL-scoped permission")
+    func webfetch() {
+        let spec = factory.make(toolName: "webfetch", arguments: .object(["url": .string("https://example.test/a")]))
+        #expect(spec.permission == "webfetch")
+        #expect(spec.patterns == ["https://example.test/a"])
+        #expect(spec.always.isEmpty)
+    }
 }
 
 @Suite("Shell command decomposition")
@@ -248,6 +278,38 @@ struct EngineTests {
         let engine = PermissionEngine(ruleset: baseline(), prompt: { _ in .reject(message: "not now") })
         let decision = await engine.ask(PermissionRequestSpec(permission: "bash", patterns: ["ls"], always: ["ls *"]), sessionID: "s")
         #expect(decision == .deny(reason: "not now"))
+    }
+
+    @Test("bash permission approval does not cover external paths")
+    func bashExternalPathHook() async {
+        let prompted = Mutex<[String]>([])
+        let engine = PermissionEngine(
+            ruleset: baseline(),
+            prompt: { request in
+                prompted.withLock { $0.append(request.permission) }
+                return .once
+            }
+        )
+        let hook = permissionHook(
+            engine: engine,
+            factory: PermissionRequestFactory(workingDirectory: "/work"),
+            sessionID: "s"
+        )
+        let command = "cat /tmp/outside > /tmp/result"
+        let context = BeforeToolCallContext(
+            assistantMessage: AssistantMessage(model: "test-model"),
+            toolCall: ToolCallBlock(id: "call-1", name: "bash"),
+            arguments: .object(["command": .string(command)])
+        )
+
+        let decision = await hook(context)
+
+        if case .proceed(arguments: .keep) = decision.decision {
+            // expected
+        } else {
+            Issue.record("external-path hook should proceed, got \(decision.decision)")
+        }
+        #expect(prompted.withLock { $0 } == ["bash", "external_directory", "external_directory"])
     }
 
     @Test("doom-loop escalation uses the reserved permission and repeated tool metadata")

@@ -81,6 +81,34 @@ public struct PermissionRequestFactory: Sendable {
         }
     }
 
+    /// Returns the primary tool request plus one external-directory request for
+    /// every path-like bash argument that leaves the workspace. Keeping these
+    /// requests separate is important: a saved bash prefix grant must not also
+    /// authorize an unrelated absolute path.
+    public func makeAll(toolName: String, arguments: JSONValue) -> [PermissionRequestSpec] {
+        let primary = make(toolName: toolName, arguments: arguments)
+        guard toolName == "bash",
+              let command = arguments["command"]?.stringValue
+        else { return [primary] }
+
+        var specs = [primary]
+        var seen: Set<String> = []
+        for path in externalPaths(in: command) where seen.insert(path).inserted {
+            specs.append(
+                PermissionRequestSpec(
+                    permission: "external_directory",
+                    patterns: [path],
+                    always: [path],
+                    metadata: [
+                        "filepath": .string(path),
+                        "command": .string(command),
+                    ]
+                )
+            )
+        }
+        return specs
+    }
+
     /// What "allow always" persists for a path-keyed tool: THAT path, and nothing
     /// wider.
     ///
@@ -173,6 +201,83 @@ public struct PermissionRequestFactory: Sendable {
             metadata: ["command": .string(command)],
             configProtected: protectedBash
         )
+    }
+
+    private func externalPaths(in command: String) -> [String] {
+        var paths: [String] = []
+        for fragment in ShellCommand.split(command) {
+            var tokens = ShellCommand.stripEnvAssignments(ShellCommand.tokenize(fragment))
+            guard !tokens.isEmpty else { continue }
+            tokens.removeFirst() // The executable itself is not a data directory.
+
+            var expectsRedirectTarget = false
+            for token in tokens {
+                let value = unquote(token)
+                if expectsRedirectTarget {
+                    expectsRedirectTarget = false
+                    if let path = externalPath(value) { paths.append(path) }
+                    continue
+                }
+                if value == ">" || value == ">>" || value == "<" || value == "<<" ||
+                    value == "2>" || value == "2>>"
+                {
+                    expectsRedirectTarget = true
+                    continue
+                }
+                if let redirect = redirectTarget(value) {
+                    if let path = externalPath(redirect) { paths.append(path) }
+                    continue
+                }
+                if value.hasPrefix("-") {
+                    if let equals = value.firstIndex(of: "=") {
+                        let suffix = String(value[value.index(after: equals)...])
+                        if let path = externalPath(suffix) { paths.append(path) }
+                    }
+                    continue
+                }
+                if let path = externalPath(value) { paths.append(path) }
+            }
+        }
+        return paths
+    }
+
+    private func externalPath(_ value: String) -> String? {
+        guard looksLikePath(value) else { return nil }
+        let expanded = NSString(string: value).expandingTildeInPath
+        let url = URL(fileURLWithPath: expanded, relativeTo: URL(fileURLWithPath: workingDirectory, isDirectory: true))
+            .standardizedFileURL
+        let path = url.path
+        let root = URL(fileURLWithPath: workingDirectory, isDirectory: true).standardizedFileURL.path
+        guard path != root, !path.hasPrefix(root.hasSuffix("/") ? root : root + "/") else { return nil }
+        return path
+    }
+
+    private func looksLikePath(_ value: String) -> Bool {
+        value.hasPrefix("/")
+            || value.hasPrefix("~/")
+            || value.hasPrefix("./")
+            || value.hasPrefix("../")
+            || value.contains("/")
+    }
+
+    private func redirectTarget(_ value: String) -> String? {
+        for marker in [">>", "2>", "1>", "<"] where value.hasPrefix(marker) {
+            let target = String(value.dropFirst(marker.count))
+            return target.isEmpty ? nil : target
+        }
+        return nil
+    }
+
+    private func unquote(_ token: String) -> String {
+        var value = token
+        if value.count >= 2,
+           (value.hasPrefix("'") && value.hasSuffix("'"))
+            || (value.hasPrefix("\"") && value.hasSuffix("\""))
+        {
+            value.removeFirst()
+            value.removeLast()
+        }
+        return value.replacingOccurrences(of: "\\\\", with: "")
     }
 
     /// The `path` / `file_path` argument, defensively (mirrors the tool layer's alias).
