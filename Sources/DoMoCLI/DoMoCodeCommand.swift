@@ -72,7 +72,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             explicitly. Add --max-cost-per-run USD for a priced budget cap. Under -p, hitting \
             the turn cap exits 2, the runaway guard exits 3, and the cost cap exits 4, so a \
             script can distinguish under-budgeting, a stuck model, and a spend ceiling.
-            """
+            """,
+        subcommands: [DiffCommand.self]
     )
 
     @Option(
@@ -251,8 +252,25 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     /// while preserving its help/version/exit-code behavior via `exit(withError:)`.
     public static func run() async {
         do {
+            // ArgumentParser treats options declared by the root as global even
+            // when they appear after a subcommand. The JSON flag belongs to both
+            // the print surface and domo diff, so parse the diff tail directly
+            // before asking the root parser to handle the ordinary command.
+            let rawArguments = Array(CommandLine.arguments.dropFirst())
+            if rawArguments.first == "diff" {
+                let diff = try DiffCommand.parse(Array(rawArguments.dropFirst()))
+                try await diff.run()
+                return
+            }
             let parsed = try parseAsRoot()
-            if var asyncCommand = parsed as? AsyncParsableCommand {
+            // Keep concrete subcommand values intact. Calling `run()` through
+            // the protocol existential can re-enter the root's default dispatch
+            // path and lose parsed flag storage for a value subcommand.
+            if let diff = parsed as? DiffCommand {
+                try await diff.run()
+            } else if let root = parsed as? DoMoCodeCommand {
+                try await root.run()
+            } else if var asyncCommand = parsed as? AsyncParsableCommand {
                 try await asyncCommand.run()
             } else {
                 var command = parsed
@@ -938,7 +956,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             systemPromptForPromptAndTools: promptForTools,
             toolsForSession: sessionToolResolver,
             questionBroker: questionBroker,
-            sessionStartHead: sessionStartHead
+            sessionStartHead: sessionStartHead,
+            diffSource: DoMoGit(shell: shell)
         ))
         return (runtime, mcpManager, backgroundSessions)
     }

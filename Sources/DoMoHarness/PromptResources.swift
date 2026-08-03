@@ -111,8 +111,10 @@ public enum LocalCommand: String, Codable, Hashable, Sendable {
     case clear
     case compact
     case context
+    case diff
     case exit
     case help
+    case review
     case tree
 }
 
@@ -208,6 +210,12 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             action: .context
         ),
         CommandDescriptor(
+            name: "diff",
+            description: "Review the current working-tree changes",
+            kind: .local,
+            action: .diff
+        ),
+        CommandDescriptor(
             name: "exit",
             description: "End the session",
             kind: .local,
@@ -226,6 +234,12 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             action: .help
         ),
         CommandDescriptor(
+            name: "review",
+            description: "Review current changes and their risks",
+            kind: .local,
+            action: .review
+        ),
+        CommandDescriptor(
             name: "tree",
             description: "Browse and branch the conversation tree",
             kind: .local,
@@ -236,12 +250,6 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             description: "Inspect the repository and create or update AGENTS.md",
             argumentHint: "[instructions]",
             template: "Inspect this repository and create or update a root AGENTS.md with concise, actionable instructions for future coding-agent sessions. Preserve existing useful guidance. $ARGUMENTS"
-        ),
-        CommandDescriptor(
-            name: "review",
-            description: "Review the current changes for correctness and risk",
-            argumentHint: "[focus]",
-            template: "Review the current git diff and surrounding code as a careful maintainer. Report concrete correctness, security, regression, and testing issues first, with file and line references when possible. If there are no findings, say so and summarize the remaining test coverage. Focus: $ARGUMENTS"
         ),
     ])
 

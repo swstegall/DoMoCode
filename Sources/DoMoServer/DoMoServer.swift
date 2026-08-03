@@ -38,6 +38,12 @@ public struct SessionTitleResult: Codable, Sendable, Hashable {
     public init(title: String?) { self.title = title }
 }
 
+/// The result of an optional LLM-generated commit subject.
+public struct CommitMessageResult: Codable, Sendable, Hashable {
+    public var message: String?
+    public init(message: String?) { self.message = message }
+}
+
 private struct CreateBody: Decodable {
     var resume: String?
 }
@@ -69,6 +75,7 @@ private struct ModelBody: Decodable { var modelID: String }
 private struct RenameBody: Decodable { var name: String? }
 private struct LabelBody: Decodable { var targetID: String; var label: String? }
 private struct LeafBody: Decodable { var targetID: String? }
+private struct DiffRevertBody: Decodable { var path: String; var base: String? }
 
 // MARK: - Auth middleware
 
@@ -216,6 +223,31 @@ public struct DoMoServer: Sendable {
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
                 return try Self.json(try await self.runtime.context(sessionID: id))
+            }
+        }
+
+        router.get("/session/:id/diff") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let base = request.uri.queryParameters["base"].map(String.init)
+                return try Self.json(try await self.runtime.diff(sessionID: id, base: base))
+            }
+        }
+
+        router.post("/session/:id/diff/revert") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(DiffRevertBody.self, request)
+                try await self.runtime.restoreDiffFile(sessionID: id, path: body.path, base: body.base)
+                return Response(status: .ok)
+            }
+        }
+
+        router.post("/session/:id/diff/commit-message") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let message = try await self.runtime.commitMessage(sessionID: id)
+                return try Self.json(CommitMessageResult(message: message), status: .ok)
             }
         }
 

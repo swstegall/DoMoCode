@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 
+import DoMoGit
 import DoMoTUI
 import DoMoServer
 import DoMoTermIO
@@ -206,6 +207,221 @@ final class DialogConfirm: Component {
     }
 
     func handleInput(_ data: [UInt8]) { list.handleInput(data) }
+}
+
+/// A keyboard-first diff review surface. The sidebar is deliberately compact:
+/// common directory prefixes collapse to an ellipsis, leaving room for the
+/// selected file's hunks. The dialog keeps review marks locally; refreshing a
+/// live diff preserves marks for paths that still exist.
+@MainActor
+final class DiffReviewDialog: Component {
+    private var diff: GitDiff?
+    private var selectedFile = 0
+    private var selectedHunk = 0
+    private var reviewed: Set<String> = []
+    private var splitView = false
+    private var splitModeExplicit = false
+    private var commitMessage: String?
+
+    var onClose: (() -> Void)?
+    var onRevert: ((String) -> Void)?
+    var onCommitMessage: (() -> Void)?
+
+    init(diff: GitDiff? = nil) {
+        self.diff = diff
+    }
+
+    func update(diff: GitDiff) {
+        self.diff = diff
+        let paths = Set(diff.files.map(\.path))
+        reviewed = reviewed.intersection(paths)
+        selectedFile = min(selectedFile, max(0, diff.files.count - 1))
+        selectedHunk = min(selectedHunk, max(0, selectedFileHunks.count - 1))
+    }
+
+    func showCommitMessage(_ message: String?) {
+        commitMessage = message.map { sanitizeUntrustedText(collapseToOneLine($0)) }
+    }
+
+    func render(width: Int) -> [String] {
+        guard width > 0 else { return [] }
+        if !splitModeExplicit { splitView = width >= 96 }
+        guard let diff else {
+            return [
+                truncateToWidth("\u{1b}[1mGit diff review\u{1b}[0m", width, ellipsis: ""),
+                "Loading diff…",
+            ]
+        }
+        let files = diff.files
+        let sidebarWidth = min(34, max(20, width / 3))
+        let bodyWidth = max(1, width - sidebarWidth - 3)
+        var rows: [String] = []
+        let base = diff.base.map { String($0.prefix(12)) } ?? "working tree"
+            rows.append(truncateToWidth(
+                "\u{1b}[1mGit diff review\u{1b}[0m  \(base)  \(diff.additions)+ \(diff.deletions)-",
+            width,
+            ellipsis: ""
+        ))
+        if files.isEmpty {
+            rows.append("No modified files.")
+        } else {
+            let left = sidebarRows(files: files, width: sidebarWidth)
+            let right = bodyRows(files: files, width: bodyWidth)
+            let height = max(left.count, right.count)
+            for index in 0..<height {
+                let leftRow = index < left.count ? left[index] : ""
+                let rightRow = index < right.count ? right[index] : ""
+                let paddedLeft = padToWidth(leftRow, sidebarWidth)
+                rows.append(truncateToWidth(paddedLeft + " │ " + rightRow, width, ellipsis: ""))
+            }
+        }
+        if let commitMessage, !commitMessage.isEmpty {
+            rows.append(truncateToWidth("commit subject: \(commitMessage)", width, ellipsis: ""))
+        }
+        rows.append(truncateToWidth(
+            "↑/↓ file · ]/[ hunk · r reviewed · u \(splitView ? "unified" : "split") · v restore · c subject · Esc close",
+            width,
+            ellipsis: ""
+        ))
+        return rows
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if data == [0x1b] {
+            onClose?()
+            return
+        }
+        guard let diff, !diff.files.isEmpty else { return }
+        switch data {
+        case [0x1b, 0x5b, 0x41]:
+            moveFile(by: -1)
+        case [0x1b, 0x5b, 0x42]:
+            moveFile(by: 1)
+        case Array("]".utf8):
+            moveHunk(by: 1)
+        case Array("[".utf8):
+            moveHunk(by: -1)
+        case Array("r".utf8), Array("m".utf8):
+            reviewed.insert(diff.files[selectedFile].path)
+        case Array("u".utf8):
+            splitModeExplicit = true
+            splitView.toggle()
+        case Array("v".utf8):
+            onRevert?(diff.files[selectedFile].path)
+        case Array("c".utf8):
+            onCommitMessage?()
+        default:
+            return
+        }
+    }
+
+    private var selectedHunkCount: Int {
+        guard let diff, diff.files.indices.contains(selectedFile) else { return 0 }
+        return diff.files[selectedFile].hunks.count
+    }
+
+    private var selectedFileHunks: [GitDiffHunk] {
+        guard let diff, diff.files.indices.contains(selectedFile) else { return [] }
+        return diff.files[selectedFile].hunks
+    }
+
+    private func moveFile(by delta: Int) {
+        guard let diff, !diff.files.isEmpty else { return }
+        selectedFile = (selectedFile + delta + diff.files.count) % diff.files.count
+        selectedHunk = 0
+    }
+
+    private func moveHunk(by delta: Int) {
+        guard selectedHunkCount > 0 else { return }
+        selectedHunk = (selectedHunk + delta + selectedHunkCount) % selectedHunkCount
+    }
+
+    private func sidebarRows(files: [GitDiffFile], width: Int) -> [String] {
+        var rows = ["FILES \(files.count)"]
+        for (index, file) in files.enumerated() {
+            let marker = index == selectedFile ? ">" : " "
+            let done = reviewed.contains(file.path) ? "✓" : " "
+            let change = "\(file.additions)+ \(file.deletions)-"
+            rows.append(truncateToWidth(
+                "\(marker)\(done) \(collapsedPath(sanitizeUntrustedText(file.path), width: width - 10)) \(change)",
+                width,
+                ellipsis: ""
+            ))
+        }
+        return rows
+    }
+
+    private func bodyRows(files: [GitDiffFile], width: Int) -> [String] {
+        guard files.indices.contains(selectedFile) else { return [] }
+        let file = files[selectedFile]
+        var rows = [
+            "\(sanitizeUntrustedText(file.path))  \(file.status.rawValue)  \(file.additions)+ \(file.deletions)-",
+            file.binary ? "binary file" : "hunks \(file.hunks.count)",
+        ]
+        guard !file.binary else { return rows }
+        for (index, hunk) in file.hunks.enumerated() {
+            let marker = index == selectedHunk ? ">" : " "
+            rows.append("\(marker) \(sanitizeUntrustedText(hunk.header))")
+            if index != selectedHunk { continue }
+            rows.append(contentsOf: splitView
+                ? splitRows(hunk: hunk, width: width)
+                : hunk.lines.map { line in
+                    let prefix: String
+                    switch line.kind {
+                    case .addition: prefix = "+"
+                    case .deletion: prefix = "-"
+                    case .context: prefix = " "
+                    case .metadata: prefix = "!"
+                    }
+                    return prefix + sanitizeUntrustedText(line.text)
+                })
+        }
+        return rows
+    }
+
+    private func splitRows(hunk: GitDiffHunk, width: Int) -> [String] {
+        let column = max(1, (width - 3) / 2)
+        var old: [String] = []
+        var new: [String] = []
+        for line in hunk.lines {
+            switch line.kind {
+            case .deletion, .context:
+                old.append(line.text)
+            default:
+                break
+            }
+            switch line.kind {
+            case .addition, .context:
+                new.append(line.text)
+            default:
+                break
+            }
+        }
+        let rows = max(old.count, new.count)
+        return (0..<rows).map { index in
+            let left = index < old.count ? sanitizeUntrustedText(old[index]) : ""
+            let right = index < new.count ? sanitizeUntrustedText(new[index]) : ""
+            return padToWidth(String(left.prefix(column)), column) + " │ " + String(right.prefix(column))
+        }
+    }
+
+    private func collapsedPath(_ path: String, width: Int) -> String {
+        let safeWidth = max(6, width)
+        guard path.count > safeWidth else { return path }
+        let components = path.split(separator: "/").map(String.init)
+        guard components.count > 2 else {
+            return "…" + String(path.suffix(safeWidth - 1))
+        }
+        let tail = components.suffix(2).joined(separator: "/")
+        return "…/" + String(tail.suffix(safeWidth - 2))
+    }
+
+    private func padToWidth(_ value: String, _ width: Int) -> String {
+        let clipped = truncateToWidth(value, width, ellipsis: "")
+        let visible = visibleWidth(clipped)
+        guard visible < width else { return clipped }
+        return clipped + String(repeating: " ", count: width - visible)
+    }
 }
 
 /// The full-screen client's structured-question surface. A server question may

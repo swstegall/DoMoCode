@@ -87,4 +87,55 @@ struct DoMoGitTests {
         #expect(DoMoGit.quote("a'b") == "'a'\\''b'")
         #expect(DoMoGit.quote("") == "''")
     }
+
+    @Test("porcelain status preserves branch tracking and path states")
+    func parsesStatus() {
+        let bytes = Array(
+            "## main...origin/main [ahead 2, behind 1]\0 M Sources/App.swift\0?? notes with spaces.md\0R  new.swift\0old.swift\0"
+                .utf8
+        )
+        let status = GitStatusParser.parse(bytes)
+
+        #expect(status.branch == "main...origin/main")
+        #expect(status.ahead == 2)
+        #expect(status.behind == 1)
+        #expect(status.files.map(\.path) == ["Sources/App.swift", "notes with spaces.md", "new.swift"])
+        #expect(status.files[0].kind == .modified)
+        #expect(status.files[1].kind == .untracked)
+        #expect(status.files[2].oldPath == "old.swift")
+        #expect(status.files[2].kind == .renamed)
+    }
+
+    @Test("unified patches expose files, hunks, line kinds, and line numbers")
+    func parsesDiff() {
+        let patch = """
+        diff --git a/Sources/App.swift b/Sources/App.swift
+        index 1111111..2222222 100644
+        --- a/Sources/App.swift
+        +++ b/Sources/App.swift
+        @@ -1,2 +1,3 @@
+         first
+        -old
+        +new
+        +extra
+        """
+        let status = GitStatus(
+            branch: "main",
+            files: [GitFileStatus(path: "Sources/App.swift", kind: .modified)]
+        )
+        let files = GitDiffParser.parse(patch, status: status)
+
+        let file = try! #require(files.first)
+        let hunk = try! #require(file.hunks.first)
+        #expect(file.path == "Sources/App.swift")
+        #expect(hunk.oldStart == 1)
+        #expect(hunk.newCount == 3)
+        #expect(hunk.lines.map(\.kind) == [.context, .deletion, .addition, .addition])
+        #expect(hunk.lines[0].oldLine == 1)
+        #expect(hunk.lines[0].newLine == 1)
+        #expect(hunk.lines[1].oldLine == 2)
+        #expect(hunk.lines[2].newLine == 2)
+        #expect(file.additions == 2)
+        #expect(file.deletions == 1)
+    }
 }

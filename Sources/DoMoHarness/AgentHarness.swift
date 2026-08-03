@@ -669,6 +669,19 @@ public actor AgentHarness {
     /// `model_change` entry when a session is reopened.
     public var currentModel: String { activeModel }
 
+    /// The latest Git HEAD checkpoint on the active session branch, if one was
+    /// recorded. Older sessions simply return `nil`.
+    public func sessionStartHead() throws -> String? {
+        try SessionTree.load(from: store)
+            .branch(from: leaf)
+            .reversed()
+            .compactMap { entry -> String? in
+                if case .sessionStart(let head) = entry.payload { return head }
+                return nil
+            }
+            .first
+    }
+
     /// The most recent user-visible session name, if one was recorded.
     public func sessionName() throws -> String? {
         try SessionTree.latestSessionName(in: SessionTree.load(from: store).branch(from: leaf))
@@ -804,6 +817,43 @@ public actor AgentHarness {
         guard !title.isEmpty else { return nil }
         try appendMetadata(.sessionInfo(name: title), usage: terminal.usage)
         return title
+    }
+
+    /// Ask the active model for a one-line commit message for a diff without
+    /// persisting the request as a conversation turn.
+    public func generateCommitMessage(diff: String) async throws -> String? {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot generate a commit message while a turn is running")
+        }
+        let trimmedDiff = diff.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedDiff.isEmpty else { return nil }
+        let boundedDiff = String(trimmedDiff.prefix(80_000))
+        let request = Context(
+            systemPrompt: "You write concise Git commit subjects. Reply with one imperative subject line, at most 72 characters, with no quotes, markdown, or trailing punctuation.",
+            messages: [
+                .user(UserMessage(content: [.text(
+                    "Write a commit subject for this working-tree diff:\n\n\(boundedDiff)"
+                )]))
+            ],
+            tools: []
+        )
+        var terminal: AssistantMessage?
+        for try await event in activeStreamFn(request) {
+            if let message = event.terminalMessage { terminal = message }
+        }
+        guard let terminal else {
+            throw DoMoError(.provider(status: nil, isRetryable: false), "Commit-message generation produced no response")
+        }
+        if let failure = terminal.failure { throw failure }
+        let line = terminal.text
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "*_\"'#"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let line, !line.isEmpty else { return nil }
+        return String(line.prefix(72))
     }
 
     /// Persist a bookmark on an entry. A nil label clears the bookmark.

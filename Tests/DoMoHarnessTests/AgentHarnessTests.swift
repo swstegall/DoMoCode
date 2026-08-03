@@ -188,6 +188,28 @@ struct AgentHarnessTests {
         #expect(afterRun[1].parentId == afterRun[0].id)
     }
 
+    @Test("commit-message generation is a bounded metadata request")
+    func generatesCommitMessageWithoutPersistingATurn() async throws {
+        let responder = ScriptedResponder([assistant("* Add the review surface.\nsecond line")])
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(
+                streamFn: responder.fn(),
+                ids: SequentialIDs(prefix: "subject")
+            )
+        )
+
+        let message = try await harness.generateCommitMessage(
+            diff: String(repeating: "diff ", count: 20_000)
+        )
+
+        #expect(message == "Add the review surface.")
+        #expect(responder.callCount == 1)
+        let recorded = try entries(of: await harness.sessionFilePath)
+        #expect(recorded.isEmpty)
+    }
+
     @Test("a run persists the user prompt and each assistant turn in transcript order")
     func runPersistsTranscript() async throws {
         let responder = ScriptedResponder([assistant("hi there")])

@@ -13,6 +13,7 @@
 
 import AsyncHTTPClient
 import DoMoHarness
+import DoMoGit
 import DoMoLLM
 import DoMoPermissions
 import DoMoServer
@@ -124,6 +125,7 @@ public struct ServerClient: Sendable {
     private struct RenameBody: Encodable { let name: String? }
     private struct LabelBody: Encodable { let targetID: String; let label: String? }
     private struct LeafBody: Encodable { let targetID: String? }
+    private struct DiffRevertBody: Encodable { let path: String; let base: String? }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -184,6 +186,32 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode(ContextSnapshot.self, from: data)
+    }
+
+    /// Fetch the current working-tree diff from the session's start checkpoint.
+    /// Pass base to review an explicit revision instead.
+    public func diff(sessionID: String, base: String? = nil) async throws -> GitDiff {
+        var path = "/session/\(sessionID)/diff"
+        if let base {
+            path += "?base=\(Self.percentEncode(base))"
+        }
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(GitDiff.self, from: data)
+    }
+
+    public func restoreDiffFile(sessionID: String, path: String, base: String? = nil) async throws {
+        let route = "/session/\(sessionID)/diff/revert"
+        let body = try JSONEncoder().encode(DiffRevertBody(path: path, base: base))
+        let (status, data) = try await send(.post, route, body: body)
+        try expect(status, 200, route, body: data)
+    }
+
+    public func commitMessage(sessionID: String) async throws -> String? {
+        let path = "/session/\(sessionID)/diff/commit-message"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(CommitMessageResult.self, from: data).message
     }
 
     /// Force one compaction checkpoint. `POST /session/{id}/compact` → 200.
@@ -554,6 +582,12 @@ public struct ServerClient: Sendable {
     }
 
     // MARK: Plumbing
+
+    private static func percentEncode(_ value: String) -> String {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+#?")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+    }
 
     private func send(_ method: Method, _ path: String, body: Data? = nil) async throws -> (status: UInt, body: Data) {
         var request = HTTPClientRequest(url: baseURL + path)

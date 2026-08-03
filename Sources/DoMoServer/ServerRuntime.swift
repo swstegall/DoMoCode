@@ -4,6 +4,7 @@
 import DoMoAgent
 import DoMoCore
 import DoMoHarness
+import DoMoGit
 import DoMoLLM
 import DoMoPermissions
 import Foundation
@@ -272,6 +273,12 @@ public actor ServerRuntime {
         /// The committed HEAD recorded for each new session, when the serving
         /// process started inside a repository with a commit.
         public var sessionStartHead: String?
+        /// Git operations for diff/review routes. Nil keeps embedded test
+        /// runtimes and older integrations free of repository access.
+        public var git: DoMoGit?
+        /// The review source abstraction. The git property remains as a
+        /// compatibility fallback for callers that predate DiffSource.
+        public var diffSource: (any DiffSource)?
         /// Late-bound bridge used by a tool context to suspend the owning
         /// session on a structured question.
         public var questionBroker: QuestionBroker?
@@ -310,7 +317,9 @@ public actor ServerRuntime {
             systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)? = nil,
             toolsForSession: (@Sendable (String, String) async -> [any AgentTool])? = nil,
             questionBroker: QuestionBroker? = nil,
-            sessionStartHead: String? = nil
+            sessionStartHead: String? = nil,
+            git: DoMoGit? = nil,
+            diffSource: (any DiffSource)? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -336,6 +345,8 @@ public actor ServerRuntime {
             self.steeringMode = steeringMode
             self.maxCostPerRun = maxCostPerRun
             self.sessionStartHead = sessionStartHead
+            self.git = git
+            self.diffSource = diffSource
             self.questionBroker = questionBroker
         }
     }
@@ -1357,6 +1368,59 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         let messages = try await session.harness.contextMessages()
         return ContextSnapshot(messages: messages, accounting: try? await session.harness.accounting())
+    }
+
+    /// Read the working-tree diff for a live session. The session's own start
+    /// checkpoint is preferred; an explicit base is useful for branch review.
+    public func diff(sessionID: String, base: String? = nil) async throws -> GitDiff {
+        let source = try configuredDiffSource()
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        let checkpoint: String?
+        if let base {
+            checkpoint = base
+        } else {
+            checkpoint = try await session.harness.sessionStartHead()
+        }
+        if let checkpoint {
+            return try await source.diff(from: checkpoint, at: FilePath(config.cwd), includeUntracked: true)
+        }
+        return try await source.workingTreeDiff(at: FilePath(config.cwd), includeUntracked: true)
+    }
+
+    /// Restore one changed file after the client has confirmed the destructive
+    /// action. The session must be idle so a run cannot edit it again mid-request.
+    public func restoreDiffFile(sessionID: String, path: String, base: String? = nil) async throws {
+        let source = try configuredDiffSource()
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        let checkpoint: String?
+        if let base {
+            checkpoint = base
+        } else {
+            if let sessionHead = try await session.harness.sessionStartHead() {
+                checkpoint = sessionHead
+            } else {
+                checkpoint = try await source.head(at: FilePath(config.cwd))
+            }
+        }
+        guard let checkpoint else {
+            throw DoMoError(.configuration, "There is no Git base revision to restore \(path) from.")
+        }
+        try await source.restore(path: path, from: checkpoint, at: FilePath(config.cwd))
+    }
+
+    /// Generate a commit subject from the same diff currently shown in review.
+    public func commitMessage(sessionID: String) async throws -> String? {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        let diff = try await diff(sessionID: sessionID)
+        return try await session.harness.generateCommitMessage(diff: diff.patch)
+    }
+
+    private func configuredDiffSource() throws(DoMoError) -> any DiffSource {
+        if let source = config.diffSource { return source }
+        if let git = config.git { return git }
+        throw DoMoError(.configuration, "Git integration is unavailable in this runtime.")
     }
 
     /// The direct children of a node (or of the tree roots when `parent` is nil),

@@ -14,15 +14,16 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 ## Status: the port is finished; the harness is being built out
 
 **The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine,
-the MCP client, the Phase 5b command layer, Phase 5c client polish, and Phase 5d terminal-native
-polish, and Phase 10 context engineering are implemented, with focused
-coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8, 8.5, 9 and 10 had
-**2,566 tests in 382 suites green in the Swift 6.3.3 debug matrix; release verification is green with
-the repository's documented macOS `DoMoCLITests` runtime exception**.
+the MCP client, the Phase 5b command layer, Phase 5c client polish, Phase 5d terminal-native polish,
+Phase 10 context engineering, Phase 11's mutable tool suite, and Phase 12's Git review surface are
+implemented, with focused coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8, 8.5, 9, 10,
+11, and 12 are complete. The Swift 6.3.3 debug matrix is green for the focused Phase 12 suites;
+the full macOS run remains subject to the repository's documented `DoMoCLITests` child-process runtime
+exception.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
-**Every phase of the pi port has shipped through Phase 10 context engineering.**
+**Every phase of the pi port has shipped through Phase 12 Git review.**
 Phases 5a–5d — truth and plumbing, the command layer, client polish, and terminal-native polish — are
 complete. The default client now receives the same command registry as the inline surface,
 `/review`, `/init`, and `/tree` are available through that registry, trusted project instructions and
@@ -34,9 +35,9 @@ actions, refreshes open pickers, presents labels on their target nodes, preserve
 and starts automatic titling only after a completed first turn. **Phase 5d now closes the terminal-native
 polish gap.**
 Beyond it,
-[a second survey of the sibling harnesses](#sibling-harnesses-and-prior-art) found **706 distinct
-capabilities DoMoCode does not have** — subagents, checkpoints and undo, a diff review pane, plan mode,
-LSP diagnostics, sandboxing. The [roadmap](#roadmap) now sequences them.
+[a second survey of the sibling harnesses](#sibling-harnesses-and-prior-art) found a broad set of
+capabilities DoMoCode did not have — subagents, checkpoints and undo, plan mode, LSP diagnostics, and
+sandboxing remain on the roadmap. The [roadmap](#roadmap) now sequences them.
 
 The goal has changed accordingly. DoMoCode began as a deliberately **narrowed** port; the
 [first scope expansion](#what-expanded-and-what-did-not) widened it in four directions, all of which
@@ -150,6 +151,8 @@ Sources/
                     hooks, the system-prompt builder, and command/skill resource loading.
   DoMoExec/         FileSystem + Shell over swift-subprocess; gitignore walker; path sandboxing;
                     per-path file mutation coordinator; image-attachment loading.
+  DoMoGit/          The non-interactive Git facade, machine-oriented status/diff parsers, session-start
+                    checkpoints, and the DiffSource boundary used by review and future shadow history.
   DoMoTools/        The built-in tools (read/write/edit/bash/grep/find/ls), headless by design.
   DoMoPermissions/  The granular allow/ask/deny engine: glob matching, last-match-wins evaluation,
                     the bash arity table, the .env guard, the config self-edit guard, an actor that
@@ -557,7 +560,7 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       and end-to-end tests cover the suite. The file-tool refusal versus bash's
       `external_directory` prompt closes the last permission asymmetry in this slice: an
       "allow always" on a bash prefix no longer silently widens a read beyond the workspace.
-- [ ] **Phase 12 — Git: facade, diff, review.** The first phase needing a new subsystem rather than a
+- [x] **Phase 12 — Git: facade, diff, review.** The first phase needing a new subsystem rather than a
       seam. DoMoCode has no git integration at all, and a `DoMoGit` facade gates the diff viewer,
       `/review`, checkpoints and eventually worktrees — so it is built once, deliberately, with the
       flag discipline (`--no-optional-locks`, `core.quotepath=false`, `GIT_TERMINAL_PROMPT=0`, …) that
@@ -569,7 +572,13 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       collapsed path chains, split-versus-unified chosen by width, `]`/`[` hunk navigation,
       mark-reviewed, a source switcher behind one `DiffSource` protocol — plus per-file revert, a live
       modified-files sidebar, and LLM commit-message generation. *Exit:* `domo diff` and a `/diff`
-      pane; `/review` on a branch produces an advisory review.
+      pane; `/review` on a branch produces an advisory review. **Exit met:** `DoMoGit` now owns the
+      non-interactive command policy and machine-oriented parsing; new sessions record their start
+      HEAD; `domo diff` emits the raw patch or structured JSON; the server/client expose diff, per-file
+      restore, and commit-subject routes; and the full-screen review dialog provides a width-aware
+      file tree, hunk navigation, reviewed marks, live refresh, destructive restore confirmation, and
+      LLM-generated subjects. The inline surface names the full-screen affordance rather than sending
+      `/diff` to the model.
 - [ ] **Phase 13 — Checkpoints and undo.** The single highest-value absent capability in the survey.
       Today a bad edit is permanent unless the user's own VCS happened to have it staged. Shadow git —
       a second `GIT_DIR` in the data directory whose work-tree is the user's project, capturing

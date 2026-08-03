@@ -78,6 +78,12 @@ public final class ClientApp {
     private var forceClearDialog: DialogConfirm?
     private var draftEditorHandle: ScreenOverlayHandle?
     private var draftEditorDialog: DialogEditor?
+    private var diffReviewHandle: ScreenOverlayHandle?
+    private var diffReviewDialog: DiffReviewDialog?
+    private var diffReviewSessionID: String?
+    private var diffRefreshTask: Task<Void, Never>?
+    private var diffRevertHandle: ScreenOverlayHandle?
+    private var diffRevertDialog: DialogConfirm?
     private var theme = Theme.standard
     private var appearance: ThemeAppearance = .dark
     private var eventTask: Task<Void, Never>?
@@ -385,7 +391,7 @@ public final class ClientApp {
             await self?.bootstrap()
         })
 
-        let tasks = actionTasks + [eventTask, spinnerTask].compactMap { $0 }
+        let tasks = actionTasks + [eventTask, spinnerTask, diffRefreshTask].compactMap { $0 }
         // Cancellation is the hand-off to the owned HTTPClient below. Waiting for
         // every task here can deadlock on Linux when an async-http-client body
         // reader is already parked on its connection: the reader needs the
@@ -396,6 +402,7 @@ public final class ClientApp {
         actionTasks.removeAll()
         eventTask = nil
         spinnerTask = nil
+        diffRefreshTask = nil
 
         if let error = driver.startupError { throw error }
         if let error = driver.renderError { throw error }
@@ -1541,6 +1548,9 @@ public final class ClientApp {
     }
 
     private func open(_ sessionID: String) async {
+        if diffReviewSessionID != nil, diffReviewSessionID != sessionID {
+            dismissDiffReview()
+        }
         // A new session's transcript is a different document; carrying the old
         // scroll position into it would open it part-way up at an arbitrary row.
         transcriptView.scrollToBottom()
@@ -1883,6 +1893,8 @@ public final class ClientApp {
             SelectItem(value: "title", label: "Auto-title session", description: "Ask the active model for a short name"),
             SelectItem(value: "model", label: "Switch model", description: "Write a model_change entry"),
             SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
+            SelectItem(value: "diff", label: "Review working-tree diff", description: "Inspect changes since the session started"),
+            SelectItem(value: "review", label: "Review diff (guided)", description: "Mark files reviewed and restore individual paths"),
             SelectItem(value: "theme-dark", label: "Theme: dark", description: "Use the dark palette"),
             SelectItem(value: "theme-light", label: "Theme: light", description: "Use the light palette"),
             SelectItem(value: "edit-dialog", label: "Edit prompt in dialog", description: "Edit the draft inside the client"),
@@ -1912,6 +1924,8 @@ public final class ClientApp {
         case "title": autoTitleSession()
         case "model": openModelPicker()
         case "tree": openTreePicker()
+        case "diff": openDiffReview(advisory: false)
+        case "review": openDiffReview(advisory: true)
         case "theme-dark": setAppearance(.dark)
         case "theme-light": setAppearance(.light)
         case "edit-dialog": openPromptEditorDialog()
@@ -2271,6 +2285,160 @@ public final class ClientApp {
         draftEditorDialog = nil
     }
 
+    // MARK: Diff review
+
+    /// Open the working-tree review surface for the selected session. The server
+    /// remains the authority for the repository path and session checkpoint; the
+    /// client only owns navigation marks and the destructive-action confirmation.
+    private func openDiffReview(advisory: Bool) {
+        if diffReviewHandle != nil {
+            dismissDiffReview()
+            return
+        }
+        guard let sessionID = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+
+        let dialog = DiffReviewDialog()
+        dialog.onClose = { [weak self] in self?.dismissDiffReview() }
+        dialog.onRevert = { [weak self] path in self?.confirmDiffRevert(path: path) }
+        dialog.onCommitMessage = { [weak self] in self?.requestCommitMessage() }
+        diffReviewDialog = dialog
+        diffReviewSessionID = sessionID
+        guard let handle = dialogs?.present(
+            dialog,
+            options: overlayOptions(
+                width: min(140, max(60, surface?.target.columns ?? 100)),
+                height: max(10, (surface?.target.rows ?? 24) - 2)
+            )
+        ) else {
+            diffReviewDialog = nil
+            diffReviewSessionID = nil
+            post(notice: "could not open the diff review")
+            return
+        }
+        diffReviewHandle = handle
+
+        let initial = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.loadDiffReview(sessionID: sessionID, reportFailure: true)
+        }
+        actionTasks.append(initial)
+
+        diffRefreshTask?.cancel()
+        diffRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled, let self,
+                      self.diffReviewHandle != nil,
+                      self.diffReviewSessionID == sessionID
+                else { return }
+                await self.loadDiffReview(sessionID: sessionID, reportFailure: false)
+            }
+        }
+        if advisory {
+            post(notice: "review mode — mark files with r, restore with v", seconds: 6)
+        }
+    }
+
+    private func loadDiffReview(sessionID: String, reportFailure: Bool) async {
+        guard diffReviewSessionID == sessionID, diffReviewHandle != nil else { return }
+        do {
+            let diff = try await client.diff(sessionID: sessionID)
+            guard diffReviewSessionID == sessionID, diffReviewHandle != nil else { return }
+            diffReviewDialog?.update(diff: diff)
+            surface?.requestRender()
+        } catch {
+            guard diffReviewSessionID == sessionID, diffReviewHandle != nil else { return }
+            if reportFailure {
+                postError("Could not load the working-tree diff", error)
+            }
+        }
+    }
+
+    private func dismissDiffReview() {
+        diffRefreshTask?.cancel()
+        diffRefreshTask = nil
+        dismissDiffRevertConfirmation()
+        dismissDialog(diffReviewHandle)
+        diffReviewHandle = nil
+        diffReviewDialog = nil
+        diffReviewSessionID = nil
+    }
+
+    private func confirmDiffRevert(path: String) {
+        guard let sessionID = diffReviewSessionID, diffReviewHandle != nil else { return }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        guard diffRevertHandle == nil else { return }
+        let visiblePath = sanitizeUntrustedText(collapseToOneLine(path))
+        let dialog = DialogConfirm(
+            title: "Restore file?",
+            message: "Discard the working-tree changes in \(visiblePath)?",
+            confirmLabel: "Restore",
+            cancelLabel: "Cancel",
+            keybindings: keybindings
+        )
+        dialog.onCancel = { [weak self] in self?.dismissDiffRevertConfirmation() }
+        dialog.onResult = { [weak self] confirmed in
+            guard let self else { return }
+            self.dismissDiffRevertConfirmation()
+            guard confirmed else {
+                self.post(notice: "restore cancelled")
+                return
+            }
+            let task = Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.client.restoreDiffFile(sessionID: sessionID, path: path)
+                    guard self.diffReviewSessionID == sessionID else { return }
+                    await self.loadDiffReview(sessionID: sessionID, reportFailure: true)
+                    self.post(notice: "restored \(visiblePath)")
+                } catch {
+                    self.postError("Could not restore \(visiblePath)", error)
+                }
+            }
+            self.actionTasks.append(task)
+        }
+        diffRevertDialog = dialog
+        diffRevertHandle = dialogs?.present(dialog, options: overlayOptions(width: 82, height: 8))
+        if diffRevertHandle == nil {
+            diffRevertDialog = nil
+            post(notice: "could not open the restore confirmation")
+        }
+    }
+
+    private func dismissDiffRevertConfirmation() {
+        dismissDialog(diffRevertHandle)
+        diffRevertHandle = nil
+        diffRevertDialog = nil
+    }
+
+    private func requestCommitMessage() {
+        guard let sessionID = diffReviewSessionID, diffReviewHandle != nil else { return }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        diffReviewDialog?.showCommitMessage("generating…")
+        surface?.requestRender()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let message = try await self.client.commitMessage(sessionID: sessionID)
+                guard self.diffReviewSessionID == sessionID, self.diffReviewHandle != nil else { return }
+                self.diffReviewDialog?.showCommitMessage(message ?? "no subject generated")
+                self.surface?.requestRender()
+            } catch {
+                self.postError("Could not generate a commit subject", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
     private func setAppearance(_ value: ThemeAppearance) {
         appearance = value
         promptInput.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
@@ -2361,6 +2529,10 @@ public final class ClientApp {
                 post(notice: names, seconds: 8)
             case .tree:
                 openTreePicker()
+            case .diff:
+                openDiffReview(advisory: false)
+            case .review:
+                openDiffReview(advisory: true)
             case .compact:
                 guard let id = store.selectedSessionID else {
                     post(notice: "no session is open")
@@ -3158,6 +3330,7 @@ extension ClientApp: TerminalApp {
         if autocompleteHandle != nil || paletteHandle != nil || sessionPickerHandle != nil
             || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
             || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
+            || diffReviewHandle != nil || diffRevertHandle != nil
             || questionHandle != nil {
             surface?.handleInput(data)
             return

@@ -258,7 +258,7 @@ let package = Package(
         .target(
             name: "DoMoServer",
             dependencies: [
-                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness", "DoMoPermissions",
+                "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness", "DoMoGit", "DoMoPermissions",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
             ],
@@ -278,7 +278,7 @@ let package = Package(
         .target(
             name: "DoMoClient",
             dependencies: [
-                "DoMoCore", "DoMoServer", "DoMoLLM", "DoMoHarness", "DoMoPermissions",
+                "DoMoCore", "DoMoServer", "DoMoGit", "DoMoLLM", "DoMoHarness", "DoMoPermissions",
                 // DoMoExec is the package's single image loader
                 // (`ImageAttachmentLoader`) and its single filesystem seam. The
                 // client reads a dropped file locally before staging it, so it
