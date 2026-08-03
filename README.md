@@ -15,12 +15,12 @@ with or endorsed by the Pi Agent Harness project. See [NOTICES.md](NOTICES.md) f
 
 **The runtime, both terminal UIs, the HTTP/SSE server, inline images in and out, the permission engine,
 the MCP client, the Phase 5b command layer, Phase 5c client polish, Phase 5d terminal-native polish,
-Phase 10 context engineering, Phase 11's mutable tool suite, Phase 12's Git review surface, and
-Phases 13–17's checkpoints, agents, subagents, diagnostics, and memory are implemented, with focused
-coverage added here** — Phases 0–4, 5a, 5.5, 6, 7, 7.5, 8, 8.5, and 9–17 are complete. The Swift
-6.3.3 debug matrix is green for the focused Phase 17 suites;
-the full macOS run remains subject to the repository's documented `DoMoCLITests` child-process runtime
-exception.
+Phase 10 context engineering, Phase 11's mutable tool suite, Phase 12's Git review surface, Phases
+13–17's checkpoints, agents, subagents, diagnostics, and memory, Phase 18 sandboxing, and Phase 19's
+PTY/interactive-terminal seam are implemented, with focused coverage added here** — Phases 0–19 are
+complete. The focused Swift 6.3.3 debug and release matrices for the new paths are green: bounded PTY
+service, VT screen model, inline terminal provider, and server ownership. The broad macOS integration
+matrix remains subject to existing timing-sensitive full-screen client/server tests.
 `domo` with no arguments is a full-screen client attached to a loopback server it spawns itself;
 `--inline` is the classic scrollback REPL; `-p` is headless.
 
@@ -157,7 +157,8 @@ Sources/
                     sandboxing; per-path file mutation coordinator; image-attachment loading.
   DoMoGit/          The non-interactive Git facade, machine-oriented status/diff parsers, session-start
                     checkpoints, and the DiffSource boundary used by review and future shadow history.
-  DoMoTools/        The built-in tools (read/write/edit/bash/grep/find/ls), headless by design.
+  DoMoTools/        The built-in tools (read/write/edit/bash/grep/find/ls), background processes, and
+                    the inline-first interactive_terminal PTY capability with a headless refusal.
   DoMoPermissions/  The granular allow/ask/deny engine: glob matching, last-match-wins evaluation,
                     the bash arity table, the .env guard, the config self-edit guard, an actor that
                     remembers and persists grants, and the beforeToolCall hook that gates the loop.
@@ -170,13 +171,15 @@ Sources/
 
   # The server — hosts the runtime behind a local socket
   DoMoServer/       Hummingbird HTTP+SSE. Write path drives the AgentHarness actor; read path is an
-                    SSE broadcast hub. Loopback-only bind, per-session token. Also owns the wire
+                    SSE broadcast hub. Loopback-only bind, per-session token, and a session-owned
+                    PTY service ready for a future bidirectional client transport. Also owns the wire
                     DTOs (ServerEvent, ServerNotice) that the client decodes.
 
   # The terminal client
   DoMoTermIO/       The POSIX seam. The only module that imports Darwin/Glibc: termios raw mode,
                     TIOCGWINSZ, SIGWINCH, the stdin byte pump, panic-safe restore, alternate-screen
-                    enter/exit, mouse reporting, and the cell-pixel-size probe.
+                    enter/exit, mouse reporting, PTY process groups, bounded output replay, and the
+                    VT screen model used to interpret foreign interactive programs.
   DoMoTUI/          Both renderers. Inline: the differential scrollback renderer, Component protocol,
                     overlays, multi-line Editor, keybindings, ANSI/display-width text engine.
                     Full-screen: AltScreenCore + CellBuffer (absolute-CUP cell compositor), the
@@ -689,18 +692,24 @@ Ordered strictly by dependency. Each phase ends with something runnable and test
       server but cannot introduce or replace one; and unknown/MCP tool grants are scoped to canonical,
       glob-inert argument payloads. *Exit met:* `--sandbox` never silently falls back to an
       unconfined model-originated process.
-- [ ] **Phase 19 — PTY and interactive terminal.** Harder here than in any surveyed harness, because
+- [x] **Phase 19 — PTY and interactive terminal.** Harder here than in any surveyed harness, because
       of the client/server split. Control messages already flow client→server over REST
       (`/prompt`, `/abort`, `/permission`), but there is no *streaming* channel to carry keystrokes
       into a live process, and SSE cannot become one. A
       server-owned PTY service with a bounded retained ring and a two-step attach (replay-then-
-      activate) closes the race where bytes arrive between replay and subscription. Needs a small VT
-      screen emulator written as a separate type: the existing scanner handles OSC and APC strings
-      but recognizes only the five CSI final bytes the renderer itself emits (`m G K H J`), which is
-      correct for measuring DoMoCode's own output and nowhere near enough to interpret a foreign
-      program's. `interactive_terminal` ships
-      **inline-first**, degrading to a model-visible refusal elsewhere until a client input channel
-      exists. *Exit:* `gh auth login` and an ssh passphrase prompt work from inside the agent.
+      activate) closes the race where bytes arrive between replay and subscription. `VTScreen` is a
+      separate small emulator for foreign programs: cursor motion, erase/edit operations, scrolling,
+      SGR, alternate-screen modes, OSC titles, split UTF-8, and common line editing are interpreted
+      without feeding untrusted output into the renderer. `interactive_terminal` ships
+      **inline-first**: the inline CLI owns a PTY-backed provider, routes raw keyboard bytes to the
+      active child, and exposes a bounded VT projection; print and remote contexts return a
+      model-visible refusal until a client input channel exists. Sandboxed inline sessions reuse the
+      same `ProcessSandbox` launch plan as shell and background processes. The server runtime owns
+      session-scoped PTYs and cleans them up on shutdown, but does not pretend SSE can provide input.
+      *Exit met:* replay/activation, input round trips, bounded retention and gap reporting, VT
+      interpretation, inline provider actions, headless refusal, sandbox propagation, and server
+      session ownership are covered by focused tests; the live PTY path is suitable for `gh auth
+      login` and ssh passphrase prompts.
 - [ ] **Phase 20 — Export, replay, and scriptability.** Small and self-contained. Markdown transcript
       export with a content-options dialog and a shared `/copy` using the same formatter — the export
       people actually want, and it should ship before any HTML viewer. Single-file HTML export is
@@ -1332,8 +1341,8 @@ real — each of these is now a property of the shipped system, not a forecast:
 
 ## Contributing
 
-All shipped phases through Phase 18 are implemented.
-**Phase 18 — Sandboxing and permission hardening — is complete**, followed by Phases 19–21. The [dependency spine](#the-dependency-spine)
+All shipped phases through Phase 19 are implemented.
+**Phase 19 — PTY and interactive terminal — is complete**, followed by Phases 20–21. The [dependency spine](#the-dependency-spine)
 is the useful map: six seams gate most of what is left, and a change that lands one of them is worth
 more than a change that ships a feature around it. Issues proposing scope changes — particularly anything in
 [Non-goals](#non-goals-and-known-gaps) or the
