@@ -57,7 +57,9 @@ public struct ShellEnvironment: Sendable, Hashable {
         ShellEnvironment(base: .empty, overrides: values.mapValues { $0 })
     }
 
-    fileprivate var subprocessEnvironment: Subprocess.Environment {
+    /// The swift-subprocess environment form used by both one-shot and
+    /// session-scoped process runners in this module.
+    var subprocessEnvironment: Subprocess.Environment {
         let mapped = Dictionary(
             uniqueKeysWithValues: overrides.map { (Subprocess.Environment.Key(stringLiteral: $0.key), $0.value) }
         )

@@ -162,4 +162,36 @@ struct UtilityToolTests {
         #expect(result.isError)
         #expect(result.text.contains("headless"))
     }
+
+    @Test("background_process keeps a session child addressable across calls")
+    func backgroundProcess() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+
+        let started = try await BackgroundProcessTool().execute(
+            ["action": "start", "command": "printf 'started\\n'; sleep 30"],
+            in: fixture.context
+        )
+        #expect(!started.isError)
+        let id = started.details["id"]?.stringValue
+        #expect(id != nil)
+
+        var polled = ToolResult.error("not polled")
+        for _ in 0..<50 {
+            polled = try await BackgroundProcessTool().execute(
+                ["action": "poll", "id": .string(id ?? "")],
+                in: fixture.context
+            )
+            if polled.text.contains("started") { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(polled.text.contains("started"))
+
+        let killed = try await BackgroundProcessTool().execute(
+            ["action": "kill", "id": .string(id ?? "")],
+            in: fixture.context
+        )
+        #expect(!killed.isError)
+        await fixture.context.backgroundProcesses.shutdown()
+    }
 }

@@ -1915,6 +1915,9 @@ public struct InteractiveMode: Sendable {
     private let prompterBox: PrompterBox
     /// The late-bound structured-question handler for the built-in question tool.
     private let questionBox: QuestionBox
+    /// Children started by `background_process`; all are stopped when this
+    /// interactive session returns.
+    private let backgroundProcesses: BackgroundProcessManager
     /// The MCP servers backing this session's MCP tools (Phase 8c), held so ``run``
     /// can tear them down on exit — they spawn in their own process group and would
     /// otherwise be orphaned. `nil` when no MCP servers are configured.
@@ -1939,6 +1942,7 @@ public struct InteractiveMode: Sendable {
         steering: SteeringBox,
         prompterBox: PrompterBox,
         questionBox: QuestionBox,
+        backgroundProcesses: BackgroundProcessManager,
         metadataRelay: ResponseMetadataRelay,
         requestedModel: String,
         fileSystem: SandboxedFileSystem? = nil,
@@ -1955,6 +1959,7 @@ public struct InteractiveMode: Sendable {
         self.steering = steering
         self.prompterBox = prompterBox
         self.questionBox = questionBox
+        self.backgroundProcesses = backgroundProcesses
         self.metadataRelay = metadataRelay
         self.requestedModel = requestedModel
         self.fileSystem = fileSystem
@@ -2180,6 +2185,7 @@ public struct InteractiveMode: Sendable {
             steering: steering,
             prompterBox: prompterBox,
             questionBox: questionBox,
+            backgroundProcesses: toolContext.backgroundProcesses,
             metadataRelay: metadataRelay,
             requestedModel: runtime.model,
             fileSystem: toolContext.fileSystem,
@@ -2296,6 +2302,7 @@ public struct InteractiveMode: Sendable {
             await coordinator.agentLoop()
         })
 
+        await backgroundProcesses.shutdown()
         // Tear the MCP servers down before reporting any terminal error — they run in
         // their own process group, so leaving them up would orphan them.
         await mcpManager?.shutdown()

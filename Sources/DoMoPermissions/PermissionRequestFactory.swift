@@ -73,6 +73,21 @@ public struct PermissionRequestFactory: Sendable {
                 always: [],
                 metadata: ["url": .string(url)]
             )
+        case "background_process":
+            let action = arguments["action"]?.stringValue ?? ""
+            let target = arguments["command"]?.stringValue
+                ?? arguments["id"]?.stringValue
+                ?? "*"
+            return PermissionRequestSpec(
+                permission: "background_process",
+                patterns: [action.isEmpty ? target : "\(action) \(target)"],
+                always: [],
+                metadata: [
+                    "action": .string(action),
+                    "command": arguments["command"] ?? .null,
+                    "id": arguments["id"] ?? .null,
+                ]
+            )
         default:
             // find/grep/todo/etc. and every MCP tool: a coarse `*` resource. Known
             // read-only tools are auto-allowed by the baseline; an unknown MCP name is

@@ -204,7 +204,8 @@ public struct ToolRegistry: Sendable {
         ToolRegistry([ReadTool(), GrepTool(), FindTool(), LsTool()])
     }
 
-    /// All seven built-in tools.
+    /// All built-in tools. Stateful tools receive their per-session state through
+    /// the ``ToolContext`` supplied at execution time.
     public static var builtin: ToolRegistry {
         builtin(todoStore: TodoStore())
     }
@@ -216,6 +217,7 @@ public struct ToolRegistry: Sendable {
         ToolRegistry([
             ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
             TodoWriteTool(store: todoStore), GlobTool(), FinishTool(), QuestionTool(), WebFetchTool(),
+            BackgroundProcessTool(),
         ])
     }
 
@@ -337,6 +339,11 @@ public struct ToolContext: Sendable {
     /// The HTTP seam used by WebFetchTool.
     public let webFetch: WebFetch
 
+    /// Session-scoped long-running children used by ``BackgroundProcessTool``.
+    /// The manager is created with the context so one session can poll a process
+    /// from a later tool call without sharing it with another session.
+    public let backgroundProcesses: BackgroundProcessManager
+
     /// The default web-fetch implementation. It follows redirects according to
     /// the platform URL loading system and leaves permission decisions to the
     /// caller's PermissionEngine.
@@ -357,7 +364,8 @@ public struct ToolContext: Sendable {
         toolLocator: ExternalToolLocator = .pathSearch,
         environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
         questionHandler: QuestionHandler? = nil,
-        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch
+        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
+        backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager()
     ) {
         self.fileSystem = fileSystem
         self.shell = shell
@@ -366,6 +374,7 @@ public struct ToolContext: Sendable {
         self.environment = environment
         self.questionHandler = questionHandler
         self.webFetch = webFetch
+        self.backgroundProcesses = backgroundProcesses
     }
 
     /// Builds a context confined to `root`, resolving the root through the base
@@ -378,7 +387,8 @@ public struct ToolContext: Sendable {
         toolLocator: ExternalToolLocator = .pathSearch,
         environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
         questionHandler: QuestionHandler? = nil,
-        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch
+        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
+        backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager()
     ) async throws(DoMoError) -> ToolContext {
         let sandboxed = try await SandboxedFileSystem.rooted(at: root, using: base)
         return ToolContext(
@@ -387,7 +397,8 @@ public struct ToolContext: Sendable {
             toolLocator: toolLocator,
             environment: environment,
             questionHandler: questionHandler,
-            webFetch: webFetch
+            webFetch: webFetch,
+            backgroundProcesses: backgroundProcesses
         )
     }
 
