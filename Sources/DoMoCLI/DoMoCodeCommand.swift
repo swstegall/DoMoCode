@@ -60,6 +60,14 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             Use at most one of --continue, --resume, or --session. An unknown id or a file that is \
             not a session is a hard error (non-zero exit).
 
+            TRAJECTORY REPLAY. Validate a recorded tool stream through a selected entry and create
+            a normal, resumeable branch without starting a model or running local tools:
+
+              --replay <session> --until <entry>
+
+            The equivalent `domo replay [<session>] --until <entry>` subcommand also emits a JSON
+            report with --json.
+
             PROJECT TRUST. When the current directory carries a .domocode/settings.json — which can \
             redirect the model, the proxy, and where sessions are written — domo will not use it \
             until the directory is trusted. An interactive session asks once, on the terminal, and \
@@ -75,7 +83,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             the turn cap exits 2, the runaway guard exits 3, and the cost cap exits 4, so a \
             script can distinguish under-budgeting, a stuck model, and a spend ceiling.
             """,
-        subcommands: [DiffCommand.self, ExportCommand.self]
+        subcommands: [DiffCommand.self, ExportCommand.self, ReplayCommand.self]
     )
 
     @Option(
@@ -245,6 +253,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     @Option(name: .customLong("session"), help: "Resume the session at an explicit file path.")
     public var session: String?
 
+    @Option(
+        name: .customLong("replay"),
+        help: "Validate a recorded session trajectory and create a branch from it."
+    )
+    public var replay: String?
+
+    @Option(
+        name: .customLong("until"),
+        help: "Replay branch point entry id (used with --replay)."
+    )
+    public var until: String?
+
     @Flag(
         name: .customLong("fork"),
         help: "Resume but branch into a new session file, leaving the original untouched."
@@ -309,6 +329,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 try await export.run()
                 return
             }
+            if rawArguments.first == "replay" {
+                let replay = try ReplayCommand.parse(Array(rawArguments.dropFirst()))
+                try await replay.run()
+                return
+            }
             let parsed = try parseAsRoot()
             // Keep concrete subcommand values intact. Calling `run()` through
             // the protocol existential can re-enter the root's default dispatch
@@ -317,6 +342,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 try await diff.run()
             } else if let export = parsed as? ExportCommand {
                 try await export.run()
+            } else if let replay = parsed as? ReplayCommand {
+                try await replay.run()
             } else if let root = parsed as? DoMoCodeCommand {
                 try await root.run()
             } else if var asyncCommand = parsed as? AsyncParsableCommand {
@@ -349,6 +376,22 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     private func execute() async throws {
         let environment = ProcessInfo.processInfo.environment
         let workingDirectory = FilePath(FileManager.default.currentDirectoryPath)
+
+        if let replay {
+            guard prompt == nil, !serve, resume == nil, session == nil, !continueSession, !fork else {
+                throw DoMoError(
+                    .configuration,
+                    "--replay cannot be combined with a live run or session-selection flags."
+                )
+            }
+            let report = try await ReplaySupport.perform(
+                sessionPath: replay,
+                until: until,
+                configuredSessionDirectory: ReplaySupport.defaultSessionDirectory(environment: environment)
+            )
+            try ReplaySupport.write(report, asJSON: json)
+            return
+        }
 
         // Refuse to run an untrusted project's local settings BEFORE they are
         // parsed, not after. The gate used to run some thirty lines below

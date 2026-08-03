@@ -69,6 +69,17 @@ extension AgentTool {
     public var executionMode: ToolExecutionMode? { nil }
 }
 
+/// Executes a completed tool call against a host-provided result stream.
+///
+/// This is deliberately separate from ``AgentTool``. An ``AgentTool`` performs
+/// work from arguments; a ``ToolExecutor`` can instead reproduce work that was
+/// already recorded, which is what trajectory replay needs. The call id is
+/// part of the input so an executor can reject a model that diverged from the
+/// recorded branch rather than silently returning the wrong result.
+public protocol ToolExecutor: Sendable {
+    func execute(_ toolCall: ToolCallBlock) async throws(DoMoError) -> AgentToolResult
+}
+
 /// What a tool produced, in the loop's vocabulary.
 ///
 /// A narrower cousin of ``DoMoTools/ToolResult``: the loop needs the text the
