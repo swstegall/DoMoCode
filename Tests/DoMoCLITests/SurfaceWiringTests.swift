@@ -381,7 +381,7 @@ struct SurfaceWiringTests {
 
     @Test
     func miniSurfaceUsesNormalScrollbackAndSemanticPromptMarks() throws {
-        let gateway = try MockGateway(chatCompletionBodies: [])
+        let gateway = try MockGateway(chatCompletionBodies: [Self.textTurn("done.")])
         gateway.start()
         defer { gateway.stop() }
 
@@ -395,10 +395,17 @@ struct SurfaceWiringTests {
         )
 
         #expect(terminal.waitUntilPainted(), "the mini REPL never painted a frame: \(terminal.text)")
+        #expect(
+            terminal.submit("hello", until: { gateway.requestCount >= 1 }),
+            "the mini REPL never submitted a turn"
+        )
+        terminal.settle()
         let output = terminal.text
         #expect(output.contains("\u{1b}[1;"), "mini mode never set a DECSTBM region")
         #expect(output.contains("\u{1b}]133;A\u{07}"), "mini mode never marked prompt start")
         #expect(output.contains("\u{1b}]133;B\u{07}"), "mini mode never marked prompt end")
+        #expect(output.contains("\u{1b}]133;C\u{07}"), "mini mode never marked command start")
+        #expect(output.contains("\u{1b}]133;D;0\u{07}"), "mini mode never marked command end")
         #expect(!output.contains("\u{1b}[?1049h"), "mini mode entered the alternate screen")
         #expect(!output.contains("\u{1b}[?1002h"), "mini mode claimed mouse reporting")
     }
