@@ -40,6 +40,16 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     /// A resumed run does not identify the parent session that owns its child
     /// agents and permission boundary.
     case workflowSessionRequired
+    /// The runtime was not configured with a durable handoff ledger.
+    case handoffUnavailable
+    /// A durable handoff id is not known to this runtime.
+    case handoffNotFound
+    /// A handoff state transition or cursor was not admissible.
+    case handoffConflict
+    /// The caller is not the owner authorized for this handoff operation.
+    case handoffDenied
+    /// The handoff request or cursor was malformed.
+    case handoffInvalid(String)
 }
 
 /// A reference to a session, returned by create and fork.
@@ -367,6 +377,9 @@ public actor ServerRuntime {
         /// this seam optional preserves lightweight embedded runtimes while the
         /// serving CLI can opt into project-local durability.
         public var workflowStore: WorkflowStore?
+        /// Optional append-only session handoff ledger. The runtime owns the
+        /// route boundary; the ledger owns durable state transitions.
+        public var sessionHandoffs: SessionHandoffManager?
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -413,7 +426,8 @@ public actor ServerRuntime {
             maxSubagentDepth: Int = 2,
             projectMemoryProvider: (any ProjectMemoryProvider)? = nil,
             terminalService: PTYService? = nil,
-            workflowStore: WorkflowStore? = nil
+            workflowStore: WorkflowStore? = nil,
+            sessionHandoffs: SessionHandoffManager? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -453,6 +467,7 @@ public actor ServerRuntime {
             self.projectMemoryProvider = projectMemoryProvider
             self.terminalService = terminalService
             self.workflowStore = workflowStore
+            self.sessionHandoffs = sessionHandoffs
         }
     }
 
@@ -653,6 +668,129 @@ public actor ServerRuntime {
     public func memory() async throws -> [ProjectMemoryRecord] {
         guard let provider = config.projectMemoryProvider else { return [] }
         return try await provider.list()
+    }
+
+    // MARK: Session handoff
+
+    /// List durable handoffs, optionally scoped to their source session. This
+    /// is a level-triggered projection; clients may safely refresh after a
+    /// dropped event without inventing a state transition.
+    public func handoffs(sourceSessionID: String? = nil) async throws -> [SessionHandoffRecord] {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.list(sourceSessionID: sourceSessionID)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    public func handoff(id: String) async throws -> SessionHandoffRecord? {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.snapshot(id: id)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    /// Return handoff events after a monotonic cursor. Passing an id filters the
+    /// global ledger without changing its cursor namespace.
+    public func handoffEvents(
+        after sequence: Int = 0,
+        handoffID: String? = nil
+    ) async throws -> [SessionHandoffEvent] {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.events(after: sequence, handoffID: handoffID)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    public func proposeHandoff(_ request: SessionHandoffRequest) async throws -> SessionHandoffRecord {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.propose(request)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    public func acceptHandoff(id: String, owner: String) async throws -> SessionHandoffRecord {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.accept(id: id, owner: owner)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    public func completeHandoff(
+        id: String,
+        owner: String,
+        target: SessionHandoffTarget? = nil,
+        metadata: [String: JSONValue] = [:]
+    ) async throws -> SessionHandoffRecord {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.complete(
+                id: id,
+                owner: owner,
+                target: target,
+                metadata: metadata
+            )
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    public func rejectHandoff(id: String, owner: String, reason: String) async throws -> SessionHandoffRecord {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.reject(id: id, owner: owner, reason: reason)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    public func cancelHandoff(
+        id: String,
+        owner: String,
+        reason: String = "Handoff cancelled."
+    ) async throws -> SessionHandoffRecord {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.cancel(id: id, owner: owner, reason: reason)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
+    }
+
+    public func handoffExport(id: String) async throws -> [SessionHandoffJournalEntry] {
+        guard let manager = config.sessionHandoffs else {
+            throw ServerRuntimeError.handoffUnavailable
+        }
+        do {
+            return try await manager.export(id: id)
+        } catch {
+            throw Self.mapHandoffError(error)
+        }
     }
 
     public func models() -> [ModelOption] {
@@ -1144,6 +1282,24 @@ public actor ServerRuntime {
         workflowRunners.removeValue(forKey: runID)
         workflowTasks.removeValue(forKey: runID)
         resolvePendingWorkflowApprovals(runID: runID, decision: .cancelled)
+    }
+
+    private static func mapHandoffError(_ error: any Error) -> ServerRuntimeError {
+        guard let error = error as? SessionHandoffError else {
+            return .handoffInvalid("Handoff operation failed.")
+        }
+        switch error {
+        case .notFound:
+            return .handoffNotFound
+        case .duplicate, .invalidTransition:
+            return .handoffConflict
+        case .ownershipDenied:
+            return .handoffDenied
+        case .invalidRequest(let message):
+            return .handoffInvalid(message)
+        case .invalidCursor(let cursor):
+            return .handoffInvalid("Invalid handoff cursor (cursor).")
+        }
     }
 
     /// Project the same late-bound tool resolver used before the next model

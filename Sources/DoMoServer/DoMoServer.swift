@@ -90,6 +90,17 @@ private struct WorkflowApprovalBody: Decodable {
     var reason: String?
 }
 
+private struct HandoffDecisionBody: Decodable {
+    var owner: String
+    var reason: String?
+}
+
+private struct HandoffCompleteBody: Decodable {
+    var owner: String
+    var target: SessionHandoffTarget?
+    var metadata: [String: JSONValue]?
+}
+
 // MARK: - Auth middleware
 
 /// Rejects any request that does not present the server's bearer token.
@@ -225,6 +236,103 @@ public struct DoMoServer: Sendable {
         router.get("/models") { _, _ in
             try await self.mapErrors {
                 try Self.json(await self.runtime.models())
+            }
+        }
+
+        // Session handoffs are durable control records. The ledger owns
+        // authorization and transitions; these routes only authenticate and
+        // project its level-triggered state and resumable cursor.
+        router.get("/handoffs") { request, _ in
+            try await self.mapErrors {
+                let sourceSessionID = request.uri.queryParameters["sourceSession"]
+                    .map(String.init)
+                return try Self.json(try await self.runtime.handoffs(sourceSessionID: sourceSessionID))
+            }
+        }
+
+        router.post("/handoff") { request, _ in
+            try await self.mapErrors {
+                let body = try await Self.requiredBody(SessionHandoffRequest.self, request)
+                return try Self.json(try await self.runtime.proposeHandoff(body), status: .created)
+            }
+        }
+
+        router.get("/handoff/:id") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                guard let handoff = try await self.runtime.handoff(id: id) else {
+                    throw HTTPError(.notFound)
+                }
+                return try Self.json(handoff)
+            }
+        }
+
+        router.get("/handoff/:id/events") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let rawAfter = request.uri.queryParameters["after"].map(String.init)
+                let after: Int
+                if let rawAfter {
+                    guard let parsed = Int(rawAfter), parsed >= 0 else {
+                        throw HTTPError(.badRequest)
+                    }
+                    after = parsed
+                } else {
+                    after = 0
+                }
+                return try Self.json(try await self.runtime.handoffEvents(after: after, handoffID: id))
+            }
+        }
+
+        router.get("/handoff/:id/export") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.handoffExport(id: id))
+            }
+        }
+
+        router.post("/handoff/:id/accept") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(HandoffDecisionBody.self, request)
+                return try Self.json(try await self.runtime.acceptHandoff(id: id, owner: body.owner))
+            }
+        }
+
+        router.post("/handoff/:id/complete") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(HandoffCompleteBody.self, request)
+                return try Self.json(try await self.runtime.completeHandoff(
+                    id: id,
+                    owner: body.owner,
+                    target: body.target,
+                    metadata: body.metadata ?? [:]
+                ))
+            }
+        }
+
+        router.post("/handoff/:id/reject") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(HandoffDecisionBody.self, request)
+                return try Self.json(try await self.runtime.rejectHandoff(
+                    id: id,
+                    owner: body.owner,
+                    reason: body.reason ?? "Handoff rejected."
+                ))
+            }
+        }
+
+        router.post("/handoff/:id/cancel") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(HandoffDecisionBody.self, request)
+                return try Self.json(try await self.runtime.cancelHandoff(
+                    id: id,
+                    owner: body.owner,
+                    reason: body.reason ?? "Handoff cancelled."
+                ))
             }
         }
 
@@ -722,6 +830,14 @@ public struct DoMoServer: Sendable {
             case .workflowRunBusy, .workflowRunNotResumable:
                 throw HTTPError(.conflict)
             case .workflowSessionRequired:
+                throw HTTPError(.badRequest)
+            case .handoffUnavailable, .handoffNotFound:
+                throw HTTPError(.notFound)
+            case .handoffConflict:
+                throw HTTPError(.conflict)
+            case .handoffDenied:
+                throw HTTPError(.forbidden)
+            case .handoffInvalid:
                 throw HTTPError(.badRequest)
             }
         }

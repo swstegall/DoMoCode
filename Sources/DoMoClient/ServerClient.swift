@@ -140,6 +140,15 @@ public struct ServerClient: Sendable {
         let decision: String
         let reason: String?
     }
+    private struct HandoffDecisionBody: Encodable {
+        let owner: String
+        let reason: String?
+    }
+    private struct HandoffCompleteBody: Encodable {
+        let owner: String
+        let target: SessionHandoffTarget?
+        let metadata: [String: JSONValue]
+    }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -188,6 +197,91 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([ModelOption].self, from: data)
+    }
+
+    /// List durable session handoffs, optionally scoped to a source session.
+    public func handoffs(sourceSessionID: String? = nil) async throws -> [SessionHandoffRecord] {
+        var path = "/handoffs"
+        if let sourceSessionID {
+            path += "?sourceSession=\(Self.percentEncode(sourceSessionID))"
+        }
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionHandoffRecord].self, from: data)
+    }
+
+    /// Propose a durable handoff. The server returns the admission snapshot;
+    /// accepting and completing it remain explicit operations.
+    public func proposeHandoff(_ request: SessionHandoffRequest) async throws -> SessionHandoffRecord {
+        let path = "/handoff"
+        let body = try JSONEncoder().encode(request)
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 201, path, body: data)
+        return try JSONDecoder().decode(SessionHandoffRecord.self, from: data)
+    }
+
+    public func handoff(id: String) async throws -> SessionHandoffRecord {
+        let path = "/handoff/\(Self.percentEncode(id))"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionHandoffRecord.self, from: data)
+    }
+
+    /// Read handoff events after the global ledger cursor. The cursor is safe
+    /// to persist and reuse after reconnecting or switching clients.
+    public func handoffEvents(id: String, after sequence: Int = 0) async throws -> [SessionHandoffEvent] {
+        let path = "/handoff/\(Self.percentEncode(id))/events?after=\(sequence)"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionHandoffEvent].self, from: data)
+    }
+
+    public func handoffExport(id: String) async throws -> [SessionHandoffJournalEntry] {
+        let path = "/handoff/\(Self.percentEncode(id))/export"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionHandoffJournalEntry].self, from: data)
+    }
+
+    public func acceptHandoff(id: String, owner: String) async throws -> SessionHandoffRecord {
+        let path = "/handoff/\(Self.percentEncode(id))/accept"
+        let body = try JSONEncoder().encode(HandoffDecisionBody(owner: owner, reason: nil))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionHandoffRecord.self, from: data)
+    }
+
+    public func completeHandoff(
+        id: String,
+        owner: String,
+        target: SessionHandoffTarget? = nil,
+        metadata: [String: JSONValue] = [:]
+    ) async throws -> SessionHandoffRecord {
+        let path = "/handoff/\(Self.percentEncode(id))/complete"
+        let body = try JSONEncoder().encode(HandoffCompleteBody(
+            owner: owner,
+            target: target,
+            metadata: metadata
+        ))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionHandoffRecord.self, from: data)
+    }
+
+    public func rejectHandoff(id: String, owner: String, reason: String? = nil) async throws -> SessionHandoffRecord {
+        let path = "/handoff/\(Self.percentEncode(id))/reject"
+        let body = try JSONEncoder().encode(HandoffDecisionBody(owner: owner, reason: reason))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionHandoffRecord.self, from: data)
+    }
+
+    public func cancelHandoff(id: String, owner: String, reason: String? = nil) async throws -> SessionHandoffRecord {
+        let path = "/handoff/\(Self.percentEncode(id))/cancel"
+        let body = try JSONEncoder().encode(HandoffDecisionBody(owner: owner, reason: reason))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionHandoffRecord.self, from: data)
     }
 
     /// Fetch durable workflow definitions exposed by the serving runtime.
