@@ -116,6 +116,73 @@ struct WorkflowRunnerTests {
         #expect(run.output == "plan")
     }
 
+    @Test("context inputs forward non-direct outputs and provenance to synthesis")
+    func contextInputs() async throws {
+        let definition = WorkflowDefinition(
+            id: "context-inputs",
+            stages: [
+                WorkflowStageDefinition(
+                    id: "research",
+                    kind: .research,
+                    outputArtifact: ".domocode/evidence/context.json"
+                ),
+                WorkflowStageDefinition(
+                    id: "plan",
+                    kind: .plan,
+                    dependencies: ["research"],
+                    outputArtifact: ".domocode/plans/context.md"
+                ),
+                WorkflowStageDefinition(
+                    id: "synthesize",
+                    kind: .synthesize,
+                    dependencies: ["plan"],
+                    contextInputs: ["research", "plan"]
+                ),
+            ]
+        )
+        let researchEvidence = WorkflowEvidence(
+            id: "research:observation",
+            stageID: "research",
+            source: "research-child",
+            kind: .observed,
+            untrustedData: true,
+            summary: "Observed repository evidence."
+        )
+        let planEvidence = WorkflowEvidence(
+            id: "plan:inference",
+            stageID: "plan",
+            source: "plan-child",
+            kind: .inference,
+            untrustedData: true,
+            summary: "Inferred implementation plan."
+        )
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { request in
+            guard request.stage.id == "synthesize" else {
+                let evidence = request.stage.id == "research" ? [researchEvidence] : [planEvidence]
+                return WorkflowStageResult(
+                    output: .string(request.stage.id),
+                    evidence: evidence
+                )
+            }
+            guard request.contextOutputs.keys.sorted() == ["plan", "research"],
+                  request.contextArtifacts["research"] == ".domocode/evidence/context.json",
+                  request.contextArtifacts["plan"] == ".domocode/plans/context.md",
+                  request.contextEvidence["research"] == [researchEvidence],
+                  request.contextEvidence["plan"] == [planEvidence]
+            else {
+                return WorkflowStageResult(output: .string("missing synthesis context"))
+            }
+            return WorkflowStageResult(output: .string("synthesis"))
+        }
+
+        let run = try await runner.run(runID: "context-inputs-run")
+        #expect(run.status == .succeeded)
+        #expect(run.output == "synthesis")
+    }
+
     @Test("parallel execution completes independent stages before their join")
     func parallelJoin() async throws {
         let definition = WorkflowDefinition(

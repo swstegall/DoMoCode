@@ -1020,20 +1020,29 @@ public actor ServerRuntime {
         if requested.isEmpty || requested.contains("prompt") || requested.contains("input") {
             context["prompt"] = request.input
         }
-        for dependency in request.stage.dependencies where requested.isEmpty || requested.contains(dependency.lowercased()) {
-            if let artifact = request.dependencyArtifacts[dependency] {
+        var contextOutputs = request.dependencyOutputs
+        contextOutputs.merge(request.contextOutputs) { _, latest in latest }
+        var contextArtifacts = request.dependencyArtifacts
+        contextArtifacts.merge(request.contextArtifacts) { _, latest in latest }
+        for stageID in contextOutputs.keys.sorted() {
+            guard requested.isEmpty || requested.contains(stageID.lowercased())
+                || request.stage.dependencies.contains(stageID)
+            else { continue }
+            if let artifact = contextArtifacts[stageID] {
                 let artifactPath = try workflowArtifactPath(artifact)
                 if FileManager.default.fileExists(atPath: artifactPath),
                    let contents = try? String(contentsOfFile: artifactPath, encoding: .utf8) {
-                    context[dependency] = .string(contents)
+                    context[stageID] = .string(contents)
                     continue
                 }
             }
-            if let output = request.dependencyOutputs[dependency] {
-                context[dependency] = output
+            if let output = contextOutputs[stageID] {
+                context[stageID] = output
             }
         }
-        let dependencyEvidence = request.dependencyEvidence.values
+        var contextEvidence = request.dependencyEvidence
+        contextEvidence.merge(request.contextEvidence) { _, latest in latest }
+        let dependencyEvidence = contextEvidence.values
             .flatMap { $0 }
             .map { $0.jsonValue }
         if !dependencyEvidence.isEmpty {

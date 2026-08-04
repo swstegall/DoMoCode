@@ -12,6 +12,12 @@ public struct WorkflowStageRequest: Sendable, Hashable {
     public let dependencyOutputs: [String: JSONValue]
     public let dependencyArtifacts: [String: String]
     public let dependencyEvidence: [String: [WorkflowEvidence]]
+    /// Outputs explicitly requested by ``WorkflowStageDefinition.contextInputs``.
+    /// Direct dependencies are included as well, even when a definition omits
+    /// them from its context list.
+    public let contextOutputs: [String: JSONValue]
+    public let contextArtifacts: [String: String]
+    public let contextEvidence: [String: [WorkflowEvidence]]
 
     public init(
         workflowID: String,
@@ -21,7 +27,10 @@ public struct WorkflowStageRequest: Sendable, Hashable {
         input: JSONValue,
         dependencyOutputs: [String: JSONValue],
         dependencyArtifacts: [String: String] = [:],
-        dependencyEvidence: [String: [WorkflowEvidence]] = [:]
+        dependencyEvidence: [String: [WorkflowEvidence]] = [:],
+        contextOutputs: [String: JSONValue] = [:],
+        contextArtifacts: [String: String] = [:],
+        contextEvidence: [String: [WorkflowEvidence]] = [:]
     ) {
         self.workflowID = workflowID
         self.runID = runID
@@ -31,6 +40,9 @@ public struct WorkflowStageRequest: Sendable, Hashable {
         self.dependencyOutputs = dependencyOutputs
         self.dependencyArtifacts = dependencyArtifacts
         self.dependencyEvidence = dependencyEvidence
+        self.contextOutputs = contextOutputs
+        self.contextArtifacts = contextArtifacts
+        self.contextEvidence = contextEvidence
     }
 }
 
@@ -536,6 +548,19 @@ public actor WorkflowRunner {
                 if let evidence = run.stage(withID: dependency)?.evidence, !evidence.isEmpty {
                     result[dependency] = evidence
                 }
+            },
+            contextOutputs: contextStageIDs(for: stage, run: run).reduce(into: [String: JSONValue]()) { result, stageID in
+                if let output = outputs[stageID] { result[stageID] = output }
+            },
+            contextArtifacts: contextStageIDs(for: stage, run: run).reduce(into: [String: String]()) { result, stageID in
+                if let artifact = definition.stages.first(where: { $0.id == stageID })?.outputArtifact {
+                    result[stageID] = artifact
+                }
+            },
+            contextEvidence: contextStageIDs(for: stage, run: run).reduce(into: [String: [WorkflowEvidence]]()) { result, stageID in
+                if let evidence = run.stage(withID: stageID)?.evidence, !evidence.isEmpty {
+                    result[stageID] = evidence
+                }
             }
         )
         do {
@@ -621,6 +646,21 @@ public actor WorkflowRunner {
                 isPause: false
             )
         )
+    }
+
+    private func contextStageIDs(
+        for stage: WorkflowStageDefinition,
+        run: WorkflowRunRecord
+    ) -> [String] {
+        let requested = Set(stage.contextInputs.map { $0.lowercased() })
+        return definition.stages.compactMap { candidate in
+            guard candidate.id != stage.id,
+                  run.stage(withID: candidate.id)?.status == .succeeded
+            else { return nil }
+            let isDependency = stage.dependencies.contains(candidate.id)
+            let isRequested = requested.contains(candidate.id.lowercased())
+            return isDependency || isRequested ? candidate.id : nil
+        }
     }
 
     private func markDependentsSkipped(
