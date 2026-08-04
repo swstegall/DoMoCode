@@ -97,14 +97,8 @@ public actor ExecutionTargetCoordinator {
         if let workspaceID = request.workspaceID {
             do {
                 workspace = try await workspaces.lease(for: workspaceID)
-            } catch let error as WorkspaceLeaseCoordinatorError {
-                throw .workspace(error)
             } catch {
-                throw .workspace(.providerFailed(
-                    leaseID: workspaceID,
-                    operation: "lookup",
-                    message: Redaction.diagnostic(String(describing: error))
-                ))
+                throw .workspace(error)
             }
             guard let workspace else {
                 throw .workspace(.notFound(workspaceID))
@@ -126,13 +120,8 @@ public actor ExecutionTargetCoordinator {
         do {
             let backend = try await backends.select(request.backend)
             return ExecutionTarget(backend: backend, workspace: workspace)
-        } catch let error as BackendRegistryError {
-            throw .backend(error)
         } catch {
-            throw .backend(.lifecycleFailed(
-                backendID: request.backend.backendID ?? "",
-                message: Redaction.diagnostic(String(describing: error))
-            ))
+            throw .backend(error)
         }
     }
 }
