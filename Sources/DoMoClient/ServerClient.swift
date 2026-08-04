@@ -214,6 +214,18 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
     }
 
+    /// Download the ordered definition and run snapshots needed to archive or
+    /// replay a workflow without starting any child sessions.
+    public func workflowExport(
+        workflowID: String,
+        runID: String
+    ) async throws -> [WorkflowStoreRecord] {
+        let path = "/workflow/\(workflowID)/run/\(runID)/export"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([WorkflowStoreRecord].self, from: data)
+    }
+
     /// Start a durable workflow rooted at a live parent session.
     public func startWorkflow(
         workflowID: String,

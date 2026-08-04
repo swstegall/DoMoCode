@@ -255,6 +255,17 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        router.get("/workflow/:id/run/:runID/export") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let runID = try context.parameters.require("runID")
+                return try Self.json(try await self.runtime.workflowExport(
+                    workflowID: id,
+                    runID: runID
+                ))
+            }
+        }
+
         router.post("/workflow/:id/run") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")

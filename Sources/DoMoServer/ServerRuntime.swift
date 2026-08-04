@@ -678,6 +678,19 @@ public actor ServerRuntime {
         return run
     }
 
+    /// Exports the definition history and every durable snapshot for one run in
+    /// their original append order. The response is replay data, not a command
+    /// to resume or execute the workflow.
+    public func workflowExport(
+        workflowID: String,
+        runID: String
+    ) throws -> [WorkflowStoreRecord] {
+        guard let store = config.workflowStore,
+              try workflowRun(workflowID: workflowID, runID: runID) != nil
+        else { throw ServerRuntimeError.workflowRunNotFound }
+        return try store.exportRecords(workflowID: workflowID, runID: runID)
+    }
+
     /// Admit a durable workflow run and execute its stages through child
     /// sessions rooted at the supplied parent session. The returned snapshot is
     /// the admission record; subsequent stage transitions are append-only and

@@ -53,5 +53,18 @@ struct WorkflowStoreTests {
         #expect(try store.latestRun(withID: "run-1") == pending)
         #expect(try store.latestRuns().map(\.id) == ["run-1"])
         #expect(try store.records().count == 3)
+
+        let exported = try store.exportRecords(workflowID: "workflow-1", runID: "run-1")
+        #expect(exported.count == 3)
+        #expect(WorkflowStore.replayLatestRun(
+            from: exported,
+            workflowID: "workflow-1",
+            runID: "run-1"
+        ) == pending)
+        #expect(WorkflowStore.exportRecords(
+            from: exported,
+            workflowID: "other",
+            runID: "run-1"
+        ).isEmpty)
     }
 }

@@ -78,6 +78,21 @@ struct WorkflowRouteTests {
         #expect(runsResponse.status.code == 200)
         #expect(try JSONDecoder().decode([WorkflowRunRecord].self, from: runsData) == [run])
 
+        var exportRequest = HTTPClientRequest(url: "http://127.0.0.1:\(port)/workflow/standard/run/run-1/export")
+        exportRequest.method = .GET
+        exportRequest.headers.add(name: "authorization", value: "Bearer \(Self.token)")
+        let exportResponse = try await http.execute(exportRequest, timeout: .seconds(10))
+        var exportBuffer = try await exportResponse.body.collect(upTo: 1 << 20)
+        let exportData = Data(exportBuffer.readBytes(length: exportBuffer.readableBytes) ?? [])
+        #expect(exportResponse.status.code == 200)
+        let exported = try JSONDecoder().decode([WorkflowStoreRecord].self, from: exportData)
+        #expect(exported.count == 2)
+        #expect(WorkflowStore.replayLatestRun(
+            from: exported,
+            workflowID: "standard",
+            runID: "run-1"
+        ) == run)
+
         try await http.shutdown()
         serverTask.cancel()
         _ = try? await serverTask.value

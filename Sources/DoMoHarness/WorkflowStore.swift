@@ -78,11 +78,7 @@ public struct WorkflowStore: Sendable {
     }
 
     public func latestRun(withID id: String) throws -> WorkflowRunRecord? {
-        var result: WorkflowRunRecord?
-        for record in try records() where record.kind == .runSnapshot && record.id == id {
-            result = record.run
-        }
-        return result
+        Self.replayLatestRun(from: try records(), runID: id)
     }
 
     public func latestRuns() throws -> [WorkflowRunRecord] {
@@ -91,6 +87,56 @@ public struct WorkflowStore: Sendable {
             if let run = record.run { latest[run.id] = run }
         }
         return latest.values.sorted { $0.updatedAt < $1.updatedAt }
+    }
+
+    /// Returns the complete ordered history needed to archive or replay one run.
+    /// All definition revisions for the workflow are retained, followed by every
+    /// snapshot for the requested run. The original JSONL order is preserved.
+    public func exportRecords(
+        workflowID: String,
+        runID: String
+    ) throws -> [WorkflowStoreRecord] {
+        Self.exportRecords(
+            from: try records(),
+            workflowID: workflowID,
+            runID: runID
+        )
+    }
+
+    /// Reconstructs the latest run state from an exported record sequence. This
+    /// is intentionally pure: importing an archive never writes to the live
+    /// store or starts an executor.
+    public static func replayLatestRun(
+        from records: [WorkflowStoreRecord],
+        workflowID: String? = nil,
+        runID: String
+    ) -> WorkflowRunRecord? {
+        var result: WorkflowRunRecord?
+        for record in records where record.kind == .runSnapshot && record.id == runID {
+            guard let run = record.run,
+                  workflowID == nil || run.workflowID == workflowID
+            else { continue }
+            result = run
+        }
+        return result
+    }
+
+    /// Selects export records without touching the filesystem. Keeping this as a
+    /// value operation lets import/export callers validate a downloaded archive
+    /// before handing it to a store.
+    public static func exportRecords(
+        from records: [WorkflowStoreRecord],
+        workflowID: String,
+        runID: String
+    ) -> [WorkflowStoreRecord] {
+        records.filter { record in
+            switch record.kind {
+            case .definition:
+                return record.id == workflowID
+            case .runSnapshot:
+                return record.run?.workflowID == workflowID && record.run?.id == runID
+            }
+        }
     }
 
     private var writer: JSONLinesFileWriter {
