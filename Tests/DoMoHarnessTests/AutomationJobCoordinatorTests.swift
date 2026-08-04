@@ -7,7 +7,7 @@ struct AutomationJobCoordinatorTests {
     @Test("links an audited invocation to a bounded durable job")
     func linksInvocationAndJob() async throws {
         let registry = AutomationRegistry(now: { "2026-01-01T00:00:00Z" })
-        try await registry.register(definition(enabled: true))
+        _ = try await registry.register(definition(enabled: true))
         let jobs = JobManager(now: { "2026-01-01T00:00:00Z" }, sleep: { _ in })
         let coordinator = AutomationJobCoordinator(
             registry: registry,
@@ -38,7 +38,7 @@ struct AutomationJobCoordinatorTests {
     @Test("applies output and runtime budgets without retrying policy failures")
     func budgetFailures() async throws {
         let registry = AutomationRegistry(now: { "2026-01-01T00:00:00Z" })
-        try await registry.register(definition(
+        _ = try await registry.register(definition(
             enabled: true,
             budget: AutomationBudget(maxRuntimeMilliseconds: 10, maxAttempts: 1, maxOutputBytes: 4)
         ))
@@ -78,7 +78,7 @@ struct AutomationJobCoordinatorTests {
     @Test("preserves trigger provenance and retries transient operation failures")
     func retryAndProvenance() async throws {
         let registry = AutomationRegistry(now: { "2026-01-01T00:00:00Z" })
-        try await registry.register(definition(
+        _ = try await registry.register(definition(
             enabled: true,
             trigger: AutomationTrigger(kind: .schedule, expression: "0 2 * * *"),
             budget: AutomationBudget(maxAttempts: 2)

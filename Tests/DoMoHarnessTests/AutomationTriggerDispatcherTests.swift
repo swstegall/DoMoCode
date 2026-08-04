@@ -10,11 +10,11 @@ struct AutomationTriggerDispatcherTests {
     @Test("a validated filesystem event becomes a bounded durable job")
     func dispatchesFilesystemEvent() async throws {
         let registry = AutomationRegistry(now: { "2026-01-01T00:00:00Z" })
-        try await registry.register(definition(trigger: AutomationTrigger(
+        _ = try await registry.register(definition(trigger: AutomationTrigger(
             kind: .filesystem,
             path: "/tmp/project"
         )))
-        try await registry.setEnabled(id: "automation", owner: "owner", enabled: true)
+        _ = try await registry.setEnabled(id: "automation", owner: "owner", enabled: true)
         let jobs = JobManager(now: { "2026-01-01T00:00:00Z" }, sleep: { _ in })
         let coordinator = AutomationJobCoordinator(registry: registry, jobs: jobs)
         let dispatcher = AutomationTriggerDispatcher(registry: registry, coordinator: coordinator)
@@ -31,18 +31,18 @@ struct AutomationTriggerDispatcherTests {
 
         #expect(result.invocation.source == .filesystemTrigger)
         #expect(result.job.state == .succeeded)
-        #expect(result.job.triggerSource == .filesystemTrigger)
+        #expect(result.job.triggerSource == .filesystem)
         #expect(result.job.metadata["path"] == .string("/tmp/project/Sources/App.swift"))
     }
 
     @Test("a mismatched trigger is refused before job admission")
     func refusesMismatchedEvent() async throws {
         let registry = AutomationRegistry(now: { "2026-01-01T00:00:00Z" })
-        try await registry.register(definition(trigger: AutomationTrigger(
+        _ = try await registry.register(definition(trigger: AutomationTrigger(
             kind: .repository,
             branch: "main"
         )))
-        try await registry.setEnabled(id: "automation", owner: "owner", enabled: true)
+        _ = try await registry.setEnabled(id: "automation", owner: "owner", enabled: true)
         let jobs = JobManager(now: { "2026-01-01T00:00:00Z" }, sleep: { _ in })
         let coordinator = AutomationJobCoordinator(registry: registry, jobs: jobs)
         let dispatcher = AutomationTriggerDispatcher(registry: registry, coordinator: coordinator)
@@ -67,12 +67,12 @@ struct AutomationTriggerDispatcherTests {
     @Test("webhook dispatch requires the registered identity and authentication")
     func validatesWebhook() async throws {
         let registry = AutomationRegistry(now: { "2026-01-01T00:00:00Z" })
-        try await registry.register(definition(trigger: AutomationTrigger(
+        _ = try await registry.register(definition(trigger: AutomationTrigger(
             kind: .webhook,
             webhookID: "hook",
             authenticated: true
         )))
-        try await registry.setEnabled(id: "automation", owner: "owner", enabled: true)
+        _ = try await registry.setEnabled(id: "automation", owner: "owner", enabled: true)
         let jobs = JobManager(now: { "2026-01-01T00:00:00Z" }, sleep: { _ in })
         let coordinator = AutomationJobCoordinator(registry: registry, jobs: jobs)
         let dispatcher = AutomationTriggerDispatcher(registry: registry, coordinator: coordinator)
