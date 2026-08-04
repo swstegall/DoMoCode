@@ -21,13 +21,29 @@ struct NoticeFrameTests {
 
     @Test("A notice round-trips through JSON with every field populated")
     func fullRoundTrip() throws {
+        let recovery = RecoveryEnvelope(
+            originalKind: "provider",
+            status: 503,
+            error: "upstream overloaded",
+            model: "m",
+            retryHistory: [
+                .init(
+                    number: 1,
+                    requestNumber: 2,
+                    maxAttempts: 10,
+                    reason: "provider busy",
+                    delayMilliseconds: 1_000
+                )
+            ]
+        )
         let event = ServerEvent.notice(ServerNotice(
             level: .error,
             code: "provider_error",
             text: "the gateway said no",
             detail: "upstream: 502 bad gateway",
             kind: DoMoError.Kind.authentication.label,
-            ttlMilliseconds: 8_000
+            ttlMilliseconds: 8_000,
+            recovery: recovery
         ))
         let decoded = try JSONDecoder().decode(
             ServerEvent.self, from: try JSONEncoder().encode(event)
@@ -49,6 +65,7 @@ struct NoticeFrameTests {
         #expect(json["notice"]?["detail"] == nil)
         #expect(json["notice"]?["kind"] == nil)
         #expect(json["notice"]?["ttlMilliseconds"] == nil)
+        #expect(json["notice"]?["recovery"] == nil)
     }
 
     @Test("A runtime notice projects onto the wire, Duration becoming milliseconds")

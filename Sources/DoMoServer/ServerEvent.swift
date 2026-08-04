@@ -262,6 +262,9 @@ public struct ServerNotice: Sendable, Hashable, Codable {
     /// How long the message stays relevant. `nil` means "use the consumer's
     /// default".
     public var ttlMilliseconds: Int?
+    /// Typed, redacted recovery data, when this notice carries a provider
+    /// diagnostic envelope.
+    public var recovery: RecoveryEnvelope?
 
     public init(
         level: Level,
@@ -269,7 +272,8 @@ public struct ServerNotice: Sendable, Hashable, Codable {
         text: String,
         detail: String? = nil,
         kind: String? = nil,
-        ttlMilliseconds: Int? = nil
+        ttlMilliseconds: Int? = nil,
+        recovery: RecoveryEnvelope? = nil
     ) {
         self.level = level
         self.code = code
@@ -277,6 +281,7 @@ public struct ServerNotice: Sendable, Hashable, Codable {
         self.detail = detail
         self.kind = kind
         self.ttlMilliseconds = ttlMilliseconds
+        self.recovery = recovery
     }
 
     /// Project a runtime notice onto the wire. Total: `AgentNotice.Level` and
@@ -296,7 +301,8 @@ public struct ServerNotice: Sendable, Hashable, Codable {
             // ("forever", the right answer for a hostile header) rather than
             // trap and kill the server — which is exactly what that projection
             // does.
-            ttlMilliseconds: notice.ttl.map(DoMoError.wholeMilliseconds)
+            ttlMilliseconds: notice.ttl.map(DoMoError.wholeMilliseconds),
+            recovery: notice.recovery
         )
     }
 }

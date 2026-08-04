@@ -167,6 +167,12 @@ private final class Notices: Sendable {
     var all: [RetryNotice] { stored.withLock { $0 } }
 }
 
+private final class Recoveries: Sendable {
+    private let stored = Mutex<[RecoveryEnvelope]>([])
+    func add(_ envelope: RecoveryEnvelope) { stored.withLock { $0.append(envelope) } }
+    var all: [RecoveryEnvelope] { stored.withLock { $0 } }
+}
+
 /// The full-jitter-free, sleep-free client every schedule assertion uses.
 private func client(
     _ transport: any StreamingTransport,
@@ -208,6 +214,97 @@ private func drain(
 
 private func retryNotices(_ events: [AssemblyEvent]) -> [RetryNotice] {
     events.compactMap { if case .retrying(let notice) = $0 { notice } else { nil } }
+}
+
+private func recoveryEnvelopes(_ events: [AssemblyEvent]) -> [RecoveryEnvelope] {
+    events.compactMap { if case .recovery(let envelope) = $0 { envelope } else { nil } }
+}
+
+// MARK: - Recovery envelopes
+
+@Suite("Recovery envelopes — retry boundaries")
+struct RecoveryEnvelopeIntegrationTests {
+
+    @Test("An exhausted provider response emits one bounded recovery record")
+    func exhaustedProviderCarriesHistory() async {
+        let transport = ReplayTransport([.error(503, #"{"error":{"message":"service unavailable"}}"#)])
+        let (events, error) = await drain(
+            client(transport).streamCompletion(model: "m", context: retryContext)
+        )
+        let envelopes = recoveryEnvelopes(events)
+        let envelope = envelopes.first
+
+        #expect(envelopes.count == 1)
+        #expect(envelope?.originalKind == "provider")
+        #expect(envelope?.status == 503)
+        #expect(envelope?.retryHistory.count == 9)
+        #expect(envelope?.retryHistory.first?.requestNumber == 2)
+        #expect(envelope?.retryHistory.last?.requestNumber == 10)
+        #expect(envelope?.recursionPrevented == true)
+        #expect(error?.kind == .provider(status: 503, isRetryable: true))
+    }
+
+    @Test("A non-retryable response emits recovery data without a retry")
+    func nonRetryableResponseCarriesStatus() async {
+        let transport = ReplayTransport([.error(401, #"{"error":{"message":"bad key"}}"#)])
+        let (events, error) = await drain(
+            client(transport).streamCompletion(model: "m", context: retryContext)
+        )
+        let envelope = recoveryEnvelopes(events).first
+
+        #expect(envelope?.originalKind == "authentication")
+        #expect(envelope?.status == 401)
+        #expect(envelope?.retryHistory.isEmpty == true)
+        #expect(error?.kind == .authentication)
+    }
+
+    @Test("The non-streaming API reports the same recovery envelope")
+    func completeReportsRecovery() async {
+        let recoveries = Recoveries()
+        let transport = ReplayTransport([.error(502, #"{"error":{"message":"bad gateway"}}"#)])
+
+        do {
+            _ = try await client(transport).complete(
+                model: "m",
+                context: retryContext,
+                onRecovery: { recoveries.add($0) }
+            )
+            Issue.record("expected a throw")
+        } catch let error as DoMoError {
+            #expect(error.kind == .provider(status: 502, isRetryable: true))
+        } catch {
+            Issue.record("wrong error type: \(error)")
+        }
+
+        #expect(recoveries.all.count == 1)
+        #expect(recoveries.all.first?.status == 502)
+        #expect(recoveries.all.first?.retryHistory.count == 9)
+    }
+
+    @Test("A committed stream emits recovery before its failed terminal")
+    func committedStreamRecoveryPrecedesFailure() async {
+        let transport = ReplayTransport([
+            Reply(
+                status: 200,
+                chunks: [
+                    frame(#"{"id":"x","model":"m","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#),
+                    frame(#"{"error":{"message":"upstream failed","type":"api_error"}}"#),
+                ]
+            )
+        ])
+        let (events, error) = await drain(
+            client(transport).streamCompletion(model: "m", context: retryContext)
+        )
+        let recoveryIndex = events.firstIndex { if case .recovery = $0 { true } else { false } }
+        let terminalIndex = events.firstIndex { $0.isTerminal }
+
+        #expect(error == nil)
+        #expect(recoveryIndex != nil)
+        #expect(terminalIndex != nil)
+        if let recoveryIndex, let terminalIndex { #expect(recoveryIndex < terminalIndex) }
+        #expect(recoveryEnvelopes(events).first?.status == 200)
+        #expect(events.last?.terminalMessage?.text == "partial")
+    }
 }
 
 // MARK: - The ten-attempt budget

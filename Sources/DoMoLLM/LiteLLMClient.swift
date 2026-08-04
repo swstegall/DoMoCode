@@ -457,11 +457,23 @@ public struct LiteLLMClient: Sendable {
         var retryCount = 0
         var everConnected = false
         var spentOnRetries = Duration.zero
+        var retryHistory: [RecoveryEnvelope.Retry] = []
         let retryStartedAt = configuration.now()
 
         while true {
             guard !retryWallClockExpired(since: retryStartedAt) else {
-                continuation.finish(throwing: retryWallClockBudgetError())
+                let failure = retryWallClockBudgetError()
+                continuation.yield(
+                    .recovery(
+                        Self.makeRecoveryEnvelope(
+                            error: failure,
+                            status: nil,
+                            body: "",
+                            headers: [:],
+                            model: model,
+                            retryHistory: retryHistory
+                        )))
+                continuation.finish(throwing: failure)
                 return
             }
             let response: StreamingResponse
@@ -509,21 +521,32 @@ public struct LiteLLMClient: Sendable {
                         startedAt: retryStartedAt)
                 {
                     retryCount += 1
+                    let notice = RetryNotice(
+                        attempt: retryCount,
+                        maxAttempts: cap,
+                        delay: delay,
+                        reason: RetryNotice.reason(for: classified),
+                        message: Self.retryNoticeMessage(classified)
+                    )
+                    retryHistory.append(Self.recoveryRetry(from: notice))
                     continuation.yield(
-                        .retrying(
-                            RetryNotice(
-                                attempt: retryCount,
-                                maxAttempts: cap,
-                                delay: delay,
-                                reason: RetryNotice.reason(for: classified),
-                                message: Self.retryNoticeMessage(classified)
-                            )))
+                        .retrying(notice))
                     guard await sleepForRetry(delay) else {
                         finishAborted(assembly, continuation)
                         return
                     }
                     continue
                 }
+                continuation.yield(
+                    .recovery(
+                        Self.makeRecoveryEnvelope(
+                            error: classified,
+                            status: nil,
+                            body: "",
+                            headers: [:],
+                            model: model,
+                            retryHistory: retryHistory
+                        )))
                 continuation.finish(throwing: classified)
                 return
             }
@@ -545,21 +568,32 @@ public struct LiteLLMClient: Sendable {
                         startedAt: retryStartedAt)
                 {
                     retryCount += 1
+                    let notice = RetryNotice(
+                        attempt: retryCount,
+                        maxAttempts: configuration.maxAttempts,
+                        delay: delay,
+                        reason: RetryNotice.reason(for: error),
+                        message: Self.retryNoticeMessage(error)
+                    )
+                    retryHistory.append(Self.recoveryRetry(from: notice))
                     continuation.yield(
-                        .retrying(
-                            RetryNotice(
-                                attempt: retryCount,
-                                maxAttempts: configuration.maxAttempts,
-                                delay: delay,
-                                reason: RetryNotice.reason(for: error),
-                                message: Self.retryNoticeMessage(error)
-                            )))
+                        .retrying(notice))
                     guard await sleepForRetry(delay) else {
                         finishAborted(assembly, continuation)
                         return
                     }
                     continue
                 }
+                continuation.yield(
+                    .recovery(
+                        Self.makeRecoveryEnvelope(
+                            error: error,
+                            status: status,
+                            body: bodyText,
+                            headers: ResponseMetadata(head: response.head).headers,
+                            model: model,
+                            retryHistory: retryHistory
+                        )))
                 continuation.finish(throwing: error)
                 return
             }
@@ -578,12 +612,44 @@ public struct LiteLLMClient: Sendable {
             assembly.setReportedCost(metadata.responseCost)
             onResponse?(metadata)
             do {
-                try await consumeSSE(response.body, into: assembly, continuation: continuation)
+                let result = try await consumeSSE(
+                    response.body,
+                    into: assembly,
+                    continuation: continuation
+                )
+                if let failure = result.failure {
+                    continuation.yield(
+                        .recovery(
+                            Self.makeRecoveryEnvelope(
+                                error: failure,
+                                status: status,
+                                body: result.wireError?.summary ?? "",
+                                headers: metadata.headers,
+                                model: model,
+                                retryHistory: retryHistory
+                            )))
+                    if let wireError = result.wireError {
+                        for event in assembly.fail(wireError) { continuation.yield(event) }
+                    } else {
+                        for event in assembly.fail(failure) { continuation.yield(event) }
+                    }
+                }
                 continuation.finish()
             } catch let error where DoMoError.isCancellation(error) {
                 finishAborted(assembly, continuation)
             } catch {
-                for event in assembly.fail(Self.streamFailure(Self.classifyTransport(error))) {
+                let failure = Self.classifyTransport(error)
+                continuation.yield(
+                    .recovery(
+                        Self.makeRecoveryEnvelope(
+                            error: failure,
+                            status: status,
+                            body: "",
+                            headers: metadata.headers,
+                            model: model,
+                            retryHistory: retryHistory
+                        )))
+                for event in assembly.fail(Self.streamFailure(failure)) {
                     continuation.yield(event)
                 }
                 continuation.finish()
@@ -600,9 +666,11 @@ public struct LiteLLMClient: Sendable {
         _ body: AsyncThrowingStream<[UInt8], any Error>,
         into assembly: StreamingAssembly,
         continuation: AsyncThrowingStream<AssemblyEvent, any Error>.Continuation
-    ) async throws {
+    ) async throws -> (failure: DoMoError?, wireError: WireError?) {
         let decoder = SSEByteDecoder()
         var sawDone = false
+        var failure: DoMoError?
+        var wireFailure: WireError?
 
         func process(_ frames: [SSEFrame]) {
             for frame in frames {
@@ -623,7 +691,8 @@ public struct LiteLLMClient: Sendable {
                         // classifier tokens `LiteLLMErrorPatterns` reads and a
                         // reader diagnoses by; they are vocabulary, not payload.
                         wireError.message = wireError.message.map { Redaction.diagnostic($0) }
-                        for event in assembly.fail(wireError) { continuation.yield(event) }
+                        wireFailure = wireError
+                        failure = wireError.asDoMoError(status: nil)
                     } else {
                         do {
                             let chunk = try ChatCompletionChunk.decode(sseData: payload)
@@ -632,31 +701,30 @@ public struct LiteLLMClient: Sendable {
                             // `decode` quotes the raw SSE payload back verbatim,
                             // so an undecodable frame carries whatever the
                             // gateway put in it straight into `errorMessage`.
-                            for event in assembly.fail(Self.streamFailure(error)) {
-                                continuation.yield(event)
-                            }
+                            failure = Self.streamFailure(error)
                         }
                     }
                 }
-                if sawDone || assembly.isTerminated { break }
+                if sawDone || assembly.isTerminated || failure != nil { break }
             }
         }
 
         for try await chunk in body {
             try Task.checkCancellation()
             process(await decoder.consume(chunk))
-            if sawDone || assembly.isTerminated { break }
+            if sawDone || assembly.isTerminated || failure != nil { break }
         }
         // The byte stream finishing (rather than throwing) on cancellation would
         // otherwise read as a clean end-of-stream; this makes cancellation win.
         try Task.checkCancellation()
 
-        if !assembly.isTerminated {
+        if failure == nil, !assembly.isTerminated {
             process(await decoder.finish())
         }
-        if !assembly.isTerminated {
+        if failure == nil, !assembly.isTerminated {
             for event in assembly.finish() { continuation.yield(event) }
         }
+        return (failure, wireFailure)
     }
 
     // MARK: Non-streaming completion
@@ -682,7 +750,8 @@ public struct LiteLLMClient: Sendable {
         toolChoice: WireToolChoice? = nil,
         rates: ModelCostRates? = nil,
         onResponse: (@Sendable (ResponseMetadata) -> Void)? = nil,
-        onRetry: (@Sendable (RetryNotice) -> Void)? = nil
+        onRetry: (@Sendable (RetryNotice) -> Void)? = nil,
+        onRecovery: (@Sendable (RecoveryEnvelope) -> Void)? = nil
     ) async throws -> AssistantMessage {
         let built = try buildRequest(
             model: model,
@@ -697,10 +766,20 @@ public struct LiteLLMClient: Sendable {
         var retryCount = 0
         var everConnected = false
         var spentOnRetries = Duration.zero
+        var retryHistory: [RecoveryEnvelope.Retry] = []
         let retryStartedAt = configuration.now()
         while true {
             guard !retryWallClockExpired(since: retryStartedAt) else {
-                throw retryWallClockBudgetError()
+                let failure = retryWallClockBudgetError()
+                onRecovery?(Self.makeRecoveryEnvelope(
+                    error: failure,
+                    status: nil,
+                    body: "",
+                    headers: [:],
+                    model: model,
+                    retryHistory: retryHistory
+                ))
+                throw failure
             }
             let response: StreamingResponse
             do {
@@ -729,19 +808,28 @@ public struct LiteLLMClient: Sendable {
                         startedAt: retryStartedAt)
                 {
                     retryCount += 1
-                    onRetry?(
-                        RetryNotice(
-                            attempt: retryCount,
-                            maxAttempts: cap,
-                            delay: delay,
-                            reason: RetryNotice.reason(for: classified),
-                            message: Self.retryNoticeMessage(classified)
-                        ))
+                    let notice = RetryNotice(
+                        attempt: retryCount,
+                        maxAttempts: cap,
+                        delay: delay,
+                        reason: RetryNotice.reason(for: classified),
+                        message: Self.retryNoticeMessage(classified)
+                    )
+                    retryHistory.append(Self.recoveryRetry(from: notice))
+                    onRetry?(notice)
                     guard await sleepForRetry(delay) else {
                         throw DoMoError(.cancelled, "Request was aborted")
                     }
                     continue
                 }
+                onRecovery?(Self.makeRecoveryEnvelope(
+                    error: classified,
+                    status: nil,
+                    body: "",
+                    headers: [:],
+                    model: model,
+                    retryHistory: retryHistory
+                ))
                 throw classified
             }
 
@@ -758,14 +846,15 @@ public struct LiteLLMClient: Sendable {
                         startedAt: retryStartedAt)
                 {
                     retryCount += 1
-                    onRetry?(
-                        RetryNotice(
-                            attempt: retryCount,
-                            maxAttempts: configuration.maxAttempts,
-                            delay: delay,
-                            reason: RetryNotice.reason(for: error),
-                            message: Self.retryNoticeMessage(error)
-                        ))
+                    let notice = RetryNotice(
+                        attempt: retryCount,
+                        maxAttempts: configuration.maxAttempts,
+                        delay: delay,
+                        reason: RetryNotice.reason(for: error),
+                        message: Self.retryNoticeMessage(error)
+                    )
+                    retryHistory.append(Self.recoveryRetry(from: notice))
+                    onRetry?(notice)
                     guard await sleepForRetry(delay) else {
                         // Cancellation mid-backoff leaves as `.cancelled`, not as
                         // a raw `CancellationError`, matching the transport arm
@@ -774,6 +863,14 @@ public struct LiteLLMClient: Sendable {
                     }
                     continue
                 }
+                onRecovery?(Self.makeRecoveryEnvelope(
+                    error: error,
+                    status: status,
+                    body: bodyText,
+                    headers: ResponseMetadata(head: response.head).headers,
+                    model: model,
+                    retryHistory: retryHistory
+                ))
                 throw error
             }
 
@@ -783,7 +880,7 @@ public struct LiteLLMClient: Sendable {
             do {
                 decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: Data(bodyText.utf8))
             } catch {
-                throw DoMoError(
+                let failure = DoMoError(
                     .malformedResponse,
                     // Redacted before the cap, for the reason spelled out on
                     // ``retryNoticeMessage(_:)``: cutting first can split a
@@ -792,15 +889,35 @@ public struct LiteLLMClient: Sendable {
                         + DoMoError.truncating(Redaction.diagnostic(bodyText), to: 512),
                     cause: error
                 )
+                onRecovery?(Self.makeRecoveryEnvelope(
+                    error: failure,
+                    status: status,
+                    body: bodyText,
+                    headers: metadata.headers,
+                    model: model,
+                    retryHistory: retryHistory
+                ))
+                throw failure
             }
             // The billed cost rides on the message's usage rather than only on
             // `onResponse`, so a caller that passed no callback still gets it.
-            return AssistantMessage(
+            let message = AssistantMessage(
                 response: decoded,
                 model: model,
                 rates: rates,
                 reportedCost: metadata.responseCost
             )
+            if let failure = message.failure {
+                onRecovery?(Self.makeRecoveryEnvelope(
+                    error: failure,
+                    status: status,
+                    body: bodyText,
+                    headers: metadata.headers,
+                    model: model,
+                    retryHistory: retryHistory
+                ))
+            }
+            return message
         }
     }
 
@@ -904,6 +1021,44 @@ public struct LiteLLMClient: Sendable {
                 : "\(configuration.authScheme) \(apiKey)"
             request.headerFields[name] = value
         }
+    }
+
+    /// Turns a display retry notice into the bounded form retained in a
+    /// recovery envelope. The initial request is number one, so a retry's
+    /// request number is its one-based retry number plus one.
+    private static func recoveryRetry(from notice: RetryNotice) -> RecoveryEnvelope.Retry {
+        RecoveryEnvelope.Retry(
+            number: notice.attempt,
+            requestNumber: min(notice.maxAttempts, notice.attempt + 1),
+            maxAttempts: notice.maxAttempts,
+            reason: notice.reason.label,
+            delayMilliseconds: DoMoError.wholeMilliseconds(notice.delay)
+        )
+    }
+
+    /// Builds the only representation of a provider failure allowed to cross
+    /// the diagnostic boundary. `RecoveryEnvelope` performs the final
+    /// redaction and caps, including headers and provider body text.
+    private static func makeRecoveryEnvelope(
+        error: DoMoError,
+        status: Int?,
+        body: String,
+        headers: [String: String],
+        model: String,
+        retryHistory: [RecoveryEnvelope.Retry]
+    ) -> RecoveryEnvelope {
+        let detail = body.isEmpty
+            ? error.description
+            : "\(error.description)\nprovider_body:\n\(body)"
+        return RecoveryEnvelope(
+            originalKind: error.kind.label,
+            status: status,
+            error: detail,
+            providerMetadata: headers,
+            model: model,
+            retryHistory: retryHistory,
+            recursionPrevented: true
+        )
     }
 
     // MARK: Retry timing

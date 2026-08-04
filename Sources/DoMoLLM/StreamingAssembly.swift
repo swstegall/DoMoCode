@@ -195,6 +195,11 @@ public enum AssemblyEvent: Sendable, Hashable {
     /// first `.start`, so a guard placed above it drops every one of them.
     case retrying(RetryNotice)
 
+    /// A final, redacted diagnostic record for a failed request. It is
+    /// non-terminal and precedes the failed assistant message so the agent
+    /// loop can attach it to the normal error notice.
+    case recovery(RecoveryEnvelope)
+
     /// The turn ended and its content is usable, truncation included.
     case done(AssistantMessage)
 

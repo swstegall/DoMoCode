@@ -134,6 +134,28 @@ struct RetryNoticeTests {
         #expect(notices.map(\.level) == [.warning, .error])
     }
 
+    @Test
+    func aRecoveryEnvelopeReachesTheErrorNotice() async {
+        let sink = RecordingSink()
+        let envelope = RecoveryEnvelope(
+            originalKind: "provider",
+            status: 503,
+            error: "upstream overloaded",
+            model: "m",
+            recursionPrevented: true
+        )
+        var script = assistantTurn(text: "", stopReason: .error)
+        script.insert(.recovery(envelope), at: 0)
+
+        let result = await runOnce(sink: sink, streamFn: ScriptedStream([script]).fn)
+
+        #expect(result.stopReason == .errored)
+        #expect(sink.errorNotices.count == 1)
+        #expect(sink.errorNotices.first?.code == "recovery")
+        #expect(sink.errorNotices.first?.recovery == envelope)
+        #expect((sink.noticeIndices.first ?? .max) < sink.agentEndIndex)
+    }
+
     /// A turn that never retries emits no notice at all. Guards against a fold
     /// that reports something on the happy path.
     @Test

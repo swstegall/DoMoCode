@@ -62,14 +62,20 @@ public func runAgentLoop(
     /// ``AgentRunResult/failure``. The order is load-bearing:
     /// ``AsyncStreamAgentSink`` finishes its continuation on `agentEnd`, so
     /// anything emitted after it is dropped on the floor.
-    func settle(_ reason: RunStopReason, failure: DoMoError? = nil) async -> AgentRunResult {
+    func settle(
+        _ reason: RunStopReason,
+        failure: DoMoError? = nil,
+        recovery: RecoveryEnvelope? = nil
+    ) async -> AgentRunResult {
         let carried: DoMoError?
         if reason == .errored, let failure, !failure.isCancellation {
             carried = failure
         } else {
             carried = nil
         }
-        if let carried {
+        if let recovery {
+            await sink.emit(.notice(AgentNotice(recovery)))
+        } else if let carried {
             await sink.emit(
                 .notice(
                     AgentNotice(
@@ -202,7 +208,11 @@ public func runAgentLoop(
                 // `.provider(status: nil, isRetryable: false)`. Coarse, but
                 // never nil for a `.error` stop reason, so `.errored` always
                 // carries evidence.
-                return await settle(.errored, failure: outcome.failure ?? message.failure)
+                return await settle(
+                    .errored,
+                    failure: outcome.failure ?? message.failure,
+                    recovery: outcome.recovery
+                )
             }
             if message.stopReason == .aborted {
                 await sink.emit(.turnEnd(message: message, toolResults: []))
@@ -437,9 +447,14 @@ private func streamAssistantResponse(
     model: String,
     sink: any AgentEventSink,
     streamFn: AgentStreamFn
-) async -> (message: AssistantMessage, failure: DoMoError?) {
+) async -> (
+    message: AssistantMessage,
+    failure: DoMoError?,
+    recovery: RecoveryEnvelope?
+) {
     var current: AssistantMessage?
     var startEmitted = false
+    var recovery: RecoveryEnvelope?
 
     do {
         for try await event in streamFn(context) {
@@ -453,7 +468,7 @@ private func streamAssistantResponse(
                 // A `.failed` terminal still reports itself through the
                 // message's own `stopReason`; the caller falls back to
                 // `AssistantMessage.failure` for it.
-                return (terminal, nil)
+                return (terminal, nil, recovery)
             }
 
             if case .start(let snapshot) = event {
@@ -480,6 +495,11 @@ private func streamAssistantResponse(
                 continue
             }
 
+            if case .recovery(let envelope) = event {
+                recovery = envelope
+                continue
+            }
+
             guard startEmitted else { continue }
             if let snapshot = event.boundarySnapshot {
                 current = snapshot.message
@@ -499,7 +519,8 @@ private func streamAssistantResponse(
             cancelled: Task.isCancelled,
             failure: DoMoError(.malformedResponse, unterminated),
             errorMessage: unterminated,
-            sink: sink
+            sink: sink,
+            recovery: recovery
         )
     } catch {
         // `cancelled` is read ONCE and used for both decisions below. Reading
@@ -534,7 +555,8 @@ private func streamAssistantResponse(
             // rewritten, so a gateway that echoed the API key back at us would
             // otherwise leave it on disk for the life of the session.
             errorMessage: classified?.description ?? String(describing: error),
-            sink: sink
+            sink: sink,
+            recovery: recovery
         )
     }
 }
@@ -559,8 +581,13 @@ private func synthesizeTerminal(
     cancelled: Bool,
     failure: DoMoError?,
     errorMessage: String,
-    sink: any AgentEventSink
-) async -> (message: AssistantMessage, failure: DoMoError?) {
+    sink: any AgentEventSink,
+    recovery: RecoveryEnvelope?
+) async -> (
+    message: AssistantMessage,
+    failure: DoMoError?,
+    recovery: RecoveryEnvelope?
+) {
     let (stopReason, text, carried): (StopReason, String, DoMoError?) =
         cancelled
         ? (.aborted, "Request was aborted", nil)
@@ -576,7 +603,7 @@ private func synthesizeTerminal(
         await sink.emit(.messageStart(.assistant(message)))
     }
     await sink.emit(.messageEnd(.assistant(message)))
-    return (message, carried)
+    return (message, carried, recovery)
 }
 
 extension AssemblyEvent {
@@ -592,7 +619,7 @@ extension AssemblyEvent {
             .toolCallStart(_, let snapshot),
             .toolCallEnd(_, _, let snapshot):
             return snapshot
-        case .textDelta, .reasoningDelta, .toolCallDelta, .retrying, .done, .failed:
+        case .textDelta, .reasoningDelta, .toolCallDelta, .retrying, .recovery, .done, .failed:
             return nil
         }
     }

@@ -115,13 +115,18 @@ public struct AgentNotice: Sendable, Hashable {
     /// dwell time, and a transcript that shows them permanently ignores this.
     public var ttl: Duration?
 
+    /// A typed, redacted provider-failure record, when this notice represents
+    /// recovery data rather than only display prose.
+    public var recovery: RecoveryEnvelope?
+
     public init(
         level: Level,
         code: String,
         text: String,
         detail: String? = nil,
         kind: String? = nil,
-        ttl: Duration? = nil
+        ttl: Duration? = nil,
+        recovery: RecoveryEnvelope? = nil
     ) {
         self.level = level
         self.code = code
@@ -129,6 +134,21 @@ public struct AgentNotice: Sendable, Hashable {
         self.detail = detail
         self.kind = kind
         self.ttl = ttl
+        self.recovery = recovery
+    }
+}
+
+extension AgentNotice {
+    /// The normal error notice carrying a typed recovery envelope.
+    public init(_ recovery: RecoveryEnvelope) {
+        self.init(
+            level: .error,
+            code: "recovery",
+            text: "Provider request failed; diagnostic recovery data is available",
+            detail: recovery.error,
+            kind: recovery.originalKind,
+            recovery: recovery
+        )
     }
 }
 
