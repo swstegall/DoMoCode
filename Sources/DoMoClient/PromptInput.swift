@@ -94,7 +94,7 @@ final class PromptInput: @MainActor Focusable {
     private var dropCounter: UInt32 = 0
 
     private static let placeholder =
-        "Type a message — Enter to send, Alt+↵ or ^J for a newline, ↑/↓ for history, Tab to switch pane"
+        "Type a message — Enter to send, Shift+↵ or ^J for a newline, ↑/↓ for history, Tab to switch pane"
 
     init(keybindings: Keybindings = Keybindings(), terminalRows: @escaping () -> Int = { 24 }) {
         self.keybindings = keybindings

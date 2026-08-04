@@ -101,7 +101,8 @@ public final class ClientApp {
     private var diffRevertHandle: ScreenOverlayHandle?
     private var diffRevertDialog: DialogConfirm?
     private var theme = Theme.standard
-    private var appearance: ThemeAppearance = .dark
+    private let themePreferenceStore: ThemePreferenceStore
+    private var appearance: ThemeAppearance
     private var eventTask: Task<Void, Never>?
     /// User actions can outlive the input event that started them. Keep them under
     /// the app's lifetime so shutdown cancels and drains in-flight HTTP requests
@@ -271,40 +272,34 @@ public final class ClientApp {
     /// the whole sleep budget, so nothing legitimate is ever truncated by this.
     private static let maxNoticeDwell: Double = 300
 
-    private static let ctrlC: [UInt8] = [0x03]
-    private static let escape: [UInt8] = [0x1b]
-    /// `^O` toggles expanded error/tool detail. A raw byte compare, matching the
-    /// `ctrlC` precedent above and deliberately NOT a new `Keybinding`: ^O is
-    /// unbound everywhere in this package, and adding a binding would mean
-    /// editing a file three other areas also want.
-    private static let ctrlO: [UInt8] = [0x0f]
+    /// The app-level controls are decoded by ``matchesKey`` rather than compared
+    /// with one terminal's raw control byte. iTerm2 can report the same physical
+    /// key as a raw byte, Kitty CSI-u, or xterm modifyOtherKeys; handling all three
+    /// is what keeps these controls usable when a terminal profile changes.
+    private static func matchesControl(_ data: [UInt8], _ character: Character) -> Bool {
+        matchesKey(data, Key.ctrl(character))
+    }
+
     /// What one image drop may cost. The client's own limits rather than
     /// `.unlimited`, because a drop is a one-handed gesture: the `--image` flag is
     /// an operator naming a file deliberately, a drag is a file that happened to
     /// be under the pointer.
     private static let attachmentLimits = ImageAttachmentLimits.default
-    /// `^G` opens the diagnostics panel. Same reasoning as `ctrlO`, and verified
-    /// free on this path: it is in no `Keybindings.defaults`, `PromptInput` only
-    /// accepts scalars ≥ 0x20, and the sidebar ignores it.
-    private static let ctrlG: [UInt8] = [0x07]
-    /// The command palette and the three pickers are intentionally on free
-    /// control bytes so they remain available while the prompt is focused.
-    private static let ctrlP: [UInt8] = [0x10]
-    private static let ctrlS: [UInt8] = [0x13]
-    private static let ctrlM: [UInt8] = [0x0c]
-    private static let ctrlT: [UInt8] = [0x14]
-    private static let ctrlE: [UInt8] = [0x05]
 
     public init(
         client: ServerClient,
         historyStore: PromptHistoryStore? = nil,
+        themePreferencePath: FilePath? = nil,
         clipboard: any ClipboardSink = NoClipboardSink(),
         clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
         multiplexer: TerminalMultiplexer = .none,
         mouseOwned: Bool = true
     ) {
+        let preferences = ThemePreferenceStore(path: themePreferencePath)
         self.client = client
         self.historyStore = historyStore
+        self.themePreferenceStore = preferences
+        self.appearance = preferences.load()
         self.clipboard = clipboard
         self.clipboardPaste = clipboardPaste
         self.multiplexer = multiplexer
@@ -337,6 +332,8 @@ public final class ClientApp {
         }
         surface.frameBackground = theme.palette(for: appearance).background
         surface.frameBackgroundTrueColor = graphicsCapabilities.trueColor
+        surface.frameForeground = theme.palette(for: appearance).foreground
+        surface.frameForegroundTrueColor = graphicsCapabilities.trueColor
         self.surface = surface
         self.dialogs = DialogStack(surface: surface)
         // Held for F8. The app can flip its own `mouseOwned` flag all it likes;
@@ -641,6 +638,7 @@ public final class ClientApp {
             parts.append("↑/↓: choose")
             parts.append("Enter: answer")
             parts.append("Esc: select Reject")
+            parts.append("^P: palette")
             parts.append("^C: quit")
         } else if selection.selection != nil {
             // While something is highlighted the ordinary hints are wrong in the
@@ -651,56 +649,25 @@ public final class ClientApp {
             parts.append("right-click: copy")
             parts.append("Esc: clear selection")
             parts.append(mouseOwned ? "F8: release mouse" : "F8: capture mouse")
+            parts.append("^P: palette")
             parts.append("^C: quit")
         } else {
-            // Which mode the mouse is in, always, and FIRST among the hints — a
-            // released mouse changes what every other hint means (whether a drag
-            // selects here or in the terminal, whether the wheel scrolls the
-            // transcript), and a status line is truncated from the right, so a
-            // mode marker at the end is a mode marker that vanishes on a narrow
-            // terminal exactly when a notice is explaining it.
-            //
-            // It also carries the scroll keys, and it is the ONLY place they are
-            // advertised, for two reasons. The line is already over budget at
-            // ordinary widths — a ninth constant hint would push `Esc: abort` off
-            // an 80-column terminal — and this is exactly the state in which the
-            // wheel does not work, so it is the state in which the keys have to be
-            // discoverable. With the mouse captured the wheel is the gesture, and
-            // the "↑ N rows — PgDn to follow" segment names the key the moment
-            // there is anything to scroll back to.
-            //
-            // Spelled "mouse: released" rather than "mouse released" so it is not a
-            // substring of the six-second F8 notice: the two used to be
-            // indistinguishable on the page, which meant deleting this marker
-            // entirely changed nothing any test could see.
-            //
-            // Kept SHORT on purpose. Naming the keys here instead cost 21 columns
-            // and pushed "Esc: abort" and "^C: quit" off a 150-column terminal
-            // whenever the mouse was released — the same harm this block's own
-            // reasoning avoids by not adding a ninth constant hint. The keys go on
-            // the transient F8 notice, which has the room and is on screen at
-            // exactly the moment the user needs them.
             if !mouseOwned { parts.append("mouse: released") }
-            // The current mouse contract is more important than the static
-            // navigation hints below, and the notice above can consume most of
-            // the row on a narrow terminal. Keep the escape hatch beside the
-            // persistent mode marker so it remains visible in both directions.
             parts.append(mouseOwned ? "F8: release mouse" : "F8: capture mouse")
-            // Keep the abort contract near the contextual controls. The status
-            // row is truncated from the right, and on a narrow full-screen client
-            // the always-available tail would otherwise disappear before the
-            // user can see how to stop a run.
-            parts.append("Esc: abort")
-            parts.append("Tab: mode")
-            parts.append("Enter: send")
-            // The working newline bindings, not the one a user will reach for first.
-            // Shift+Enter is byte-identical to Enter unless the terminal volunteers a
-            // CSI-u report, and this package never negotiates the Kitty keyboard
-            // protocol that would ask for one — so advertising Shift+Enter would be
-            // advertising a key that submits.
-            parts.append("Alt+↵/^J: newline")
-            parts.append("↑/↓: history")
-            parts.append("^C: quit")
+            // Keep the complete contract in the bottom marquee. It is intentionally
+            // long: the marquee reveals the tail over time, while a narrow terminal
+            // no longer hides controls simply because they were appended after the
+            // visible portion of a static status string.
+            parts.append(
+                "^P: palette   ^S: sessions   ^L: model   ^T: tree   ^E: edit prompt   "
+                + "^G: diagnostics   ^O: detail   F6: images   ^V: paste image   "
+                + "Tab: pane   Ctrl+Tab: mode   Enter: send   Shift+↵/^J: newline   "
+                + "↑/↓: history/list   PgUp/PgDn: scroll   Esc: abort   ^C: quit   "
+                + "Ctrl+B/F: cursor   Alt+←/→/B/F: word   Home/End: line   ^A: line start   "
+                + "Ctrl+]/Ctrl+Alt+]: jump   Backspace/Delete: char delete   "
+                + "Ctrl+W/Alt+Backspace: word delete   Alt+D: word delete forward   "
+                + "^U/^K: line delete   ^Y/Alt+Y: yank   Ctrl+-: undo   Ctrl+D: delete"
+            )
         }
         return parts.joined(separator: "   ")
     }
@@ -1996,7 +1963,7 @@ public final class ClientApp {
             SelectItem(value: "rename", label: "Rename session", description: "Persist a display name"),
             SelectItem(value: "title", label: "Auto-title session", description: "Ask the active model for a short name"),
             SelectItem(value: "model", label: "Switch model", description: "Write a model_change entry"),
-            SelectItem(value: "mode", label: "Toggle build/plan mode", description: "Tab also toggles the active policy"),
+            SelectItem(value: "mode", label: "Toggle build/plan mode", description: "Ctrl+Tab also toggles the active policy"),
             SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
             SelectItem(value: "timeline", label: "Show session timeline", description: "Inspect checkpoints and history moves"),
             SelectItem(value: "undo", label: "Undo conversation and workspace", description: "Restore the previous checkpoint"),
@@ -2005,8 +1972,13 @@ public final class ClientApp {
             SelectItem(value: "clone", label: "Clone session", description: "Open an independent copy of this branch"),
             SelectItem(value: "diff", label: "Review working-tree diff", description: "Inspect changes since the session started"),
             SelectItem(value: "review", label: "Review diff (guided)", description: "Mark files reviewed and restore individual paths"),
-            SelectItem(value: "theme-dark", label: "Theme: dark", description: "Use the dark palette"),
-            SelectItem(value: "theme-light", label: "Theme: light", description: "Use the light palette"),
+        ] + ThemeAppearance.allCases.map { appearance in
+            SelectItem(
+                value: "theme-\(appearance.rawValue)",
+                label: "Theme: \(appearance.displayName)",
+                description: "Use the \(appearance.displayName) palette"
+            )
+        } + [
             SelectItem(value: "edit-dialog", label: "Edit prompt in dialog", description: "Edit the draft inside the client"),
             SelectItem(value: "edit", label: "Edit prompt in $EDITOR", description: "Hand the draft to the external editor"),
         ]
@@ -2142,6 +2114,11 @@ public final class ClientApp {
     }
 
     private func activatePalette(_ value: String) {
+        if value.hasPrefix("theme-"),
+           let selected = ThemeAppearance(rawValue: String(value.dropFirst("theme-".count))) {
+            setAppearance(selected)
+            return
+        }
         switch value {
         case "session": openSessionPicker()
         case "rename": openRenameDialog()
@@ -2157,8 +2134,6 @@ public final class ClientApp {
         case "clone": forkSession(clone: true)
         case "diff": openDiffReview(advisory: false)
         case "review": openDiffReview(advisory: true)
-        case "theme-dark": setAppearance(.dark)
-        case "theme-light": setAppearance(.light)
         case "edit-dialog": openPromptEditorDialog()
         case "edit": editPromptInEditor()
         default: break
@@ -2864,13 +2839,25 @@ public final class ClientApp {
 
     private func setAppearance(_ value: ThemeAppearance) {
         appearance = value
+        var noticeText = "theme: \(value.displayName)"
+        do {
+            try themePreferenceStore.save(value)
+        } catch {
+            // A theme is a local preference, not a reason to interrupt the live
+            // session. Keep the selection active and make the persistence failure
+            // visible so the next process is not a surprising reset.
+            noticeText += " (not saved)"
+        }
         promptInput.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
         statusBar.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
         footerBar.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
-        surface?.frameBackground = theme.palette(for: value).background
+        let palette = theme.palette(for: value)
+        surface?.frameBackground = palette.background
         surface?.frameBackgroundTrueColor = graphicsCapabilities.trueColor
+        surface?.frameForeground = palette.foreground
+        surface?.frameForegroundTrueColor = graphicsCapabilities.trueColor
         surface?.requestFullRedraw()
-        post(notice: "theme: \(value.rawValue)")
+        post(notice: noticeText)
     }
 
     /// Hand the current draft to `$VISUAL`/`$EDITOR` while restoring the terminal
@@ -4165,7 +4152,7 @@ extension ClientApp: TerminalApp {
         // A modal that swallowed Ctrl-C turned it into "reject this one prompt", so an
         // agent that re-asks on every tool call left the session genuinely unquittable
         // while the status bar still advertised "^C: quit".
-        if data == Self.ctrlC { quit.quit(); return }
+        if Self.matchesControl(data, "c") { quit.quit(); return }
         // F8 takes or releases the mouse. ABOVE the modal branch deliberately: the
         // moment a user most wants their terminal's own selection back is while a
         // modal is showing them a command they want to copy elsewhere.
@@ -4174,12 +4161,12 @@ extension ClientApp: TerminalApp {
         // reason ^O is: a parked modal is one of the states you most want to
         // diagnose, and it is the state in which a user is most likely to conclude
         // the client has frozen. BELOW Ctrl-C, always, so it can never shadow quit.
-        if data == Self.ctrlG { toggleDiagnostics(); return }
+        if Self.matchesControl(data, "g") { toggleDiagnostics(); return }
         // ^O expands capped error and failed-tool detail. ABOVE the modal branch
         // deliberately: reading the failure that is being re-tried, or the tool
         // output that prompted the approval you are being asked for, is exactly
         // what you want while a modal is up.
-        if data == Self.ctrlO {
+        if Self.matchesControl(data, "o") {
             transcriptView.expandErrors.toggle()
             surface?.requestRender()
             return
@@ -4189,11 +4176,13 @@ extension ClientApp: TerminalApp {
             surface?.requestRender()
             return
         }
-        if data == Self.ctrlP { openPalette(); return }
-        if data == Self.ctrlS { openSessionPicker(); return }
-        if data == Self.ctrlM { openModelPicker(); return }
-        if data == Self.ctrlT { openTreePicker(); return }
-        if data == Self.ctrlE { editPromptInEditor(); return }
+        if Self.matchesControl(data, "p") { openPalette(); return }
+        if Self.matchesControl(data, "s") { openSessionPicker(); return }
+        // Ctrl-L is the model picker. The old raw-byte constant was named ctrlM,
+        // which obscured the actual iTerm2 key shown to users in the footer.
+        if Self.matchesControl(data, "l") { openModelPicker(); return }
+        if Self.matchesControl(data, "t") { openTreePicker(); return }
+        if Self.matchesControl(data, "e") { editPromptInEditor(); return }
         // The workflow workspace is a separate root, not a modal. Keep the
         // process-level quit and mouse controls above, then hand every remaining
         // key to its phase/agent navigator so Escape means "back" rather than
@@ -4292,10 +4281,11 @@ extension ClientApp: TerminalApp {
             }
             return
         }
-        // Tab is the phase-14 mode switch on the main surface. Modal dialogs keep
-        // Tab for their own controls through the branches above; the runtime remains
-        // authoritative and rejects a switch while a turn is running.
-        if data == [0x09] {
+        // Plain Tab belongs to ScreenSurface's focus ring, which moves between the
+        // prompt/content pane and the session list. Ctrl-Tab is the mode switch;
+        // unlike the old raw Tab branch it does not steal focus traversal, and its
+        // decoded forms work in iTerm2 whether Kitty or modifyOtherKeys is active.
+        if matchesKey(data, KeyId(base: .tab, ctrl: true)) {
             toggleAgentMode()
             return
         }

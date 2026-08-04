@@ -157,6 +157,17 @@ struct ScreenSurfaceTests {
         try drive(surface, into: oracle, from: target)
         #expect(oracle.cursor.row == 1)
 
+        // A Kitty CSI-u Tab report must traverse the same focus ring; this is
+        // the form iTerm2 can emit once its keyboard protocol is enabled.
+        surface.handleInput(bytes("\u{1b}[9u"))
+        try drive(surface, into: oracle, from: target)
+        #expect(oracle.cursor.row == 0)
+
+        // Return to bravo for the routing assertion below.
+        surface.handleInput([0x09])
+        try drive(surface, into: oracle, from: target)
+        #expect(oracle.cursor.row == 1)
+
         // Typed input reaches bravo, not alpha.
         surface.handleInput(bytes("z"))
         #expect(bravo.received == [bytes("z")])

@@ -23,7 +23,12 @@ final class DialogStack {
     @discardableResult
     func present(_ component: Component, options: OverlayOptions? = nil) -> ScreenOverlayHandle? {
         guard let surface else { return nil }
-        let handle = surface.showOverlay(component, options: options)
+        // Every application dialog gets the same visible frame. Preserve the
+        // explicitly boxed callers whose sizing logic already accounts for the
+        // two border rows, while making palette/picker/form callers equally clear
+        // against a bright or dark page background.
+        let framed: Component = component is Box ? component : Box(component, paddingX: 1)
+        let handle = surface.showOverlay(framed, options: options)
         handles.append(handle)
         return handle
     }

@@ -683,10 +683,10 @@ final class InteractiveCoordinator {
             } else if kb.matches(data, .selectConfirm) {
                 resolvePermission(Self.reply(for: list.getSelectedItem()?.value))
                 render()
-            } else if data == [0x03] {
-                // Ctrl-C is an unambiguous single byte, so it can answer directly.
-                // Checked BEFORE `.selectCancel`, which is bound to both Ctrl-C and
-                // Escape, and Escape must not answer — see below.
+            } else if kb.matches(data, .inputCopy) {
+                // Ctrl-C is checked BEFORE `.selectCancel`, which is bound to both
+                // Ctrl-C and Escape. Decode all supported terminal reports so an
+                // iTerm2/Kitty control frame can reject just like the raw byte.
                 resolvePermission(.reject(message: nil))
                 render()
             } else if kb.matches(data, .selectCancel) {

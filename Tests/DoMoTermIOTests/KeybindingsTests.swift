@@ -75,20 +75,17 @@ struct KeybindingsTests {
     @Test("The newline bindings decode in legacy and negotiated forms")
     func newLineBindingsResolve() {
         let kb = Keybindings()
-        // Alt/Option+Enter is `ESC \r`. It was bound to nothing and was a silent
-        // no-op; it is now the newline key a user is most likely to reach for that
-        // this package can actually SEE.
-        #expect(kb.matches(Array("\u{1b}\r".utf8), .inputNewLine))
+        // Shift+Enter is explicit in the terminal protocols that can distinguish
+        // it from submit: Kitty CSI-u and xterm modifyOtherKeys.
+        #expect(kb.matches(Array("\u{1b}[13;2u".utf8), .inputNewLine))
+        #expect(kb.matches(Array("\u{1b}[27;2;13~".utf8), .inputNewLine))
         // Ctrl+J, guaranteed everywhere.
         #expect(kb.matches([0x0a], .inputNewLine))
         // Plain Enter is untouched: it submits, and it is NOT a newline. The alt
-        // match requires the ESC prefix, so adding it cannot capture a bare CR.
+        // form is no longer a newline binding.
         #expect(!kb.matches([0x0d], .inputNewLine))
         #expect(kb.matches([0x0d], .inputSubmit))
-        #expect(!kb.matches(Array("\u{1b}\r".utf8), .inputSubmit))
-        // The explicit CSI-u form is what the driver emits/receives after Kitty
-        // negotiation, and it is a newline rather than a submit.
+        #expect(!kb.matches(Array("\u{1b}\r".utf8), .inputNewLine))
         #expect(!kb.matches(Array("\u{1b}[13;2u".utf8), .inputSubmit))
-        #expect(kb.matches(Array("\u{1b}[13;2u".utf8), .inputNewLine))
     }
 }

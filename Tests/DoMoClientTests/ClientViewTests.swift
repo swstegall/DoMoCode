@@ -120,7 +120,7 @@ struct ClientViewTests {
     @Test("The full-screen status bar scrolls long controls instead of dropping them")
     func statusBarMarquee() {
         let status = StatusBar()
-        status.text = "working — diagnostics — Esc: abort — Tab: mode — Enter: send"
+        status.text = "working — diagnostics — Esc: abort — Tab: pane — Ctrl+Tab: mode — Enter: send"
         status.clock = { 10.0 }
         let initial = status.render(width: 18)[0]
         status.clock = { 11.2 }
@@ -272,7 +272,9 @@ struct ClientViewTests {
 
     /// Ctrl+J — the newline binding guaranteed on every terminal.
     private static let ctrlJ: [UInt8] = [0x0a]
-    /// Alt/Option+Enter, `ESC \r`.
+    /// Shift+Enter, Kitty CSI-u.
+    private static let shiftEnter: [UInt8] = Array("\u{1b}[13;2u".utf8)
+    /// Alt/Option+Enter, `ESC \r`, intentionally no longer a newline binding.
     private static let altEnter: [UInt8] = [0x1b, 0x0d]
     private static let enter: [UInt8] = [0x0d]
 
@@ -304,8 +306,8 @@ struct ClientViewTests {
         #expect(input.render(width: 40).count == 4)
     }
 
-    @Test("Enter submits; Ctrl+J and Alt+Enter insert a newline")
-    func promptInputEnterSubmitsCtrlJAndAltEnterDoNot() {
+    @Test("Enter submits; Ctrl+J and Shift+Enter insert a newline")
+    func promptInputEnterSubmitsCtrlJAndShiftEnterDoNot() {
         let input = PromptInput()
         input.focused = true
         var submitted: [String] = []
@@ -314,10 +316,13 @@ struct ClientViewTests {
         type(input, "a")
         input.handleInput(Self.ctrlJ)
         type(input, "b")
-        input.handleInput(Self.altEnter)
+        input.handleInput(Self.shiftEnter)
         type(input, "c")
         #expect(input.text == "a\nb\nc", "neither newline binding may submit")
         #expect(submitted.isEmpty)
+
+        input.handleInput(Self.altEnter)
+        #expect(input.text == "a\nb\nc", "Alt+Enter is no longer a newline binding")
 
         input.handleInput(Self.enter)
         #expect(submitted == ["a\nb\nc"])

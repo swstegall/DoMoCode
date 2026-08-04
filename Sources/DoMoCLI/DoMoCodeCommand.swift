@@ -1472,6 +1472,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     sessionDirectory: configuration.sessionDirectory,
                     cwd: workingDirectory.string
                 ),
+                themePreferencePath: configuration.configDirectory.appending("theme.json"),
                 // The clipboard half a terminal cannot do for itself. Resolved ONCE,
                 // here, from this process's environment: DoMoClient has no
                 // subprocess dependency and must not grow one so a right-click can

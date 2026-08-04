@@ -74,6 +74,17 @@ struct CtrlLetterTests {
         #expect(parseKey([0x1a]) == Key.ctrl("z"))
     }
 
+    @Test("Control letters match raw, Kitty, and modifyOtherKeys reports")
+    func controlReports() {
+        #expect(matchesKey([0x10], Key.ctrl("p")))
+        #expect(matchesKey(seq("\u{1b}[112;5u"), Key.ctrl("p")))
+        #expect(matchesKey(seq("\u{1b}[27;5;112~"), Key.ctrl("p")))
+        #expect(matchesKey(seq("\u{1b}[9;5u"), KeyId(base: .tab, ctrl: true)))
+        #expect(matchesKey(seq("\u{1b}[27;5;9~"), KeyId(base: .tab, ctrl: true)))
+        #expect(matchesKey(seq("\u{1b}[99;5:3u"), Key.ctrl("c")))
+        #expect(matchesKey(seq("\u{1b}[27;5;99~"), Key.ctrl("c")))
+    }
+
     @Test("Ctrl+symbol via the 0x1c..0x1f range")
     func ctrlSymbols() {
         #expect(parseKey([0x1c]) == KeyId(base: .char("\\"), ctrl: true))

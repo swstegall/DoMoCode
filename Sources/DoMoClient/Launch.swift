@@ -56,6 +56,7 @@ public func runFullScreenClient(
     resize: AsyncStream<TerminalSize>,
     lifecycle: any TerminalLifecycleControl,
     promptHistoryPath: FilePath? = nil,
+    themePreferencePath: FilePath? = nil,
     clipboard: any ClipboardSink = NoClipboardSink(),
     clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
     multiplexer: TerminalMultiplexer = .none,
@@ -66,6 +67,7 @@ public func runFullScreenClient(
     let app = ClientApp(
         client: client,
         historyStore: promptHistoryPath.map { PromptHistoryStore(path: $0) },
+        themePreferencePath: themePreferencePath,
         clipboard: clipboard,
         clipboardPaste: clipboardPaste,
         multiplexer: multiplexer,

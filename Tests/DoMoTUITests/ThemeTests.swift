@@ -36,6 +36,19 @@ struct ThemeTests {
         #expect(Theme.standard.palette(for: .light).background != .inherit)
     }
 
+    @Test("built-in themes are selectable and keep readable page contrast")
+    func builtInThemesAndContrast() {
+        #expect(ThemeAppearance.allCases.count == 6)
+        #expect(ThemeAppearance.gruvboxDark.rawValue == "gruvbox-dark")
+        #expect(ThemeAppearance.solarizedLight.displayName == "solarized-light")
+
+        for appearance in ThemeAppearance.allCases {
+            let palette = Theme.standard.palette(for: appearance)
+            #expect(palette.background != .inherit, appearance.rawValue)
+            #expect(Self.contrast(palette.foreground, palette.background) >= 4.5, appearance.rawValue)
+        }
+    }
+
     @Test("a concrete frame background restates after component resets")
     func frameBackgroundRestatesAfterReset() {
         let lines = paintFrameBackground(
@@ -55,5 +68,37 @@ struct ThemeTests {
         )
         #expect(rgb[0].contains("\u{1b}[48;2;1;2;3m"))
         #expect(paintFrameBackground(["plain"], width: 5, color: .inherit) == ["plain"])
+    }
+
+    @Test("a concrete frame foreground restates after component resets")
+    func frameForegroundRestatesAfterReset() {
+        let lines = paintFrameForeground(
+            ["\u{1b}[31mred\u{1b}[0m tail", ""],
+            width: 10,
+            color: .ansiIndex(15),
+            trueColor: false
+        )
+        #expect(lines.allSatisfy { visibleWidth($0) == 10 })
+        #expect(lines[0].hasPrefix("\u{1b}[38;5;15m"))
+        #expect(lines[0].contains("\u{1b}[0m\u{1b}[38;5;15m"))
+        #expect(paintFrameForeground(["plain"], width: 5, color: .inherit) == ["plain"])
+    }
+
+    private static func contrast(_ foreground: ThemeColor, _ background: ThemeColor) -> Double {
+        func channel(_ value: UInt8) -> Double {
+            let normalized = Double(value) / 255
+            return normalized <= 0.03928
+                ? normalized / 12.92
+                : pow((normalized + 0.055) / 1.055, 2.4)
+        }
+        func luminance(_ color: ThemeColor) -> Double {
+            guard case let .rgb(red, green, blue) = color else { return 0 }
+            return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+        }
+        let first = luminance(foreground)
+        let second = luminance(background)
+        let lighter = max(first, second)
+        let darker = min(first, second)
+        return (lighter + 0.05) / (darker + 0.05)
     }
 }

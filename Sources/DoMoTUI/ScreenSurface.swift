@@ -38,6 +38,12 @@ public final class ScreenSurface: TerminalApp {
     public var frameBackground: ThemeColor = .inherit
     /// Whether a true-colour SGR should be used for ``frameBackground``.
     public var frameBackgroundTrueColor = true
+    /// The page-wide foreground. A concrete value gives unstyled components —
+    /// notably dialog text — a readable color instead of inheriting the terminal's
+    /// pre-alt-screen state. ``ThemeColor/inherit`` preserves the old behavior.
+    public var frameForeground: ThemeColor = .inherit
+    /// Whether a true-colour SGR should be used for ``frameForeground``.
+    public var frameForegroundTrueColor = true
     /// The alt-screen differential renderer (absolute CUP, no scroll state).
     private var core: AltScreenCore
     /// Tab-order focus between the regions the app registers.
@@ -153,6 +159,12 @@ public final class ScreenSurface: TerminalApp {
             color: frameBackground,
             trueColor: frameBackgroundTrueColor
         )
+        lines = paintFrameForeground(
+            lines,
+            width: width,
+            color: frameForeground,
+            trueColor: frameForegroundTrueColor
+        )
         lastFrameLines = lines
         if let decorateFrame { lines = decorateFrame(lines) }
         let bytes = try core.frame(
@@ -210,11 +222,6 @@ public final class ScreenSurface: TerminalApp {
 
     // MARK: Input
 
-    /// Horizontal tab — moves focus forward.
-    private static let tab: [UInt8] = [0x09]
-    /// The back-tab / CBT sequence `ESC [ Z` (Shift-Tab) — moves focus backward.
-    private static let backTab: [UInt8] = [0x1b, 0x5b, 0x5a]
-
     /// Dispatch one framed input sequence.
     ///
     /// A capturing overlay owns input while it is up (a modal dialog): it blocks
@@ -234,12 +241,12 @@ public final class ScreenSurface: TerminalApp {
             return
         }
 
-        if data == ScreenSurface.tab {
+        if matchesKey(data, Key.tab) {
             focus.focusNext()
             requestRender()
             return
         }
-        if data == ScreenSurface.backTab {
+        if matchesKey(data, KeyId(base: .tab, shift: true)) {
             focus.focusPrevious()
             requestRender()
             return

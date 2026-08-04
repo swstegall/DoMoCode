@@ -149,14 +149,12 @@ public struct Keybindings: Sendable {
         .editorYank: [Key.ctrl("y")],
         .editorYankPop: [Key.alt("y")],
         .editorUndo: [Key.ctrl("-")],
-        // Alt+Enter remains the portable fallback. Shift+Enter is recognized from
-        // explicit Kitty CSI-u or xterm modifyOtherKeys frames; the terminal driver
-        // negotiates one of those modes at session start and normalizes the two
-        // legacy ambiguous byte forms when Kitty is active. Plain Enter is
-        // unaffected: the alt match requires the ESC prefix.
+        // Shift+Enter is recognized from explicit Kitty CSI-u or xterm
+        // modifyOtherKeys frames; the terminal driver negotiates one of those
+        // modes at session start and normalizes the two legacy ambiguous byte
+        // forms when Kitty is active. Ctrl+J remains the portable fallback.
         .inputNewLine: [
             KeyId(base: .enter, shift: true),
-            KeyId(base: .enter, alt: true),
             Key.ctrl("j"),
         ],
         .inputSubmit: [Key.enter],

@@ -28,3 +28,29 @@ public func paintFrameBackground(
         return background + restated + reset
     }
 }
+
+/// Paints the selected page foreground into every cell of a full-screen frame.
+///
+/// This is the foreground counterpart to ``paintFrameBackground``. It matters
+/// especially for plain dialog text: a component that emits no foreground SGR
+/// otherwise inherits whatever color the terminal happened to have before the
+/// alternate screen started, which made the light theme unreadable in iTerm2.
+/// Restating the foreground after local resets keeps component-level styling
+/// isolated without allowing a reset to fall back to the terminal default.
+public func paintFrameForeground(
+    _ lines: [String],
+    width: Int,
+    color: ThemeColor,
+    trueColor: Bool = true
+) -> [String] {
+    guard width > 0 else { return lines }
+    let foreground = color.foreground(trueColor: trueColor)
+    guard !foreground.isEmpty else { return lines }
+
+    let reset = "\u{1b}[0m"
+    return lines.map { line in
+        let fitted = visibleWidth(line) < width ? padToWidth(line, width) : line
+        let restated = fitted.replacingOccurrences(of: reset, with: reset + foreground)
+        return foreground + restated + reset
+    }
+}

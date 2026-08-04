@@ -174,18 +174,78 @@ public struct ThemePalette: Sendable, Hashable, Codable {
     )
 
     public static let light = ThemePalette(
-        foreground: ThemeColor(specification: "#252a31")!,
-        accent: ThemeColor(specification: "#155fbd")!,
-        muted: ThemeColor(specification: "#5d6670")!,
-        error: ThemeColor(specification: "#a51d2d")!,
-        warning: ThemeColor(specification: "#7a4b00")!,
-        background: ThemeColor(specification: "#f5f7fa")!
+        // A warm, slightly tinted page keeps the light theme comfortable in a
+        // terminal while the foreground remains dark enough for body text.
+        foreground: ThemeColor(specification: "#1c2228")!,
+        accent: ThemeColor(specification: "#0b4f8a")!,
+        muted: ThemeColor(specification: "#46515c")!,
+        error: ThemeColor(specification: "#b42318")!,
+        warning: ThemeColor(specification: "#7a3e00")!,
+        background: ThemeColor(specification: "#eeeae2")!
+    )
+
+    public static let gruvboxDark = ThemePalette(
+        foreground: ThemeColor(specification: "#ebdbb2")!,
+        accent: ThemeColor(specification: "#83a598")!,
+        muted: ThemeColor(specification: "#a89984")!,
+        error: ThemeColor(specification: "#fb4934")!,
+        warning: ThemeColor(specification: "#fabd2f")!,
+        background: ThemeColor(specification: "#282828")!
+    )
+
+    public static let gruvboxLight = ThemePalette(
+        foreground: ThemeColor(specification: "#3c3836")!,
+        accent: ThemeColor(specification: "#076678")!,
+        muted: ThemeColor(specification: "#665c54")!,
+        error: ThemeColor(specification: "#9d0006")!,
+        warning: ThemeColor(specification: "#b57614")!,
+        background: ThemeColor(specification: "#fbf1c7")!
+    )
+
+    public static let solarizedDark = ThemePalette(
+        foreground: ThemeColor(specification: "#839496")!,
+        accent: ThemeColor(specification: "#268bd2")!,
+        muted: ThemeColor(specification: "#586e75")!,
+        error: ThemeColor(specification: "#dc322f")!,
+        warning: ThemeColor(specification: "#b58900")!,
+        background: ThemeColor(specification: "#002b36")!
+    )
+
+    public static let solarizedLight = ThemePalette(
+        foreground: ThemeColor(specification: "#586e75")!,
+        accent: ThemeColor(specification: "#268bd2")!,
+        muted: ThemeColor(specification: "#657b83")!,
+        error: ThemeColor(specification: "#dc322f")!,
+        warning: ThemeColor(specification: "#b58900")!,
+        background: ThemeColor(specification: "#fdf6e3")!
     )
 }
 
-public enum ThemeAppearance: String, Sendable, Hashable, Codable {
+public enum ThemeAppearance: String, CaseIterable, Sendable, Hashable, Codable {
     case dark
     case light
+    case gruvboxDark = "gruvbox-dark"
+    case gruvboxLight = "gruvbox-light"
+    case solarizedDark = "solarized-dark"
+    case solarizedLight = "solarized-light"
+
+    public var displayName: String {
+        switch self {
+        case .dark: return "dark"
+        case .light: return "light"
+        case .gruvboxDark: return "gruvbox-dark"
+        case .gruvboxLight: return "gruvbox-light"
+        case .solarizedDark: return "solarized-dark"
+        case .solarizedLight: return "solarized-light"
+        }
+    }
+
+    public var isDark: Bool {
+        switch self {
+        case .dark, .gruvboxDark, .solarizedDark: return true
+        case .light, .gruvboxLight, .solarizedLight: return false
+        }
+    }
 }
 
 /// A complete theme with independent dark and light palettes.
@@ -199,7 +259,14 @@ public struct Theme: Sendable, Hashable, Codable {
     }
 
     public func palette(for appearance: ThemeAppearance) -> ThemePalette {
-        appearance == .dark ? dark : light
+        switch appearance {
+        case .dark: return dark
+        case .light: return light
+        case .gruvboxDark: return .gruvboxDark
+        case .gruvboxLight: return .gruvboxLight
+        case .solarizedDark: return .solarizedDark
+        case .solarizedLight: return .solarizedLight
+        }
     }
 
     public static let standard = Theme()

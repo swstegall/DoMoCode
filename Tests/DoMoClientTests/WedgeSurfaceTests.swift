@@ -411,6 +411,23 @@ struct WedgeSurfaceTests {
 
     // MARK: ^G
 
+    @Test("Ctrl-P opens a framed command palette from a Kitty control report")
+    func commandPaletteControlAndFrame() async throws {
+        let stub = try Self.runtime()
+        stub.start()
+        defer { stub.stop() }
+
+        let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token)
+        #expect(await client.wait(for: "^P: palette"), "screen:\n\(client.joined())")
+
+        client.send(Array("\u{1b}[112;5u".utf8))
+        #expect(await client.wait(for: "Command palette"), "screen:\n\(client.joined())")
+        let palette = client.joined()
+        #expect(palette.contains("┌"), "palette has no top outline:\n\(palette)")
+        #expect(palette.contains("┐"), "palette has no top-right outline:\n\(palette)")
+        await client.quit()
+    }
+
     @Test("^G shows connection and run state, and Ctrl-C still quits with it up")
     func diagnosticsPanel() async throws {
         let stub = try ExplainingServer(

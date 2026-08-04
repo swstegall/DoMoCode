@@ -404,10 +404,23 @@ public final class Spacer: Component {
 /// line to a uniform block, and wraps the block in box-drawing characters — so a
 /// `Box` line is always exactly `width` columns, which is exactly what the
 /// renderer's fatal-width invariant wants to see.
-public final class Box: Component {
+public final class Box: Focusable {
     public var child: Component
     public var paddingX: Int
     public var paddingY: Int
+    private var focusState = false
+
+    public var focused: Bool {
+        get { focusState }
+        set {
+            focusState = newValue
+            (child as? any Focusable)?.focused = newValue
+        }
+    }
+
+    public var wantsKeyRelease: Bool {
+        child.wantsKeyRelease
+    }
 
     /// Corner and edge glyphs, all width 1.
     private static let topLeft = "\u{250C}"
@@ -424,6 +437,10 @@ public final class Box: Component {
     }
 
     public func invalidate() { child.invalidate() }
+
+    public func handleInput(_ data: [UInt8]) {
+        child.handleInput(data)
+    }
 
     public func render(width: Int) -> [String] {
         // Two border columns plus horizontal padding on each side.
