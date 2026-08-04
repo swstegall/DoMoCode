@@ -415,24 +415,24 @@ applicable, and a release build under Swift 6.3.
 
 ### Planned phases
 
-#### Phase 22 — MIT source compliance and dependency audit — P0
+#### Phase 22 — MIT source compliance and dependency audit — P0 — complete
 
-- [ ] Produce a machine-readable inventory of every direct and transitive
+- [x] Produce a machine-readable inventory of every direct and transitive
   package in Package.resolved, its GitHub URL, exact license, copyright,
   SPDX identifier, and whether it is runtime or test-only. Non-MIT package
   licenses are allowed; their notices must travel with the deliverable.
-- [ ] Inventory every copied or derived source file, verify its exact
+- [x] Inventory every copied or derived source file, verify its exact
   upstream path and commit, and preserve SPDX/copyright headers. Approved
   permissive source licenses, including MIT and Apache-2.0, remain eligible
   when the exact provenance is recorded; unreviewed, proprietary, and
   PolyForm-derived source remains ineligible. Keep non-MIT package
   dependencies as separately noticed dependencies rather than misclassifying
   them as source violations.
-- [ ] Add a repeatable CI admission check for new code: approved permissive
+- [x] Add a repeatable CI admission check for new code: approved permissive
   source provenance, no proprietary/PolyForm subtree, no secrets, and a
   matching NOTICES.md entry. Add a separate package-license check that permits
   approved non-MIT dependencies from public GitHub.
-- [ ] Define provider, backend, workflow, tool-catalog, adapter, extension,
+- [x] Define provider, backend, workflow, tool-catalog, adapter, extension,
   and theme protocols without baking LiteLLM, macOS, JSONL, or the
   full-screen client into the abstractions.
 
