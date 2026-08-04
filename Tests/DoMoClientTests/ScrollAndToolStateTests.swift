@@ -355,14 +355,14 @@ struct ScrollAndToolStateTests {
     func argumentSummaries() {
         #expect(toolCallDetail(name: "edit", arguments: .object(["path": .string("a/b.swift")])) == "a/b.swift")
         let patch = "*** Begin Patch\n*** Update File: Sources/App.swift\n@@\n-old\n+new\n*** End Patch"
-        #expect(toolCallDetail(name: "apply_patch", arguments: ["patch": patch]) == "Sources/App.swift")
-        #expect(toolCallDetail(name: "websearch", arguments: ["query": "swift concurrency"]) == "swift concurrency")
-        #expect(toolCallDetail(name: "mcp_resource", arguments: [
-            "action": "read",
-            "server": "docs",
-            "uri": "memo://one",
-        ]) == "read  docs  memo://one")
-        #expect(toolCallDetail(name: "skill", arguments: ["name": "review"]) == "review")
+        #expect(toolCallDetail(name: "apply_patch", arguments: .object(["patch": .string(patch)])) == "Sources/App.swift")
+        #expect(toolCallDetail(name: "websearch", arguments: .object(["query": .string("swift concurrency")])) == "swift concurrency")
+        #expect(toolCallDetail(name: "mcp_resource", arguments: .object([
+            "action": .string("read"),
+            "server": .string("docs"),
+            "uri": .string("memo://one"),
+        ])) == "read  docs  memo://one")
+        #expect(toolCallDetail(name: "skill", arguments: .object(["name": .string("review")])) == "review")
         // The tool layer accepts `file_path` as an alias, so the summary must too.
         #expect(toolCallDetail(name: "write", arguments: .object(["file_path": .string("c.txt")])) == "c.txt")
         #expect(toolCallDetail(name: "bash", arguments: .object(["command": .string("ls -la")])) == "ls -la")

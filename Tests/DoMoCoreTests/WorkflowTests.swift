@@ -90,12 +90,13 @@ struct WorkflowTests {
             createdAt: "2026-01-01T00:00:00Z",
             stageIDs: ["research"]
         )
-        #expect(run.updateStage(
+        let recordedEvidence = run.updateStage(
             "research",
             status: .succeeded,
             timestamp: "2026-01-01T00:01:00Z",
             evidence: [evidence]
-        ))
+        )
+        #expect(recordedEvidence)
         let copy = try JSONDecoder().decode(
             WorkflowRunRecord.self,
             from: JSONEncoder().encode(run)
@@ -141,17 +142,29 @@ struct WorkflowTests {
             stageIDs: ["research", "plan"]
         )
 
-        #expect(run.updateStage("research", status: .running, timestamp: "2026-01-01T00:01:00Z", agentIDs: ["agent-1"]))
-        #expect(run.updateStage(
+        let startedResearch = run.updateStage(
+            "research",
+            status: .running,
+            timestamp: "2026-01-01T00:01:00Z",
+            agentIDs: ["agent-1"]
+        )
+        #expect(startedResearch)
+        let completedResearch = run.updateStage(
             "research",
             status: .succeeded,
             timestamp: "2026-01-01T00:02:00Z",
             output: ["evidence": "one"]
-        ))
+        )
+        #expect(completedResearch)
         #expect(run.stage(withID: "research")?.status == .succeeded)
         #expect(run.stage(withID: "research")?.agentIDs == ["agent-1"])
         #expect(run.stage(withID: "research")?.output["evidence"]?.stringValue == "one")
         #expect(run.stage(withID: "plan")?.status == .pending)
-        #expect(!run.updateStage("unknown", status: .running, timestamp: "2026-01-01T00:03:00Z"))
+        let unknownStageUpdated = run.updateStage(
+            "unknown",
+            status: .running,
+            timestamp: "2026-01-01T00:03:00Z"
+        )
+        #expect(!unknownStageUpdated)
     }
 }
