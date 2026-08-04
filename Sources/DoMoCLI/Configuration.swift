@@ -147,6 +147,14 @@ public struct Settings: Sendable, Hashable, Codable {
     /// Trusted, opt-in post-mutation formatting. See ``AutoFormatSettings``.
     public var autoFormat: AutoFormatSettings?
 
+    /// Named provider profiles contain endpoint and capability metadata only;
+    /// credential values remain in the environment or another external store.
+    public var providerProfiles: [String: ProviderProfile]?
+
+    /// Ordered provider fallback routes. Project settings may replace a route,
+    /// but the route itself never contains a credential value.
+    public var providerRoutes: [String: ProviderRoute]?
+
     public init(
         baseURL: String? = nil,
         model: String? = nil,
@@ -169,7 +177,9 @@ public struct Settings: Sendable, Hashable, Codable {
         contextWindow: Int? = nil,
         agentModes: [String: Ruleset]? = nil,
         autoFormat: AutoFormatSettings? = nil,
-        retryWallClockMS: Int? = nil
+        retryWallClockMS: Int? = nil,
+        providerProfiles: [String: ProviderProfile]? = nil,
+        providerRoutes: [String: ProviderRoute]? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -193,6 +203,8 @@ public struct Settings: Sendable, Hashable, Codable {
         self.agentModes = agentModes
         self.autoFormat = autoFormat
         self.retryWallClockMS = retryWallClockMS
+        self.providerProfiles = providerProfiles
+        self.providerRoutes = providerRoutes
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -218,6 +230,8 @@ public struct Settings: Sendable, Hashable, Codable {
         case contextWindow
         case agentModes
         case autoFormat
+        case providerProfiles
+        case providerRoutes
     }
 
     /// Loads a settings file: `nil` when it is genuinely absent, a thrown error
@@ -831,6 +845,14 @@ public struct ResolvedConfiguration: Sendable {
     /// fields; an absent value leaves formatting disabled at the wiring layer.
     public var autoFormat: AutoFormatSettings?
 
+    /// Inspectable provider metadata resolved from trusted settings. The
+    /// default profile is synthesized when no profile was declared, preserving
+    /// the historical LiteLLM configuration path.
+    public var providerProfiles: [String: ProviderProfile]
+
+    /// Named, ordered provider routes resolved from trusted settings.
+    public var providerRoutes: [String: ProviderRoute]
+
     /// The *name* of the environment variable the API key was read from, when a
     /// settings file named one. Never the key.
     ///
@@ -876,7 +898,9 @@ public struct ResolvedConfiguration: Sendable {
         agentModes: [String: Ruleset] = [:],
         autoFormat: AutoFormatSettings? = nil,
         apiKeyEnvName: String? = nil,
-        warnings: [String] = []
+        warnings: [String] = [],
+        providerProfiles: [String: ProviderProfile] = [:],
+        providerRoutes: [String: ProviderRoute] = [:]
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -904,6 +928,8 @@ public struct ResolvedConfiguration: Sendable {
         self.autoFormat = autoFormat
         self.apiKeyEnvName = apiKeyEnvName
         self.warnings = warnings
+        self.providerProfiles = providerProfiles
+        self.providerRoutes = providerRoutes
     }
 
     // MARK: Per-model truth
@@ -1181,6 +1207,36 @@ extension ResolvedConfiguration {
             project: project?.contextWindow, user: user?.contextWindow, key: "contextWindow"
         )
 
+        // Profiles and routes are non-secret metadata. A trusted project may
+        // select or tighten them, but values are still resolved only from the
+        // external credential reference carried by each profile.
+        var providerProfiles = user?.providerProfiles ?? [:]
+        providerProfiles.merge(project?.providerProfiles ?? [:]) { _, projectValue in projectValue }
+        if providerProfiles["default"] == nil {
+            providerProfiles["default"] = ProviderProfile(
+                id: "default",
+                displayName: "LiteLLM gateway",
+                adapterID: "litellm",
+                endpoint: baseURL,
+                defaultModel: model,
+                credential: ProviderCredentialReference(
+                    name: apiKeyEnvName ?? EnvName.apiKey,
+                    required: apiKey != nil
+                ),
+                capabilities: ["chat", "streaming", "tools", "usage", "retry", "recovery"],
+                contextWindow: contextWindow
+            )
+        }
+        var providerRoutes = user?.providerRoutes ?? [:]
+        providerRoutes.merge(project?.providerRoutes ?? [:]) { _, projectValue in projectValue }
+        if providerRoutes["default"] == nil {
+            providerRoutes["default"] = ProviderRoute(
+                id: "default",
+                displayName: "Default provider",
+                profileIDs: ["default"]
+            )
+        }
+
         var agentModes = user?.agentModes ?? [:]
         for (mode, rules) in project?.agentModes ?? [:] {
             agentModes[mode] = merge(agentModes[mode] ?? [], rules)
@@ -1228,7 +1284,9 @@ extension ResolvedConfiguration {
             agentModes: agentModes,
             autoFormat: autoFormat,
             apiKeyEnvName: apiKeyEnvName,
-            warnings: warnings
+            warnings: warnings,
+            providerProfiles: providerProfiles,
+            providerRoutes: providerRoutes
         )
     }
 

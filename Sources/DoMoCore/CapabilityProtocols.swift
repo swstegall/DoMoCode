@@ -27,17 +27,47 @@ public struct AdapterDescriptor: Sendable, Codable, Hashable {
     public var displayName: String
     public var version: String?
     public var capabilities: [String]
+    public var kind: AdapterKind
+    public var source: AdapterSourceMetadata
 
     public init(
         id: String,
         displayName: String,
         version: String? = nil,
-        capabilities: [String] = []
+        capabilities: [String] = [],
+        kind: AdapterKind = .other,
+        source: AdapterSourceMetadata = .builtInMIT
     ) {
         self.id = id
         self.displayName = displayName
         self.version = version
         self.capabilities = capabilities
+        self.kind = kind
+        self.source = source
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, displayName, version, capabilities, kind, source
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        version = try container.decodeIfPresent(String.self, forKey: .version)
+        capabilities = try container.decodeIfPresent([String].self, forKey: .capabilities) ?? []
+        kind = try container.decodeIfPresent(AdapterKind.self, forKey: .kind) ?? .other
+        source = try container.decodeIfPresent(AdapterSourceMetadata.self, forKey: .source) ?? .builtInMIT
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encodeIfPresent(version, forKey: .version)
+        try container.encode(capabilities, forKey: .capabilities)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(source, forKey: .source)
     }
 }
 
@@ -113,9 +143,13 @@ public struct ProviderEvent: Sendable, Codable, Hashable {
         case textDelta
         case reasoningDelta
         case toolCallDelta
+        case toolResult
         case usage
+        case retry
+        case permission
         case messageEnd
         case error
+        case cancelled
         case unknown
     }
 

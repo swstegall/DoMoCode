@@ -83,7 +83,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             the turn cap exits 2, the runaway guard exits 3, and the cost cap exits 4, so a \
             script can distinguish under-budgeting, a stuck model, and a spend ceiling.
             """,
-        subcommands: [DiffCommand.self, ExportCommand.self, ReplayCommand.self]
+        subcommands: [
+            AdaptersCommand.self,
+            DiffCommand.self,
+            ExportCommand.self,
+            ReplayCommand.self,
+        ]
     )
 
     @Option(
@@ -339,6 +344,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             if rawArguments.first == "replay" {
                 let replay = try ReplayCommand.parse(Array(rawArguments.dropFirst()))
                 try await replay.run()
+                return
+            }
+            if rawArguments.first == "adapters" {
+                let tail = Array(rawArguments.dropFirst())
+                if tail.first == "doctor" {
+                    let doctor = try AdaptersDoctorCommand.parse(Array(tail.dropFirst()))
+                    try await doctor.run()
+                } else {
+                    let listArguments = tail.first == "list" ? Array(tail.dropFirst()) : tail
+                    let list = try AdaptersListCommand.parse(listArguments)
+                    try await list.run()
+                }
                 return
             }
             let parsed = try parseAsRoot()
