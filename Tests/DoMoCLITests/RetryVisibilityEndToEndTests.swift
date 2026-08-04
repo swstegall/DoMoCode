@@ -68,7 +68,7 @@ struct RetryVisibilityEndToEndTests {
             result.standardError.contains("Retrying in"),
             "stderr should report the wait: \(result.standardError)")
         #expect(result.standardError.contains("provider busy"))
-        #expect(result.standardError.contains("attempt 1/"))
+        #expect(result.standardError.contains("request 2/10"))
     }
 
     /// stdout is a scripted contract. A retry line on it would corrupt every
@@ -183,7 +183,9 @@ struct RetryVisibilityEndToEndTests {
 
         #expect(result.exitCode == 1)
         #expect(!result.standardError.contains("Retrying"))
-        // Exactly one attempt: an unretryable status is not slept on.
-        #expect(gateway.requestCount == 1)
+        // The failed provider request is followed by one bounded diagnostic
+        // request. The diagnostic is not a retry and therefore does not emit a
+        // retry notice or replay the original turn.
+        #expect(gateway.requestCount == 2)
     }
 }
