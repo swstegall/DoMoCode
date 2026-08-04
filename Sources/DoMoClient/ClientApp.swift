@@ -1963,7 +1963,11 @@ public final class ClientApp {
             SelectItem(value: "rename", label: "Rename session", description: "Persist a display name"),
             SelectItem(value: "title", label: "Auto-title session", description: "Ask the active model for a short name"),
             SelectItem(value: "model", label: "Switch model", description: "Write a model_change entry"),
-            SelectItem(value: "mode", label: "Toggle build/plan mode", description: "Ctrl+Tab also toggles the active policy"),
+            SelectItem(
+                value: "mode",
+                label: "Switch agent mode (currently \(agentMode.rawValue))",
+                description: "Ctrl+Tab cycles build, plan, ask, debug, and review policies"
+            ),
             SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
             SelectItem(value: "timeline", label: "Show session timeline", description: "Inspect checkpoints and history moves"),
             SelectItem(value: "undo", label: "Undo conversation and workspace", description: "Restore the previous checkpoint"),
@@ -2235,7 +2239,7 @@ public final class ClientApp {
             refuseAsBusy()
             return
         }
-        let next: AgentMode = agentMode == .build ? .plan : .build
+        let next = agentMode.next
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
