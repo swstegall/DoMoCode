@@ -336,7 +336,7 @@ public enum WorkspaceBranchNaming {
         .prefix(40)
         .description
         let safeSlug = slug.isEmpty ? "session" : slug
-        return "domo/(safeSlug)-(shortHash(sessionID))"
+        return "domo/\(safeSlug)-\(shortHash(sessionID))"
     }
 
     private static func shortHash(_ value: String) -> String {

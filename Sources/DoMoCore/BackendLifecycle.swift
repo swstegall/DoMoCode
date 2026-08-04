@@ -214,7 +214,11 @@ public actor BackendRegistry {
 
     public func unregister(id: String) async throws(BackendRegistryError) {
         guard let record = records[id] else { throw .notRegistered(id) }
-        try await record.backend.cleanup()
+        do {
+            try await record.backend.cleanup()
+        } catch {
+            throw .lifecycleFailed(backendID: id, message: Redaction.diagnostic(String(describing: error)))
+        }
         records.removeValue(forKey: id)
         order.removeAll { $0 == id }
         appendEvent(id: id, state: .stopped, message: "Backend unregistered")
