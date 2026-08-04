@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import DoMoCore
+import Foundation
 import Testing
 
 @Suite("Resource reload coordination", .serialized)
@@ -116,6 +117,34 @@ struct ResourceReloadTests {
 
         await subscription.stop()
         #expect(await subscription.isRunning == false)
+    }
+
+    @Test("portable polling watcher observes file changes")
+    func pollingWatcherObservesChanges() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("domocode-watch-\(UUID().uuidString)", isDirectory: true)
+        let file = root.appendingPathComponent("theme.json")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("before".utf8).write(to: file)
+
+        let source = PollingResourceWatchSource(
+            paths: [ResourceWatchPath(path: file.path, kind: .theme, resourceID: "theme")],
+            interval: .milliseconds(20)
+        )
+        let coordinator = ResourceReloadCoordinator(debounceMilliseconds: 60_000)
+        let subscription = ResourceWatchSubscription(source: source, coordinator: coordinator)
+        try await subscription.start()
+        try await Task.sleep(for: .milliseconds(80))
+        try Data("after".utf8).write(to: file)
+        try await Task.sleep(for: .milliseconds(120))
+        await subscription.stop()
+
+        let notice = await coordinator.flush()
+        #expect(notice?.changes.count == 1)
+        #expect(notice?.changes.first?.path == file.path)
+        #expect(notice?.changes.first?.kind == .theme)
+        #expect(notice?.changes.first?.resourceID == "theme")
     }
 }
 

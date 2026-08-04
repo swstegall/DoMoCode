@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 
+import Foundation
+
 /// Debounced reload coordination for trusted resources and workspace files.
 /// Filesystem, repository, or editor watchers feed events into this actor; the
 /// actor owns coalescing, cancellation, and the rule that an active turn's
@@ -73,6 +75,148 @@ public enum ResourceReloadError: Error, Sendable, Equatable {
     case noActiveTurn
     case wrongTurn(String)
     case watcherAlreadyRunning
+}
+
+/// One path owned by a portable polling watcher. Platform-native adapters can
+/// implement ``ResourceWatchSource`` with FSEvents, inotify, or an editor
+/// bridge; this source keeps the core usable on every supported platform and
+/// in installations where those APIs are unavailable.
+public struct ResourceWatchPath: Sendable, Codable, Hashable {
+    public var path: String
+    public var kind: ResourceReloadKind
+    public var resourceID: String?
+
+    public init(
+        path: String,
+        kind: ResourceReloadKind,
+        resourceID: String? = nil
+    ) {
+        self.path = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.kind = kind
+        self.resourceID = resourceID
+    }
+}
+
+/// A bounded, dependency-free watcher for trusted resource and workspace
+/// paths. It records an initial snapshot, then emits only changes observed on
+/// later polls. The stream owns its polling task: cancelling the consumer or
+/// stopping a ``ResourceWatchSubscription`` stops the task without leaving a
+/// late event that could reload a running turn.
+public struct PollingResourceWatchSource: ResourceWatchSource {
+    public let paths: [ResourceWatchPath]
+    public let interval: Duration
+
+    public init(
+        paths: [ResourceWatchPath],
+        interval: Duration = .milliseconds(250)
+    ) {
+        var seen = Set<ResourceWatchPath>()
+        self.paths = paths.filter { !$0.path.isEmpty && seen.insert($0).inserted }
+        self.interval = interval < .milliseconds(20) ? .milliseconds(20) : interval
+    }
+
+    public func events() -> AsyncStream<ResourceReloadEvent> {
+        let source = self
+        return AsyncStream { continuation in
+            let task = Task {
+                var previous = source.snapshot()
+                while !Task.isCancelled {
+                    do {
+                        try await Task.sleep(for: source.interval)
+                    } catch {
+                        break
+                    }
+                    guard !Task.isCancelled else { break }
+
+                    let current = source.snapshot()
+                    for path in source.changedPaths(from: previous, to: current) {
+                        guard let watched = source.watchPath(for: path) else { continue }
+                        continuation.yield(ResourceReloadEvent(
+                            path: path,
+                            kind: watched.kind,
+                            resourceID: watched.resourceID,
+                            observedAt: Self.timestamp()
+                        ))
+                    }
+                    previous = current
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private struct FileStamp: Sendable, Hashable {
+        let exists: Bool
+        let modificationMicros: Int64
+        let size: Int64
+        let isDirectory: Bool
+    }
+
+    private func snapshot() -> [String: FileStamp] {
+        var result: [String: FileStamp] = [:]
+        for watched in paths {
+            let root = Self.normalize(watched.path)
+            guard !root.isEmpty else { continue }
+            result[root] = Self.stamp(for: root)
+            guard result[root]?.isDirectory == true,
+                  let children = FileManager.default.subpaths(atPath: root)
+            else { continue }
+            for child in children {
+                let path = Self.normalize(root + "/" + child)
+                result[path] = Self.stamp(for: path)
+            }
+        }
+        return result
+    }
+
+    private func changedPaths(
+        from previous: [String: FileStamp],
+        to current: [String: FileStamp]
+    ) -> [String] {
+        Set(previous.keys).union(current.keys).filter { path in
+            previous[path] != current[path]
+        }.sorted()
+    }
+
+    private func watchPath(for path: String) -> ResourceWatchPath? {
+        paths
+            .filter { watched in
+                let root = Self.normalize(watched.path)
+                return path == root || path.hasPrefix(root + "/")
+            }
+            .sorted { $0.path.count > $1.path.count }
+            .first
+    }
+
+    private static func normalize(_ path: String) -> String {
+        URL(fileURLWithPath: path.trimmingCharacters(in: .whitespacesAndNewlines))
+            .standardizedFileURL.path
+    }
+
+    private static func stamp(for path: String) -> FileStamp {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path),
+              let values = try? url.resourceValues(forKeys: [
+                  .contentModificationDateKey,
+                  .fileSizeKey,
+                  .isDirectoryKey,
+              ])
+        else {
+            return FileStamp(exists: false, modificationMicros: 0, size: 0, isDirectory: false)
+        }
+        let modification = values.contentModificationDate?.timeIntervalSince1970 ?? 0
+        return FileStamp(
+            exists: true,
+            modificationMicros: Int64(modification * 1_000_000),
+            size: Int64(values.fileSize ?? 0),
+            isDirectory: values.isDirectory == true
+        )
+    }
+
+    private static func timestamp() -> String {
+        ISO8601DateFormatter().string(from: Date())
+    }
 }
 
 /// A platform-specific watcher feeds facts into the shared reload boundary.
