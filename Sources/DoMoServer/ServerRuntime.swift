@@ -1452,8 +1452,6 @@ public actor ServerRuntime {
             streamFn: config.streamFn,
             streamFnForModel: config.modelStreamFactory,
             contextWindowForModel: config.modelContextWindow,
-            recoveryDiagnostic: config.recoveryDiagnostic,
-            recoveryDiagnosticTools: config.recoveryDiagnosticTools,
             // The three below are the whole reason `Config` carries them: a value
             // that stops here is a knob a user can set and nothing reads. The
             // harness clamps `compaction` against `contextWindow` in its own
@@ -1470,7 +1468,9 @@ public actor ServerRuntime {
             toolLifecycleTimeout: config.toolLifecycleTimeout,
             onNoProgress: onNoProgress,
             maxCostPerRun: config.maxCostPerRun,
-            sessionStartHead: config.sessionStartHead
+            sessionStartHead: config.sessionStartHead,
+            recoveryDiagnostic: config.recoveryDiagnostic,
+            recoveryDiagnosticTools: config.recoveryDiagnosticTools
         )
         configuration.workspaceSnapshots = config.workspaceSnapshotsForSession?(sessionID) ?? config.workspaceSnapshots
         return configuration
