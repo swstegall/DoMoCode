@@ -306,8 +306,11 @@ public actor ExtensionHost {
         guard state == .stopped || state == .failed else {
             throw .invalidState(state)
         }
+        // Admission is deliberately outside the transport failure boundary:
+        // an unapproved or policy-denied extension was never started and must
+        // remain truthfully stopped rather than looking like a failed process.
+        let plan = try admissionPlan(approval: approval)
         do {
-            let plan = try admissionPlan(approval: approval)
             state = .starting
             try await transport.start(using: plan)
             let response = try await transport.request(
