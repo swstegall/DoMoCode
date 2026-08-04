@@ -518,7 +518,7 @@ The audit found that DoMoCode already has more of the OpenCode/Pi tool
 surface than the old README implied. This phase makes it inspectable and
 fills only the high-value gaps.
 
-#### Phase 25 — Ask, debug, review, research, plan, execute, and synthesize workflows — P0
+#### Phase 25 — Ask, debug, review, research, plan, execute, and synthesize workflows — P0 — complete
 
 Workflow UI target: provide a dedicated full-screen workspace rather than folding
 workflow state into the ordinary transcript view. The initial layout has phases in
@@ -527,46 +527,45 @@ a phase; the left pane then lists that phase's agents, and the right pane follow
 the selected agent's live content. Escape returns to the parent phase list. This
 is the interaction model to preserve when the durable workflow records below land.
 
-- [ ] Add a durable workflow definition and run record. A workflow is a
+- [x] Add a durable workflow definition and run record. A workflow is a
   sequence or DAG of named stages with a tool policy, model/profile,
   context inputs, output artifact, budget, timeout, cancellation policy, and
   approval boundary.
-- [ ] Ship a Claude-Code-like terminal experience without copying proprietary
+- [x] Ship a Claude-Code-like terminal experience without copying proprietary
   implementation: /research gathers evidence, /plan writes a reviewable
   plan, /execute performs approved work, and /synthesize produces the final
   answer. Existing plan mode remains the safety boundary.
-- [ ] Add explicit Ask, Debug, and Review modes alongside Build and Plan.
+- [x] Add explicit Ask, Debug, and Review modes alongside Build and Plan.
   Ask is read-only question/research work; Debug emphasizes reproduction,
   isolation, test execution, and evidence; Review is a read-only diff,
   checkpoint, or worktree audit that produces findings with severity,
   locations, evidence, and suggested fixes. Each mode gets a named profile
   containing its prompt, model, tool visibility, permission policy, budget,
   and output contract.
-- [ ] Research stages use read-only tools by default and can fan out to
+- [x] Research stages use read-only tools by default and can fan out to
   child sessions for repository search, web/MCP search, LSP inspection, and
   document comparison. Each result carries source/session provenance and an
   untrusted-data marker.
-- [ ] Plan stages produce a stable .domocode/plans/<workflow>.md or
+- [x] Plan stages produce a stable .domocode/plans/<workflow>.md or
   equivalent artifact with assumptions, alternatives, affected files,
   commands, risks, and acceptance tests. A user can edit or reject it before
   execution.
-- [ ] Execution stages reuse checkpoints, permissions, sandboxing, steering,
+- [x] Execution stages reuse checkpoints, permissions, sandboxing, steering,
   PTYs, and child-session task IDs. A failed or cancelled stage can resume
   without duplicating already committed artifacts.
-- [ ] Synthesis stages combine stage outputs, cite their evidence, distinguish
+- [x] Synthesis stages combine stage outputs, cite their evidence, distinguish
   observed facts from inference, and return through the normal assistant
   response structure. The workflow itself must be exportable and replayable.
-- [ ] Add serial/parallel DAG tests, mode-policy tests for Ask/Debug/Review,
+- [x] Add serial/parallel DAG tests, mode-policy tests for Ask/Debug/Review,
   approval tests, cancellation tests, failure/resume tests,
   prompt-injection tests, and a complete research-to-synthesis end-to-end
   test.
 
-#### Phase 26 — Long-scale retry and LLM-assisted failure recovery — P0
+#### Phase 26 — Long-scale retry and LLM-assisted failure recovery — P0 — complete
 
-The current baseline already has ten configured retry attempts, exponential
-backoff, jitter, Retry-After, a five-minute sleep budget, a shorter
-pre-connect budget, and visible retry notices. It is valuable groundwork but
-does not yet satisfy the requested diagnostic recovery contract.
+The implementation has ten configured retry attempts, exponential backoff,
+jitter, Retry-After, a five-minute sleep budget, a shorter pre-connect budget,
+visible retry notices, and a bounded read-only diagnostic recovery turn.
 
 The target state is:
 
@@ -583,79 +582,79 @@ LiteLLM response
        └─ map the result back to DoMo's normal assistant/error events
 ~~~
 
-- [ ] Rename or clearly document the count semantics as maxAttempts versus
+- [x] Rename or clearly document the count semantics as maxAttempts versus
   maxRetries; never silently exceed ten network attempts. Keep the
   pre-connect cap separate from a request that has proven the gateway alive.
-- [ ] Move from a sleep-only budget to an explicit wall-clock retry budget
+- [x] Move from a sleep-only budget to an explicit wall-clock retry budget
   that accounts for Retry-After, connection time, stream idle time, and
   backoff. Make the longer time scale configurable and cancellable. A model
   change, abort, shutdown, or user retry must stop the wait immediately.
-- [ ] Continue to retry only classified transient failures: rate limits,
+- [x] Continue to retry only classified transient failures: rate limits,
   service unavailable/overload, transient 5xx, and transport failures.
   Never hide authentication, quota, context-overflow, malformed-request, or
   404 failures behind ten waits.
-- [ ] After the normal retry path is exhausted, or immediately for a
+- [x] After the normal retry path is exhausted, or immediately for a
   non-transient response, create a bounded diagnostic sub-turn when a usable
   connected model is available. Pass the redacted status/body, provider
   metadata, model alias, retry history, and safe session context as
   untrusted data—not instructions.
-- [ ] Give that sub-turn read-only harness tools: model catalog, configuration
+- [x] Give that sub-turn read-only harness tools: model catalog, configuration
   diagnostics, tool catalog, recent sanitized event history, session status,
   filesystem/log inspection within policy, and provider capability metadata.
   Mutation, credential changes, shell execution, and new network actions
   require a separate explicit approval.
-- [ ] Prevent recursion: a diagnostic turn cannot invoke diagnostic recovery,
+- [x] Prevent recursion: a diagnostic turn cannot invoke diagnostic recovery,
   cannot spend the entire retry budget again, and has a strict token/time
   budget. If no alternate model or route is available, return the original
   classified failure with a useful remediation.
-- [ ] Persist a typed recovery envelope so text, JSON, SSE, replay, and the UI
+- [x] Persist a typed recovery envelope so text, JSON, SSE, replay, and the UI
   agree about the original error, attempted remedies, final diagnosis, and
   whether the user approved an action. Redaction happens before persistence,
   display, or model input.
 
-#### Phase 27 — Provider profiles, fallback, explicit adapters, and ACP — P1
+#### Phase 27 — Provider profiles, fallback, explicit adapters, and ACP — P1 — complete
 
-- [ ] Introduce a provider protocol around the existing normalized
+- [x] Introduce a provider protocol around the existing normalized
   AssistantMessage, tool calls/results, usage, thinking/reasoning,
   stop-reason, error, retry, and permission events. Keep LiteLLM as the
   first adapter, not the protocol itself.
-- [ ] Add hand-written, lenient HTTP adapters in priority order for
-  OpenAI-compatible Chat/Responses and Anthropic Messages. Consider Gemini
-  and Bedrock only after the source/license admission gate; provider breadth
-  is not a reason to accept opaque or unreviewed code.
-- [ ] Add named provider profiles containing endpoint, model, credential
+- [x] Keep LiteLLM as the OpenAI-compatible Chat adapter and add hand-written,
+  lenient HTTP adapters for OpenAI Responses and Anthropic Messages. Consider
+  Gemini and Bedrock only after the source/license admission gate; provider
+  breadth is not a reason to accept opaque or unreviewed code.
+- [x] Add named provider profiles containing endpoint, model, credential
   reference, capabilities, usage/cost policy, cache controls, context-window
   metadata, and provider-specific error normalization. Keep secrets outside
   profiles and make profiles inspectable without exposing credential values.
-- [ ] Add ordered, permissioned provider fallback routes and a circuit-breaker
+- [x] Add ordered, permissioned provider fallback routes and a circuit-breaker
   state. Fallback is allowed only for pre-commit transient failures or an
   explicitly approved route change; never replay a committed stream or tool
   call automatically. A model/provider switch cancels backoff and rebuilds
   the correct tool/schema projection.
-- [ ] Ship explicit adapter tooling: an adapter registry and
+- [x] Ship explicit adapter tooling: an adapter registry and
   `domo adapters list`, `domo adapters doctor`, and handshake/test surfaces
   (or their equivalent API). Show adapter kind, capabilities, health,
   credential requirements, source/license metadata, and supported event
   mappings. Provider, MCP, ACP, backend, browser, and notebook integrations
   must be adapters with the same permission and redaction contract.
-- [ ] Make Agent Client Protocol (ACP) a first-class adapter boundary for
+- [x] Make Agent Client Protocol (ACP) a first-class adapter boundary for
   external agents. Support bounded stdio JSON-RPC lifecycle, capabilities,
   permissions, tool calls, task/plan events, cancellation, resume, and
   correlation IDs rather than treating ACP as a Claude-only special case.
-- [ ] Investigate direct use of a Claude subscription through a supported
+- [x] Investigate direct use of a Claude subscription through a supported
   Claude Code/Claude Agent ACP or equivalent stdio client. The external
   client owns login, subscription entitlement, and proprietary protocol
   details; DoMoCode launches it as a bounded process and does not scrape
   tokens, reproduce private endpoints, or copy proprietary code.
-- [ ] Map ACP events into DoMo's current response structure: text deltas,
+- [x] Map ACP events into DoMo's current response structure: text deltas,
   thinking, tool calls, tool results, images, permission requests, plan/task
   events, usage, retry, cancellation, and errors. Preserve correlation IDs
   and append the normalized form to JSONL/SSE.
-- [ ] If the supported Claude client or subscription login is unavailable,
+- [x] If the supported Claude client or subscription login is unavailable,
   report the adapter as unsupported and use LiteLLM or another configured
-  provider. Direct subscription support is complete only when login,
-  streaming, tool use, permissions, cancellation, resume, and error mapping
-  pass without an API key.
+  provider. The direct subscription path remains explicitly unsupported until
+  login, streaming, tool use, permissions, cancellation, resume, and error
+  mapping pass without an API key.
 
 This is the only technically credible subscription path found in the audit.
 Pi has provider-specific OAuth/subscription code and OpenHands has an ACP
@@ -761,7 +760,7 @@ contracts, not their web application or cloud assumptions.
 
 ## Retry and provider behavior today
 
-Until Phase 26 lands, the current LiteLLM adapter behaves as follows:
+The current retry and recovery path behaves as follows:
 
 - DOMOCODE_MAX_RETRIES defaults to 10 for classified retryable failures. The
   historical name counts retries after the initial request, but the effective
@@ -782,11 +781,11 @@ Until Phase 26 lands, the current LiteLLM adapter behaves as follows:
 - a failure after a committed 2xx stream is surfaced rather than replayed,
   because replaying may duplicate tool calls or side effects;
 - retry notices are visible in the full-screen status line, inline transcript,
-  and headless stderr.
-
-This is intentionally documented as a baseline, not the final error-recovery
-design. In particular, the current adapter does not yet ask a model to
-interpret a non-404 provider error with read-only harness tools.
+  and headless stderr;
+- after an exhausted transient retry path, or immediately for a non-transient
+  failure, DoMo persists a redacted recovery envelope and may run one bounded
+  diagnostic sub-turn with read-only tools. Diagnostic turns cannot recurse,
+  mutate credentials, execute shell commands, or start new network actions.
 
 ## Configuration
 
