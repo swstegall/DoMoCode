@@ -46,4 +46,20 @@ struct AgentModePolicyTests {
             PermissionRule(permission: "write", pattern: "*", action: .allow)
         ]).isEmpty)
     }
+
+    @Test("ask and review stay read-only while debug shells require approval")
+    func explicitReadOnlyModes() {
+        let plan = "/work/.domocode/plans/session.md"
+        for mode in [AgentMode.ask, .review] {
+            let rules = AgentModePolicy.rules(for: mode, planPath: plan)
+            #expect(evaluate("read", "/work/README.md", rules).action == .allow)
+            #expect(evaluate("write", "/work/README.md", rules).action == .deny)
+            #expect(evaluate("plan_exit", "*", rules).action == .deny)
+            #expect(evaluate("task", "*", rules).action == .allow)
+        }
+
+        let debug = AgentModePolicy.rules(for: .debug, planPath: plan)
+        #expect(evaluate("bash", "swift test", debug).action == .ask)
+        #expect(evaluate("write", "/work/README.md", debug).action == .deny)
+    }
 }
