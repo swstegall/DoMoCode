@@ -86,19 +86,25 @@ private final class EventLog: AgentEventSink {
 
 /// Captures what a persistence sink asks to be written, with the interval it
 /// measured.
-private final class RecordingPersister: SessionMessagePersisting {
+private final class RecordingPersister: SessionMessagePersisting, SessionRecoveryPersisting {
     struct Recorded: Sendable {
         var message: Message
         var elapsedMs: Int?
     }
 
     private let storage = Mutex<[Recorded]>([])
+    private let recoveryStorage = Mutex<[RecoveryEnvelope]>([])
 
     func persistMessage(_ message: Message, elapsedMs: Int?) async throws {
         storage.withLock { $0.append(Recorded(message: message, elapsedMs: elapsedMs)) }
     }
 
+    func persistRecovery(_ envelope: RecoveryEnvelope) async throws {
+        recoveryStorage.withLock { $0.append(envelope) }
+    }
+
     var recorded: [Recorded] { storage.withLock { $0 } }
+    var recoveries: [RecoveryEnvelope] { recoveryStorage.withLock { $0 } }
 }
 
 private struct TimingEchoTool: AgentTool {
@@ -464,6 +470,26 @@ struct SessionTimingTests {
 
         #expect(persister.recorded.map(\.elapsedMs) == [nil, nil, nil])
         #expect(clock.readCount == 0, "the clock was read for messages that are not measurements")
+    }
+
+    @Test("a recovery notice is persisted as typed metadata without a message")
+    func recoveryNoticePersistsTypedMetadata() async {
+        let persister = RecordingPersister()
+        let sink = SessionPersistenceSink(
+            persister: persister,
+            errorBox: PersistenceErrorBox()
+        )
+        let envelope = RecoveryEnvelope(
+            originalKind: "authentication",
+            status: 401,
+            error: "bad key",
+            model: "m"
+        )
+
+        await sink.emit(.notice(AgentNotice(envelope)))
+
+        #expect(persister.recoveries == [envelope])
+        #expect(persister.recorded.isEmpty)
     }
 
     // MARK: - Ordering keys

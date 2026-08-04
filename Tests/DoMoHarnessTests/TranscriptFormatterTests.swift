@@ -113,4 +113,29 @@ struct TranscriptFormatterTests {
         #expect(markdown.contains("Git HEAD: `abc123`"))
         #expect(markdown.contains("## User\n\nhello"))
     }
+
+    @Test("Session export includes bounded recovery metadata without making it a message")
+    func formatsRecoveryMetadata() {
+        let envelope = RecoveryEnvelope(
+            originalKind: "provider",
+            status: 503,
+            error: "upstream\nfailed",
+            diagnosis: "retry later\nwithout changing the prompt"
+        )
+        let entry = SessionTreeEntry(
+            id: "recovery",
+            parentId: nil,
+            timestamp: "2026-08-03T12:00:00Z",
+            payload: .recovery(envelope)
+        )
+
+        let markdown = TranscriptFormatter.markdown(
+            entries: [entry],
+            options: TranscriptFormatOptions(includeMetadata: true)
+        )
+        #expect(markdown.contains("## Recovery"))
+        #expect(markdown.contains("Status: `503`"))
+        #expect(markdown.contains("Error: upstream failed"))
+        #expect(markdown.contains("Diagnosis: retry later without changing the prompt"))
+    }
 }

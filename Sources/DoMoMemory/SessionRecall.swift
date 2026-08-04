@@ -180,7 +180,7 @@ public struct SessionRecallIndex: SessionRecallProvider, Sendable {
             append(.assistant, summary.summary)
         case .workspaceCheckpoint(let snapshot):
             for path in snapshot.files { append(.file, path) }
-        case .modelChange, .label, .sessionInfo, .sessionStart, .historyAction, .leaf, .subagent:
+        case .modelChange, .label, .sessionInfo, .sessionStart, .historyAction, .leaf, .subagent, .recovery:
             break
         }
     }

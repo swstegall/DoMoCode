@@ -262,8 +262,9 @@ public struct SessionHistoryAction: Sendable, Hashable, Codable {
 /// `label`, `session_info` and `model_change`; `session_start` records the Git
 /// checkpoint for Phase 12, `workspace_checkpoint` and `history_action` carry
 /// Phase 13's append-only file/conversation history, `subagent` records a
-/// navigable delegated child, and `leaf` is included because tree navigation
-/// records the active tip as a `leaf` entry and it is cheap. The extension-facing
+/// navigable delegated child, `recovery` records a bounded provider diagnostic,
+/// and `leaf` is included because tree navigation records the active tip as a
+/// `leaf` entry and it is cheap. The extension-facing
 /// entries (`custom`, `custom_message`) and the
 /// settings entries pi has for thinking level and dynamic tool sets are
 /// deliberately not modeled: DoMoCode has no extension host and no
@@ -372,6 +373,9 @@ public struct SessionTreeEntry: Sendable, Hashable {
         case leaf(targetId: String?)
         /// A delegated child-session lifecycle event.
         case subagent(SubagentTaskEvent)
+        /// A redacted, typed provider-failure diagnostic. It is durable metadata,
+        /// never a model-facing conversation message.
+        case recovery(RecoveryEnvelope)
     }
 }
 
@@ -389,6 +393,7 @@ extension SessionTreeEntry {
         case historyAction = "history_action"
         case leaf
         case subagent
+        case recovery
     }
 
     public var entryType: EntryType {
@@ -404,6 +409,7 @@ extension SessionTreeEntry {
         case .historyAction: return .historyAction
         case .leaf: return .leaf
         case .subagent: return .subagent
+        case .recovery: return .recovery
         }
     }
 
@@ -436,7 +442,7 @@ extension SessionTreeEntry: Codable {
         case parentId
         case timestamp
         // Envelope, added after the format shipped. This is ONE FLAT namespace
-        // shared by all eight payload shapes (`summary` and `usage` are each
+        // shared by all payload shapes (`summary` and `usage` are each
         // used by two of them, `targetId` by two), so a new envelope key has to
         // be checked against every payload's fields, not just the envelope's:
         // neither `seq` nor `elapsedMs` appears in any payload below. `usage`
@@ -470,6 +476,7 @@ extension SessionTreeEntry: Codable {
         case failedPaths
         case status
         case subagent
+        case recovery
     }
 
     public init(from decoder: any Decoder) throws {
@@ -576,6 +583,8 @@ extension SessionTreeEntry: Codable {
             self.payload = .leaf(targetId: try container.decodeIfPresent(String.self, forKey: .targetId))
         case .subagent:
             self.payload = .subagent(try container.decode(SubagentTaskEvent.self, forKey: .subagent))
+        case .recovery:
+            self.payload = .recovery(try container.decode(RecoveryEnvelope.self, forKey: .recovery))
         }
     }
 
@@ -644,6 +653,8 @@ extension SessionTreeEntry: Codable {
             try container.encode(targetId, forKey: .targetId)
         case .subagent(let event):
             try container.encode(event, forKey: .subagent)
+        case .recovery(let envelope):
+            try container.encode(envelope, forKey: .recovery)
         }
     }
 }

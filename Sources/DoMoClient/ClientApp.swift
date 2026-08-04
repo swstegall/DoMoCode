@@ -2515,6 +2515,10 @@ public final class ClientApp {
                 kind = .branch
                 label = "subagent  \(event.status.rawValue)  \(collapseToOneLine(event.description))"
                 description = event.childSessionID
+            case .recovery(let envelope):
+                kind = .metadata
+                label = "recovery  \(envelope.originalKind)"
+                description = envelope.status.map(String.init) ?? "transport"
             }
             let currentLabel = labelsByTarget[entry.id]
             let decoratedLabel = currentLabel.map { label + "  [" + $0 + "]" } ?? label

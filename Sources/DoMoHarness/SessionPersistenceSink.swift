@@ -58,6 +58,16 @@ public protocol SessionMessagePersisting: Sendable {
     // call site.
 }
 
+/// Optional append capability for typed provider-recovery records.
+///
+/// Kept separate from ``SessionMessagePersisting`` so lightweight embedders and
+/// test sinks that only store conversation messages do not have to adopt the
+/// metadata format. The concrete ``AgentHarness`` supports both capabilities.
+public protocol SessionRecoveryPersisting: Sendable {
+    /// Durably append a redacted recovery envelope as session metadata.
+    func persistRecovery(_ envelope: RecoveryEnvelope) async throws
+}
+
 /// Optional persistence hook for a turn-boundary workspace snapshot.
 ///
 /// It is separate from ``SessionMessagePersisting`` so test sinks and other
@@ -307,8 +317,18 @@ public struct SessionPersistenceSink: AgentEventSink {
                     errorBox.recordIfFirst(error)
                 }
             }
+        case .notice(let notice):
+            if let recovery = notice.recovery,
+               let recoveryPersister = persister as? any SessionRecoveryPersisting
+            {
+                do {
+                    try await recoveryPersister.persistRecovery(recovery)
+                } catch {
+                    errorBox.recordIfFirst(error)
+                }
+            }
         case .agentStart, .agentEnd, .turnStart, .messageUpdate,
-            .toolExecutionStart, .toolExecutionEnd, .subagent, .notice:
+            .toolExecutionStart, .toolExecutionEnd, .subagent:
             break
         }
         await forward?.emit(event)

@@ -140,6 +140,12 @@ struct JSONLSessionStoreTests {
             .label(targetId: "x", label: "mark"),
             .sessionInfo(name: "My session"),
             .leaf(targetId: nil),
+            .recovery(RecoveryEnvelope(
+                originalKind: "provider",
+                status: 503,
+                error: "upstream overloaded",
+                model: "m"
+            )),
         ]
 
         var built: [SessionTreeEntry] = []

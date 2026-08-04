@@ -88,6 +88,8 @@ public enum TranscriptFormatter {
                 sections.append("## History \(action.operation.rawValue)\n\nTarget: `\(markdownCode(action.targetEntryID))`")
             case .subagent(let event) where options.includeMetadata:
                 sections.append(subagentSection(event))
+            case .recovery(let envelope) where options.includeMetadata:
+                sections.append(recoverySection(envelope))
             case .leaf where options.includeMetadata:
                 sections.append("## Branch move\n\nThe active conversation branch moved.")
             default:
@@ -182,6 +184,18 @@ public enum TranscriptFormatter {
         var body = "## Subagent\n\n- Task: \(escapeMetadata(event.description))\n- Status: `\(markdownCode(event.status.rawValue))`"
         if let output = event.output, !output.isEmpty {
             body += "\n\n" + fenced(output, language: "text")
+        }
+        return body
+    }
+
+    private static func recoverySection(_ envelope: RecoveryEnvelope) -> String {
+        var body = "## Recovery\n\n- Kind: `\(markdownCode(envelope.originalKind))`"
+        if let status = envelope.status {
+            body += "\n- Status: `\(status)`"
+        }
+        body += "\n- Error: \(escapeMetadata(envelope.error))"
+        if let diagnosis = envelope.diagnosis, !diagnosis.isEmpty {
+            body += "\n- Diagnosis: \(escapeMetadata(diagnosis))"
         }
         return body
     }

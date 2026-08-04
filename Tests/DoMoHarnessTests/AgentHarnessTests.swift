@@ -238,6 +238,51 @@ struct AgentHarnessTests {
         #expect(recorded[1].parentId == recorded[0].id)
     }
 
+    @Test("a failed run persists its typed recovery envelope after the assistant entry")
+    func failedRunPersistsRecoveryEnvelope() async throws {
+        let envelope = RecoveryEnvelope(
+            originalKind: "provider",
+            status: 503,
+            error: "upstream overloaded",
+            model: "test-model",
+            retryHistory: [
+                .init(
+                    number: 1,
+                    requestNumber: 2,
+                    maxAttempts: 2,
+                    reason: "provider busy",
+                    delayMilliseconds: 100
+                )
+            ]
+        )
+        let stream: AgentStreamFn = { _ in
+            AsyncThrowingStream { continuation in
+                continuation.yield(.recovery(envelope))
+                continuation.finish(
+                    throwing: DoMoError(.provider(status: 503, isRetryable: true), "upstream overloaded")
+                )
+            }
+        }
+        let harness = try AgentHarness.start(
+            cwd: "/work/project",
+            sessionDirectory: makeSessionDirectory(),
+            configuration: configuration(streamFn: stream, ids: SequentialIDs(prefix: "recovery"))
+        )
+
+        let result = try await harness.run(prompt: "hello")
+        let recorded = try entries(of: await harness.sessionFilePath)
+
+        #expect(result.stopReason == .errored)
+        #expect(recorded.count == 3)
+        guard case .recovery(let persisted) = recorded.last?.payload else {
+            Issue.record("the typed recovery entry was not persisted")
+            return
+        }
+        #expect(persisted == envelope)
+        #expect(recorded.last?.parentId == recorded[1].id)
+        #expect(ContextBuilder.messages(for: recorded.last!).isEmpty)
+    }
+
     @Test("tool results are persisted as their own entries between turns")
     func toolResultsPersisted() async throws {
         let responder = ScriptedResponder([

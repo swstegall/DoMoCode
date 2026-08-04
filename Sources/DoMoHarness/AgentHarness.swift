@@ -195,7 +195,8 @@ public actor AgentHarness {
                 if let compactionUsage = compaction.usage { usage = usage + compactionUsage }
             case .branchSummary(let branch):
                 if let branchUsage = branch.usage { usage = usage + branchUsage }
-            case .message, .modelChange, .label, .leaf, .workspaceCheckpoint, .historyAction, .subagent:
+            case .message, .modelChange, .label, .leaf, .workspaceCheckpoint, .historyAction, .subagent,
+                .recovery:
                 break
             case .sessionInfo, .sessionStart:
                 if let metadataUsage = entry.metadataUsage { usage = usage + metadataUsage }
@@ -1713,6 +1714,24 @@ extension AgentHarness: SessionMessagePersisting {
             accumulatedUsage = accumulatedUsage + assistant.usage
             recordedTurns += 1
         }
+    }
+}
+
+extension AgentHarness: SessionRecoveryPersisting {
+    /// Appends a bounded recovery record after the run has settled. Recovery
+    /// metadata is a real tree node so it survives resume and export, but the
+    /// context builder deliberately projects it to no model message.
+    public func persistRecovery(_ envelope: RecoveryEnvelope) throws {
+        let entry = SessionTreeEntry(
+            id: store.createEntryID(),
+            parentId: leaf,
+            timestamp: timestamp(),
+            payload: .recovery(envelope),
+            seq: nextSeq
+        )
+        try store.appendEntry(entry)
+        nextSeq += 1
+        leafChain.append(entry.id)
     }
 }
 

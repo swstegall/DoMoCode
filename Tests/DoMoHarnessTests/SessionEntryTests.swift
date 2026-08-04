@@ -135,6 +135,30 @@ struct SessionEntryTests {
         #expect(ContextBuilder.messages(for: decoded).isEmpty)
     }
 
+    @Test("typed recovery metadata round-trips without entering message context")
+    func recoveryRoundTrips() throws {
+        let envelope = RecoveryEnvelope(
+            originalKind: "provider",
+            status: 503,
+            error: "upstream overloaded",
+            model: "m",
+            attemptedRemedies: ["retried"],
+            diagnosis: "provider capacity was exhausted",
+            userApprovedAction: false
+        )
+        let entry = SessionTreeEntry(
+            id: "recovery-1",
+            parentId: "m1",
+            timestamp: "2026-07-23T12:00:02.900Z",
+            payload: .recovery(envelope)
+        )
+
+        let decoded = try roundTrip(entry)
+        #expect(decoded == entry)
+        #expect(decoded.entryType == .recovery)
+        #expect(ContextBuilder.messages(for: decoded).isEmpty)
+    }
+
     @Test("message entry round-trips an assistant message with tool calls and usage")
     func messageAssistantRoundTrips() throws {
         let assistant = AssistantMessage(

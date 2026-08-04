@@ -71,6 +71,16 @@ public enum HTMLTranscriptExporter {
                 var body = textHTML(event.description) + "<p class=\"meta\">Status: <code>\(htmlEscape(event.status.rawValue))</code></p>"
                 if let output = event.output, !output.isEmpty { body += "<pre>\(htmlEscape(output))</pre>" }
                 sections.append(metadataSection(title: "Subagent", body: body))
+            case .recovery(let envelope) where options.includeMetadata:
+                var body = "<p>Kind: <code>\(htmlEscape(envelope.originalKind))</code></p>"
+                if let status = envelope.status {
+                    body += "<p>Status: <code>\(status)</code></p>"
+                }
+                body += "<p class=\"error\"><strong>Error:</strong> \(textHTML(envelope.error))</p>"
+                if let diagnosis = envelope.diagnosis, !diagnosis.isEmpty {
+                    body += "<p>Diagnosis: \(textHTML(diagnosis))</p>"
+                }
+                sections.append(metadataSection(title: "Recovery", body: body))
             case .leaf where options.includeMetadata:
                 sections.append(metadataSection(title: "Branch move", body: "<p>The active conversation branch moved.</p>"))
             default:
