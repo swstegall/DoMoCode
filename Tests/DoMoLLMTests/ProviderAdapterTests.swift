@@ -111,7 +111,7 @@ struct ProviderAdapterTests {
         )
         var error: DoMoError?
         do {
-            for try await _ in adapter.stream(ProviderRequest(model: "claude-test")) {}
+            for try await _ in adapter.stream(ProviderRequest(model: "claude-test", messages: [])) {}
         } catch let thrown as DoMoError {
             error = thrown
         } catch {
