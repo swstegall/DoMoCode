@@ -144,6 +144,9 @@ public struct ProviderEvent: Sendable, Codable, Hashable {
         case reasoningDelta
         case toolCallDelta
         case toolResult
+        case image
+        case plan
+        case task
         case usage
         case retry
         case permission
