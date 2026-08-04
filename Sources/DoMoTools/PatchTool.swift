@@ -89,7 +89,7 @@ public struct ApplyPatchTool: Tool {
                 changedPaths.append(changedPath)
             }
 
-            let pathNames = changedPaths.map { .string($0.string) }
+            let pathNames = changedPaths.map { JSONValue.string($0.string) }
             var result = ToolResult.text(
                 "Applied patch to \(changedPaths.count) file\(changedPaths.count == 1 ? "" : "s").",
                 details: .object([
