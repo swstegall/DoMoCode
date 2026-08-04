@@ -399,9 +399,14 @@ private enum ResourceSHA256 {
             hash[7] = hash[7] &+ h
         }
 
+        let digits = Array("0123456789abcdef")
         return hash.map { value in
-            let high = String(format: "%08x", value)
-            return high
+            var text = ""
+            for shift in stride(from: 28, through: 0, by: -4) {
+                let nibble = Int((value >> UInt32(shift)) & 0x0f)
+                text.append(digits[nibble])
+            }
+            return text
         }.joined()
     }
 }
