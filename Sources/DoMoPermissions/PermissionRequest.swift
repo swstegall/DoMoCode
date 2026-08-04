@@ -1,4 +1,5 @@
 // Copyright (c) 2025 opencode contributors. MIT license.
+// https://github.com/anomalyco/opencode/blob/def14d96ef897ed60fd6039e9ac96a63314642ad/packages/opencode/src/permission/index.ts
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 //

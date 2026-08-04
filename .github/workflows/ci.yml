@@ -47,6 +47,9 @@ jobs:
       - name: Swift version
         run: swift --version
 
+      - name: Compliance admission check
+        run: python3 Scripts/check-compliance.py
+
       - name: Build
         run: swift build --configuration ${{ matrix.configuration }}
 

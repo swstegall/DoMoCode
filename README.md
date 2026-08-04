@@ -422,19 +422,21 @@ applicable, and a release build under Swift 6.3.
   SPDX identifier, and whether it is runtime or test-only. Non-MIT package
   licenses are allowed; their notices must travel with the deliverable.
 - [ ] Inventory every copied or derived source file, verify its exact
-  upstream path and commit, preserve SPDX/copyright headers, and remove or
-  replace the existing non-MIT-derived source so all shipped DoMoCode code is
-  MIT-licensed. Keep non-MIT package dependencies as separately noticed
-  dependencies rather than misclassifying them as source violations.
-- [ ] Add a repeatable CI admission check for new code: MIT-compatible source
-  provenance, no proprietary/PolyForm subtree, no secrets, and a matching
-  NOTICES.md entry. Add a separate package-license check that permits
+  upstream path and commit, and preserve SPDX/copyright headers. Approved
+  permissive source licenses, including MIT and Apache-2.0, remain eligible
+  when the exact provenance is recorded; unreviewed, proprietary, and
+  PolyForm-derived source remains ineligible. Keep non-MIT package
+  dependencies as separately noticed dependencies rather than misclassifying
+  them as source violations.
+- [ ] Add a repeatable CI admission check for new code: approved permissive
+  source provenance, no proprietary/PolyForm subtree, no secrets, and a
+  matching NOTICES.md entry. Add a separate package-license check that permits
   approved non-MIT dependencies from public GitHub.
 - [ ] Define provider, backend, workflow, tool-catalog, adapter, extension,
   and theme protocols without baking LiteLLM, macOS, JSONL, or the
   full-screen client into the abstractions.
 
-#### Phase 23 — TUI theme contract, divider, and marquees — P0
+#### Phase 23 — TUI theme contract, divider, marquees, and image thumbnails — P0
 
 - [ ] Make ThemePalette.background a real full-page paint contract. The
   alternate-screen frame must fill every cell, including blank rows and
@@ -444,6 +446,12 @@ applicable, and a release build under Swift 6.3.
 - [ ] Draw a theme-colored vertical divider between the sidebar and main
   content. Derive its column from ClientLayout so hit testing, selection,
   width measurement, and the visible divider cannot disagree.
+- [ ] Render terminal image blocks as bounded thumbnails by default. Start
+  with a configurable maximum of 40 terminal columns by 12 rows, clamp both
+  dimensions to the available content pane, preserve aspect ratio using the
+  terminal's cell/pixel geometry, and never let an image displace the footer,
+  sidebar, or surrounding transcript. An explicit user action may open a
+  larger view; ordinary tool output must remain layout-safe.
 - [ ] Replace right truncation of the bottom status/control line with a
   deterministic horizontal marquee. Keep critical controls discoverable,
   pause at both ends, reset predictably on state changes, and make the clock
@@ -453,13 +461,16 @@ applicable, and a release build under Swift 6.3.
   exceeds the sidebar width, marquee the label within its row; do not scroll
   unrelated rows or alter the stable session marker/id columns.
 - [ ] Test blank-cell background coverage, stale-cell clearing, divider
-  placement, resize, true-color/indexed-color fallback, marquee timing,
+  placement, thumbnail caps, aspect-ratio preservation, image resize and
+  fallback behavior, true-color/indexed-color fallback, marquee timing,
   hover enter/exit, and narrow terminals with the existing cell oracle and
-  real-PTY tests.
+  real-PTY tests on compatible Kitty/iTerm2-style terminals.
 
 The current theme value type and dark/light palettes are Phase 5c
 foundations. This phase is the missing renderer/layout behavior, not a claim
-that the existing theme work was absent.
+that the existing theme work was absent. Phase 7.5 established image
+encoding, capability detection, and placement; this phase adds the
+layout-safe thumbnail policy.
 
 #### Phase 24 — Live tool catalog, lifecycle hooks, and remote MCP — P0
 

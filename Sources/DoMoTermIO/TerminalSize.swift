@@ -1,10 +1,13 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
-// SPDX-License-Identifier: MIT
+// Copyright (c) 2020 Apple Inc. and the Swift project authors.
+// Licensed under the Apache License 2.0 with Runtime Library Exception.
+// https://github.com/apple/swift-argument-parser/blob/6a52f3251125d74daf04fcbd5e6f08a75d074382/Sources/ArgumentParser/Utilities/Platform.swift
+// SPDX-License-Identifier: MIT AND Apache-2.0
 //
-// The per-platform TIOCGWINSZ constants follow the shape of
-// swift-argument-parser's internal Platform.swift (Apache-2.0), which hardcodes
-// them for the same reason: the values come from the `_IOR` macro and are not
-// reliably surfaced by the Swift platform overlays.
+// The per-platform TIOCGWINSZ constants are adapted from the platform handling
+// in Swift Argument Parser. The behavior remains intentionally local to this
+// POSIX seam and is recorded as Apache-licensed derived source in the Phase 22
+// provenance inventory.
 
 import Foundation
 

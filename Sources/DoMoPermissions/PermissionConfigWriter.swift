@@ -1,4 +1,5 @@
 // Copyright (c) 2025 Kilo Code / opencode contributors. MIT license.
+// https://github.com/Kilo-Org/kilocode/blob/6ec20f23952b94517a106de366c23024a628e0b9/packages/opencode/src/permission/index.ts
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 //

@@ -1,0 +1,325 @@
+{
+  "schemaVersion": 1,
+  "auditDate": "2026-08-03",
+  "resolvedOriginHash": "181b49ed2ac4d717166dcb6d6453f2552f3d094fd31bbd6ef836cb31e033328c",
+  "sourcePolicy": {
+    "sourceLicenses": ["MIT", "Apache-2.0", "MIT AND Apache-2.0"],
+    "dependencyLicenses": "Approved public GitHub packages may use any license recorded below."
+  },
+  "packages": [
+    {
+      "identity": "async-http-client",
+      "url": "https://github.com/swift-server/async-http-client",
+      "version": "1.36.0",
+      "revision": "9544287b9416c0bc71e58b9f3aead8dd14b16103",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2017-2021 The AsyncHTTPClient Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`async-http-client`"
+    },
+    {
+      "identity": "eventsource",
+      "url": "https://github.com/mattt/EventSource",
+      "version": "1.4.1",
+      "revision": "a3a85a85214caf642abaa96ae664e4c772a59f6e",
+      "licenses": [{"name": "MIT", "spdxIdentifier": "MIT", "copyright": "2025 Mattt (https://mat.tt)"}],
+      "usage": "runtime",
+      "noticeMarker": "`eventsource`"
+    },
+    {
+      "identity": "hummingbird",
+      "url": "https://github.com/hummingbird-project/hummingbird",
+      "version": "2.25.1",
+      "revision": "db50d7b5da7709d245120ccc25e094cbf9365260",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2024 The Hummingbird Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`hummingbird`"
+    },
+    {
+      "identity": "swift-algorithms",
+      "url": "https://github.com/apple/swift-algorithms.git",
+      "version": "1.2.1",
+      "revision": "87e50f483c54e6efd60e885f7f5aa946cee68023",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2020 Apple Inc. and the Swift project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-algorithms`"
+    },
+    {
+      "identity": "swift-argument-parser",
+      "url": "https://github.com/apple/swift-argument-parser",
+      "version": "1.8.2",
+      "revision": "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+      "licenses": [{"name": "Apache-2.0 with Runtime Library Exception", "spdxIdentifier": "Apache-2.0", "exception": "Runtime Library Exception", "copyright": "2020 Apple Inc. and the Swift project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-argument-parser`"
+    },
+    {
+      "identity": "swift-asn1",
+      "url": "https://github.com/apple/swift-asn1.git",
+      "version": "1.7.1",
+      "revision": "a9a5efd40eaf558a2bcd48d64b1d1646be686008",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2022 The SwiftASN1 Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-asn1`"
+    },
+    {
+      "identity": "swift-async-algorithms",
+      "url": "https://github.com/apple/swift-async-algorithms.git",
+      "version": "1.1.5",
+      "revision": "3da39bbc4e687d4192af7c9cf4eab805745a0b9c",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2022 Apple Inc. and the Swift project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-async-algorithms`"
+    },
+    {
+      "identity": "swift-atomics",
+      "url": "https://github.com/apple/swift-atomics.git",
+      "version": "1.3.1",
+      "revision": "0442cb5a3f98ab802acb777929fdb446bda11a34",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2020-2025 Apple Inc. and the Swift project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-atomics`"
+    },
+    {
+      "identity": "swift-certificates",
+      "url": "https://github.com/apple/swift-certificates.git",
+      "version": "1.19.3",
+      "revision": "89fbc3714264cce8db8e4ec51b64e01c3e28c6c5",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2022 The SwiftCertificates Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-certificates`"
+    },
+    {
+      "identity": "swift-cmark",
+      "url": "https://github.com/swiftlang/swift-cmark.git",
+      "version": "0.8.0",
+      "revision": "924936d0427cb25a61169739a7660230bffa6ea6",
+      "licenses": [
+        {"name": "BSD-2-Clause", "spdxIdentifier": "BSD-2-Clause", "copyright": "2014 John MacFarlane"},
+        {"name": "MIT", "spdxIdentifier": "MIT", "copyright": "2012 Vicent Martí; 2012 GitHub, Inc.; 2013 Karl Dubost"},
+        {"name": "CC-BY-SA-4.0", "spdxIdentifier": "CC-BY-SA-4.0", "copyright": "2014-2015 John MacFarlane"},
+        {"name": "MIT", "spdxIdentifier": "MIT", "copyright": "2009 Public Software Group e. V., Berlin, Germany"}
+      ],
+      "usage": "runtime",
+      "noticeMarker": "`swift-cmark`"
+    },
+    {
+      "identity": "swift-collections",
+      "url": "https://github.com/apple/swift-collections.git",
+      "version": "1.6.0",
+      "revision": "a0cb0954ecb21e4e31b0070e6ed5674e8556685a",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2021-2026 Apple Inc. and the Swift project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-collections`"
+    },
+    {
+      "identity": "swift-configuration",
+      "url": "https://github.com/apple/swift-configuration.git",
+      "version": "1.2.0",
+      "revision": "be76c4ad929eb6c4bcaf3351799f2adf9e6848a9",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2025 The SwiftConfiguration Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-configuration`"
+    },
+    {
+      "identity": "swift-crypto",
+      "url": "https://github.com/apple/swift-crypto.git",
+      "version": "4.5.1",
+      "revision": "47d3869a7291f085c1fb9fb1e6d3b97a793f45c6",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2019 The SwiftCrypto Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-crypto`"
+    },
+    {
+      "identity": "swift-displaywidth",
+      "url": "https://github.com/ainame/swift-displaywidth",
+      "version": "0.1.0",
+      "revision": "5493276f6c91fd09d348e6cea70d66346fc7b610",
+      "licenses": [{"name": "MIT", "spdxIdentifier": "MIT", "copyright": "2025 Satoshi Namai"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-displaywidth`"
+    },
+    {
+      "identity": "swift-distributed-tracing",
+      "url": "https://github.com/apple/swift-distributed-tracing.git",
+      "version": "1.4.1",
+      "revision": "dc4030184203ffafbb2ec614352487235d747fe0",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2020-2026 Apple Inc. and the Swift Distributed Tracing project authors; SwiftNIO project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-distributed-tracing`"
+    },
+    {
+      "identity": "swift-http-structured-headers",
+      "url": "https://github.com/apple/swift-http-structured-headers.git",
+      "version": "1.7.0",
+      "revision": "933538faa42c432d385f02e07df0ace7c5ecfc47",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2020-2022 Apple Inc. and the SwiftNIO project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-http-structured-headers`"
+    },
+    {
+      "identity": "swift-http-types",
+      "url": "https://github.com/apple/swift-http-types",
+      "version": "1.6.0",
+      "revision": "db774a277f60063a32d854f2980299caf06da041",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2023 The Swift HTTP Types Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-http-types`"
+    },
+    {
+      "identity": "swift-json-schema",
+      "url": "https://github.com/ajevans99/swift-json-schema",
+      "version": "0.13.1",
+      "revision": "f299eb1cce78b2dd736d9a390ec0779d28678416",
+      "licenses": [{"name": "MIT", "spdxIdentifier": "MIT", "copyright": "2024 Austin Evans"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-json-schema`"
+    },
+    {
+      "identity": "swift-log",
+      "url": "https://github.com/apple/swift-log.git",
+      "version": "1.14.0",
+      "revision": "a878e7f8f46cfc0e1125e565b5c08e7d5272dc9a",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2018-2019 The SwiftLog Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-log`"
+    },
+    {
+      "identity": "swift-markdown",
+      "url": "https://github.com/swiftlang/swift-markdown.git",
+      "version": "0.8.0",
+      "revision": "3c6f9523da3a1ec2fd829673e472d95b8097a3b8",
+      "licenses": [
+        {"name": "Apache-2.0 with Runtime Library Exception", "spdxIdentifier": "Apache-2.0", "exception": "Runtime Library Exception", "copyright": "2021 Apple Inc. and the Swift project authors"},
+        {"name": "BSD-2-Clause", "spdxIdentifier": "BSD-2-Clause", "copyright": "2014 John MacFarlane and cmark-gfm contributors"}
+      ],
+      "usage": "runtime",
+      "noticeMarker": "`swift-markdown`"
+    },
+    {
+      "identity": "swift-metrics",
+      "url": "https://github.com/apple/swift-metrics.git",
+      "version": "2.11.0",
+      "revision": "087e8074afa97040c3b870c8664fe5482fb87cc4",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2018-2019 The SwiftMetrics Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-metrics`"
+    },
+    {
+      "identity": "swift-nio",
+      "url": "https://github.com/apple/swift-nio.git",
+      "version": "2.101.3",
+      "revision": "0b18836bd8b0162e7e17a995a3fbee20ed8f3b2b",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2017-2018 The SwiftNIO Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-nio`"
+    },
+    {
+      "identity": "swift-nio-extras",
+      "url": "https://github.com/apple/swift-nio-extras.git",
+      "version": "1.34.3",
+      "revision": "88a51340f59cf181ebde888bd1b749296b3ec029",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2017-2018 The SwiftNIO Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-nio-extras`"
+    },
+    {
+      "identity": "swift-nio-http2",
+      "url": "https://github.com/apple/swift-nio-http2.git",
+      "version": "1.45.0",
+      "revision": "45bdf670248be5f16ec0340e125dca285536f0fb",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2017-2018 The SwiftNIO Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-nio-http2`"
+    },
+    {
+      "identity": "swift-nio-ssl",
+      "url": "https://github.com/apple/swift-nio-ssl.git",
+      "version": "2.37.2",
+      "revision": "d930168b86f46ca51a4bc09c5ca45c1833db8067",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2017-2018 The SwiftNIO Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-nio-ssl`"
+    },
+    {
+      "identity": "swift-nio-transport-services",
+      "url": "https://github.com/apple/swift-nio-transport-services.git",
+      "version": "1.28.0",
+      "revision": "67787bb645a5e67d2edcdfbe48a216cc549222d5",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2017-2018 The SwiftNIO Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-nio-transport-services`"
+    },
+    {
+      "identity": "swift-numerics",
+      "url": "https://github.com/apple/swift-numerics.git",
+      "version": "1.1.1",
+      "revision": "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2019-2025 Apple Inc. and the Swift Numerics project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-numerics`"
+    },
+    {
+      "identity": "swift-service-context",
+      "url": "https://github.com/apple/swift-service-context.git",
+      "version": "1.3.0",
+      "revision": "d0997351b0c7779017f88e7a93bc30a1878d7f29",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2024 The Swift Service Context Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-service-context`"
+    },
+    {
+      "identity": "swift-service-lifecycle",
+      "url": "https://github.com/swift-server/swift-service-lifecycle",
+      "version": "2.11.0",
+      "revision": "9829955b385e5bb88128b73f1b8389e9b9c3191a",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2019-2023 The ServiceLifecycle Project"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-service-lifecycle`"
+    },
+    {
+      "identity": "swift-subprocess",
+      "url": "https://github.com/swiftlang/swift-subprocess",
+      "version": "0.5.0",
+      "revision": "11633673a41f509f8945f23c96c7acd4adafd679",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2025 Apple Inc. and the Swift project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-subprocess`"
+    },
+    {
+      "identity": "swift-syntax",
+      "url": "https://github.com/swiftlang/swift-syntax.git",
+      "version": "603.0.2",
+      "revision": "79e4b74a295b6eb74a8b585e3a39d29e70c1dbd1",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2014-2023 Apple Inc. and the Swift project authors"}],
+      "usage": "build-only",
+      "noticeMarker": "`swift-syntax`"
+    },
+    {
+      "identity": "swift-system",
+      "url": "https://github.com/apple/swift-system",
+      "version": "1.7.5",
+      "revision": "50688cacbd41d547e9eb9f7a213542340b7c442b",
+      "licenses": [{"name": "Apache-2.0", "spdxIdentifier": "Apache-2.0", "copyright": "2020-2024 Apple Inc. and the Swift System project authors"}],
+      "usage": "runtime",
+      "noticeMarker": "`swift-system`"
+    },
+    {
+      "identity": "swiftterm",
+      "url": "https://github.com/migueldeicaza/SwiftTerm",
+      "version": "1.15.0",
+      "revision": "dd2fb8ac5b861e7bf617c872895e338f38165648",
+      "licenses": [{"name": "MIT", "spdxIdentifier": "MIT", "copyright": "2019-2022 Miguel de Icaza; 2017-2019 The xterm.js authors; 2014-2016 SourceLair Private Company; 2012-2013 Christopher Jeffrey"}],
+      "usage": "test-only",
+      "noticeMarker": "`swiftterm`"
+    },
+    {
+      "identity": "yams",
+      "url": "https://github.com/jpsim/Yams",
+      "version": "6.2.2",
+      "revision": "a27b21e0c81c5bf42049b897a62aaf387e80f279",
+      "licenses": [{"name": "MIT", "spdxIdentifier": "MIT", "copyright": "2016 JP Simard"}],
+      "usage": "runtime",
+      "noticeMarker": "`yams`"
+    }
+  ]
+}

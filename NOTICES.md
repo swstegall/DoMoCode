@@ -344,6 +344,127 @@ dependencies. None was: no code from any of them is used, and none appears in `P
 
 ---
 
+## Phase 22 compliance inventories
+
+`Compliance/package-inventory.json` is the machine-readable inventory for every pin in
+`Package.resolved`, including transitive packages, exact revisions, SPDX identifiers, copyright
+holders, and whether the package is runtime, build-only, or test-only. Apache-2.0 and other
+permissive dependency licenses are intentional and approved; they are not source-provenance
+violations. The table below provides the matching human-readable notice marker for each package.
+
+| Package | License / SPDX | Usage |
+|---|---|---|
+| `async-http-client` | Apache-2.0 / `Apache-2.0` | runtime |
+| `eventsource` | MIT / `MIT` | runtime |
+| `hummingbird` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-algorithms` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-argument-parser` | Apache-2.0 + Runtime Library Exception / `Apache-2.0` | runtime |
+| `swift-asn1` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-async-algorithms` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-atomics` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-certificates` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-cmark` | BSD-2-Clause, MIT, CC-BY-SA-4.0 / `BSD-2-Clause`, `MIT`, `CC-BY-SA-4.0` | runtime |
+| `swift-collections` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-configuration` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-crypto` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-displaywidth` | MIT / `MIT` | runtime |
+| `swift-distributed-tracing` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-http-structured-headers` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-http-types` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-json-schema` | MIT / `MIT` | runtime |
+| `swift-log` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-markdown` | Apache-2.0 + Runtime Library Exception, BSD-2-Clause / `Apache-2.0`, `BSD-2-Clause` | runtime |
+| `swift-metrics` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-nio` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-nio-extras` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-nio-http2` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-nio-ssl` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-nio-transport-services` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-numerics` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-service-context` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-service-lifecycle` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-subprocess` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swift-syntax` | Apache-2.0 / `Apache-2.0` | build-only |
+| `swift-system` | Apache-2.0 / `Apache-2.0` | runtime |
+| `swiftterm` | MIT / `MIT` | test-only |
+| `yams` | MIT / `MIT` | runtime |
+
+`Compliance/source-inventory.json` records the exact upstream file and full commit for every
+copied or derived shipped Swift file. These markers keep the per-file inventory connected to this
+notice document; the source headers remain authoritative at the file itself.
+
+| Source marker | License expression |
+|---|---|
+| `Sources/DoMoAgent/AgentEvent.swift` | MIT |
+| `Sources/DoMoAgent/AgentLoop.swift` | MIT |
+| `Sources/DoMoAgent/AgentTypes.swift` | MIT |
+| `Sources/DoMoAgent/ToolDispatch.swift` | MIT |
+| `Sources/DoMoCLI/TrustStore.swift` | MIT |
+| `Sources/DoMoCore/DoMoError.swift` | MIT |
+| `Sources/DoMoCore/JSONLines.swift` | MIT |
+| `Sources/DoMoCore/PartialJSON.swift` | MIT |
+| `Sources/DoMoCore/UUIDv7.swift` | MIT |
+| `Sources/DoMoExec/FileSystem.swift` | MIT |
+| `Sources/DoMoExec/FileWalker.swift` | MIT |
+| `Sources/DoMoExec/Shell.swift` | MIT |
+| `Sources/DoMoHarness/AgentHarness.swift` | MIT |
+| `Sources/DoMoHarness/BranchSummary.swift` | MIT |
+| `Sources/DoMoHarness/Compaction.swift` | MIT |
+| `Sources/DoMoHarness/ContextBuilder.swift` | MIT |
+| `Sources/DoMoHarness/JSONLSessionStore.swift` | MIT |
+| `Sources/DoMoHarness/SessionEntry.swift` | MIT |
+| `Sources/DoMoHarness/SessionPersistenceSink.swift` | MIT |
+| `Sources/DoMoHarness/SessionStorage.swift` | MIT |
+| `Sources/DoMoHarness/SessionTree.swift` | MIT |
+| `Sources/DoMoLLM/LiteLLMClient.swift` | MIT |
+| `Sources/DoMoLLM/Message.swift` | MIT |
+| `Sources/DoMoLLM/StreamingAssembly.swift` | MIT |
+| `Sources/DoMoLLM/Wire.swift` | MIT |
+| `Sources/DoMoPermissions/BashArity.swift` | MIT |
+| `Sources/DoMoPermissions/PermissionConfig.swift` | MIT |
+| `Sources/DoMoPermissions/PermissionConfigWriter.swift` | MIT |
+| `Sources/DoMoPermissions/PermissionEngine.swift` | MIT |
+| `Sources/DoMoPermissions/PermissionPolicy.swift` | MIT |
+| `Sources/DoMoPermissions/PermissionRequest.swift` | MIT |
+| `Sources/DoMoPermissions/PermissionRequestFactory.swift` | MIT |
+| `Sources/DoMoPermissions/Wildcard.swift` | MIT |
+| `Sources/DoMoTUI/AltScreenCore.swift` | MIT |
+| `Sources/DoMoTUI/Autocomplete.swift` | MIT |
+| `Sources/DoMoTUI/Component.swift` | MIT |
+| `Sources/DoMoTUI/Editor.swift` | MIT |
+| `Sources/DoMoTUI/Fuzzy.swift` | MIT |
+| `Sources/DoMoTUI/Input.swift` | MIT |
+| `Sources/DoMoTUI/Loader.swift` | MIT |
+| `Sources/DoMoTUI/Markdown.swift` | MIT |
+| `Sources/DoMoTUI/Overlay.swift` | MIT |
+| `Sources/DoMoTUI/Primitives.swift` | MIT |
+| `Sources/DoMoTUI/Renderer.swift` | MIT |
+| `Sources/DoMoTUI/SelectList.swift` | MIT |
+| `Sources/DoMoTUI/TerminalDriver.swift` | MIT |
+| `Sources/DoMoTUI/TextSlicing.swift` | MIT |
+| `Sources/DoMoTUI/TextWidth.swift` | MIT |
+| `Sources/DoMoTUI/TruncatedText.swift` | MIT |
+| `Sources/DoMoTUI/UndoStack.swift` | MIT |
+| `Sources/DoMoTUI/WordNavigation.swift` | MIT |
+| `Sources/DoMoTermGraphics/Capabilities.swift` | MIT |
+| `Sources/DoMoTermGraphics/ImageDimensions.swift` | MIT |
+| `Sources/DoMoTermGraphics/ImageEncoding.swift` | MIT |
+| `Sources/DoMoTermGraphics/RenderImage.swift` | MIT |
+| `Sources/DoMoTermIO/Key.swift` | MIT |
+| `Sources/DoMoTermIO/KeyDecoding.swift` | MIT |
+| `Sources/DoMoTermIO/Keybindings.swift` | MIT |
+| `Sources/DoMoTermIO/StdinFraming.swift` | MIT |
+| `Sources/DoMoTermIO/TerminalLifecycle.swift` | MIT |
+| `Sources/DoMoTermIO/TerminalNative.swift` | MIT |
+| `Sources/DoMoTermIO/TerminalSize.swift` | MIT AND Apache-2.0 |
+| `Sources/DoMoTools/BashTool.swift` | MIT |
+| `Sources/DoMoTools/FileTools.swift` | MIT |
+| `Sources/DoMoTools/SearchTools.swift` | MIT |
+| `Sources/DoMoTools/Tool.swift` | MIT |
+| `Sources/DoMoToolsUI/CommandToolRenderers.swift` | MIT |
+| `Sources/DoMoToolsUI/FileToolRenderers.swift` | MIT |
+| `Sources/DoMoToolsUI/ToolRenderer.swift` | MIT |
+
 ## Distribution
 
 Several dependencies above are licensed under Apache-2.0, whose section 4(d) requires attribution

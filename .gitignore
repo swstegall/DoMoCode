@@ -73,3 +73,6 @@ fastlane/test_output
 
 # Scratch path for cross-checking the Linux build in Docker.
 .build-linux/
+
+# Python compliance tooling
+__pycache__/

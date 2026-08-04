@@ -1,0 +1,1197 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "Scripts/generate-source-inventory.py",
+  "auditDate": "2026-08-03",
+  "allowedLicenseExpressions": [
+    "MIT",
+    "MIT AND Apache-2.0"
+  ],
+  "files": [
+    {
+      "path": "Sources/DoMoAgent/AgentEvent.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/types.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoAgent/AgentEvent.swift`"
+    },
+    {
+      "path": "Sources/DoMoAgent/AgentLoop.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/agent-loop.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoAgent/AgentLoop.swift`"
+    },
+    {
+      "path": "Sources/DoMoAgent/AgentTypes.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/types.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoAgent/AgentTypes.swift`"
+    },
+    {
+      "path": "Sources/DoMoAgent/ToolDispatch.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/agent-loop.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoAgent/ToolDispatch.swift`"
+    },
+    {
+      "path": "Sources/DoMoCLI/TrustStore.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/trust-manager.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoCLI/TrustStore.swift`"
+    },
+    {
+      "path": "Sources/DoMoCore/DoMoError.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/ai/src/utils/retry.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoCore/DoMoError.swift`"
+    },
+    {
+      "path": "Sources/DoMoCore/JSONLines.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/session-manager.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoCore/JSONLines.swift`"
+    },
+    {
+      "path": "Sources/DoMoCore/PartialJSON.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/ai/src/utils/json-parse.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoCore/PartialJSON.swift`"
+    },
+    {
+      "path": "Sources/DoMoCore/UUIDv7.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/ai/src/utils/uuid.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoCore/UUIDv7.swift`"
+    },
+    {
+      "path": "Sources/DoMoExec/FileSystem.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/env/nodejs.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoExec/FileSystem.swift`"
+    },
+    {
+      "path": "Sources/DoMoExec/FileWalker.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/skills.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoExec/FileWalker.swift`"
+    },
+    {
+      "path": "Sources/DoMoExec/Shell.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/env/nodejs.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoExec/Shell.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/AgentHarness.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/agent-harness.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/AgentHarness.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/BranchSummary.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/compaction/branch-summarization.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/BranchSummary.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/Compaction.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/compaction/compaction.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/Compaction.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/ContextBuilder.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/session/session.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/ContextBuilder.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/JSONLSessionStore.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/session/jsonl-storage.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/JSONLSessionStore.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/SessionEntry.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/types.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/SessionEntry.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/SessionPersistenceSink.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/agent-harness.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/SessionPersistenceSink.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/SessionStorage.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/types.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/SessionStorage.swift`"
+    },
+    {
+      "path": "Sources/DoMoHarness/SessionTree.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/agent/src/harness/session/session.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoHarness/SessionTree.swift`"
+    },
+    {
+      "path": "Sources/DoMoLLM/LiteLLMClient.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/ai/src/api/openai-completions.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoLLM/LiteLLMClient.swift`"
+    },
+    {
+      "path": "Sources/DoMoLLM/Message.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/ai/src/types.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoLLM/Message.swift`"
+    },
+    {
+      "path": "Sources/DoMoLLM/StreamingAssembly.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/ai/src/api/openai-completions.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoLLM/StreamingAssembly.swift`"
+    },
+    {
+      "path": "Sources/DoMoLLM/Wire.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/ai/src/api/openai-completions.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoLLM/Wire.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/BashArity.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/anomalyco/opencode",
+          "path": "packages/opencode/src/permission/arity.ts",
+          "commit": "def14d96ef897ed60fd6039e9ac96a63314642ad"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/BashArity.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/PermissionConfig.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opencode contributors",
+        "2025 Kilo Code / opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/anomalyco/opencode",
+          "path": "packages/opencode/src/permission/index.ts",
+          "commit": "def14d96ef897ed60fd6039e9ac96a63314642ad"
+        },
+        {
+          "repository": "https://github.com/Kilo-Org/kilocode",
+          "path": "packages/opencode/src/permission/index.ts",
+          "commit": "6ec20f23952b94517a106de366c23024a628e0b9"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/PermissionConfig.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/PermissionConfigWriter.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Kilo Code / opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/Kilo-Org/kilocode",
+          "path": "packages/opencode/src/permission/index.ts",
+          "commit": "6ec20f23952b94517a106de366c23024a628e0b9"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/PermissionConfigWriter.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/PermissionEngine.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/anomalyco/opencode",
+          "path": "packages/opencode/src/permission/index.ts",
+          "commit": "def14d96ef897ed60fd6039e9ac96a63314642ad"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/PermissionEngine.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/PermissionPolicy.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/anomalyco/opencode",
+          "path": "packages/opencode/src/permission/index.ts",
+          "commit": "def14d96ef897ed60fd6039e9ac96a63314642ad"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/PermissionPolicy.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/PermissionRequest.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/anomalyco/opencode",
+          "path": "packages/opencode/src/permission/index.ts",
+          "commit": "def14d96ef897ed60fd6039e9ac96a63314642ad"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/PermissionRequest.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/PermissionRequestFactory.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/anomalyco/opencode",
+          "path": "packages/opencode/src/permission/index.ts",
+          "commit": "def14d96ef897ed60fd6039e9ac96a63314642ad"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/PermissionRequestFactory.swift`"
+    },
+    {
+      "path": "Sources/DoMoPermissions/Wildcard.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opencode contributors",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/anomalyco/opencode",
+          "path": "packages/opencode/src/util/wildcard.ts",
+          "commit": "def14d96ef897ed60fd6039e9ac96a63314642ad"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoPermissions/Wildcard.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/AltScreenCore.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/tui.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/AltScreenCore.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Autocomplete.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/autocomplete.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Autocomplete.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Component.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/tui.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Component.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Editor.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/components/editor.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Editor.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Fuzzy.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/fuzzy.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Fuzzy.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Input.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/components/input.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Input.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Loader.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/components/loader.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        },
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/components/cancellable-loader.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Loader.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Markdown.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/components/markdown.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Markdown.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Overlay.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/tui.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Overlay.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Primitives.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/utils.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Primitives.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/Renderer.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/tui.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/Renderer.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/SelectList.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/components/select-list.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/SelectList.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/TerminalDriver.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/tui.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/TerminalDriver.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/TextSlicing.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/utils.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/TextSlicing.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/TextWidth.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/utils.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/TextWidth.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/TruncatedText.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/components/truncated-text.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/TruncatedText.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/UndoStack.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/undo-stack.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/UndoStack.swift`"
+    },
+    {
+      "path": "Sources/DoMoTUI/WordNavigation.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/word-navigation.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTUI/WordNavigation.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermGraphics/Capabilities.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/terminal-image.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermGraphics/Capabilities.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermGraphics/ImageDimensions.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/terminal-image.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermGraphics/ImageDimensions.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermGraphics/ImageEncoding.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/terminal-image.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermGraphics/ImageEncoding.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermGraphics/RenderImage.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/terminal-image.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermGraphics/RenderImage.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermIO/Key.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/keys.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermIO/Key.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermIO/KeyDecoding.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2025 opentui. MIT license.  https://github.com/anomalyco/opentui",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/keys.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermIO/KeyDecoding.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermIO/Keybindings.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/keybindings.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermIO/Keybindings.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermIO/StdinFraming.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 opentui. MIT license.  https://github.com/anomalyco/opentui",
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/stdin-buffer.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermIO/StdinFraming.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermIO/TerminalLifecycle.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/terminal.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermIO/TerminalLifecycle.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermIO/TerminalNative.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/tui/src/terminal.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermIO/TerminalNative.swift`"
+    },
+    {
+      "path": "Sources/DoMoTermIO/TerminalSize.swift",
+      "licenseExpression": "MIT AND Apache-2.0",
+      "spdxIdentifier": "Apache-2.0",
+      "copyright": [
+        "2026 Sam Stegall",
+        "2020 Apple Inc. and the Swift project authors"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/apple/swift-argument-parser",
+          "path": "Sources/ArgumentParser/Utilities/Platform.swift",
+          "commit": "6a52f3251125d74daf04fcbd5e6f08a75d074382"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTermIO/TerminalSize.swift`"
+    },
+    {
+      "path": "Sources/DoMoTools/BashTool.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/tools/bash.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTools/BashTool.swift`"
+    },
+    {
+      "path": "Sources/DoMoTools/FileTools.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/tools/read.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTools/FileTools.swift`"
+    },
+    {
+      "path": "Sources/DoMoTools/SearchTools.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/tools/ls.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTools/SearchTools.swift`"
+    },
+    {
+      "path": "Sources/DoMoTools/Tool.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/tools/index.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoTools/Tool.swift`"
+    },
+    {
+      "path": "Sources/DoMoToolsUI/CommandToolRenderers.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/tools/bash.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoToolsUI/CommandToolRenderers.swift`"
+    },
+    {
+      "path": "Sources/DoMoToolsUI/FileToolRenderers.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/tools/edit-diff.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoToolsUI/FileToolRenderers.swift`"
+    },
+    {
+      "path": "Sources/DoMoToolsUI/ToolRenderer.swift",
+      "licenseExpression": "MIT",
+      "spdxIdentifier": "MIT",
+      "copyright": [
+        "2025 Mario Zechner",
+        "2026 Sam Stegall"
+      ],
+      "upstreams": [
+        {
+          "repository": "https://github.com/earendil-works/pi",
+          "path": "packages/coding-agent/src/core/tools/render-utils.ts",
+          "commit": "9b3a2059171bcc74ad9d2cadeea6d186776cf2db"
+        }
+      ],
+      "noticeMarker": "`Sources/DoMoToolsUI/ToolRenderer.swift`"
+    }
+  ]
+}
