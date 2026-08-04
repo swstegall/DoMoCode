@@ -105,7 +105,7 @@ struct WorkflowRunnerTests {
                 }
             }
             return WorkflowStageResult(
-                output: request.stage.id,
+                output: .string(request.stage.id),
                 evidence: request.stage.id == "research" ? [evidence] : []
             )
         }
@@ -200,7 +200,7 @@ struct WorkflowRunnerTests {
             if request.stage.id == "research" {
                 throw TestWorkflowFailure()
             }
-            return WorkflowStageResult(output: request.stage.id)
+            return WorkflowStageResult(output: .string(request.stage.id))
         }
 
         do {
@@ -213,7 +213,10 @@ struct WorkflowRunnerTests {
             }
         }
 
-        let run = try #require(await runner.snapshot())
+        guard let run = await runner.snapshot() else {
+            Issue.record("expected a durable workflow snapshot")
+            return
+        }
         #expect(run.status == .failed)
         #expect(run.stage(withID: "research")?.status == .failed)
         #expect(run.stage(withID: "review")?.status == .succeeded)
@@ -237,7 +240,7 @@ struct WorkflowRunnerTests {
         ) { request in
             await signal.markStarted()
             try await Task.sleep(nanoseconds: 20_000_000)
-            return WorkflowStageResult(output: request.stage.id)
+            return WorkflowStageResult(output: .string(request.stage.id))
         }
 
         let task = Task { try await runner.run(runID: "pause-run") }
