@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import DoMoCore
+import Foundation
 import Testing
 
 @Suite("Permissioned extension host", .serialized)
