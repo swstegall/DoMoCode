@@ -396,8 +396,8 @@ struct RetryWallClockTests {
             baseRetryDelay: .seconds(1),
             maxRetryDelay: .seconds(60),
             retryDelayBudget: nil,
-            retryWallClockBudget: .seconds(3),
             jitter: { 1.0 },
+            retryWallClockBudget: .seconds(3),
             now: { clock.now }
         )
         configuration.sleep = { delay in
@@ -432,8 +432,8 @@ struct RetryWallClockTests {
         let configuration = LiteLLMClient.Configuration(
             maxRetries: 10,
             retryDelayBudget: nil,
-            retryWallClockBudget: .seconds(3),
             jitter: { 1.0 },
+            retryWallClockBudget: .seconds(3),
             now: { clock.now }
         )
 

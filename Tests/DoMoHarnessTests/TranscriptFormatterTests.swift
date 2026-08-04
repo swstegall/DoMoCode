@@ -1,3 +1,4 @@
+import DoMoCore
 import DoMoLLM
 import DoMoHarness
 import Foundation

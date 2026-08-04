@@ -44,8 +44,11 @@ struct ThemeTests {
 
         for appearance in ThemeAppearance.allCases {
             let palette = Theme.standard.palette(for: appearance)
-            #expect(palette.background != .inherit, appearance.rawValue)
-            #expect(Self.contrast(palette.foreground, palette.background) >= 4.5, appearance.rawValue)
+            #expect(palette.background != .inherit, Comment(rawValue: appearance.rawValue))
+            #expect(
+                Self.contrast(palette.foreground, palette.background) >= 4.5,
+                Comment(rawValue: appearance.rawValue)
+            )
         }
     }
 
