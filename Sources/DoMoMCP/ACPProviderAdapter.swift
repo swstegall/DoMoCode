@@ -114,25 +114,25 @@ public enum ACPEventMapper {
 
         switch updateName {
         case "agent_message_chunk":
-            return contentEvents(
+            let events = contentEvents(
                 content: update["content"],
                 sessionID: sessionID,
                 update: update,
                 kind: .textDelta,
-                sequence: &sequence,
-                fallback: { make(.unknown, payload()) }
+                sequence: &sequence
             )
+            return events.isEmpty ? [make(.unknown, payload())] : events
         case "user_message", "user_message_chunk":
             return [make(.task, payload(["role": .string("user")]))]
         case "agent_thought_chunk":
-            return contentEvents(
+            let events = contentEvents(
                 content: update["content"],
                 sessionID: sessionID,
                 update: update,
                 kind: .reasoningDelta,
-                sequence: &sequence,
-                fallback: { make(.unknown, payload()) }
+                sequence: &sequence
             )
+            return events.isEmpty ? [make(.unknown, payload())] : events
         case "tool_call":
             return [make(.toolCallDelta, payload([
                 "phase": .string("start"),
@@ -198,10 +198,9 @@ public enum ACPEventMapper {
         sessionID: String,
         update: JSONValue,
         kind: ProviderEvent.Kind,
-        sequence: inout Int,
-        fallback: () -> ProviderEvent
+        sequence: inout Int
     ) -> [ProviderEvent] {
-        guard let content else { return [fallback()] }
+        guard let content else { return [] }
 
         let blocks: [JSONValue]
         if let array = content.arrayValue {
@@ -229,7 +228,7 @@ public enum ACPEventMapper {
             events.append(ProviderEvent(kind: eventKind, payload: payload, sequence: sequence))
             sequence += 1
         }
-        return events.isEmpty ? [fallback()] : events
+        return events
     }
 }
 
