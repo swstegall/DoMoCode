@@ -11,6 +11,8 @@ struct PromptResourcesTests {
         #expect(CommandRegistry.builtIn.command(named: "compact")?.action == .compact)
         #expect(CommandRegistry.builtIn.command(named: "context")?.action == .context)
         #expect(CommandRegistry.builtIn.command(named: "memory")?.action == .memory)
+        #expect(CommandRegistry.builtIn.command(named: "research")?.action == .workflow)
+        #expect(CommandRegistry.builtIn.command(named: "synthesize")?.action == .workflow)
     }
 
     private func makeDirectory() throws -> FilePath {

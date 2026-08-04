@@ -50,6 +50,10 @@ public final class ClientApp {
     private let footerBar = FooterBar()
     private let focus = FocusRing()
     private let quit = QuitSignal()
+    /// A separate root for the phase/agent workflow experience. It is deliberately
+    /// not an overlay: the workflow owns the full frame until Escape walks back to
+    /// the ordinary session view.
+    private var workflowWorkspace: WorkflowWorkspaceController?
     /// Command metadata is fetched from the runtime at bootstrap. The client
     /// uses local actions immediately and forwards prompt commands unchanged so
     /// the server remains the authority for template expansion.
@@ -473,6 +477,9 @@ public final class ClientApp {
     }
 
     private func buildTree(width: Int, height: Int) -> any LayoutNode {
+        if let workflowWorkspace {
+            return workflowWorkspace.layout(width: width)
+        }
         // Refresh the views from the current store state.
         sidebar.sessions = store.sessions
         sidebar.openID = store.selectedSessionID
@@ -2924,6 +2931,59 @@ public final class ClientApp {
         actionTasks.append(task)
     }
 
+    /// Mount the dedicated workflow root. The standard phase values are a neutral
+    /// initial snapshot; later run events replace them through the controller's
+    /// `setPhases` seam without changing navigation or layout.
+    private func openWorkflow(startingAt phaseID: String? = nil) {
+        if workflowWorkspace != nil {
+            post(notice: "workflow workspace is already open")
+            return
+        }
+        let workspace = WorkflowWorkspaceController(phases: Self.standardWorkflowPhases)
+        workspace.onChange = { [weak self] in self?.surface?.requestRender() }
+        workspace.onExit = { [weak self] in self?.closeWorkflow() }
+        if let phaseID { workspace.selectPhase(id: phaseID) }
+        workflowWorkspace = workspace
+        focus.register(workspace)
+        focus.setCurrent(workspace)
+        surface?.requestFullRedraw()
+    }
+
+    private func closeWorkflow() {
+        guard let workspace = workflowWorkspace else { return }
+        workflowWorkspace = nil
+        focus.unregister(workspace)
+        focus.setCurrent(promptInput)
+        surface?.requestFullRedraw()
+    }
+
+    private static let standardWorkflowPhases: [WorkflowWorkspacePhase] = [
+        WorkflowWorkspacePhase(
+            id: "research",
+            title: "Research",
+            summary: "Read-only evidence gathering and source provenance.",
+            agents: [WorkflowWorkspaceAgent(id: "research-agent", title: "research", content: "")]
+        ),
+        WorkflowWorkspacePhase(
+            id: "plan",
+            title: "Plan",
+            summary: "Turn the collected evidence into a reviewable implementation plan.",
+            agents: [WorkflowWorkspaceAgent(id: "plan-agent", title: "plan", content: "")]
+        ),
+        WorkflowWorkspacePhase(
+            id: "execute",
+            title: "Execute",
+            summary: "Apply approved work with the session's permission and sandbox policy.",
+            agents: [WorkflowWorkspaceAgent(id: "execute-agent", title: "execute", content: "")]
+        ),
+        WorkflowWorkspacePhase(
+            id: "synthesize",
+            title: "Synthesize",
+            summary: "Collect outcomes, evidence, and unresolved follow-up items.",
+            agents: [WorkflowWorkspaceAgent(id: "synthesize-agent", title: "synthesize", content: "")]
+        ),
+    ]
+
     /// Send a prompt — and never destroy it silently.
     ///
     /// `PromptInput` clears its text BEFORE calling this, so the typed string survives
@@ -2982,6 +3042,11 @@ public final class ClientApp {
                 openDiffReview(advisory: false)
             case .review:
                 openDiffReview(advisory: true)
+            case .workflow:
+                let phase = ["research", "plan", "execute", "synthesize"].contains(commandName.lowercased())
+                    ? commandName.lowercased()
+                    : nil
+                openWorkflow(startingAt: phase)
             case .compact:
                 guard let id = store.selectedSessionID else {
                     post(notice: "no session is open")
@@ -3814,6 +3879,14 @@ extension ClientApp: TerminalApp {
         if data == Self.ctrlM { openModelPicker(); return }
         if data == Self.ctrlT { openTreePicker(); return }
         if data == Self.ctrlE { editPromptInEditor(); return }
+        // The workflow workspace is a separate root, not a modal. Keep the
+        // process-level quit and mouse controls above, then hand every remaining
+        // key to its phase/agent navigator so Escape means "back" rather than
+        // aborting the ordinary session run.
+        if workflowWorkspace != nil {
+            surface?.handleInput(data)
+            return
+        }
         // The reusable client dialogs capture ordinary keyboard input. This
         // branch must precede the global Escape/abort interpretation below:
         // Escape dismisses a palette, picker, or rename form, while it still

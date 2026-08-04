@@ -126,6 +126,7 @@ public enum LocalCommand: String, Codable, Hashable, Sendable {
     case tools
     case tree
     case undo
+    case workflow
 }
 
 /// A skill loaded from a `SKILL.md` or compatible markdown file.
@@ -415,6 +416,36 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             description: "Review current changes and their risks",
             kind: .local,
             action: .review
+        ),
+        CommandDescriptor(
+            name: "workflow",
+            description: "Open the phase-and-agent workflow workspace",
+            kind: .local,
+            action: .workflow
+        ),
+        CommandDescriptor(
+            name: "research",
+            description: "Open the workflow at its research phase",
+            kind: .local,
+            action: .workflow
+        ),
+        CommandDescriptor(
+            name: "plan",
+            description: "Open the workflow at its planning phase",
+            kind: .local,
+            action: .workflow
+        ),
+        CommandDescriptor(
+            name: "execute",
+            description: "Open the workflow at its execution phase",
+            kind: .local,
+            action: .workflow
+        ),
+        CommandDescriptor(
+            name: "synthesize",
+            description: "Open the workflow at its synthesis phase",
+            kind: .local,
+            action: .workflow
         ),
         CommandDescriptor(
             name: "timeline",
