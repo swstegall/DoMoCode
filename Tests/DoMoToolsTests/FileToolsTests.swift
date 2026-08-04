@@ -435,7 +435,7 @@ struct ApplyPatchToolTests {
              }
             *** End Patch
             """
-        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+        let result = try await ApplyPatchTool().execute(.object(["patch": .string(patch)]), in: fixture.context)
 
         #expect(!result.isError)
         #expect(result.details["updated"]?.intValue == 1)
@@ -457,7 +457,7 @@ struct ApplyPatchToolTests {
             *** Delete File: remove.txt
             *** End Patch
             """
-        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+        let result = try await ApplyPatchTool().execute(.object(["patch": .string(patch)]), in: fixture.context)
 
         #expect(!result.isError)
         #expect(result.details["added"]?.intValue == 1)
@@ -480,7 +480,7 @@ struct ApplyPatchToolTests {
             +inserted
             *** End Patch
             """
-        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+        let result = try await ApplyPatchTool().execute(.object(["patch": .string(patch)]), in: fixture.context)
 
         #expect(result.isError)
         #expect(result.text.contains("empty insertions are ambiguous"))
@@ -502,7 +502,7 @@ struct ApplyPatchToolTests {
             +changed
             *** End Patch
             """
-        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+        let result = try await ApplyPatchTool().execute(.object(["patch": .string(patch)]), in: fixture.context)
 
         #expect(result.isError)
         #expect(result.text.contains("occurrences"))

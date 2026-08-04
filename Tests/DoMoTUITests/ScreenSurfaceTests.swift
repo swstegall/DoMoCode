@@ -114,7 +114,7 @@ struct ScreenSurfaceTests {
         let target = CaptureTarget(columns: width, rows: height)
         let ring = FocusRing()
         let surface = ScreenSurface(target: target, focus: ring, showHardwareCursor: false) {
-            Column([LinesComponent(["base"]), FlexSpacer()])
+            Column([ComponentBox(LinesComponent(["base"])), FlexSpacer()])
         }
         surface.frameBackground = .ansiIndex(33)
         surface.frameBackgroundTrueColor = false

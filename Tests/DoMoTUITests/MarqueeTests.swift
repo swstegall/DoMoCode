@@ -4,6 +4,7 @@
 import DoMoTUI
 import Testing
 
+@MainActor
 @Suite("Marquee rendering")
 struct MarqueeTests {
     @Test("a long row pauses, advances, pauses at the end, then resets")
