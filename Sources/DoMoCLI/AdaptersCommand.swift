@@ -178,7 +178,7 @@ private enum AdapterTooling {
             )
         }
 
-        return [
+        var result = [
             (
                 descriptor("litellm", "LiteLLM / OpenAI-compatible Chat", .provider,
                     ["chat", "streaming", "tools", "usage", "retry", "recovery"]),
@@ -248,6 +248,65 @@ private enum AdapterTooling {
             (
                 descriptor("remote-search-mcp", "Remote search through MCP", .remoteSearch, ["search", "citations", "redaction"]),
                 AdapterHealth(status: .unsupported, message: "No remote-search MCP server is configured")
+            ),
+        ]
+        result.append(contentsOf: optionalBackendManifests(environment: environment))
+        return result
+    }
+
+    private static func optionalBackendManifests(
+        environment: [String: String]
+    ) -> [(descriptor: AdapterDescriptor, health: AdapterHealth)] {
+        let source = AdapterSourceMetadata(
+            kind: .user,
+            attribution: "User-installed command speaking the DoMo backend protocol"
+        )
+
+        func manifest(
+            id: String,
+            name: String,
+            environmentName: String
+        ) -> (descriptor: AdapterDescriptor, health: AdapterHealth) {
+            let configured = environment[environmentName]?.isEmpty == false
+            return (
+                AdapterDescriptor(
+                    id: id,
+                    displayName: name,
+                    capabilities: ["health-handshake", "lifecycle", "workspace-write"],
+                    kind: .backend,
+                    source: source
+                ),
+                AdapterHealth(
+                    status: configured ? .degraded : .unsupported,
+                    message: configured
+                        ? "Command configured; start must return capabilities and isolation proof"
+                        : "Set \(environmentName) to enable this user-installed adapter",
+                    supportedEvents: ["health", "start", "stop", "pause", "resume", "reconnect", "cleanup"],
+                    credentialRequired: false
+                )
+            )
+        }
+
+        return [
+            manifest(
+                id: "docker-backend",
+                name: "Docker through external command",
+                environmentName: "DOMOCODE_DOCKER_BACKEND_COMMAND"
+            ),
+            manifest(
+                id: "gondolin-backend",
+                name: "Gondolin through external command",
+                environmentName: "DOMOCODE_GONDOLIN_BACKEND_COMMAND"
+            ),
+            manifest(
+                id: "openshell-backend",
+                name: "OpenShell through external command",
+                environmentName: "DOMOCODE_OPENSHELL_BACKEND_COMMAND"
+            ),
+            manifest(
+                id: "remote-worker-backend",
+                name: "Remote worker through external command",
+                environmentName: "DOMOCODE_REMOTE_WORKER_COMMAND"
             ),
         ]
     }
