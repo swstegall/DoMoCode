@@ -379,12 +379,12 @@ import Testing
     let tool = echoTool("slow", ran: ran)
     let config = AgentLoopConfig(
         model: "m",
-        toolLifecycleTimeout: .milliseconds(10),
         toolLifecycle: { event in
             stages.withLock { $0.append(event.stage) }
             try? await Task.sleep(for: .milliseconds(100))
             return .proceed
-        }
+        },
+        toolLifecycleTimeout: .milliseconds(10)
     )
     let stream = ScriptedStream([
         assistantTurn(toolCalls: [tc("slow")], stopReason: .toolUse),
