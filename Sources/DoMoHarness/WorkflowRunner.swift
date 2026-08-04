@@ -94,7 +94,7 @@ public actor WorkflowRunner {
 
     public init(
         definition: WorkflowDefinition,
-        executionMode: WorkflowExecutionMode = .serial,
+        executionMode: WorkflowExecutionMode? = nil,
         sessionID: String? = nil,
         store: WorkflowStore? = nil,
         now: @escaping @Sendable () -> String = { WorkflowStore.timestamp() },
@@ -102,7 +102,7 @@ public actor WorkflowRunner {
         executor: @escaping WorkflowStageExecutor
     ) {
         self.definition = definition
-        self.executionMode = executionMode
+        self.executionMode = executionMode ?? definition.executionMode
         self.sessionID = sessionID
         self.store = store
         self.now = now

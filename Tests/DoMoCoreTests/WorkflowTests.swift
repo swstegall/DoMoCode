@@ -13,6 +13,7 @@ struct WorkflowTests {
         let definition = WorkflowDefinition.standard
         #expect(definition.isValid)
         #expect(definition.stages.map(\.id) == ["research", "plan", "execute", "synthesize"])
+        #expect(definition.executionMode == .serial)
         #expect(definition.stages[0].toolPolicy.mode == .readOnly)
         #expect(definition.stages[2].approvalBoundary == .beforeMutation)
         let data = try JSONEncoder().encode(definition)
@@ -24,6 +25,7 @@ struct WorkflowTests {
         let definition = WorkflowDefinition(
             id: "research-to-plan",
             displayName: "Research to plan",
+            executionMode: .parallel,
             stages: [
                 WorkflowStageDefinition(
                     id: "research",
@@ -54,8 +56,19 @@ struct WorkflowTests {
             from: JSONEncoder().encode(definition)
         )
         #expect(copy == definition)
+        #expect(copy.executionMode == .parallel)
         #expect(copy.stages[1].dependencies == ["research"])
         #expect(copy.stages[1].toolPolicy.allowedTools == ["write"])
+    }
+
+    @Test("legacy definitions without a scheduling mode remain serial")
+    func legacySchedulingModeDefaultsToSerial() throws {
+        let data = Data(
+            "{\"id\":\"legacy\",\"displayName\":\"legacy\",\"version\":1,\"stages\":[{\"id\":\"ask\",\"displayName\":\"ask\",\"kind\":\"ask\",\"dependencies\":[],\"toolPolicy\":{\"mode\":\"readOnly\",\"allowedTools\":[]},\"model\":null,\"profile\":null,\"contextInputs\":[],\"outputArtifact\":null,\"budget\":{\"maxTokens\":null,\"maxCostUSD\":null,\"wallClockSeconds\":null},\"timeoutSeconds\":null,\"cancellationPolicy\":\"stopDependents\",\"approvalBoundary\":\"none\",\"metadata\":{}}],\"metadata\":{}}".utf8
+        )
+        let definition = try JSONDecoder().decode(WorkflowDefinition.self, from: data)
+        #expect(definition.executionMode == .serial)
+        #expect(definition.isValid)
     }
 
     @Test("validation catches duplicate, missing, and cyclic stage references")

@@ -834,6 +834,7 @@ public actor ServerRuntime {
     ) -> WorkflowRunner {
         WorkflowRunner(
             definition: definition,
+            executionMode: definition.executionMode,
             sessionID: sessionID,
             store: config.workflowStore,
             approvalHandler: { [weak self] request in

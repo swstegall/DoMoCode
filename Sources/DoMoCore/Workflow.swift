@@ -133,6 +133,7 @@ public struct WorkflowDefinition: Sendable, Codable, Hashable {
     public var id: String
     public var displayName: String
     public var version: Int
+    public var executionMode: WorkflowExecutionMode
     public var stages: [WorkflowStageDefinition]
     public var metadata: [String: JSONValue]
 
@@ -140,14 +141,49 @@ public struct WorkflowDefinition: Sendable, Codable, Hashable {
         id: String,
         displayName: String? = nil,
         version: Int = 1,
+        executionMode: WorkflowExecutionMode = .serial,
         stages: [WorkflowStageDefinition],
         metadata: [String: JSONValue] = [:]
     ) {
         self.id = id
         self.displayName = displayName ?? id
         self.version = version
+        self.executionMode = executionMode
         self.stages = stages
         self.metadata = metadata
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case displayName
+        case version
+        case executionMode
+        case stages
+        case metadata
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        version = try container.decode(Int.self, forKey: .version)
+        // Records written before persisted scheduling existed were serial.
+        executionMode = try container.decodeIfPresent(
+            WorkflowExecutionMode.self,
+            forKey: .executionMode
+        ) ?? .serial
+        stages = try container.decode([WorkflowStageDefinition].self, forKey: .stages)
+        metadata = try container.decode([String: JSONValue].self, forKey: .metadata)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(version, forKey: .version)
+        try container.encode(executionMode, forKey: .executionMode)
+        try container.encode(stages, forKey: .stages)
+        try container.encode(metadata, forKey: .metadata)
     }
 
     public var validationIssues: [String] {
@@ -216,6 +252,7 @@ public struct WorkflowDefinition: Sendable, Codable, Hashable {
     public static let standard = WorkflowDefinition(
         id: "standard",
         displayName: "Research → Plan → Execute → Synthesize",
+        executionMode: .serial,
         stages: [
             WorkflowStageDefinition(
                 id: "research",

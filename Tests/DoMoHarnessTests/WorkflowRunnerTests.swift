@@ -74,6 +74,7 @@ struct WorkflowRunnerTests {
     func parallelJoin() async throws {
         let definition = WorkflowDefinition(
             id: "parallel",
+            executionMode: .parallel,
             stages: [
                 WorkflowStageDefinition(id: "a", kind: .research),
                 WorkflowStageDefinition(id: "b", kind: .research),
@@ -82,7 +83,6 @@ struct WorkflowRunnerTests {
         )
         let runner = WorkflowRunner(
             definition: definition,
-            executionMode: .parallel,
             now: { "2026-01-01T00:00:00Z" }
         ) { request in
             if request.stage.id == "synthesize" {
