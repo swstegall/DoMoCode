@@ -319,6 +319,12 @@ struct ServerRuntimeTests {
         let run = try #require(settled)
         #expect(run.stages.allSatisfy { $0.status == .succeeded })
         #expect(run.stages.allSatisfy { !$0.agentIDs.isEmpty })
+        let evidencePath = dirs.cwd.appendingPathComponent(".domocode/evidence/standard.json")
+        let evidence = try JSONValue(parsing: Data(contentsOf: evidencePath))
+        #expect(evidence["sourceSessionID"]?.stringValue == parent.id)
+        #expect(evidence["untrustedData"]?.boolValue == true)
+        let planPath = dirs.cwd.appendingPathComponent(".domocode/plans/standard.md")
+        #expect(try String(contentsOf: planPath).contains("stage output"))
     }
 
     @Test("background results enter the parent queue and can start an idle parent")

@@ -857,16 +857,29 @@ public actor ServerRuntime {
         ))
         switch child.status {
         case .completed:
+            let output = child.output ?? ""
             var metadata: [String: JSONValue] = [
                 "stage": .string(request.stage.id),
                 "kind": .string(request.stage.kind.rawValue),
                 "toolPolicy": .string(request.stage.toolPolicy.mode.rawValue),
+                "sourceSessionID": .string(sessionID),
+                "untrustedData": .bool(request.stage.kind == .research || AgentModePolicy.isReadOnly(workflowStageMode(request.stage))),
             ]
             if let artifact = request.stage.outputArtifact {
                 metadata["outputArtifact"] = .string(artifact)
+                let artifactPath = try workflowArtifactPath(artifact)
+                try AtomicFileWrite.replace(
+                    at: artifactPath,
+                    with: workflowArtifactContents(
+                        stage: request.stage,
+                        output: output,
+                        sourceSessionID: sessionID
+                    )
+                )
+                metadata["artifactPath"] = .string(artifactPath)
             }
             return WorkflowStageResult(
-                output: .string(child.output ?? ""),
+                output: .string(output),
                 metadata: metadata,
                 agentIDs: child.childSessionID.map { [$0] } ?? []
             )
@@ -877,6 +890,34 @@ public actor ServerRuntime {
         case .started, .accepted:
             throw WorkflowStageExecutionError(message: "Workflow child session did not settle.")
         }
+    }
+
+    private func workflowArtifactPath(_ artifact: String) throws -> String {
+        let relative = artifact.trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = URL(fileURLWithPath: config.cwd, isDirectory: true).standardizedFileURL
+        guard !relative.isEmpty, !relative.hasPrefix("/") else {
+            throw WorkflowStageExecutionError(message: "Workflow artifact path must be relative to the workspace.")
+        }
+        let candidate = root.appendingPathComponent(relative).standardizedFileURL
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard candidate.path.hasPrefix(rootPath) else {
+            throw WorkflowStageExecutionError(message: "Workflow artifact path escapes the workspace.")
+        }
+        return candidate.path
+    }
+
+    private func workflowArtifactContents(
+        stage: WorkflowStageDefinition,
+        output: String,
+        sourceSessionID: String
+    ) throws -> String {
+        guard stage.kind == .research else { return output }
+        return try JSONValue.object([
+            "stageID": .string(stage.id),
+            "sourceSessionID": .string(sourceSessionID),
+            "untrustedData": .bool(true),
+            "content": .string(output),
+        ]).encodedString(prettyPrinted: true)
     }
 
     private func workflowStageMode(_ stage: WorkflowStageDefinition) -> AgentMode {
