@@ -438,29 +438,29 @@ applicable, and a release build under Swift 6.3.
 
 #### Phase 23 — TUI theme contract, divider, marquees, and image thumbnails — P0
 
-- [ ] Make ThemePalette.background a real full-page paint contract. The
+- [x] Make ThemePalette.background a real full-page paint contract. The
   alternate-screen frame must fill every cell, including blank rows and
   spaces around short components, with the selected background SGR. inherit
   remains an explicit opt-out; it must not be the accidental default that lets
   a desktop terminal background image show through.
-- [ ] Draw a theme-colored vertical divider between the sidebar and main
+- [x] Draw a theme-colored vertical divider between the sidebar and main
   content. Derive its column from ClientLayout so hit testing, selection,
   width measurement, and the visible divider cannot disagree.
-- [ ] Render terminal image blocks as bounded thumbnails by default. Start
+- [x] Render terminal image blocks as bounded thumbnails by default. Start
   with a configurable maximum of 40 terminal columns by 12 rows, clamp both
   dimensions to the available content pane, preserve aspect ratio using the
   terminal's cell/pixel geometry, and never let an image displace the footer,
   sidebar, or surrounding transcript. An explicit user action may open a
   larger view; ordinary tool output must remain layout-safe.
-- [ ] Replace right truncation of the bottom status/control line with a
+- [x] Replace right truncation of the bottom status/control line with a
   deterministic horizontal marquee. Keep critical controls discoverable,
   pause at both ends, reset predictably on state changes, and make the clock
   injectable so screen-oracle tests do not depend on wall time. Apply the same
   contract to the full-screen and mini footer controls where they scroll.
-- [ ] Add pointer hover state to the sidebar. When a hovered session label
+- [x] Add pointer hover state to the sidebar. When a hovered session label
   exceeds the sidebar width, marquee the label within its row; do not scroll
   unrelated rows or alter the stable session marker/id columns.
-- [ ] Test blank-cell background coverage, stale-cell clearing, divider
+- [x] Test blank-cell background coverage, stale-cell clearing, divider
   placement, thumbnail caps, aspect-ratio preservation, image resize and
   fallback behavior, true-color/indexed-color fallback, marquee timing,
   hover enter/exit, and narrow terminals with the existing cell oracle and
@@ -474,34 +474,34 @@ layout-safe thumbnail policy.
 
 #### Phase 24 — Live tool catalog, lifecycle hooks, and remote MCP — P0
 
-- [ ] Pressing / in the full-screen prompt opens a tool catalog. Keep slash
+- [x] Pressing / in the full-screen prompt opens a tool catalog. Keep slash
   commands available through their existing completion path, and provide an
   unambiguous /tools alias for keyboards or clients that prefer a command.
-- [ ] Add a server/client tool-catalog route backed by the same late-bound
+- [x] Add a server/client tool-catalog route backed by the same late-bound
   resolver used for the next model request. Show every currently callable
   built-in and MCP tool with name, short description, source, schema summary,
   permission state, and the reason an otherwise-known tool is hidden.
-- [ ] Refresh the catalog when a session changes mode/model, permissions
+- [x] Refresh the catalog when a session changes mode/model, permissions
   change, or an MCP tools/list_changed notification arrives. The catalog
   must never advertise a tool that the model cannot receive on the next
   request.
-- [ ] Add a deterministic tool lifecycle around built-in, MCP, ACP, and
+- [x] Add a deterministic tool lifecycle around built-in, MCP, ACP, and
   adapter-backed tools: resolve, preflight, permission, invoke, result,
   postflight, cancellation, and failure. Hooks may observe, reject, or add
   safe metadata, but may never silently widen permissions or mutate a
   committed tool result. Keep ordering, idempotence, redaction, and hook
   timeouts explicit.
-- [ ] Extend MCP beyond today's stdio client to remote HTTP/SSE or
+- [x] Extend MCP beyond today's stdio client to remote HTTP/SSE or
   streamable-HTTP servers. Add capability negotiation, reconnect/backoff,
   OAuth or other credential references, resources, resource templates,
   health/test calls, network policy, and secret redaction. Remote MCP must
   enter the same permission and tool-catalog path as local MCP.
-- [ ] Add focused parity tools in priority order: a canonical apply_patch
+- [x] Add focused parity tools in priority order: a canonical apply_patch
   or patch tool with the existing mutation safety; websearch behind an
-  injectable provider or MCP; MCP resource/template inspection; a skill
-  invocation tool for already trusted skill resources; and browser,
-  notebook, and remote search adapters through MCP/ACP before considering
-  native implementations.
+  injectable provider or MCP; MCP resource/template inspection; and a skill
+  invocation tool for already trusted skill resources.
+- [ ] Add browser, notebook, and remote search adapters through MCP/ACP before
+  considering native implementations.
 - [ ] Add first-class worktree/session actions to the tool and command
   vocabulary when Phase 28 supplies their safety model. Do not let a
   convenient tool bypass permission, checkpoint, or approval policy.
