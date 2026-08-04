@@ -105,6 +105,10 @@ private struct JobOwnerBody: Decodable {
     var owner: String
 }
 
+private struct AutomationOwnerBody: Decodable {
+    var owner: String
+}
+
 // MARK: - Auth middleware
 
 /// Rejects any request that does not present the server's bearer token.
@@ -395,6 +399,110 @@ public struct DoMoServer: Sendable {
                 let id = try context.parameters.require("id")
                 let body = try await Self.requiredBody(JobOwnerBody.self, request)
                 return try Self.json(try await self.runtime.cancelJob(id: id, owner: body.owner))
+            }
+        }
+
+        // Automation routes expose policy and audit state only. A trigger
+        // adapter must perform its own authenticated admission and then hand a
+        // bounded invocation to the job layer; these routes never schedule or
+        // launch work on their own.
+        router.get("/automations") { request, _ in
+            try await self.mapErrors {
+                let owner = request.uri.queryParameters["owner"].map(String.init)
+                return try Self.json(try await self.runtime.automations(owner: owner))
+            }
+        }
+
+        router.post("/automation") { request, _ in
+            try await self.mapErrors {
+                let definition = try await Self.requiredBody(AutomationDefinition.self, request)
+                return try Self.json(
+                    try await self.runtime.registerAutomation(definition),
+                    status: .created
+                )
+            }
+        }
+
+        router.get("/automation/:id") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                guard let definition = try await self.runtime.automation(id: id) else {
+                    throw HTTPError(.notFound)
+                }
+                return try Self.json(definition)
+            }
+        }
+
+        router.post("/automation/:id/enable") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(AutomationOwnerBody.self, request)
+                return try Self.json(try await self.runtime.setAutomationEnabled(
+                    id: id,
+                    owner: body.owner,
+                    enabled: true
+                ))
+            }
+        }
+
+        router.post("/automation/:id/disable") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(AutomationOwnerBody.self, request)
+                return try Self.json(try await self.runtime.setAutomationEnabled(
+                    id: id,
+                    owner: body.owner,
+                    enabled: false
+                ))
+            }
+        }
+
+        router.post("/automation/:id/invoke") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let invocation = try await Self.requiredBody(AutomationInvocation.self, request)
+                guard invocation.automationID == id else { throw HTTPError(.badRequest) }
+                return try Self.json(try await self.runtime.invokeAutomation(invocation), status: .accepted)
+            }
+        }
+
+        router.get("/automation/:id/events") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                guard try await self.runtime.automation(id: id) != nil else {
+                    throw HTTPError(.notFound)
+                }
+                let rawAfter = request.uri.queryParameters["after"].map(String.init)
+                let after: Int
+                if let rawAfter {
+                    guard let parsed = Int(rawAfter), parsed >= 0 else {
+                        throw HTTPError(.badRequest)
+                    }
+                    after = parsed
+                } else {
+                    after = 0
+                }
+                return try Self.json(try await self.runtime.automationEvents(
+                    after: after,
+                    automationID: id
+                ))
+            }
+        }
+
+        router.get("/automation/:id/invocations") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                guard try await self.runtime.automation(id: id) != nil else {
+                    throw HTTPError(.notFound)
+                }
+                return try Self.json(try await self.runtime.automationInvocations(id: id))
+            }
+        }
+
+        router.get("/automation/:id/export") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.automationExport(id: id))
             }
         }
 
@@ -908,6 +1016,14 @@ public struct DoMoServer: Sendable {
             case .jobDenied:
                 throw HTTPError(.forbidden)
             case .jobInvalid:
+                throw HTTPError(.badRequest)
+            case .automationUnavailable, .automationNotFound:
+                throw HTTPError(.notFound)
+            case .automationConflict:
+                throw HTTPError(.conflict)
+            case .automationDenied:
+                throw HTTPError(.forbidden)
+            case .automationInvalid:
                 throw HTTPError(.badRequest)
             }
         }

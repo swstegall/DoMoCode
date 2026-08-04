@@ -60,6 +60,16 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     case jobDenied
     /// The job request or cursor was malformed.
     case jobInvalid(String)
+    /// The runtime was not configured with an automation policy registry.
+    case automationUnavailable
+    /// An automation definition is not known to this runtime.
+    case automationNotFound
+    /// An automation definition or audit cursor conflicts with durable state.
+    case automationConflict
+    /// The caller is not authorized to change or invoke the automation.
+    case automationDenied
+    /// The automation definition, invocation, or cursor was malformed.
+    case automationInvalid(String)
 }
 
 /// A reference to a session, returned by create and fork.
@@ -393,6 +403,10 @@ public actor ServerRuntime {
         /// Optional durable manager for background, workflow, and child-agent
         /// jobs. A nil value keeps embedded runtimes lightweight.
         public var jobManager: JobManager?
+        /// Optional disabled-by-default automation policy and audit registry.
+        /// Trigger adapters must explicitly invoke this seam before they can
+        /// hand bounded work to the durable job manager.
+        public var automationRegistry: AutomationRegistry?
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -441,7 +455,8 @@ public actor ServerRuntime {
             terminalService: PTYService? = nil,
             workflowStore: WorkflowStore? = nil,
             sessionHandoffs: SessionHandoffManager? = nil,
-            jobManager: JobManager? = nil
+            jobManager: JobManager? = nil,
+            automationRegistry: AutomationRegistry? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -483,6 +498,7 @@ public actor ServerRuntime {
             self.workflowStore = workflowStore
             self.sessionHandoffs = sessionHandoffs
             self.jobManager = jobManager
+            self.automationRegistry = automationRegistry
         }
     }
 
@@ -877,6 +893,105 @@ public actor ServerRuntime {
             return try await manager.recoverInterruptedJobs()
         } catch {
             throw Self.mapJobError(error)
+        }
+    }
+
+    // MARK: Local automation policy
+
+    /// List registered automation definitions. This is a policy snapshot: it
+    /// never starts a trigger adapter or creates a job.
+    public func automations(owner: String? = nil) async throws -> [AutomationDefinition] {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.list(owner: owner)
+        } catch {
+            throw Self.mapAutomationError(error)
+        }
+    }
+
+    public func automation(id: String) async throws -> AutomationDefinition? {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.definition(id: id)
+        } catch {
+            throw Self.mapAutomationError(error)
+        }
+    }
+
+    public func registerAutomation(_ definition: AutomationDefinition) async throws -> AutomationDefinition {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.register(definition)
+        } catch {
+            throw Self.mapAutomationError(error)
+        }
+    }
+
+    public func setAutomationEnabled(
+        id: String,
+        owner: String,
+        enabled: Bool
+    ) async throws -> AutomationDefinition {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.setEnabled(id: id, owner: owner, enabled: enabled)
+        } catch {
+            throw Self.mapAutomationError(error)
+        }
+    }
+
+    public func invokeAutomation(_ invocation: AutomationInvocation) async throws -> AutomationInvocation {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.invoke(invocation)
+        } catch {
+            throw Self.mapAutomationError(error)
+        }
+    }
+
+    public func automationEvents(
+        after sequence: Int = 0,
+        automationID: String? = nil
+    ) async throws -> [AutomationAuditEvent] {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.events(after: sequence, automationID: automationID)
+        } catch {
+            throw Self.mapAutomationError(error)
+        }
+    }
+
+    public func automationInvocations(id: String? = nil) async throws -> [AutomationInvocation] {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.invocations(automationID: id)
+        } catch {
+            throw Self.mapAutomationError(error)
+        }
+    }
+
+    public func automationExport(id: String) async throws -> [AutomationJournalEntry] {
+        guard let registry = config.automationRegistry else {
+            throw ServerRuntimeError.automationUnavailable
+        }
+        do {
+            return try await registry.export(id: id)
+        } catch {
+            throw Self.mapAutomationError(error)
         }
     }
 
@@ -1541,6 +1656,28 @@ public actor ServerRuntime {
             return .jobDenied
         case .invalidAdmission(let message):
             return .jobInvalid(message)
+        }
+    }
+
+    private static func mapAutomationError(_ error: any Error) -> ServerRuntimeError {
+        guard let error = error as? AutomationRegistryError else {
+            return .automationInvalid("Automation operation failed.")
+        }
+        switch error {
+        case .notFound:
+            return .automationNotFound
+        case .duplicate:
+            return .automationConflict
+        case .ownershipDenied:
+            return .automationDenied
+        case .disabled:
+            return .automationInvalid("Automation is disabled.")
+        case .triggerMismatch:
+            return .automationInvalid("Invocation source does not match the automation trigger.")
+        case .invalidDefinition(let message):
+            return .automationInvalid(message)
+        case .invalidCursor(let cursor):
+            return .automationInvalid("Invalid automation cursor \(cursor).")
         }
     }
 

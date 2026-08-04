@@ -54,7 +54,8 @@ struct JobManagerTests {
                 maxAttempts: 2,
                 initialBackoffMilliseconds: 1,
                 maximumBackoffMilliseconds: 1
-            )
+            ),
+            triggerSource: .scheduled
         ))
 
         let result = try await manager.run(jobID: "job-retry", owner: "client-a") { context in
@@ -71,12 +72,14 @@ struct JobManagerTests {
         #expect(result.progress.fraction == 1)
         #expect(result.output == .string("complete"))
         #expect(result.metadata["attempts"] == .int(2))
+        #expect(result.triggerSource == .scheduled)
 
         let allEvents = try await manager.events()
         #expect(allEvents.map(\.kind) == [
             .admitted, .started, .progress, .retryScheduled,
             .started, .progress, .succeeded,
         ])
+        #expect(allEvents.allSatisfy { $0.triggerSource == .scheduled })
         let resumed = try await manager.events(after: 3)
         #expect(resumed.map(\.sequence) == [4, 5, 6, 7])
         #expect(notifications.withLock { $0 } == allEvents)

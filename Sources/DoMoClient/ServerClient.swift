@@ -150,6 +150,7 @@ public struct ServerClient: Sendable {
         let metadata: [String: JSONValue]
     }
     private struct JobOwnerBody: Encodable { let owner: String }
+    private struct AutomationOwnerBody: Encodable { let owner: String }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -331,6 +332,73 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.post, path, body: body)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode(JobRecord.self, from: data)
+    }
+
+    /// List policy-only local automations, optionally scoped to an owner.
+    public func automations(owner: String? = nil) async throws -> [AutomationDefinition] {
+        var path = "/automations"
+        if let owner {
+            path += "?owner=\(Self.percentEncode(owner))"
+        }
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([AutomationDefinition].self, from: data)
+    }
+
+    public func registerAutomation(_ definition: AutomationDefinition) async throws -> AutomationDefinition {
+        let path = "/automation"
+        let body = try JSONEncoder().encode(definition)
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 201, path, body: data)
+        return try JSONDecoder().decode(AutomationDefinition.self, from: data)
+    }
+
+    public func automation(id: String) async throws -> AutomationDefinition {
+        let path = "/automation/\(Self.percentEncode(id))"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(AutomationDefinition.self, from: data)
+    }
+
+    public func setAutomationEnabled(
+        id: String,
+        owner: String,
+        enabled: Bool
+    ) async throws -> AutomationDefinition {
+        let path = "/automation/\(Self.percentEncode(id))/\(enabled ? "enable" : "disable")"
+        let body = try JSONEncoder().encode(AutomationOwnerBody(owner: owner))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(AutomationDefinition.self, from: data)
+    }
+
+    public func invokeAutomation(_ invocation: AutomationInvocation) async throws -> AutomationInvocation {
+        let path = "/automation/\(Self.percentEncode(invocation.automationID))/invoke"
+        let body = try JSONEncoder().encode(invocation)
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 202, path, body: data)
+        return try JSONDecoder().decode(AutomationInvocation.self, from: data)
+    }
+
+    public func automationEvents(id: String, after sequence: Int = 0) async throws -> [AutomationAuditEvent] {
+        let path = "/automation/\(Self.percentEncode(id))/events?after=\(sequence)"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([AutomationAuditEvent].self, from: data)
+    }
+
+    public func automationInvocations(id: String) async throws -> [AutomationInvocation] {
+        let path = "/automation/\(Self.percentEncode(id))/invocations"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([AutomationInvocation].self, from: data)
+    }
+
+    public func automationExport(id: String) async throws -> [AutomationJournalEntry] {
+        let path = "/automation/\(Self.percentEncode(id))/export"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([AutomationJournalEntry].self, from: data)
     }
 
     /// Fetch durable workflow definitions exposed by the serving runtime.

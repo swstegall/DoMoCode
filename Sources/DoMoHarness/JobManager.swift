@@ -69,6 +69,21 @@ public struct JobRetryPolicy: Codable, Sendable, Hashable {
     }
 }
 
+/// The origin that caused a job to be admitted. Keeping this in the durable
+/// metadata projection lets clients distinguish user prompts, automation, and
+/// child-agent results without making the manager execute any trigger.
+public enum JobTriggerSource: String, Codable, Sendable, Hashable, CaseIterable {
+    case userPrompt
+    case cli
+    case scheduled
+    case filesystem
+    case repository
+    case webhook
+    case childAgentResult
+    case systemRecovery
+    case unknown
+}
+
 /// A job's durable identity and ownership boundary.
 public struct JobAdmission: Codable, Sendable, Hashable {
     public let id: String
@@ -90,7 +105,8 @@ public struct JobAdmission: Codable, Sendable, Hashable {
         kind: String,
         owner: String,
         retryPolicy: JobRetryPolicy = .init(),
-        metadata: [String: JSONValue] = [:]
+        metadata: [String: JSONValue] = [:],
+        triggerSource: JobTriggerSource = .userPrompt
     ) {
         self.id = id
         self.correlationID = correlationID
@@ -100,6 +116,10 @@ public struct JobAdmission: Codable, Sendable, Hashable {
         self.kind = kind
         self.owner = owner
         self.retryPolicy = retryPolicy
+        var metadata = metadata
+        if metadata["triggerSource"] == nil {
+            metadata["triggerSource"] = .string(triggerSource.rawValue)
+        }
         self.metadata = metadata
     }
 }
@@ -124,6 +144,15 @@ public struct JobRecord: Codable, Sendable, Hashable {
     public var error: String?
     public var output: JSONValue?
     public var metadata: [String: JSONValue]
+
+    public var triggerSource: JobTriggerSource {
+        guard case .string(let raw) = metadata["triggerSource"],
+              let source = JobTriggerSource(rawValue: raw)
+        else {
+            return .unknown
+        }
+        return source
+    }
 
     public init(
         admission: JobAdmission,
@@ -212,6 +241,15 @@ public struct JobEvent: Codable, Sendable, Hashable {
     public let progress: JobProgress
     public let message: String?
     public let metadata: [String: JSONValue]
+
+    public var triggerSource: JobTriggerSource {
+        guard case .string(let raw) = metadata["triggerSource"],
+              let source = JobTriggerSource(rawValue: raw)
+        else {
+            return .unknown
+        }
+        return source
+    }
 
     public init(
         sequence: Int,
@@ -651,6 +689,11 @@ public actor JobManager {
         metadata: [String: JSONValue] = [:]
     ) throws -> JobEvent {
         nextSequence += 1
+        var eventMetadata = metadata
+        if eventMetadata["triggerSource"] == nil {
+            eventMetadata["triggerSource"] = record.metadata["triggerSource"]
+                ?? .string(record.triggerSource.rawValue)
+        }
         let event = JobEvent(
             sequence: nextSequence,
             jobID: record.id,
@@ -661,7 +704,7 @@ public actor JobManager {
             attempt: record.attempt,
             progress: record.progress,
             message: message,
-            metadata: metadata
+            metadata: eventMetadata
         )
         if let store {
             do {
