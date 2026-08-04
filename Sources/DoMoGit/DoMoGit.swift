@@ -216,9 +216,9 @@ public struct DoMoGit: Sendable {
                     "GIT_OPTIONAL_LOCKS": "0",
                     "LC_ALL": "C",
                 ]),
-                sandboxRole: .git,
                 timeout: .seconds(30),
-            limits: ShellOutputLimits(head: 256 * 1024, tail: 256 * 1024)
+                limits: ShellOutputLimits(head: 256 * 1024, tail: 256 * 1024),
+                sandboxRole: .git
         )
         return try await shell.run(request)
     }
