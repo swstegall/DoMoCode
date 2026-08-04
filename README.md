@@ -517,6 +517,13 @@ fills only the high-value gaps.
 
 #### Phase 25 — Ask, debug, review, research, plan, execute, and synthesize workflows — P0
 
+Workflow UI target: provide a dedicated full-screen workspace rather than folding
+workflow state into the ordinary transcript view. The initial layout has phases in
+a left pane and the selected phase's agent content on the right. Enter drills into
+a phase; the left pane then lists that phase's agents, and the right pane follows
+the selected agent's live content. Escape returns to the parent phase list. This
+is the interaction model to preserve when the durable workflow records below land.
+
 - [ ] Add a durable workflow definition and run record. A workflow is a
   sequence or DAG of named stages with a tool policy, model/profile,
   context inputs, output artifact, budget, timeout, cancellation policy, and
