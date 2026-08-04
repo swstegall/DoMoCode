@@ -8,6 +8,7 @@
 // (`tools/call`) with a per-request timeout that emits `notifications/cancelled`. A
 // faithful hand-rolled port of the MCP 2025-06-18 spec — no SDK.
 
+import AsyncHTTPClient
 import DoMoCore
 import DoMoExec
 import Foundation
@@ -30,6 +31,23 @@ public actor MCPClient {
         public let inputSchema: JSONValue
     }
 
+    /// A resource advertised by an MCP server. Kept as a small inspection value;
+    /// the raw contents remain behind ``readResource(uri:)``.
+    public struct ResourceInfo: Sendable, Hashable {
+        public let uri: String
+        public let name: String
+        public let description: String?
+        public let mimeType: String?
+    }
+
+    /// A URI template advertised by an MCP server.
+    public struct ResourceTemplateInfo: Sendable, Hashable {
+        public let uriTemplate: String
+        public let name: String
+        public let description: String?
+        public let mimeType: String?
+    }
+
     /// A `tools/call` result, still in protocol terms (mapped to a tool result by ``McpTool``).
     public struct CallResult: Sendable {
         public let content: [JSONValue]
@@ -42,6 +60,7 @@ public actor MCPClient {
         case timedOut
         case connectionClosed
         case badResponse
+        case networkPolicy(String)
     }
 
     public let serverName: String
@@ -52,8 +71,10 @@ public actor MCPClient {
     private let sandbox: ProcessSandbox?
     private let log: (@Sendable (String) -> Void)?
     private let onToolsChanged: (@Sendable () async -> Void)?
+    private let bearerToken: String?
 
     private let process = PersistentProcess()
+    private let http: HTTPClient
     private var readerTask: Task<Void, Never>?
     private var nextID = 0
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
@@ -68,6 +89,8 @@ public actor MCPClient {
     /// `tools/list_changed` arriving mid-handshake doesn't race a second discovery into
     /// the cache concurrently with the first.
     private var handshakeComplete = false
+    private var remoteSessionID: String?
+    private var capabilities: JSONValue = .object([:])
 
     public init(
         serverName: String,
@@ -77,7 +100,9 @@ public actor MCPClient {
         sensitiveEnvKeys: Set<String> = [],
         sandbox: ProcessSandbox? = nil,
         log: (@Sendable (String) -> Void)? = nil,
-        onToolsChanged: (@Sendable () async -> Void)? = nil
+        onToolsChanged: (@Sendable () async -> Void)? = nil,
+        bearerToken: String? = nil,
+        http: HTTPClient = .shared
     ) {
         self.serverName = serverName
         self.config = config
@@ -87,6 +112,8 @@ public actor MCPClient {
         self.sandbox = sandbox
         self.log = log
         self.onToolsChanged = onToolsChanged
+        self.bearerToken = bearerToken
+        self.http = http
     }
 
     // MARK: Connect / discover
@@ -94,6 +121,10 @@ public actor MCPClient {
     /// Spawn the server, complete the handshake, and discover its tools. Throws on a
     /// spawn/handshake failure so the manager can isolate this one server.
     public func connect() async throws {
+        if config.isRemote {
+            try await connectRemote()
+            return
+        }
         let cwd = config.cwd.map { resolveCwd($0) }
         try await process.start(PersistentProcess.Spawn(
             command: config.command,
@@ -110,6 +141,7 @@ public actor MCPClient {
             "clientInfo": .object(["name": .string("domocode"), "version": .string(clientVersion)]),
         ])
         let initResult = try await request("initialize", params: initParams)
+        capabilities = initResult["capabilities"] ?? .object([:])
         // Version is accepted leniently: tools/list + tools/call are stable across the
         // known versions, so proceeding is more compatible than disconnecting. But an
         // UNKNOWN version is worth a warning — it may mean tools behave unexpectedly.
@@ -138,6 +170,56 @@ public actor MCPClient {
 
     /// The tools discovered at connect (or after a `tools/list_changed`).
     public func tools() -> [ToolInfo] { toolsCache }
+
+    /// The server's negotiated capability object, retained for inspection and
+    /// resource/template gating by an embedding surface.
+    public func serverCapabilities() -> JSONValue { capabilities }
+
+    /// List resources when the server advertises them. A server without the
+    /// capability returns an empty list rather than making the catalog path fail.
+    public func listResources() async throws -> [ResourceInfo] {
+        guard capabilities["resources"] != nil else { return [] }
+        let result = try await request("resources/list", params: nil)
+        return result["resources"]?.arrayValue?.compactMap { item in
+            guard let uri = item["uri"]?.stringValue,
+                  let name = item["name"]?.stringValue
+            else { return nil }
+            return ResourceInfo(
+                uri: uri,
+                name: name,
+                description: item["description"]?.stringValue,
+                mimeType: item["mimeType"]?.stringValue
+            )
+        } ?? []
+    }
+
+    /// List URI templates when the server advertises them.
+    public func listResourceTemplates() async throws -> [ResourceTemplateInfo] {
+        guard capabilities["resources"] != nil else { return [] }
+        let result = try await request("resources/templates/list", params: nil)
+        return result["resourceTemplates"]?.arrayValue?.compactMap { item in
+            guard let uriTemplate = item["uriTemplate"]?.stringValue,
+                  let name = item["name"]?.stringValue
+            else { return nil }
+            return ResourceTemplateInfo(
+                uriTemplate: uriTemplate,
+                name: name,
+                description: item["description"]?.stringValue,
+                mimeType: item["mimeType"]?.stringValue
+            )
+        } ?? []
+    }
+
+    /// Read one resource through the same permission/catalog-owned MCP client.
+    public func readResource(uri: String) async throws -> [JSONValue] {
+        let result = try await request("resources/read", params: .object(["uri": .string(uri)]))
+        return result["contents"]?.arrayValue ?? []
+    }
+
+    /// Lightweight health/test call for diagnostics and connection setup.
+    public func health() async -> Bool {
+        (try? await request("ping", params: nil)) != nil
+    }
 
     private func listTools() async throws -> [ToolInfo] {
         var tools: [ToolInfo] = []
@@ -199,6 +281,9 @@ public actor MCPClient {
     /// `notifications/cancelled`. Cancellation of the caller also cancels the request.
     private func request(_ method: String, params: JSONValue?) async throws -> JSONValue {
         if closed { throw MCPError.connectionClosed }
+        if config.isRemote {
+            return try await requestRemote(method: method, params: params)
+        }
         let id = nextRequestID()
         var object: [String: JSONValue] = ["jsonrpc": "2.0", "id": .int(id), "method": .string(method)]
         if let params { object["params"] = params }
@@ -235,6 +320,10 @@ public actor MCPClient {
     }
 
     private func notify(_ method: String, params: JSONValue?) async throws {
+        if config.isRemote {
+            _ = try await sendRemote(method: method, params: params, id: nil)
+            return
+        }
         var object: [String: JSONValue] = ["jsonrpc": "2.0", "method": .string(method)]
         if let params { object["params"] = params }
         await process.send(try encodeLine(.object(object)))
@@ -242,6 +331,165 @@ public actor MCPClient {
 
     private func encodeLine(_ value: JSONValue) throws -> [UInt8] {
         Array((try value.encodedString()).utf8)
+    }
+
+    // MARK: Remote HTTP/SSE transport
+
+    private func connectRemote() async throws {
+        _ = try remoteURL()
+        let initParams: JSONValue = .object([
+            "protocolVersion": .string(mcpProtocolVersion),
+            "capabilities": .object([
+                "resources": .object(["subscribe": .bool(false), "listChanged": .bool(true)]),
+            ]),
+            "clientInfo": .object(["name": .string("domocode"), "version": .string(clientVersion)]),
+        ])
+        let initResult = try await requestRemote(method: "initialize", params: initParams)
+        capabilities = initResult["capabilities"] ?? .object([:])
+        try await notify("notifications/initialized", params: nil)
+        if capabilities["tools"] != nil {
+            toolsCache = try await listTools()
+        }
+        handshakeComplete = true
+    }
+
+    private func requestRemote(method: String, params: JSONValue?) async throws -> JSONValue {
+        let id = nextRequestID()
+        let response = try await sendRemote(method: method, params: params, id: id)
+        guard !response.body.isEmpty else { throw MCPError.badResponse }
+        let messages = remoteMessages(from: response.body)
+        guard let message = messages.first(where: { $0["id"]?.intValue == id }) ?? messages.first else {
+            throw MCPError.badResponse
+        }
+        if let error = message["error"] {
+            throw MCPError.protocolError(error["message"]?.stringValue ?? "remote MCP error")
+        }
+        return message["result"] ?? message
+    }
+
+    private func sendRemote(
+        method: String,
+        params: JSONValue?,
+        id: Int?
+    ) async throws -> (body: Data, status: UInt) {
+        let url = try remoteURL()
+        var object: [String: JSONValue] = ["jsonrpc": "2.0", "method": .string(method)]
+        if let id { object["id"] = .int(id) }
+        if let params { object["params"] = params }
+        let body = try JSONValue.object(object).encoded()
+
+        var request = HTTPClientRequest(url: url.absoluteString)
+        request.method = .POST
+        request.headers.add(name: "accept", value: "application/json, text/event-stream")
+        request.headers.add(name: "content-type", value: "application/json")
+        request.headers.add(name: "mcp-protocol-version", value: mcpProtocolVersion)
+        if let remoteSessionID {
+            request.headers.add(name: "mcp-session-id", value: remoteSessionID)
+        }
+        if let bearerToken, !bearerToken.isEmpty {
+            request.headers.add(name: "authorization", value: "Bearer \(bearerToken)")
+        }
+        request.body = .bytes(Array(body))
+
+        do {
+            let response = try await http.execute(
+                request,
+                timeout: .nanoseconds(Self.nanoseconds(config.requestTimeout))
+            )
+            guard (200..<300).contains(response.status.code) else {
+                // Do not include the endpoint, request body, response body, or
+                // authorization material in the surfaced error.
+                throw MCPError.protocolError("remote MCP returned HTTP \(response.status.code)")
+            }
+            for header in response.headers where header.name.lowercased() == "mcp-session-id" {
+                remoteSessionID = header.value
+            }
+            let body = try await collectRemote(response.body)
+            return (body: body, status: response.status.code)
+        } catch let error as MCPError {
+            throw error
+        } catch {
+            throw MCPError.protocolError("remote MCP request failed")
+        }
+    }
+
+    private func remoteURL() throws -> URL {
+        guard let rawURL = config.url, let url = URL(string: rawURL),
+              let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty
+        else {
+            throw MCPError.networkPolicy("remote MCP requires an http(s) URL")
+        }
+        if let allowedHosts = config.allowedHosts, !allowedHosts.isEmpty,
+           !allowedHosts.contains(where: { $0.lowercased() == host.lowercased() }) {
+            throw MCPError.networkPolicy("remote MCP host is not allowed")
+        }
+        if config.allowPrivateNetwork != true, Self.isPrivateHost(host) {
+            throw MCPError.networkPolicy("remote MCP private-network access is disabled")
+        }
+        return url
+    }
+
+    private static func isPrivateHost(_ host: String) -> Bool {
+        let lowercased = host.lowercased()
+        if lowercased == "localhost" || lowercased == "::1" || lowercased == "0.0.0.0" {
+            return true
+        }
+        let octets = lowercased.split(separator: ".").compactMap { Int($0) }
+        guard octets.count == 4 else { return lowercased.hasPrefix("fe80:") }
+        if octets[0] == 10 || octets[0] == 127 || octets[0] == 169 && octets[1] == 254 {
+            return true
+        }
+        if octets[0] == 192 && octets[1] == 168 { return true }
+        return octets[0] == 172 && (16...31).contains(octets[1])
+    }
+
+    private func collectRemote(_ body: HTTPClientResponse.Body) async throws -> Data {
+        try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask {
+                var buffer = try await body.collect(upTo: 4 << 20)
+                return Data(buffer.readBytes(length: buffer.readableBytes) ?? [])
+            }
+            group.addTask {
+                try await Task.sleep(for: self.config.requestTimeout)
+                throw MCPError.timedOut
+            }
+            let data = try await group.next() ?? Data()
+            group.cancelAll()
+            return data
+        }
+    }
+
+    private func remoteMessages(from data: Data) -> [JSONValue] {
+        if let value = try? JSONValue(parsing: data) { return [value] }
+        let text = String(decoding: data, as: UTF8.self)
+        var messages: [JSONValue] = []
+        var dataLines: [String] = []
+        func appendPayload() {
+            guard !dataLines.isEmpty else { return }
+            let payload = dataLines.joined(separator: "\n")
+            if let value = try? JSONValue(parsing: Data(payload.utf8)) { messages.append(value) }
+            dataLines.removeAll(keepingCapacity: true)
+        }
+        for line in text.components(separatedBy: "\n") {
+            if line.isEmpty || line == "\r" {
+                appendPayload()
+            } else if line.hasPrefix("data:") {
+                dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+            } else if let value = try? JSONValue(parsing: Data(line.trimmingCharacters(in: .whitespacesAndNewlines).utf8)) {
+                messages.append(value)
+            }
+        }
+        appendPayload()
+        return messages
+    }
+
+    private static func nanoseconds(_ duration: Duration) -> Int64 {
+        let components = duration.components
+        let (seconds, secondsOverflow) = components.seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        guard !secondsOverflow else { return components.seconds > 0 ? .max : .min }
+        let (nanoseconds, nanosecondsOverflow) = seconds.addingReportingOverflow(components.attoseconds / 1_000_000_000)
+        return nanosecondsOverflow ? (components.seconds > 0 ? .max : .min) : nanoseconds
     }
 
     /// The reader loop: classify every stdout line and dispatch it. When the stream

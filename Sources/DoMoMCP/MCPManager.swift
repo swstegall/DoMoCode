@@ -49,7 +49,8 @@ public actor MCPManager {
         sensitiveEnvKeys: Set<String> = [],
         sandbox: ProcessSandbox? = nil,
         reservedNames: Set<String> = [],
-        log: (@Sendable (String) -> Void)? = nil
+        log: (@Sendable (String) -> Void)? = nil,
+        credentialProvider: (@Sendable (String) -> String?)? = nil
     ) async -> [any AgentTool] {
         self.reservedNames = reservedNames
         self.log = log
@@ -57,31 +58,48 @@ public actor MCPManager {
         // namespaced MCP name that ever collided with one would be renamed, not shadow it.
         for (name, config) in servers.sorted(by: { $0.key < $1.key }) {
             if config.enabled == false { continue }
-            // An empty command would trap on `command[0]` at spawn (an uncatchable index
-            // fault, not a throw the do/catch below could isolate) — skip it up front.
-            guard !config.command.isEmpty else {
+            // An empty local command would trap on `command[0]` at spawn (an
+            // uncatchable index fault, not a throw the do/catch below could
+            // isolate). Remote entries have no command.
+            guard config.isRemote || !config.command.isEmpty else {
                 log?("MCP server '\(name)' has an empty command; skipping.")
                 continue
             }
+            let bearerToken = config.credentialReference.flatMap { credentialProvider?($0) }
+                ?? config.bearerTokenEnvironment.flatMap { ProcessInfo.processInfo.environment[$0] }
             let client = MCPClient(
                 serverName: name, config: config,
                 workspaceDirectory: workspaceDirectory, clientVersion: clientVersion,
                 sensitiveEnvKeys: sensitiveEnvKeys, sandbox: sandbox, log: log,
                 onToolsChanged: { [weak self] in
                     await self?.rebuildTools()
-                }
+                },
+                bearerToken: bearerToken
             )
-            do {
-                try await client.connect()
+            var connectionError: (any Error)?
+            let attempts = config.isRemote ? 3 : 1
+            for attempt in 0..<attempts {
+                do {
+                    try await client.connect()
+                    connectionError = nil
+                    break
+                } catch {
+                    connectionError = error
+                    guard attempt + 1 < attempts else { break }
+                    let delay = Duration.milliseconds(Int64(100 * (1 << attempt)))
+                    try? await Task.sleep(for: delay)
+                }
+            }
+            if connectionError == nil {
                 self.servers.append(ConnectedServer(name: name, client: client))
                 await rebuildTools()
                 let count = mcpTools.filter { $0.definition.name.hasPrefix(McpTool.sanitize(name) + "_") }.count
                 log?("MCP server '\(name)' connected with \(count) tool(s).")
-            } catch {
+            } else if let connectionError {
                 // Redacted: a spawn failure quotes the command, and a configured
                 // `environment` block is exactly where a user keeps that server's
                 // token. This line goes to stderr, where it would outlive the run.
-                log?(Redaction.diagnostic("MCP server '\(name)' failed to connect: \(error)"))
+                log?(Redaction.diagnostic("MCP server '\(name)' failed to connect: \(connectionError)"))
                 await client.shutdown()
             }
         }

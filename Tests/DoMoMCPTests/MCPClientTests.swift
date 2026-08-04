@@ -381,6 +381,46 @@ struct MCPClientTests {
         }
         #expect(refreshed.map(\.definition.name) == ["srv_echo", "srv_new"])
     }
+
+    @Test("Remote MCP settings require explicit private-network opt-in")
+    func remoteNetworkPolicyIsExplicit() async {
+        let config = MCPServerConfig(
+            command: [],
+            url: "http://127.0.0.1:9/mcp",
+            transport: .streamableHTTP
+        )
+        #expect(config.isRemote)
+        #expect(config.effectiveTransport == .streamableHTTP)
+
+        let client = MCPClient(
+            serverName: "remote",
+            config: config,
+            workspaceDirectory: "/tmp"
+        )
+        do {
+            try await client.connect()
+            Issue.record("private-network remote MCP unexpectedly connected")
+        } catch MCPClient.MCPError.networkPolicy(let reason) {
+            #expect(reason.contains("private-network"))
+        } catch {
+            Issue.record("unexpected remote policy error: \(error)")
+        }
+    }
+
+    @Test("Remote credential configuration persists references, never a token")
+    func remoteCredentialReferenceIsNotASecretValue() throws {
+        let config = MCPServerConfig(
+            command: [],
+            url: "https://mcp.example.test/messages",
+            credentialReference: "team-mcp",
+            bearerTokenEnvironment: "DOMO_MCP_TOKEN"
+        )
+        let data = try JSONEncoder().encode(config)
+        let text = String(decoding: data, as: UTF8.self)
+        #expect(text.contains("team-mcp"))
+        #expect(text.contains("DOMO_MCP_TOKEN"))
+        #expect(!text.contains("Bearer"))
+    }
 }
 
 @Suite("LineFramer")

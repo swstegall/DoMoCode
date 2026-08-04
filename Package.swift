@@ -253,6 +253,7 @@ let package = Package(
             name: "DoMoMCP",
             dependencies: [
                 "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoExec",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Subprocess", package: "swift-subprocess"),
                 .product(name: "SystemPackage", package: "swift-system"),
                 .product(name: "Logging", package: "swift-log"),
