@@ -276,6 +276,8 @@ struct ServerRuntimeTests {
             streamFn: textStream("default findings"),
             toolExecution: .sequential,
             maxTurns: 5,
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path,
             modelOptions: [ModelOption(id: "test-model"), ModelOption(id: alternate)],
             modelStreamFactory: { model in
                 { _ in
@@ -289,9 +291,7 @@ struct ServerRuntimeTests {
                         continuation.finish()
                     }
                 }
-            },
-            sessionDirectory: FilePath(dirs.sessions.path),
-            cwd: dirs.cwd.path
+            }
         ))
         let parent = try await runtime.createSession()
         let result = await runtime.runSubagent(SubagentTaskRequest(
