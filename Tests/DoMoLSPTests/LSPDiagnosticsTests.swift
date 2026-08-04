@@ -71,6 +71,7 @@ struct LSPContentLengthFramerTests {
         let fixture = try LSPFixture.make()
         defer { fixture.removeCleanup() }
         try fixture.write("main.swift", "let value = broken")
+        let mainURI = URL(fileURLWithPath: fixture.path("main.swift")).absoluteString
         let script = """
             #!/usr/bin/env python3
             import json
@@ -108,6 +109,23 @@ struct LSPContentLengthFramerTests {
                             }
                         }
                     })
+                elif method == "workspace/symbol":
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": [{
+                            "name": "value",
+                            "kind": 13,
+                            "location": {
+                                "uri": "\(mainURI)",
+                                "range": {
+                                    "start": {"line": 0, "character": 4},
+                                    "end": {"line": 0, "character": 9}
+                                }
+                            },
+                            "containerName": "main"
+                        }]
+                    })
                 elif method == "textDocument/diagnostic":
                     send({
                         "jsonrpc": "2.0",
@@ -131,6 +149,7 @@ struct LSPContentLengthFramerTests {
             [.posixPermissions: 0o755],
             ofItemAtPath: command
         )
+        let pool = LSPClientPool()
         let provider = LSPDiagnosticsProvider(
             root: fixture.root,
             configuration: LSPServerConfiguration(
@@ -138,7 +157,8 @@ struct LSPContentLengthFramerTests {
                 languageID: "swift",
                 environment: .inherit,
                 timeout: .seconds(2)
-            )
+            ),
+            pool: pool
         )
 
         let report = await provider.check(changedPath: FilePath("main.swift"))
@@ -150,5 +170,25 @@ struct LSPContentLengthFramerTests {
         #expect(report.diagnostics.first?.column == 5)
         #expect(report.diagnostics.first?.message == "cannot find 'broken' in scope")
         #expect(report.diagnostics.first?.source == "fixture")
+
+        let index = LSPIndexProvider(
+            root: fixture.root,
+            configuration: LSPServerConfiguration(
+                command: [command],
+                languageID: "swift",
+                environment: .inherit,
+                timeout: .seconds(2)
+            ),
+            pool: pool
+        )
+        let symbols = try await index.search(IndexSearchQuery(text: "value", rootPath: fixture.root.string))
+        #expect(symbols.freshness == .current)
+        #expect(symbols.symbols.first?.name == "value")
+        #expect(symbols.symbols.first?.kind == .variable)
+        #expect(symbols.symbols.first?.location.path == fixture.path("main.swift"))
+        let refresh = try await index.refresh(paths: [fixture.path("main.swift")])
+        #expect(refresh.paths == [fixture.path("main.swift")])
+        #expect(refresh.freshness == .current)
+        await index.shutdown()
     }
 }

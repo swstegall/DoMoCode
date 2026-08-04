@@ -146,6 +146,48 @@ public struct LSPDiagnosticsProvider: DiagnosticsProvider {
     }
 }
 
+/// A symbol/search index backed by the same bounded LSP process used for
+/// diagnostics. The index provider deliberately has no watcher of its own;
+/// ``IndexCoordinator`` owns invalidation and passes the changed paths here.
+/// This keeps file watching, freshness, and permission policy outside the
+/// language-server transport.
+public struct LSPIndexProvider: DoMoIndexProvider {
+    public let root: FilePath
+    public let configuration: LSPServerConfiguration
+    public let descriptor: IndexProviderDescriptor
+    private let pool: LSPClientPool
+
+    public init(
+        root: FilePath,
+        configuration: LSPServerConfiguration,
+        pool: LSPClientPool = LSPClientPool(),
+        providerID: String? = nil
+    ) {
+        self.root = root
+        self.configuration = configuration
+        self.pool = pool
+        let id = providerID ?? "\(configuration.languageID)-lsp-index"
+        self.descriptor = IndexProviderDescriptor(
+            id: id,
+            displayName: "\(configuration.languageID) LSP index",
+            capabilities: ["search", "symbols", "workspace-symbols"],
+            supportsIncrementalRefresh: true
+        )
+    }
+
+    public func search(_ query: IndexSearchQuery) async throws -> IndexSearchResult {
+        try await pool.search(root: root, configuration: configuration, query: query)
+    }
+
+    public func refresh(paths: [String]) async throws -> IndexRefreshResult {
+        try await pool.refresh(root: root, configuration: configuration, paths: paths)
+    }
+
+    public func shutdown() async {
+        await pool.shutdown()
+    }
+}
+
 /// Owns one LSP client per root/command key. Keeping the pool outside the
 /// provider makes it possible for several tools or sessions to share a warm
 /// language server without sharing diagnostics between roots.
@@ -166,28 +208,36 @@ public actor LSPClientPool {
         configuration: LSPServerConfiguration,
         changedPath: FilePath
     ) async -> DiagnosticsReport {
-        guard !configuration.command.isEmpty else {
+        guard let client = client(root: root, configuration: configuration) else {
             return DiagnosticsReport(
                 provider: "\(configuration.languageID)-lsp",
                 status: .unavailable,
                 note: "no language-server command was configured"
             )
         }
-        let key = Key(
-            root: root.string,
-            command: configuration.command,
-            languageID: configuration.languageID,
-            sandbox: configuration.sandbox
-        )
-        let client: LSPClient
-        if let existing = clients[key] {
-            client = existing
-        } else {
-            let created = LSPClient(root: root, configuration: configuration)
-            clients[key] = created
-            client = created
-        }
         return await client.check(changedPath: changedPath)
+    }
+
+    public func search(
+        root: FilePath,
+        configuration: LSPServerConfiguration,
+        query: IndexSearchQuery
+    ) async throws -> IndexSearchResult {
+        guard let client = client(root: root, configuration: configuration) else {
+            throw IndexCoordinatorError.unavailable
+        }
+        return try await client.searchSymbols(query)
+    }
+
+    public func refresh(
+        root: FilePath,
+        configuration: LSPServerConfiguration,
+        paths: [String]
+    ) async throws -> IndexRefreshResult {
+        guard let client = client(root: root, configuration: configuration) else {
+            throw IndexCoordinatorError.unavailable
+        }
+        return try await client.refreshIndex(paths: paths)
     }
 
     public func shutdown() async {
@@ -196,6 +246,23 @@ public actor LSPClientPool {
         for client in clients {
             await client.shutdown()
         }
+    }
+
+    private func client(
+        root: FilePath,
+        configuration: LSPServerConfiguration
+    ) -> LSPClient? {
+        guard !configuration.command.isEmpty else { return nil }
+        let key = Key(
+            root: root.string,
+            command: configuration.command,
+            languageID: configuration.languageID,
+            sandbox: configuration.sandbox
+        )
+        if let existing = clients[key] { return existing }
+        let created = LSPClient(root: root, configuration: configuration)
+        clients[key] = created
+        return created
     }
 }
 
@@ -324,6 +391,7 @@ private actor LSPClient {
     private var openDocuments: Set<String> = []
     private var versions: [String: Int] = [:]
     private var pushed: [String: [CodeDiagnostic]] = [:]
+    private var indexGeneration = 0
     private var initialized = false
     private var closed = false
 
@@ -401,6 +469,48 @@ private actor LSPClient {
         }
     }
 
+    func refreshIndex(paths: [String]) async throws -> IndexRefreshResult {
+        try await startIfNeeded()
+        let normalizedPaths = paths
+            .map { Self.absolutePath(FilePath($0), root: root) }
+            .map(Self.normalizedPath)
+            .filter { !$0.isEmpty }
+            .sorted()
+
+        var refreshed: [String] = []
+        for path in normalizedPaths {
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+                continue
+            }
+            try await publishDocument(uri: Self.fileURI(path), content: content)
+            refreshed.append(path)
+        }
+        indexGeneration += 1
+        return IndexRefreshResult(
+            paths: refreshed,
+            indexedGeneration: indexGeneration,
+            freshness: .current
+        )
+    }
+
+    func searchSymbols(_ query: IndexSearchQuery) async throws -> IndexSearchResult {
+        try await startIfNeeded()
+        let response = try await request(
+            "workspace/symbol",
+            params: .object(["query": .string(query.text)])
+        )
+        let symbols = Self.parseWorkspaceSymbols(
+            response.arrayValue ?? [],
+            query: query,
+            root: root.string
+        )
+        return IndexSearchResult(
+            symbols: Array(symbols.prefix(query.limit)),
+            freshness: .current,
+            indexedGeneration: indexGeneration
+        )
+    }
+
     func shutdown() async {
         readerTask?.cancel()
         readerTask = nil
@@ -430,6 +540,9 @@ private actor LSPClient {
                 "capabilities": .object([
                     "textDocument": .object([
                         "publishDiagnostics": .object([:]),
+                    ]),
+                    "workspace": .object([
+                        "symbol": .object(["dynamicRegistration": .bool(false)]),
                     ]),
                 ]),
                 "workspaceFolders": .array([
@@ -608,6 +721,10 @@ private extension LSPClient {
         return root.appending(path.string).string
     }
 
+    static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+
     static func fileURI(_ path: String) -> String {
         URL(fileURLWithPath: path).absoluteString
     }
@@ -632,6 +749,60 @@ private extension LSPClient {
                 message: String(message.prefix(2_000)),
                 source: value["source"]?.stringValue ?? source
             )
+        }
+    }
+
+    static func parseWorkspaceSymbols(
+        _ values: [JSONValue],
+        query: IndexSearchQuery,
+        root: String
+    ) -> [IndexSymbol] {
+        let normalizedRoot = normalizedPath(root)
+        let allowedKinds = Set(query.kinds)
+        return values.compactMap { value in
+            guard let name = value["name"]?.stringValue,
+                  let location = value["location"]
+            else { return nil }
+            let uri = location["uri"]?.stringValue ?? value["uri"]?.stringValue
+            guard let uri else { return nil }
+            let rawPath = URL(string: uri)?.path.removingPercentEncoding ?? uri
+            let path = normalizedPath(rawPath)
+            guard path == normalizedRoot || path.hasPrefix(normalizedRoot + "/") else {
+                return nil
+            }
+            let kind = indexKind(value["kind"]?.intValue ?? 0)
+            guard allowedKinds.isEmpty || allowedKinds.contains(kind) else { return nil }
+            let range = location["range"] ?? value["range"]
+            let start = range?["start"]
+            let end = range?["end"]
+            return IndexSymbol(
+                name: name,
+                kind: kind,
+                location: IndexLocation(
+                    path: path,
+                    line: start?["line"]?.intValue ?? 0,
+                    column: start?["character"]?.intValue ?? 0,
+                    endLine: end?["line"]?.intValue,
+                    endColumn: end?["character"]?.intValue
+                ),
+                containerName: value["containerName"]?.stringValue,
+                detail: value["detail"]?.stringValue
+            )
+        }
+    }
+
+    static func indexKind(_ value: Int) -> IndexSymbolKind {
+        switch value {
+        case 1: return .file
+        case 2, 4: return .module
+        case 3: return .namespace
+        case 5, 10, 11, 23: return .type
+        case 6, 9: return .method
+        case 7, 8, 24: return .property
+        case 12: return .function
+        case 13: return .variable
+        case 14, 22: return .constant
+        default: return .unknown
         }
     }
 }

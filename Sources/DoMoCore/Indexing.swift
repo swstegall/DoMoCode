@@ -305,15 +305,16 @@ public actor IndexCoordinator {
         }
         guard result.freshness == .current,
               freshness == .current,
-              result.indexedGeneration >= generation,
-              indexedGeneration >= generation
+              pendingPaths.isEmpty
         else {
             var stale = result
             stale.freshness = freshness == .unavailable ? .unavailable : .stale
             stale.warning = stale.warning ?? "Index results may be stale; refresh before treating them as source facts."
             return stale
         }
-        return result
+        var current = result
+        current.indexedGeneration = max(current.indexedGeneration, indexedGeneration)
+        return current
     }
 
     private func isIgnored(_ path: String) -> Bool {
