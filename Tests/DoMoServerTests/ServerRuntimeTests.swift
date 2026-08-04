@@ -304,7 +304,13 @@ struct ServerRuntimeTests {
         #expect(result.status == .completed)
         #expect(result.output == "alternate-model findings")
         let childID = try #require(result.childSessionID)
-        #expect(try await runtime.status(sessionID: childID).model == alternate)
+        let childMessages = try await runtime.messages(sessionID: childID)
+        #expect(childMessages.contains { message in
+            if case .assistant(let assistant) = message {
+                return assistant.model == alternate
+            }
+            return false
+        })
     }
 
     @Test("workflow runs stages through child sessions and waits at approval boundaries")
