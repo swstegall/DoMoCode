@@ -436,7 +436,7 @@ applicable, and a release build under Swift 6.3.
   and theme protocols without baking LiteLLM, macOS, JSONL, or the
   full-screen client into the abstractions.
 
-#### Phase 23 — TUI theme contract, divider, marquees, and image thumbnails — P0
+#### Phase 23 — TUI theme contract, divider, marquees, and image thumbnails — P0 — complete
 
 - [x] Make ThemePalette.background a real full-page paint contract. The
   alternate-screen frame must fill every cell, including blank rows and
@@ -472,7 +472,7 @@ that the existing theme work was absent. Phase 7.5 established image
 encoding, capability detection, and placement; this phase adds the
 layout-safe thumbnail policy.
 
-#### Phase 24 — Live tool catalog, lifecycle hooks, and remote MCP — P0
+#### Phase 24 — Live tool catalog, lifecycle hooks, and remote MCP — P0 — complete
 
 - [x] Pressing / in the full-screen prompt opens a tool catalog. Keep slash
   commands available through their existing completion path, and provide an
@@ -660,54 +660,61 @@ This is the only technically credible subscription path found in the audit.
 Pi has provider-specific OAuth/subscription code and OpenHands has an ACP
 integration; neither justifies reimplementing a private subscription API.
 
-#### Phase 28 — Portable execution, worktrees, conflict-aware orchestration, and backend lifecycle — P1
+#### Phase 28 — Portable execution, worktrees, conflict-aware orchestration, and backend lifecycle — P1 — complete
 
-- [ ] Separate workspace/backend selection from the current macOS/Linux
+- [x] Separate workspace/backend selection from the current macOS/Linux
   process implementation. Retain fail-closed local Seatbelt/bubblewrap and
   add optional adapters for user-installed Docker, Gondolin, OpenShell, or a
   remote worker; do not vendor a binary or add an unreviewed SDK. A non-MIT
   SwiftPM library is allowed when its public GitHub source and notices are
   recorded.
-- [ ] Add session-scoped worktrees with safe branch naming, setup scripts,
+- [x] Add session-scoped worktrees with safe branch naming, setup scripts,
   checkpoint integration, diff/review, promotion, cleanup, and conflict
   reporting. A child agent must never accidentally mutate its parent's
   worktree.
-- [ ] Add conflict-aware orchestration for parallel workflow stages: assign
+- [x] Add conflict-aware orchestration for parallel workflow stages: assign
   declared file/resource ownership, schedule non-overlapping waves, detect
   unexpected overlap before mutation, and require an explicit merge or
   promotion step for competing changes. Preserve per-agent checkpoints and
   make unresolved conflicts visible to the user and the parent workflow.
-- [ ] Make sandbox policy cover shell, background processes, MCP, LSP,
+- [x] Make sandbox policy cover shell, background processes, MCP, LSP,
   formatter, Git, PTY, browser, notebook, and provider subprocesses through
   one launch-plan contract.
-- [ ] Add a backend registry and lifecycle manager with health, capability,
+- [x] Add a backend registry and lifecycle manager with health, capability,
   authentication, start/stop, pause/resume, reconnect, cleanup, and truthful
   state events. A paused or stopped backend must not be presented as a
   healthy running session, and an adapter must report when required isolation
   is unavailable.
-- [ ] Add platform adapters incrementally, with capability negotiation rather
+- [x] Add platform adapters incrementally, with capability negotiation rather
   than compile-time assumptions. Every backend has a testable refusal when
   its required isolation cannot be established.
 
-#### Phase 29 — Durable jobs, session handoff, and local automation — P1
+The optional backend boundary is `ExternalCommandBackend`: a user-installed
+command receives one JSON request and returns one JSON result. Its health
+handshake must advertise capabilities and prove isolation before the backend
+can be selected. `domo adapters list` and `domo adapters doctor` expose the
+Docker, Gondolin, OpenShell, and remote-worker slots without pretending that a
+missing command or an unverified sandbox is usable.
 
-- [ ] Promote child sessions and background agents into a durable job manager
+#### Phase 29 — Durable jobs, session handoff, and local automation — P1 — complete
+
+- [x] Promote child sessions and background agents into a durable job manager
   with job records, correlation, progress, cancellation, retry, notification,
   event cursors, ownership, and restart recovery. Reuse the existing session
   tree and task IDs, and make job state truthful across headless, inline, and
   full-screen clients.
-- [ ] Add explicit session handoff: attach another client, continue in a
+- [x] Add explicit session handoff: attach another client, continue in a
   different worktree/backend/provider, or transfer a plan and artifacts to a
   new session without losing provenance.
-- [ ] Replace the current single-client-first server assumption with safe
+- [x] Replace the current single-client-first server assumption with safe
   multi-client mirroring, resumable event cursors, conflict-free writes, and
   permission prompts routed to one authoritative owner.
-- [ ] Add opt-in local automation after the job/security model is complete:
+- [x] Add opt-in local automation after the job/security model is complete:
   schedules, manual/CLI triggers, filesystem or repository triggers, and
   optional authenticated webhooks. Automations must run with a named
   profile, bounded budget, explicit workspace, sandbox, secret scope,
   cancellation policy, and audit trail.
-- [ ] Provide machine-readable activity logs, run export, failure replay,
+- [x] Provide machine-readable activity logs, run export, failure replay,
   and a clear distinction between a user prompt, a scheduled trigger, and
   a child-agent result.
 
@@ -715,48 +722,53 @@ OpenHands supplies the automation model; OpenCode and Kilo supply the
 handoff, server, and worktree patterns. DoMoCode should adopt the state
 contracts, not their web application or cloud assumptions.
 
-#### Phase 30 — Safe resource packages and permissioned out-of-process extensions — P1
+#### Phase 30 — Safe resource packages and permissioned out-of-process extensions — P1 — complete
 
-- [ ] Allow GitHub-hosted, MIT-licensed skills, commands, and themes to be
+- [x] Allow GitHub-hosted, MIT-licensed skills, commands, and themes to be
   fetched into a content-addressed, reviewable cache. Installation is data
   loading, not arbitrary code execution. Pin commits, record license and
   provenance metadata, validate schemas, and require explicit trust before a
   code-bearing resource can affect a session.
-- [ ] Add theme import/export and live reload with a fallback palette,
+- [x] Add theme import/export and live reload with a fallback palette,
   background coverage, semantic colors, accessibility contrast checks, and
   terminal capability negotiation.
-- [ ] Add a permissioned out-of-process extension host. Extensions must have
+- [x] Add a permissioned out-of-process extension host. Extensions must have
   a manifest, versioned protocol, declared capabilities, resource limits,
   executable/source/license metadata, lifecycle health, and explicit user or
   project approval. Use MCP, ACP, or a compatible JSON-RPC adapter boundary;
   do not load arbitrary code into the DoMoCode process or let an extension
   bypass tool permissions.
-- [ ] Add file watching for trusted resource and workspace changes, with
+- [x] Add file watching for trusted resource and workspace changes, with
   debounce, cancellation, and a prompt-visible reload notice. A changed
   skill, command, theme, or tool must not silently mutate a running turn's
   snapshot.
 
-#### Phase 31 — Indexing, richer code intelligence, browser, and notebook — P2
+#### Phase 31 — Indexing, richer code intelligence, browser, and notebook — P2 — complete
 
-- [ ] Add an index provider protocol and an incremental file watcher. Start
+- [x] Add an index provider protocol and an incremental file watcher. Start
   with symbol/LSP/search indexes; add semantic embeddings only when an
   acceptable SwiftPM library with a reviewed license and provider path are
   available.
-- [ ] Extend DoMoLSP and the / catalog with definitions, declarations,
+- [x] Extend DoMoLSP and the / catalog with definitions, declarations,
   references, implementations, document/workspace symbols, call hierarchy,
   diagnostics, rename/related locations where the server supports them, and
   repository navigation. Keep each operation permission-aware, cancellable,
   bounded, and usable by Ask, Debug, Review, and research workflows.
-- [ ] Add incremental symbol and dependency indexes with explicit freshness
+- [x] Add incremental symbol and dependency indexes with explicit freshness
   state, invalidation, ignored paths, and a graceful search-only fallback.
   Never present stale index results as current source facts.
-- [ ] Integrate browser automation and notebook kernels through MCP/ACP first,
+- [x] Integrate browser automation and notebook kernels through MCP/ACP first,
   including screenshot/image results, approvals, sandboxing, and output
   truncation. A native implementation needs a demonstrated GitHub/SPM
   dependency path and a platform test matrix.
-- [ ] Add provider/model capability checks for images, long context, tools,
+- [x] Add provider/model capability checks for images, long context, tools,
   reasoning, and background requests without hardcoding a provider name into
   the agent loop.
+
+Browser, notebook, and remote-search behavior remains an explicitly configured
+MCP/ACP capability. DoMoCode carries image results, approvals, cancellation,
+output bounds, and permission metadata across that boundary; it does not ship
+a native browser or notebook runtime.
 
 ## Retry and provider behavior today
 
