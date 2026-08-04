@@ -185,7 +185,7 @@ public nonisolated enum ThemeDocumentCodec {
 public extension ThemeColor {
     /// Converts RGB colors to a deterministic indexed fallback when a terminal
     /// does not advertise true-color support. ANSI colors remain unchanged.
-    func adapted(for capabilities: ThemeRenderCapabilities) -> ThemeColor {
+    nonisolated func adapted(for capabilities: ThemeRenderCapabilities) -> ThemeColor {
         guard !capabilities.trueColor else { return self }
         switch self {
         case .rgb(let red, let green, let blue):
@@ -195,7 +195,7 @@ public extension ThemeColor {
         }
     }
 
-    private static func nearestANSIIndexForCapabilities(red: UInt8, green: UInt8, blue: UInt8) -> UInt8 {
+    private nonisolated static func nearestANSIIndexForCapabilities(red: UInt8, green: UInt8, blue: UInt8) -> UInt8 {
         let r = UInt8((Int(red) * 5 + 127) / 255)
         let g = UInt8((Int(green) * 5 + 127) / 255)
         let b = UInt8((Int(blue) * 5 + 127) / 255)
@@ -204,7 +204,7 @@ public extension ThemeColor {
 }
 
 public extension ThemePalette {
-    func adapted(for capabilities: ThemeRenderCapabilities) -> ThemePalette {
+    nonisolated func adapted(for capabilities: ThemeRenderCapabilities) -> ThemePalette {
         ThemePalette(
             foreground: foreground.adapted(for: capabilities),
             accent: accent.adapted(for: capabilities),
@@ -215,7 +215,7 @@ public extension ThemePalette {
         )
     }
 
-    static let standardFallback = ThemePalette(
+    nonisolated static let standardFallback = ThemePalette(
         foreground: .rgb(red: 0xd7, green: 0xdb, blue: 0xe0),
         accent: .rgb(red: 0x78, green: 0xb7, blue: 0xff),
         muted: .rgb(red: 0x7f, green: 0x87, blue: 0x91),
