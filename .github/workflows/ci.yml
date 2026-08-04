@@ -15,10 +15,10 @@ jobs:
     name: ${{ matrix.os }} / ${{ matrix.configuration }}
     runs-on: ${{ matrix.os }}
     # The matrix intentionally runs PTY, socket, subprocess, and timing suites
-    # serially. Thirty minutes truncates a healthy full pass before Swift
-    # Testing can report its result; keep the timeout above the observed
-    # duration while retaining a hard upper bound for wedged jobs.
-    timeout-minutes: 60
+    # serially. The complete four-platform pass can exceed an hour before
+    # Swift Testing reports its result; retain a two-hour hard upper bound for
+    # wedged jobs while allowing the real suite to finish.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
