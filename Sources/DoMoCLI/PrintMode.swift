@@ -741,7 +741,6 @@ public struct PrintMode: Sendable {
             },
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
-            recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: modelRuntime),
             // Installing one is not only about spending less on compaction. The
             // harness's built-in fallback summarizer runs its request through
             // `configuration.streamFn` — which here is the seam below — so a
@@ -762,7 +761,14 @@ public struct PrintMode: Sendable {
             beforeToolCall: beforeToolCall,
             onNoProgress: onNoProgress,
             maxCostPerRun: maxCostPerRun,
-            sessionStartHead: sessionStartHead
+            sessionStartHead: sessionStartHead,
+            recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: modelRuntime),
+            recoveryDiagnosticTools: makeRecoveryDiagnosticTools(
+                client: client,
+                runtime: modelRuntime,
+                toolContext: toolContext,
+                visibleToolNames: tools.map(\.definition.name)
+            )
         )
         configuration.workspaceSnapshots = DoMoShadowGit(
             shell: toolContext.shell,

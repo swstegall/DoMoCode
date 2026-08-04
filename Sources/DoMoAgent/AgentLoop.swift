@@ -90,7 +90,8 @@ public func runAgentLoop(
                     envelope: enriched,
                     model: config.model,
                     maxOutputTokens: config.recoveryDiagnosticMaxOutputTokens,
-                    timeout: config.recoveryDiagnosticTimeout
+                    timeout: config.recoveryDiagnosticTimeout,
+                    readOnlyTools: config.recoveryDiagnosticTools
                 )
                 if let result = await runRecoveryDiagnostic(
                     diagnostic,

@@ -472,6 +472,11 @@ public struct AgentLoopConfig: Sendable {
     /// Maximum output requested from the diagnostic model.
     public var recoveryDiagnosticMaxOutputTokens: Int
 
+    /// Explicitly allowlisted read-only tools for the diagnostic sub-turn.
+    /// Mutation-capable, shell, credential, network, and recursive tools are
+    /// never inferred from the normal tool set.
+    public var recoveryDiagnosticTools: [any AgentTool]
+
     public init(
         model: String = "unknown",
         toolExecution: ToolExecutionMode = .parallel,
@@ -491,7 +496,8 @@ public struct AgentLoopConfig: Sendable {
         systemPromptForTools: (@Sendable (String, [String]) -> String?)? = nil,
         recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
         recoveryDiagnosticTimeout: Duration = .seconds(8),
-        recoveryDiagnosticMaxOutputTokens: Int = 512
+        recoveryDiagnosticMaxOutputTokens: Int = 512,
+        recoveryDiagnosticTools: [any AgentTool] = []
     ) {
         self.model = model
         self.toolExecution = toolExecution
@@ -512,6 +518,7 @@ public struct AgentLoopConfig: Sendable {
         self.recoveryDiagnostic = recoveryDiagnostic
         self.recoveryDiagnosticTimeout = recoveryDiagnosticTimeout
         self.recoveryDiagnosticMaxOutputTokens = max(1, min(2_048, recoveryDiagnosticMaxOutputTokens))
+        self.recoveryDiagnosticTools = recoveryDiagnosticTools
     }
 }
 

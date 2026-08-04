@@ -2526,7 +2526,6 @@ public struct InteractiveMode: Sendable {
             systemPromptForPromptAndTools: promptForTools,
             model: runtime.model,
             streamFn: streamFn,
-            recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: runtime),
             // A distinct small model compacts on its own request rather than through
             // `streamFn`; with none configured this is `nil` and the harness keeps
             // its built-in summarizer, unchanged.
@@ -2544,7 +2543,14 @@ public struct InteractiveMode: Sendable {
             beforeToolCall: gate,
             onNoProgress: noProgress,
             maxCostPerRun: maxCostPerRun,
-            sessionStartHead: sessionStartHead
+            sessionStartHead: sessionStartHead,
+            recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: runtime),
+            recoveryDiagnosticTools: makeRecoveryDiagnosticTools(
+                client: client,
+                runtime: runtime,
+                toolContext: toolContext,
+                visibleToolNames: tools.map(\.definition.name)
+            )
         )
         configuration.workspaceSnapshots = DoMoShadowGit(
             shell: shell,

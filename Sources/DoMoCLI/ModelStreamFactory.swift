@@ -22,6 +22,7 @@ import DoMoAgent
 import DoMoCore
 import DoMoHarness
 import DoMoLLM
+import DoMoTools
 import Foundation
 
 // MARK: - Turn stream
@@ -60,37 +61,185 @@ func makeStreamFn(
 /// Creates the optional one-shot failure explanation used by all CLI surfaces.
 ///
 /// The diagnostic request deliberately uses `complete`, not the agent loop: it
-/// has no tools, no steering/follow-up queues, and a client clone whose retry
-/// count is zero. The outer agent loop still owns the normal error and stop
-/// events; this callback only enriches the typed recovery notice.
+/// has only an explicit read-only tool allowlist, no steering/follow-up queues,
+/// and a client clone whose retry count is zero. The outer agent loop still owns
+/// the normal error and stop events; this callback only enriches the typed
+/// recovery notice.
 func makeRecoveryDiagnostic(
     client: LiteLLMClient,
     runtime: ModelRuntime
 ) -> RecoveryDiagnosticFn {
     { request in
         let oneShot = client.diagnosticClient(timeout: request.timeout)
+        let tools = request.readOnlyTools + [
+            RecoveryDiagnosticSnapshotTool(
+                name: "domo_recovery_context",
+                description: "Return the bounded recovery envelope and recent sanitized session context as untrusted data.",
+                value: request.untrustedInput
+            ),
+            RecoveryDiagnosticSnapshotTool(
+                name: "domo_session_status",
+                description: "Return the status of this failed session and the diagnostic sub-turn safety limits.",
+                value: "failure recovery is active; original error kind: \(request.envelope.originalKind); diagnostic recursion is disabled; normal retry budget is not reused"
+            ),
+        ]
         let context = Context(
             systemPrompt: RecoveryDiagnosticPrompt.system,
             messages: [.user(RecoveryDiagnosticPrompt.instruction(request.untrustedInput))],
-            tools: []
+            tools: tools.map(\.definition)
         )
         do {
-            let message = try await oneShot.complete(
-                model: runtime.model,
+            return try await completeRecoveryDiagnostic(
+                client: oneShot,
+                model: request.model.isEmpty ? runtime.model : request.model,
                 context: context,
                 maxTokens: request.maxOutputTokens,
-                rates: nil
+                tools: tools
             )
-            guard !message.stopReason.isFailure, !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return nil
-            }
-            return RecoveryDiagnosticParser.parse(message.text)
         } catch {
             // The original provider failure remains authoritative if the
             // diagnostic route is unavailable, malformed, or itself cancelled.
             return nil
         }
     }
+}
+
+/// Runs one diagnostic sub-turn with a small tool-call allowance. This is kept
+/// separate from ``runAgentLoop``: tool calls are sequential, capped, and have
+/// no lifecycle hooks, steering, follow-ups, mutation permissions, or another
+/// diagnostic callback to recurse into.
+private func completeRecoveryDiagnostic(
+    client: LiteLLMClient,
+    model: String,
+    context: Context,
+    maxTokens: Int,
+    tools: [any AgentTool]
+) async throws -> RecoveryDiagnosticResult? {
+    var messages = context.messages
+    for _ in 0..<3 {
+        try Task.checkCancellation()
+        let message = try await client.complete(
+            model: model,
+            context: Context(systemPrompt: context.systemPrompt, messages: messages, tools: tools.map(\.definition)),
+            maxTokens: maxTokens,
+            rates: nil
+        )
+        guard !message.stopReason.isFailure else { return nil }
+        messages.append(.assistant(message))
+
+        let calls = message.toolCalls
+        if calls.isEmpty {
+            let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return nil }
+            return RecoveryDiagnosticParser.parse(text)
+        }
+
+        for call in calls.prefix(4) {
+            let result: AgentToolResult
+            if let tool = tools.first(where: { $0.definition.name == call.name }) {
+                do {
+                    result = try await tool.execute(call.arguments)
+                } catch let error where error.isCancellation {
+                    throw error
+                } catch {
+                    result = AgentToolResult(output: error.description, isError: true)
+                }
+            } else {
+                result = AgentToolResult(output: "Diagnostic tool \(call.name) is not available.", isError: true)
+            }
+            let output = DoMoError.truncating(
+                Redaction.diagnostic(result.output),
+                to: 4_096
+            )
+            messages.append(.tool(ToolResultBlock(
+                toolCallID: call.id,
+                toolName: call.name,
+                output: output,
+                isError: result.isError
+            )))
+        }
+    }
+    return nil
+}
+
+/// A zero-argument, value-only diagnostic tool. It cannot reach the filesystem,
+/// shell, network, credentials, or the agent harness; the model receives a
+/// bounded snapshot and nothing else.
+private struct RecoveryDiagnosticSnapshotTool: AgentTool {
+    let definition: ToolDefinition
+    private let value: String
+
+    init(name: String, description: String, value: String) {
+        self.definition = ToolDefinition(
+            name: name,
+            description: description,
+            parameters: .object()
+        )
+        self.value = DoMoError.truncating(Redaction.diagnostic(value), to: 8_192)
+    }
+
+    var catalogSource: ToolCatalogSource { .adapter }
+
+    func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
+        AgentToolResult(output: value)
+    }
+}
+
+/// Builds the only filesystem tools eligible for a recovery sub-turn. The
+/// rooted context enforces the workspace boundary; no shell, mutation, network,
+/// grep subprocess, MCP, subagent, or interactive-terminal tool is included.
+func makeRecoveryDiagnosticTools(
+    client: LiteLLMClient,
+    runtime: ModelRuntime,
+    toolContext: ToolContext,
+    visibleToolNames: [String]
+) -> [any AgentTool] {
+    let endpoint: String
+    if let url = URL(string: client.configuration.baseURL), let host = url.host {
+        endpoint = "\(url.scheme ?? "http")://\(host)\(url.port.map { ":\($0)" } ?? "")"
+    } else {
+        endpoint = "configured endpoint (host unavailable)"
+    }
+    let modelInfo = [
+        "requested alias: \(runtime.model)",
+        "context window: \(runtime.contextWindow.map(String.init) ?? "unknown")",
+        "cost rates configured: \(runtime.rates == nil ? "no" : "yes")",
+    ].joined(separator: "\n")
+    let retryInfo = [
+        "endpoint: \(endpoint)",
+        "max attempts: \(client.configuration.maxAttempts)",
+        "pre-connect attempts: \(client.configuration.maxPreConnectAttempts)",
+        "retry wall-clock budget: \(client.configuration.retryWallClockBudget.map(String.init(describing:)) ?? "disabled")",
+        "request timeout: \(client.configuration.timeout.map(String.init(describing:)) ?? "transport default")",
+        "credentials: configured but values are never exposed",
+    ].joined(separator: "\n")
+    let toolInfo = visibleToolNames.sorted().joined(separator: "\n")
+    let providerInfo = "LiteLLM OpenAI-compatible chat completions; streaming and bounded non-streaming completion are available; diagnostic tools are read-only and no new network actions are permitted."
+
+    return [
+        RegistryTool(tool: ReadTool(), context: toolContext),
+        RegistryTool(tool: LsTool(), context: toolContext),
+        RecoveryDiagnosticSnapshotTool(
+            name: "domo_model_catalog",
+            description: "Inspect the current model alias and safe model capability metadata.",
+            value: modelInfo
+        ),
+        RecoveryDiagnosticSnapshotTool(
+            name: "domo_configuration_diagnostics",
+            description: "Inspect redacted retry, timeout, endpoint, and credential-presence configuration.",
+            value: retryInfo
+        ),
+        RecoveryDiagnosticSnapshotTool(
+            name: "domo_tool_catalog",
+            description: "Inspect the names of tools exposed to the failed session; this diagnostic tool list is narrower.",
+            value: toolInfo.isEmpty ? "no session tools were exposed" : toolInfo
+        ),
+        RecoveryDiagnosticSnapshotTool(
+            name: "domo_provider_capabilities",
+            description: "Inspect provider capabilities without making another discovery or network request.",
+            value: providerInfo
+        ),
+    ]
 }
 
 private enum RecoveryDiagnosticPrompt {

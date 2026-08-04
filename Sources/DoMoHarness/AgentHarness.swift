@@ -249,6 +249,10 @@ public actor AgentHarness {
         /// Maximum completion tokens requested by the diagnostic sub-turn.
         public var recoveryDiagnosticMaxOutputTokens: Int
 
+        /// Explicitly allowlisted read-only tools for failure diagnosis. The
+        /// normal session tool set is deliberately not reused.
+        public var recoveryDiagnosticTools: [any AgentTool]
+
         /// The model name stamped onto synthesized messages and used for
         /// compaction's summarization request. Model *selection* is the injected
         /// ``streamFn``'s job.
@@ -398,7 +402,8 @@ public actor AgentHarness {
             sessionStartHead: String? = nil,
             recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
             recoveryDiagnosticTimeout: Duration = .seconds(8),
-            recoveryDiagnosticMaxOutputTokens: Int = 512
+            recoveryDiagnosticMaxOutputTokens: Int = 512,
+            recoveryDiagnosticTools: [any AgentTool] = []
         ) {
             self.systemPrompt = systemPrompt
             self.systemPromptForPrompt = systemPromptForPrompt
@@ -408,6 +413,7 @@ public actor AgentHarness {
             self.recoveryDiagnostic = recoveryDiagnostic
             self.recoveryDiagnosticTimeout = recoveryDiagnosticTimeout
             self.recoveryDiagnosticMaxOutputTokens = max(1, min(2_048, recoveryDiagnosticMaxOutputTokens))
+            self.recoveryDiagnosticTools = recoveryDiagnosticTools
             self.model = model
             self.streamFn = streamFn
             self.streamFnForModel = streamFnForModel
@@ -1244,7 +1250,8 @@ public actor AgentHarness {
             systemPromptForTools: systemPromptForTools,
             recoveryDiagnostic: configuration.recoveryDiagnostic,
             recoveryDiagnosticTimeout: configuration.recoveryDiagnosticTimeout,
-            recoveryDiagnosticMaxOutputTokens: configuration.recoveryDiagnosticMaxOutputTokens
+            recoveryDiagnosticMaxOutputTokens: configuration.recoveryDiagnosticMaxOutputTokens,
+            recoveryDiagnosticTools: configuration.recoveryDiagnosticTools
         )
         let errorBox = PersistenceErrorBox()
         let streamFn = runOverride?.streamFn ?? activeStreamFn

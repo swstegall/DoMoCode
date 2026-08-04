@@ -14,17 +14,22 @@ public struct RecoveryDiagnosticRequest: Sendable {
     public let model: String
     public let maxOutputTokens: Int
     public let timeout: Duration
+    /// The host's explicit allowlist of tools that the diagnostic model may
+    /// call. An empty list is valid and is the fail-closed default.
+    public let readOnlyTools: [any AgentTool]
 
     public init(
         envelope: RecoveryEnvelope,
         model: String,
         maxOutputTokens: Int = 512,
-        timeout: Duration = .seconds(8)
+        timeout: Duration = .seconds(8),
+        readOnlyTools: [any AgentTool] = []
     ) {
         self.envelope = envelope
         self.model = model
         self.maxOutputTokens = max(1, min(2_048, maxOutputTokens))
         self.timeout = timeout
+        self.readOnlyTools = readOnlyTools
     }
 
     /// A clearly delimited prompt fragment. It is intentionally not a system

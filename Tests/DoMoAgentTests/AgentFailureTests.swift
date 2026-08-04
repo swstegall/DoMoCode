@@ -331,6 +331,9 @@ private struct WidgetFault: Error {}
         error: "invalid key",
         model: "test-model"
     )
+    let readOnlyTool = FakeTool("diagnostic_read") { _ in
+        AgentToolResult(output: "safe inspection")
+    }
     let stream: AgentStreamFn = { _ in
         AsyncThrowingStream { continuation in
             continuation.yield(.recovery(envelope))
@@ -343,7 +346,8 @@ private struct WidgetFault: Error {}
         config: AgentLoopConfig(
             model: "test-model",
             recoveryDiagnostic: diagnostic,
-            recoveryDiagnosticTimeout: .seconds(1)
+            recoveryDiagnosticTimeout: .seconds(1),
+            recoveryDiagnosticTools: [readOnlyTool]
         ),
         sink: sink,
         streamFn: stream
@@ -354,6 +358,7 @@ private struct WidgetFault: Error {}
     #expect(requests.value.count == 1)
     #expect(requests.value[0].untrustedInput.contains("UNTRUSTED DOMOCODE RECOVERY DATA"))
     #expect(requests.value[0].envelope.sessionContext?.contains("user: inspect the gateway") == true)
+    #expect(requests.value[0].readOnlyTools.map(\.definition.name) == ["diagnostic_read"])
     #expect(sink.errorNotices.count == 1)
     #expect(sink.errorNotices.first?.recovery?.diagnosis?.contains("gateway rejected") == true)
     #expect(sink.errorNotices.first?.recovery?.attemptedRemedies.count == 2)

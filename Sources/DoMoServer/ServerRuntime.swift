@@ -273,6 +273,9 @@ public actor ServerRuntime {
         /// Optional one-shot diagnostic resolver. It must use a bounded client,
         /// no mutation-capable tools, and never call the agent loop recursively.
         public var recoveryDiagnostic: RecoveryDiagnosticFn?
+        /// Explicitly allowlisted read-only diagnostic tools. The ordinary
+        /// session tools are not implicitly exposed to failure recovery.
+        public var recoveryDiagnosticTools: [any AgentTool]
         public var modelContextWindow: (@Sendable (String) -> Int?)?
         public var tools: [any AgentTool]
         /// Optional per-session resolver. The session id is part of the seam so
@@ -393,6 +396,7 @@ public actor ServerRuntime {
             modelOptions: [ModelOption] = [],
             modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
             recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
+            recoveryDiagnosticTools: [any AgentTool] = [],
             modelContextWindow: (@Sendable (String) -> Int?)? = nil,
             steeringMode: QueueDeliveryMode = .oneAtATime,
             maxCostPerRun: Decimal? = nil,
@@ -418,6 +422,7 @@ public actor ServerRuntime {
             self.modelOptions = modelOptions
             self.modelStreamFactory = modelStreamFactory
             self.recoveryDiagnostic = recoveryDiagnostic
+            self.recoveryDiagnosticTools = recoveryDiagnosticTools
             self.modelContextWindow = modelContextWindow
             self.tools = tools
             self.toolsForSession = toolsForSession
@@ -1446,8 +1451,9 @@ public actor ServerRuntime {
             model: config.model,
             streamFn: config.streamFn,
             streamFnForModel: config.modelStreamFactory,
-            recoveryDiagnostic: config.recoveryDiagnostic,
             contextWindowForModel: config.modelContextWindow,
+            recoveryDiagnostic: config.recoveryDiagnostic,
+            recoveryDiagnosticTools: config.recoveryDiagnosticTools,
             // The three below are the whole reason `Config` carries them: a value
             // that stops here is a knob a user can set and nothing reads. The
             // harness clamps `compaction` against `contextWindow` in its own
