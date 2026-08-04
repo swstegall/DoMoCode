@@ -111,4 +111,42 @@ struct ImageDisplayTests {
         #expect(columns <= 40)
         #expect(height <= 5)
     }
+
+    @Test("The ordinary thumbnail policy is configurable and explicit expansion may grow")
+    func configurableAndExpandedImagePolicy() {
+        let view = TranscriptView()
+        view.items = [.image(png(width: 1000, height: 1000), imageId: 8)]
+        view.imagePolicy = TranscriptImagePolicy(maxColumns: 20, maxRows: 6)
+
+        let ordinary = view.visualRows(
+            width: 80,
+            capabilities: TerminalCapabilities(images: .kitty, trueColor: true, hyperlinks: true),
+            cell: .default,
+            maxHeightRows: 30
+        )
+        guard case .image(_, _, let ordinaryColumns, let ordinaryRows) = ordinary.first(where: {
+            if case .image = $0 { true } else { false }
+        }) else {
+            Issue.record("expected an ordinary image row")
+            return
+        }
+        #expect(ordinaryColumns <= 20)
+        #expect(ordinaryRows <= 6)
+
+        view.toggleImageExpansion()
+        let expanded = view.visualRows(
+            width: 80,
+            capabilities: TerminalCapabilities(images: .kitty, trueColor: true, hyperlinks: true),
+            cell: .default,
+            maxHeightRows: 30
+        )
+        guard case .image(_, _, let expandedColumns, let expandedRows) = expanded.first(where: {
+            if case .image = $0 { true } else { false }
+        }) else {
+            Issue.record("expected an expanded image row")
+            return
+        }
+        #expect(expandedColumns > ordinaryColumns)
+        #expect(expandedRows > ordinaryRows)
+    }
 }

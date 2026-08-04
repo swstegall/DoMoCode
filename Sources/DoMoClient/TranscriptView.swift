@@ -19,6 +19,14 @@ enum TranscriptVisualRow: Sendable, Hashable {
     case image(escape: String, imageId: UInt32?, cellWidth: Int, cellRows: Int)
 }
 
+/// Safe defaults for ordinary image output. The client can raise these limits for
+/// an explicit image-open action without making every tool result a large layout
+/// block.
+struct TranscriptImagePolicy: Sendable, Hashable {
+    var maxColumns: Int = 40
+    var maxRows: Int = 12
+}
+
 /// Renders `[TranscriptItem]` to visual rows (text + images) for the main pane.
 @MainActor
 final class TranscriptView: Component {
@@ -67,10 +75,10 @@ final class TranscriptView: Component {
     private let failedToolOutputCap = 24
 
     /// Ordinary transcript images are thumbnails, not unbounded layout blocks.
-    /// These limits are the safe default; a future explicit image-open action can
-    /// raise them for that one interaction without changing ordinary tool output.
-    private static let thumbnailMaxColumns = 40
-    private static let thumbnailMaxRows = 12
+    /// The policy is configurable for an explicit image-open action.
+    var imagePolicy = TranscriptImagePolicy()
+    /// An explicit user action may use the whole available transcript viewport.
+    var imagesExpanded = false
 
     /// The braille spinner, shared with ``DoMoTUI/Loader``'s frame set so every
     /// surface animates identically.
@@ -81,7 +89,7 @@ final class TranscriptView: Component {
     /// an image (base64 + escape) every frame would be very expensive. Keyed on the
     /// content, width, streaming flag, spinner frame, the graphics context, and
     /// the expand toggle.
-    private var cache: (items: [TranscriptItem], running: Bool, spinnerFrame: Int, width: Int, maxHeightRows: Int?, capabilities: TerminalCapabilities, cell: CellDimensions, expandErrors: Bool, rows: [TranscriptVisualRow])?
+    private var cache: (items: [TranscriptItem], running: Bool, spinnerFrame: Int, width: Int, maxHeightRows: Int?, imagePolicy: TranscriptImagePolicy, imagesExpanded: Bool, capabilities: TerminalCapabilities, cell: CellDimensions, expandErrors: Bool, rows: [TranscriptVisualRow])?
 
     /// The mixed text/image rows for the main pane, given the terminal's image
     /// capability and cell size.
@@ -100,6 +108,8 @@ final class TranscriptView: Component {
         if let cache, cache.width == width, cache.running == running,
            cache.spinnerFrame == spinnerFrame,
            cache.maxHeightRows == maxHeightRows,
+           cache.imagePolicy == imagePolicy,
+           cache.imagesExpanded == imagesExpanded,
            cache.capabilities == capabilities, cache.cell == cell,
            cache.expandErrors == expandErrors, cache.items == items {
             return cache.rows
@@ -125,18 +135,43 @@ final class TranscriptView: Component {
         if scrollOffset > 0,
            let previous,
            previous.width == width, previous.maxHeightRows == maxHeightRows,
+           previous.imagePolicy == imagePolicy, previous.imagesExpanded == imagesExpanded,
            previous.capabilities == capabilities, previous.cell == cell,
            previous.expandErrors == expandErrors,
            rows.count > previous.rows.count {
             scrollOffset += rows.count - previous.rows.count
         }
-        cache = (items, running, spinnerFrame, width, maxHeightRows, capabilities, cell, expandErrors, rows)
+        cache = (
+            items,
+            running,
+            spinnerFrame,
+            width,
+            maxHeightRows,
+            imagePolicy,
+            imagesExpanded,
+            capabilities,
+            cell,
+            expandErrors,
+            rows
+        )
         return rows
     }
 
     /// Jump back to the newest content.
     func scrollToBottom() {
         scrollOffset = 0
+    }
+
+    var hasImages: Bool {
+        items.contains { item in
+            if case .image = item { return true }
+            return false
+        }
+    }
+
+    func toggleImageExpansion() {
+        guard hasImages else { return }
+        imagesExpanded.toggle()
     }
 
     /// Text-only rendering for the Component protocol: with no image protocol,
@@ -235,10 +270,12 @@ final class TranscriptView: Component {
         cell: CellDimensions
     ) -> [TranscriptVisualRow] {
         let dimensions = imageDimensions(block.data, mediaType: block.mediaType)
-        let maxRows = min(
-            Self.thumbnailMaxRows,
-            max(1, maxHeightRows ?? Self.thumbnailMaxRows)
-        )
+        let configuredColumns = max(1, imagePolicy.maxColumns)
+        let configuredRows = max(1, imagePolicy.maxRows)
+        let maxColumns = imagesExpanded ? width : min(configuredColumns, width)
+        let maxRows = imagesExpanded
+            ? max(1, maxHeightRows ?? configuredRows)
+            : min(configuredRows, max(1, maxHeightRows ?? configuredRows))
         if let dimensions,
            let rendered = renderImage(
                base64Data: block.data.base64EncodedString(),
@@ -246,7 +283,7 @@ final class TranscriptView: Component {
                mediaType: block.mediaType,
                capabilities: capabilities,
                cell: cell,
-               maxWidthCells: min(Self.thumbnailMaxColumns, width),
+               maxWidthCells: maxColumns,
                maxHeightCells: maxRows,
                imageId: imageId,
                moveCursor: false

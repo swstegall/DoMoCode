@@ -588,6 +588,9 @@ public final class ClientApp {
             parts.append("mode " + agentMode.rawValue)
             parts.append("ws " + workspaceSnapshotStatus.rawValue)
         }
+        if transcriptView.hasImages {
+            parts.append(transcriptView.imagesExpanded ? "F6: shrink images" : "F6: enlarge images")
+        }
         // Contextual controls come before transient notices. The status row is
         // truncated from the right, and a long disconnect or refusal notice can
         // otherwise hide the diagnostic key at exactly the moment it explains the
@@ -3669,6 +3672,11 @@ extension ClientApp: TerminalApp {
         // what you want while a modal is up.
         if data == Self.ctrlO {
             transcriptView.expandErrors.toggle()
+            surface?.requestRender()
+            return
+        }
+        if matchesKey(data, Key.f6) {
+            transcriptView.toggleImageExpansion()
             surface?.requestRender()
             return
         }
