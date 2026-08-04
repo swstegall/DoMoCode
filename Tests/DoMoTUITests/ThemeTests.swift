@@ -48,6 +48,12 @@ struct ThemeTests {
         #expect(lines[0].hasPrefix("\u{1b}[48;5;24m"))
         #expect(lines[0].contains("\u{1b}[0m\u{1b}[48;5;24m"))
         #expect(lines[1].contains(String(repeating: " ", count: 10)))
+        let rgb = paintFrameBackground(
+            [""],
+            width: 2,
+            color: .rgb(red: 1, green: 2, blue: 3)
+        )
+        #expect(rgb[0].contains("\u{1b}[48;2;1;2;3m"))
         #expect(paintFrameBackground(["plain"], width: 5, color: .inherit) == ["plain"])
     }
 }

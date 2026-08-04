@@ -93,6 +93,42 @@ struct ScreenSurfaceTests {
                 #expect(oracle.cell(col: column, row: row)?.style.background == .ansi(24), "(row),(column)")
             }
         }
+
+        // Switching to the explicit opt-out and forcing a redraw must clear the
+        // old coloured cells rather than leaving stale page paint in the oracle.
+        surface.frameBackground = .inherit
+        surface.requestFullRedraw()
+        try drive(surface, into: oracle, from: target)
+        for row in 0..<height {
+            for column in 0..<width {
+                #expect(oracle.cell(col: column, row: row)?.style.background == .default, "(row),(column)")
+            }
+        }
+    }
+
+    @Test("The page background also covers cells occupied by an overlay")
+    func overlayKeepsPageBackground() throws {
+        let width = 16, height = 5
+        let oracle = ScreenOracle(rows: height, cols: width)
+        oracle.feed(enterAltScreen)
+        let target = CaptureTarget(columns: width, rows: height)
+        let ring = FocusRing()
+        let surface = ScreenSurface(target: target, focus: ring, showHardwareCursor: false) {
+            Column([LinesComponent(["base"]), FlexSpacer()])
+        }
+        surface.frameBackground = .ansiIndex(33)
+        surface.frameBackgroundTrueColor = false
+        _ = surface.showOverlay(
+            LinesComponent(["POPUP"]),
+            options: OverlayOptions(width: .absolute(6), anchor: .center)
+        )
+
+        try drive(surface, into: oracle, from: target)
+        for row in 0..<height {
+            for column in 0..<width {
+                #expect(oracle.cell(col: column, row: row)?.style.background == .ansi(33), "(row),(column)")
+            }
+        }
     }
 
     /// Tab moves focus forward, Shift-Tab back — proven by the hardware cursor AND

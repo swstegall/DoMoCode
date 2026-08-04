@@ -91,19 +91,30 @@ struct ClientViewTests {
     @Test("Hovering a long sidebar row scrolls only its body and keeps marker and id stable")
     func sidebarHoverMarquee() {
         let sidebar = SessionSidebar()
-        sidebar.sessions = [summary("abcdef123456", cwd: "/home/a-very-long-project-directory")]
+        sidebar.sessions = [
+            summary("abcdef123456", cwd: "/home/a-very-long-project-directory"),
+            summary("beefed654321", cwd: "/home/another-very-long-project-directory"),
+        ]
         sidebar.clock = { 2.0 }
         sidebar.updateHover(screenRow: 2)
 
-        let initial = sidebar.render(width: 20)[2]
+        let initialLines = sidebar.render(width: 20)
+        let initial = initialLines[2]
+        let unrelated = initialLines[3]
         #expect(initial.contains("123456"))
         #expect(initial.hasPrefix("  "))
 
         sidebar.clock = { 3.1 }
-        let moved = sidebar.render(width: 20)[2]
+        let movedLines = sidebar.render(width: 20)
+        let moved = movedLines[2]
         #expect(moved.contains("123456"))
         #expect(moved != initial)
         #expect(visibleWidth(moved) == 20)
+        #expect(movedLines[3] == unrelated)
+
+        sidebar.clearHover()
+        #expect(sidebar.hoveredSessionID == nil)
+        #expect(sidebar.render(width: 20)[3] == unrelated)
     }
 
     @Test("The full-screen status bar scrolls long controls instead of dropping them")
