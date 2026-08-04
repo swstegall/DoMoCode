@@ -201,6 +201,10 @@ public actor CodeIntelligenceCoordinator {
         provider: any DoMoCodeIntelligenceProvider,
         policy: CodeIntelligencePolicy = CodeIntelligencePolicy()
     ) throws(CodeIntelligenceCoordinatorError) {
+        let trimmedRoot = rootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedRoot.isEmpty, trimmedRoot.hasPrefix("/"), !trimmedRoot.contains("\0") else {
+            throw .invalidRoot(rootPath)
+        }
         let normalized = Self.normalizePath(rootPath)
         guard Self.isAbsolute(normalized) else { throw .invalidRoot(rootPath) }
         self.rootPath = normalized
@@ -211,7 +215,11 @@ public actor CodeIntelligenceCoordinator {
     public func perform(
         _ request: CodeIntelligenceRequest
     ) async throws(CodeIntelligenceCoordinatorError) -> CodeIntelligenceResult {
-        try Task.checkCancellation()
+        do {
+            try Task.checkCancellation()
+        } catch {
+            throw .cancelled
+        }
         guard policy.allowedOperations.contains(request.operation) else {
             throw .permissionDenied(request.operation)
         }
