@@ -177,6 +177,48 @@ struct JobManagerTests {
         #expect(recoveryEvents.map(\.kind) == [.recovered])
     }
 
+    @Test("replays only terminal failures and links the new job to its source")
+    func replayFailure() async throws {
+        let manager = JobManager(
+            now: { "2026-01-01T00:00:00Z" },
+            sleep: { _ in }
+        )
+        _ = try await manager.admit(JobAdmission(
+            id: "failed-source",
+            correlationID: "corr-source",
+            kind: "automation",
+            owner: "owner",
+            triggerSource: .scheduled
+        ))
+        let failed = try await manager.run(jobID: "failed-source", owner: "owner") { _ in
+            throw JobOperationFailure(message: "temporary failure")
+        }
+        #expect(failed.state == .failed)
+
+        let replayed = try await manager.replay(
+            jobID: failed.id,
+            owner: "owner",
+            replayID: "replayed-job"
+        ) { _ in
+            JobResult(output: .string("replayed"))
+        }
+        #expect(replayed.state == .succeeded)
+        #expect(replayed.parentJobID == failed.id)
+        #expect(replayed.correlationID == failed.correlationID)
+        #expect(replayed.triggerSource == .scheduled)
+        #expect(replayed.metadata["replayOf"] == .string(failed.id))
+        #expect(replayed.output == .string("replayed"))
+
+        await #expect(throws: JobManagerError.invalidTransition(
+            id: replayed.id,
+            state: .succeeded
+        )) {
+            try await manager.replay(jobID: replayed.id, owner: "owner") { _ in
+                JobResult()
+            }
+        }
+    }
+
     private func temporaryDirectory() -> FilePath {
         FilePath(
             FileManager.default.temporaryDirectory

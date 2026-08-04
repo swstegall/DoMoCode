@@ -638,6 +638,42 @@ public actor JobManager {
         }
     }
 
+    /// Replay an owned terminal failure or cancellation through a fresh durable
+    /// job. The operation is supplied by the trusted caller; the journal alone
+    /// never contains executable instructions. The new record keeps the source
+    /// correlation and trigger provenance while linking back to the failed job.
+    public func replay(
+        jobID: String,
+        owner: String,
+        replayID: String = UUIDv7.generate().description,
+        operation: @escaping JobOperation
+    ) async throws -> JobRecord {
+        try loadIfNeeded()
+        guard let source = jobs[jobID] else { throw JobManagerError.notFound(jobID) }
+        guard source.owner == owner else { throw JobManagerError.ownershipDenied(jobID) }
+        guard source.state == .failed || source.state == .cancelled else {
+            throw JobManagerError.invalidTransition(id: jobID, state: source.state)
+        }
+
+        var metadata = source.metadata
+        metadata["replayOf"] = .string(source.id)
+        metadata["replayAttempt"] = .int(source.attempt)
+        let admission = JobAdmission(
+            id: replayID,
+            correlationID: source.correlationID,
+            sessionID: source.sessionID,
+            taskID: source.taskID,
+            parentJobID: source.id,
+            kind: source.kind,
+            owner: source.owner,
+            retryPolicy: source.retryPolicy,
+            metadata: metadata,
+            triggerSource: source.triggerSource
+        )
+        _ = try admit(admission)
+        return try await run(jobID: replayID, owner: owner, operation: operation)
+    }
+
     private func isCancellationRequested(jobID: String) -> Bool {
         cancellationRequested.contains(jobID)
     }
