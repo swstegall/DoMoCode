@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import DoMoCore
+import Foundation
 import Testing
 
 @Suite("Phase 22 capability contracts")
@@ -96,7 +97,7 @@ private struct TestProvider: DoMoProvider {
 
     func stream(_ request: ProviderRequest) -> AsyncThrowingStream<ProviderEvent, any Error> {
         AsyncThrowingStream { continuation in
-            continuation.yield(ProviderEvent(kind: .messageStart, payload: ["model": request.model]))
+            continuation.yield(ProviderEvent(kind: .messageStart, payload: ["model": .string(request.model)]))
             continuation.yield(ProviderEvent(kind: .messageEnd))
             continuation.finish()
         }
@@ -110,7 +111,7 @@ private struct TestBackend: DoMoBackend {
     func stop() async {}
 
     func execute(_ request: BackendRequest) async throws -> BackendResult {
-        BackendResult(status: .succeeded, output: ["operation": request.operation])
+        BackendResult(status: .succeeded, output: ["operation": .string(request.operation)])
     }
 
     func cancel(operationID: String) async {}
