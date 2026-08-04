@@ -173,7 +173,7 @@ struct ClientLayout {
             return PaneBounds(columns: 0..<min(sidebarWidth, width), rows: 0..<height)
         case .divider:
             guard let dividerColumn else { return PaneBounds(columns: width..<width, rows: 0..<height) }
-            return PaneBounds(columns: dividerColumn..<(dividerColumn + dividerWidth), rows: 0..<height)
+            return PaneBounds(columns: dividerColumn..<(dividerColumn + Self.dividerWidth), rows: 0..<height)
         case .transcript:
             return PaneBounds(columns: mainColumnStart..<width, rows: 0..<transcriptHeight)
         case .mainFooter:
