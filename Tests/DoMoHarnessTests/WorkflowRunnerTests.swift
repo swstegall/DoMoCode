@@ -175,6 +175,52 @@ struct WorkflowRunnerTests {
         #expect(run.error?.contains("cancellation") == true)
     }
 
+    @Test("continue-independent policy preserves unrelated stages and skips dependents")
+    func continueIndependentPolicy() async throws {
+        let definition = WorkflowDefinition(
+            id: "continue-independent",
+            stages: [
+                WorkflowStageDefinition(
+                    id: "research",
+                    kind: .research,
+                    cancellationPolicy: .continueIndependent
+                ),
+                WorkflowStageDefinition(
+                    id: "plan",
+                    kind: .plan,
+                    dependencies: ["research"]
+                ),
+                WorkflowStageDefinition(id: "review", kind: .review),
+            ]
+        )
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { request in
+            if request.stage.id == "research" {
+                throw TestWorkflowFailure()
+            }
+            return WorkflowStageResult(output: request.stage.id)
+        }
+
+        do {
+            _ = try await runner.run(runID: "continue-independent-run")
+            Issue.record("expected the failed stage to remain visible in the final run")
+        } catch let error as WorkflowRunnerError {
+            guard case .stageFailed("research", _) = error else {
+                Issue.record("unexpected runner error: \(error)")
+                return
+            }
+        }
+
+        let run = try #require(await runner.snapshot())
+        #expect(run.status == .failed)
+        #expect(run.stage(withID: "research")?.status == .failed)
+        #expect(run.stage(withID: "review")?.status == .succeeded)
+        #expect(run.stage(withID: "plan")?.status == .skipped)
+        #expect(run.metadata["deferredFailureStageID"] == .string("research"))
+    }
+
     @Test("pause preserves successful checkpoints and leaves later stages resumable")
     func pause() async throws {
         let definition = WorkflowDefinition(

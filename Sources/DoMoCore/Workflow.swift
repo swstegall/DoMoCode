@@ -61,8 +61,13 @@ public enum WorkflowApprovalBoundary: String, Sendable, Codable, Hashable, CaseI
 }
 
 public enum WorkflowCancellationPolicy: String, Sendable, Codable, Hashable, CaseIterable {
+    /// Stop the run after the stage fails, while recording dependent stages as
+    /// skipped.
     case stopDependents
+    /// Record the failure, skip only transitive dependents, and continue stages
+    /// that do not require the failed output.
     case continueIndependent
+    /// Preserve the completed checkpoint and stop before another stage begins.
     case checkpointAndStop
 }
 

@@ -171,6 +171,9 @@ public actor WorkflowRunner {
         recovered.error = nil
         recovered.cancellationRequested = false
         recovered.metadata.removeValue(forKey: "pauseRequested")
+        recovered.metadata.removeValue(forKey: "deferredFailureStageID")
+        recovered.metadata.removeValue(forKey: "deferredFailureMessage")
+        recovered.metadata.removeValue(forKey: "deferredFailureCancellation")
         recovered.updatedAt = now()
         recovered.stages = definition.stages.map { stage in
             guard let prior = stored.stage(withID: stage.id), prior.status == .succeeded else {
@@ -195,6 +198,7 @@ public actor WorkflowRunner {
         try persist(&run)
 
         var outputs = initialOutputs
+        var deferredFailure = storedDeferredFailure(from: run)
         while true {
             if cancellationRequested || Task.isCancelled {
                 for stage in definition.stages where run.stage(withID: stage.id)?.status == .pending || run.stage(withID: stage.id)?.status == .ready {
@@ -224,6 +228,16 @@ public actor WorkflowRunner {
                 return record.status == .pending
             }
             if pending.isEmpty {
+                if let deferredFailure {
+                    run.status = deferredFailure.failure.isCancellation ? .cancelled : .failed
+                    run.cancellationRequested = deferredFailure.failure.isCancellation
+                    run.error = deferredFailure.failure.message
+                    try persist(&run)
+                    throw WorkflowRunnerError.stageFailed(
+                        id: deferredFailure.stageID,
+                        message: deferredFailure.failure.message
+                    )
+                }
                 run.status = .succeeded
                 run.output = definition.stages.reversed()
                     .compactMap { outputs[$0.id] }
@@ -263,7 +277,10 @@ public actor WorkflowRunner {
                         let decision = await approvalDecision(for: stage, runID: run.id)
                         if let failure = approvalFailure(decision, stageID: stage.id) {
                             serial.append(StageOutcome(stageID: stage.id, result: nil, failure: failure))
-                            break
+                            if failure.isPause || stage.cancellationPolicy != .continueIndependent {
+                                break
+                            }
+                            continue
                         }
                         _ = run.updateStage(stage.id, status: .ready, timestamp: now())
                         setProgress(stage.id, "Approval received; starting…", run: &run)
@@ -276,7 +293,10 @@ public actor WorkflowRunner {
                     setProgress(stage.id, "Running \(stage.displayName)…", run: &run)
                     try persist(&run)
                     serial.append(await execute(stage: stage, run: run, outputs: outputs))
-                    if serial.last?.failure != nil { break }
+                    if let failure = serial.last?.failure,
+                       failure.isPause || stage.cancellationPolicy != .continueIndependent {
+                        break
+                    }
                 }
                 outcomes = serial
             case .parallel:
@@ -350,6 +370,30 @@ public actor WorkflowRunner {
                         timestamp: now(),
                         error: failure.message
                     )
+                    let policy = definition.stages
+                        .first(where: { $0.id == outcome.stageID })?
+                        .cancellationPolicy ?? .stopDependents
+                    if !failure.isPause, policy == .continueIndependent {
+                        markDependentsSkipped(
+                            of: outcome.stageID,
+                            reason: failure.message,
+                            run: &run
+                        )
+                        if deferredFailure == nil {
+                            deferredFailure = DeferredFailure(
+                                stageID: outcome.stageID,
+                                failure: failure
+                            )
+                            run.metadata["deferredFailureStageID"] = .string(outcome.stageID)
+                            run.metadata["deferredFailureMessage"] = .string(failure.message)
+                            run.metadata["deferredFailureCancellation"] = .bool(failure.isCancellation)
+                        }
+                        run.status = .running
+                        run.error = failure.message
+                        run.cancellationRequested = false
+                        try persist(&run)
+                        continue
+                    }
                     run.status = failure.isCancellation ? .cancelled : .failed
                     run.error = failure.message
                     run.cancellationRequested = failure.isCancellation
@@ -409,6 +453,11 @@ public actor WorkflowRunner {
         let message: String
         let isCancellation: Bool
         let isPause: Bool
+    }
+
+    private struct DeferredFailure: Sendable {
+        let stageID: String
+        let failure: StageFailure
     }
 
     private struct StageTimedOut: Error, Sendable {
@@ -557,6 +606,50 @@ public actor WorkflowRunner {
             var outcomes: [StageOutcome] = []
             for await outcome in group { outcomes.append(outcome) }
             return outcomes.sorted { $0.stageID < $1.stageID }
+        }
+    }
+
+    private func storedDeferredFailure(from run: WorkflowRunRecord) -> DeferredFailure? {
+        guard let stageID = run.metadata["deferredFailureStageID"]?.stringValue,
+              let message = run.metadata["deferredFailureMessage"]?.stringValue
+        else { return nil }
+        return DeferredFailure(
+            stageID: stageID,
+            failure: StageFailure(
+                message: message,
+                isCancellation: run.metadata["deferredFailureCancellation"]?.boolValue ?? false,
+                isPause: false
+            )
+        )
+    }
+
+    private func markDependentsSkipped(
+        of stageID: String,
+        reason: String,
+        run: inout WorkflowRunRecord
+    ) {
+        var dependents: Set<String> = []
+        var frontier: Set<String> = [stageID]
+        while !frontier.isEmpty {
+            var next: Set<String> = []
+            for stage in definition.stages where stage.dependencies.contains(where: frontier.contains) {
+                if dependents.insert(stage.id).inserted {
+                    next.insert(stage.id)
+                }
+            }
+            frontier = next
+        }
+
+        for stage in definition.stages where dependents.contains(stage.id) {
+            guard let record = run.stage(withID: stage.id),
+                  [.pending, .ready, .waitingForApproval, .running].contains(record.status)
+            else { continue }
+            _ = run.updateStage(
+                stage.id,
+                status: .skipped,
+                timestamp: now(),
+                error: "Skipped because stage \(stageID) failed: \(reason)"
+            )
         }
     }
 
