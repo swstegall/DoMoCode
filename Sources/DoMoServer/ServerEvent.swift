@@ -4,6 +4,7 @@
 import DoMoAgent
 import DoMoCore
 import DoMoLLM
+import Foundation
 
 // MARK: - Protocol version
 
@@ -230,6 +231,46 @@ public enum ServerEvent: Sendable, Hashable {
         case .noProgress: return "no_progress"
         case .costLimitReached: return "cost_limit_reached"
         }
+    }
+}
+
+/// A live session event with the monotonic cursor used by reconnecting clients.
+///
+/// The sequence is encoded alongside the existing event fields rather than in
+/// a nested envelope. Older clients decode the same `type` and ignore this
+/// additive key; newer clients can persist the cursor and ask the server to
+/// replay events after it.
+public struct SequencedServerEvent: Sendable, Hashable, Codable {
+    public let sequence: Int
+    public let event: ServerEvent
+
+    public init(sequence: Int, event: ServerEvent) {
+        self.sequence = sequence
+        self.event = event
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        var object = try container.decode([String: JSONValue].self)
+        guard let sequence = object.removeValue(forKey: "sequence")?.intValue,
+              sequence > 0
+        else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Missing event sequence")
+            )
+        }
+        self.sequence = sequence
+        self.event = try JSONDecoder().decode(
+            ServerEvent.self,
+            from: try JSONValue.object(object).encoded()
+        )
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        let data = try JSONEncoder().encode(event)
+        var object = try JSONDecoder().decode([String: JSONValue].self, from: data)
+        object["sequence"] = .int(sequence)
+        try JSONValue.object(object).encode(to: encoder)
     }
 }
 

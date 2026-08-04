@@ -131,6 +131,14 @@ struct ServerEventTests {
         }
     }
 
+    @Test("Sequenced frames stay decodable by old and new clients")
+    func sequencedFrameCompatibility() throws {
+        let sequenced = SequencedServerEvent(sequence: 7, event: .turnStart)
+        let data = try JSONEncoder().encode(sequenced)
+        #expect(try JSONDecoder().decode(ServerEvent.self, from: data) == .turnStart)
+        #expect(try JSONDecoder().decode(SequencedServerEvent.self, from: data) == sequenced)
+    }
+
     @Test("The wire carries a stable snake_case type discriminator and version")
     func wireShape() throws {
         let connected = try JSONValue(parsing: try JSONEncoder().encode(

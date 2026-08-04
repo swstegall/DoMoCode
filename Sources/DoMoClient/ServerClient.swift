@@ -895,7 +895,9 @@ public struct ServerClient: Sendable {
         let path = "/session/\(sessionID)/fork"
         let (status, data) = try await send(.post, path)
         try expect(status, 201, path, body: data)
-        return try JSONDecoder().decode(SessionRef.self, from: data)
+        let session = try JSONDecoder().decode(SessionRef.self, from: data)
+        _ = try await attachIfSupported(sessionID: session.id)
+        return session
     }
 
     /// Clone the session into an independent file. `POST /session/{id}/clone` → 201.
@@ -1046,8 +1048,14 @@ public struct ServerClient: Sendable {
                         // ignored so the client remains backward compatible;
                         // runtimes with the ledger now have an authority owner
                         // before the first prompt arrives.
-                        _ = try? await client.attachIfSupported(sessionID: sessionID)
-                        var request = HTTPClientRequest(url: baseURL + path)
+                        let attachment = try? await client.attachIfSupported(sessionID: sessionID)
+                        let replayPath: String
+                        if let cursor = attachment?.eventCursor, cursor > 0 {
+                            replayPath = path + "?after=\(cursor)"
+                        } else {
+                            replayPath = path
+                        }
+                        var request = HTTPClientRequest(url: baseURL + replayPath)
                         request.method = .GET
                         request.headers.add(name: "authorization", value: "Bearer \(token)")
                         request.headers.add(name: "x-domocode-client-id", value: clientID)
@@ -1070,17 +1078,41 @@ public struct ServerClient: Sendable {
                             // the thing that answers 503 with a sentence.
                             throw ServerClientError.unexpectedStatus(
                                 response.status.code,
-                                path: path,
+                                path: replayPath,
                                 body: await Self.readErrorBody(response.body)
                             )
                         }
                         var decoder = SSEFrameDecoder()
+                        var lastSeenSequence = attachment?.eventCursor ?? 0
+                        var persistedSequence = lastSeenSequence
                         for try await chunk in response.body {
                             lastActivityAt.touch(clock.now)
                             var chunk = chunk
                             let bytes = chunk.readBytes(length: chunk.readableBytes) ?? []
-                            for event in decoder.push(bytes) { continuation.yield(event) }
+                            for decoded in decoder.pushWithSequence(bytes) {
+                                continuation.yield(decoded.event)
+                                guard let sequence = decoded.sequence else { continue }
+                                lastSeenSequence = max(lastSeenSequence, sequence)
+                                guard lastSeenSequence - persistedSequence >= 16 else { continue }
+                                do {
+                                    _ = try await client.advanceSessionClientCursor(
+                                        sessionID: sessionID,
+                                        sequence: lastSeenSequence
+                                    )
+                                    persistedSequence = lastSeenSequence
+                                } catch {
+                                    // A pre-ledger server, a reconnect race, or a
+                                    // lost cursor write must not tear down the live
+                                    // event stream. The next reconnect reconciles.
+                                }
+                            }
                             try Task.checkCancellation()
+                        }
+                        if lastSeenSequence > persistedSequence {
+                            _ = try? await client.advanceSessionClientCursor(
+                                sessionID: sessionID,
+                                sequence: lastSeenSequence
+                            )
                         }
                         continuation.finish()
                     } catch {
@@ -1153,17 +1185,29 @@ public struct ServerClient: Sendable {
         return try? JSONDecoder().decode(ServerEvent.self, from: Data(frame.dropFirst(prefix.count)))
     }
 
+    /// Decode the additive cursor when a server emits a sequenced frame. A raw
+    /// pre-cursor frame intentionally returns nil and is handled by `parseFrame`.
+    static func parseSequencedFrame(_ frame: [UInt8]) -> SequencedServerEvent? {
+        let prefix = Array("data: ".utf8)
+        guard frame.count >= prefix.count, Array(frame.prefix(prefix.count)) == prefix else { return nil }
+        return try? JSONDecoder().decode(
+            SequencedServerEvent.self,
+            from: Data(frame.dropFirst(prefix.count))
+        )
+    }
+
     // MARK: Plumbing
 
     /// Register before the first operation that needs session authority. The
     /// endpoint is additive, so a client can still talk to a pre-ledger server
     /// when it answers the registration route with 404; every other failure is
     /// meaningful and must reach the caller instead of becoming a later 403.
-    private func attachIfSupported(sessionID: String) async throws {
+    private func attachIfSupported(sessionID: String) async throws -> SessionClientAttachment? {
         do {
-            _ = try await attachClient(sessionID: sessionID)
+            return try await attachClient(sessionID: sessionID)
         } catch ServerClientError.unexpectedStatus(404, _, _) {
             // Backward compatibility with servers predating the client ledger.
+            return nil
         }
     }
 
@@ -1295,12 +1339,22 @@ struct SSEFrameDecoder {
 
     /// Append a chunk's bytes and return every newly-complete event.
     mutating func push(_ bytes: [UInt8]) -> [ServerEvent] {
+        pushWithSequence(bytes).map(\.event)
+    }
+
+    /// Append a chunk and preserve an optional cursor for each decoded event.
+    /// Raw frames from older servers remain valid and simply carry `nil`.
+    mutating func pushWithSequence(_ bytes: [UInt8]) -> [DecodedServerEvent] {
         pending.append(contentsOf: bytes)
-        var events: [ServerEvent] = []
+        var events: [DecodedServerEvent] = []
         while let separator = Self.separatorIndex(in: pending) {
             let frame = Array(pending[..<separator])
             pending.removeSubrange(..<(separator + 2))   // drop the frame and its "\n\n"
-            if let event = ServerClient.parseFrame(frame) { events.append(event) }
+            if let sequenced = ServerClient.parseSequencedFrame(frame) {
+                events.append(DecodedServerEvent(event: sequenced.event, sequence: sequenced.sequence))
+            } else if let event = ServerClient.parseFrame(frame) {
+                events.append(DecodedServerEvent(event: event, sequence: nil))
+            }
         }
         return events
     }
@@ -1315,4 +1369,9 @@ struct SSEFrameDecoder {
         }
         return nil
     }
+}
+
+struct DecodedServerEvent: Sendable {
+    let event: ServerEvent
+    let sequence: Int?
 }

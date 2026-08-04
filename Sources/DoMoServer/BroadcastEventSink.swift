@@ -22,6 +22,9 @@ public final class BroadcastEventSink: AgentEventSink {
 
     private struct State {
         var subscribers: [Int: AsyncStream<ServerEvent>.Continuation] = [:]
+        var sequencedSubscribers: [Int: AsyncStream<SequencedServerEvent>.Continuation] = [:]
+        var history: [SequencedServerEvent] = []
+        var nextSequence = 0
         var nextID = 0
     }
 
@@ -31,9 +34,14 @@ public final class BroadcastEventSink: AgentEventSink {
     /// unread frames drop. Large enough that a client keeping up loses nothing;
     /// bounded so one stuck client cannot grow memory without end.
     private let perSubscriberBuffer: Int
+    /// How much resumable history is retained in memory. A reconnecting client
+    /// whose cursor is older than this window still gets the authoritative
+    /// connected/status reconciliation; it is never given an unbounded replay.
+    private let historyLimit: Int
 
-    public init(perSubscriberBuffer: Int = 512) {
+    public init(perSubscriberBuffer: Int = 512, historyLimit: Int = 2048) {
         self.perSubscriberBuffer = perSubscriberBuffer
+        self.historyLimit = max(1, historyLimit)
     }
 
     /// A live subscription: the stream to relay as SSE, and the id that
@@ -41,6 +49,12 @@ public final class BroadcastEventSink: AgentEventSink {
     public struct Subscription: Sendable {
         public let id: Int
         public let events: AsyncStream<ServerEvent>
+    }
+
+    /// A subscription that includes the durable-in-process session cursor.
+    public struct SequencedSubscription: Sendable {
+        public let id: Int
+        public let events: AsyncStream<SequencedServerEvent>
     }
 
     /// Register a subscriber. The returned stream yields every event emitted after
@@ -63,17 +77,62 @@ public final class BroadcastEventSink: AgentEventSink {
         return Subscription(id: id, events: stream)
     }
 
+    /// Register a cursor-aware subscriber. History is yielded while the state
+    /// lock is held and the live subscription is installed under that same lock,
+    /// so replayed events and newly emitted events cannot be reordered or leave
+    /// a gap between the two paths.
+    public func subscribe(after sequence: Int) -> SequencedSubscription {
+        let (stream, continuation) = AsyncStream<SequencedServerEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(perSubscriberBuffer)
+        )
+        let id = state.withLock { state -> Int in
+            let id = state.nextID
+            state.nextID += 1
+            for event in state.history where event.sequence > sequence {
+                continuation.yield(event)
+            }
+            state.sequencedSubscribers[id] = continuation
+            return id
+        }
+        continuation.onTermination = { [weak self] _ in
+            self?.unsubscribe(id)
+        }
+        return SequencedSubscription(id: id, events: stream)
+    }
+
     public func unsubscribe(_ id: Int) {
         // The lock is released before `finish()`, so the `onTermination` callback
         // it triggers re-enters `unsubscribe` cleanly (the second `removeValue`
         // returns nil) rather than deadlocking on this non-reentrant mutex.
-        let continuation = state.withLock { $0.subscribers.removeValue(forKey: id) }
-        continuation?.finish()
+        let continuations = state.withLock { state -> (
+            AsyncStream<ServerEvent>.Continuation?,
+            AsyncStream<SequencedServerEvent>.Continuation?
+        ) in
+            (
+                state.subscribers.removeValue(forKey: id),
+                state.sequencedSubscribers.removeValue(forKey: id)
+            )
+        }
+        continuations.0?.finish()
+        continuations.1?.finish()
     }
 
     /// The number of attached subscribers — for diagnostics and tests.
     public var subscriberCount: Int {
-        state.withLock { $0.subscribers.count }
+        state.withLock { $0.subscribers.count + $0.sequencedSubscribers.count }
+    }
+
+    /// Return every retained event after a cursor, ordered by the global session
+    /// sequence. The result is bounded by `historyLimit` by construction.
+    public func history(after sequence: Int = 0) -> [SequencedServerEvent] {
+        state.withLock { state in
+            state.history.filter { $0.sequence > sequence }
+        }
+    }
+
+    /// The last sequence assigned to this session sink.
+    public var currentSequence: Int {
+        state.withLock { $0.nextSequence }
     }
 
     // MARK: AgentEventSink
@@ -86,22 +145,48 @@ public final class BroadcastEventSink: AgentEventSink {
     /// Push a server-originated frame — the opening ``ServerEvent/connected`` frame
     /// or a heartbeat — to every subscriber, on the same path run events take.
     public func broadcast(_ event: ServerEvent) {
-        // Snapshot under the lock, yield outside it: `yield` is synchronous and
-        // non-blocking, but holding the mutex across a fan-out is needless.
-        let continuations = state.withLock { Array($0.subscribers.values) }
-        for continuation in continuations {
+        // Allocate the sequence and snapshot every subscriber under one lock.
+        // `yield` is synchronous and non-blocking, so it is safe to perform it
+        // after releasing the lock while preserving the captured order.
+        let snapshot = state.withLock { state -> (
+            [AsyncStream<ServerEvent>.Continuation],
+            [AsyncStream<SequencedServerEvent>.Continuation],
+            SequencedServerEvent
+        ) in
+            state.nextSequence += 1
+            let sequenced = SequencedServerEvent(sequence: state.nextSequence, event: event)
+            state.history.append(sequenced)
+            if state.history.count > historyLimit {
+                state.history.removeFirst(state.history.count - historyLimit)
+            }
+            return (
+                Array(state.subscribers.values),
+                Array(state.sequencedSubscribers.values),
+                sequenced
+            )
+        }
+        for continuation in snapshot.0 {
             continuation.yield(event)
+        }
+        for continuation in snapshot.1 {
+            continuation.yield(snapshot.2)
         }
     }
 
     /// Finish every subscriber stream, so open SSE responses complete rather than
     /// hang. Used on server shutdown.
     public func closeAll() {
-        let continuations = state.withLock { s -> [AsyncStream<ServerEvent>.Continuation] in
+        let continuations = state.withLock { s -> (
+            [AsyncStream<ServerEvent>.Continuation],
+            [AsyncStream<SequencedServerEvent>.Continuation]
+        ) in
             let values = Array(s.subscribers.values)
+            let sequencedValues = Array(s.sequencedSubscribers.values)
             s.subscribers.removeAll()
-            return values
+            s.sequencedSubscribers.removeAll()
+            return (values, sequencedValues)
         }
-        for continuation in continuations { continuation.finish() }
+        for continuation in continuations.0 { continuation.finish() }
+        for continuation in continuations.1 { continuation.finish() }
     }
 }

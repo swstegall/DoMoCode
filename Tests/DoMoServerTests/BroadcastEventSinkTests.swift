@@ -33,6 +33,28 @@ struct BroadcastEventSinkTests {
         #expect(rb == .turnStart)
     }
 
+    @Test("A cursor-aware subscriber replays retained events in order")
+    func sequencedReplay() async {
+        let sink = BroadcastEventSink(historyLimit: 8)
+        sink.broadcast(.turnStart)
+        sink.broadcast(.turnEnd)
+        let subscription = sink.subscribe(after: 1)
+        var iterator = subscription.events.makeAsyncIterator()
+        let replayed = await iterator.next()
+        #expect(replayed?.sequence == 2)
+        #expect(replayed?.event == .turnEnd)
+    }
+
+    @Test("The replay window remains bounded")
+    func boundedHistory() {
+        let sink = BroadcastEventSink(historyLimit: 2)
+        sink.broadcast(.turnStart)
+        sink.broadcast(.turnEnd)
+        sink.broadcast(.agentStart)
+        #expect(sink.history().map(\.sequence) == [2, 3])
+        #expect(sink.history(after: 1).map(\.sequence) == [2, 3])
+    }
+
     @Test("Subscriber count tracks subscribe/unsubscribe")
     func subscriberCount() {
         let sink = BroadcastEventSink()

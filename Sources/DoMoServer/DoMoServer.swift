@@ -1068,10 +1068,19 @@ public struct DoMoServer: Sendable {
             }
         }
 
-        router.get("/session/:id/events") { _, context in
+        router.get("/session/:id/events") { request, context in
             let id = try context.parameters.require("id")
             let sink = try await self.mapErrors { try await self.runtime.sink(for: id) }
-            return self.eventStream(sessionID: id, sink: sink)
+            let after: Int
+            if let rawAfter = request.uri.queryParameters["after"].map(String.init) {
+                guard let parsed = Int(rawAfter), parsed >= 0 else {
+                    throw HTTPError(.badRequest)
+                }
+                after = parsed
+            } else {
+                after = 0
+            }
+            return self.eventStream(sessionID: id, sink: sink, after: after)
         }
 
         return router
@@ -1085,7 +1094,11 @@ public struct DoMoServer: Sendable {
     ///
     /// Internal rather than private so a test can build the response and *never*
     /// consume it — the exact shape of the leak fixed below.
-    func eventStream(sessionID: String, sink: BroadcastEventSink) -> Response {
+    func eventStream(
+        sessionID: String,
+        sink: BroadcastEventSink,
+        after sequence: Int = 0
+    ) -> Response {
         let heartbeatSeconds = options.heartbeatSeconds
         var headers = HTTPFields()
         headers[.contentType] = "text/event-stream"
@@ -1098,7 +1111,7 @@ public struct DoMoServer: Sendable {
             // response whose writer is never invoked — and poisoned
             // `subscriberCount`, which is the natural diagnostic for this whole
             // class of bug.
-            let subscription = sink.subscribe()
+            let subscription = sink.subscribe(after: sequence)
             // One ordered stream of run events plus heartbeats. Two producers feed
             // it: the subscription forwarder and the heartbeat ticker. The consumer
             // is this single writer loop, so there is no contention on the writer.
@@ -1107,11 +1120,11 @@ public struct DoMoServer: Sendable {
             // `writer.write`, but the forwarder keeps draining the per-subscriber
             // stream into here — so this hop must carry the same cap, or the memory
             // bound BroadcastEventSink promises would be defeated by this buffer.
-            let (merged, continuation) = AsyncStream<ServerEvent>.makeStream(
+            let (merged, continuation) = AsyncStream<StreamFrame>.makeStream(
                 bufferingPolicy: .bufferingNewest(512)
             )
             let forward = Task {
-                for await event in subscription.events { continuation.yield(event) }
+                for await event in subscription.events { continuation.yield(.event(event)) }
                 continuation.finish()
             }
             let heartbeat = Task {
@@ -1129,15 +1142,34 @@ public struct DoMoServer: Sendable {
             try await writer.write(Self.frame(
                 .connected(protocolVersion: serverProtocolVersion, sessionID: sessionID, running: running)
             ))
-            for await event in merged {
-                try await writer.write(Self.frame(event))
+            for await frame in merged {
+                switch frame {
+                case .event(let event):
+                    try await writer.write(Self.frame(event))
+                case .heartbeat:
+                    try await writer.write(Self.frame(.heartbeat))
+                }
             }
         }
         return Response(status: .ok, headers: headers, body: body)
     }
 
+    private enum StreamFrame: Sendable {
+        case event(SequencedServerEvent)
+        case heartbeat
+    }
+
     /// One SSE frame: `data: <json>\n\n`.
     private static func frame(_ event: ServerEvent) throws -> ByteBuffer {
+        let json = try JSONEncoder().encode(event)
+        var buffer = ByteBuffer()
+        buffer.writeString("data: ")
+        buffer.writeBytes(json)
+        buffer.writeString("\n\n")
+        return buffer
+    }
+
+    private static func frame(_ event: SequencedServerEvent) throws -> ByteBuffer {
         let json = try JSONEncoder().encode(event)
         var buffer = ByteBuffer()
         buffer.writeString("data: ")

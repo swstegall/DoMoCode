@@ -109,7 +109,6 @@ public actor AutomationJobCoordinator {
             return AutomationExecutionResult(invocation: admittedInvocation, job: record)
         } catch {
             if let record = try? await jobs.snapshot(jobID: jobID),
-               let record,
                !record.state.isTerminal {
                 _ = try? await jobs.cancel(jobID: jobID, owner: definition.owner)
             }
