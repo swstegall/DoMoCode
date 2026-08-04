@@ -269,7 +269,7 @@ public actor WorkspaceLeaseCoordinator {
         let requestedRoot = try Self.normalizedRoot(request.rootPath)
         do {
             _ = try WorkspaceOwnershipPlanner.conflicts(claims)
-        } catch let error as WorkspaceOwnershipError {
+        } catch {
             throw .invalidOwnership(error)
         }
 
@@ -291,13 +291,13 @@ public actor WorkspaceLeaseCoordinator {
         do {
             allocated = try await provider.allocate(request)
         } catch {
-            throw Self.providerFailure(id: id, operation: "allocate", error: error)
+            throw Self.providerFailure(leaseID: id, operation: "allocate", error: error)
         }
 
         let allocatedRoot: String
         do {
             allocatedRoot = try Self.normalizedRoot(allocated.rootPath)
-        } catch let error as WorkspaceLeaseCoordinatorError {
+        } catch {
             try? await provider.cleanup(allocated)
             throw error
         }
@@ -415,7 +415,7 @@ public actor WorkspaceLeaseCoordinator {
             conflicts = try WorkspaceOwnershipPlanner.conflicts(allClaims).filter {
                 currentOwners.contains($0.leftOwnerID) || currentOwners.contains($0.rightOwnerID)
             }
-        } catch let error as WorkspaceOwnershipError {
+        } catch {
             throw .invalidOwnership(error)
         }
         if !conflicts.isEmpty {
