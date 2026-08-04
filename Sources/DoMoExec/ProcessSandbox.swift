@@ -23,6 +23,24 @@ public struct ProcessSandbox: Sendable, Hashable {
         case bubblewrap
     }
 
+    /// The capability owner that requested a child process. Keeping this
+    /// label in the launch plan lets one policy boundary cover every process
+    /// owner instead of treating a formatter, MCP server, or provider as an
+    /// unclassified shell.
+    public enum Role: String, Codable, Sendable, Hashable, CaseIterable {
+        case shell
+        case background
+        case mcp
+        case lsp
+        case formatter
+        case git
+        case workspaceSetup
+        case pty
+        case browser
+        case notebook
+        case provider
+    }
+
     public struct Launch: Sendable, Hashable {
         public let executable: FilePath
         public let arguments: [String]
@@ -32,6 +50,34 @@ public struct ProcessSandbox: Sendable, Hashable {
             self.executable = executable
             self.arguments = arguments
             self.workingDirectory = workingDirectory
+        }
+    }
+
+    /// The complete sandbox decision for a child. Callers pass this object to
+    /// their subprocess library rather than rebuilding executable, arguments,
+    /// cwd, and environment policy independently.
+    public struct LaunchPlan: Sendable, Hashable {
+        public let role: Role
+        public let backend: Backend
+        public let executable: FilePath
+        public let arguments: [String]
+        public let workingDirectory: FilePath
+        public let environment: ShellEnvironment
+
+        public init(
+            role: Role,
+            backend: Backend,
+            executable: FilePath,
+            arguments: [String],
+            workingDirectory: FilePath,
+            environment: ShellEnvironment
+        ) {
+            self.role = role
+            self.backend = backend
+            self.executable = executable
+            self.arguments = arguments
+            self.workingDirectory = workingDirectory
+            self.environment = environment
         }
     }
 
@@ -153,6 +199,31 @@ public struct ProcessSandbox: Sendable, Hashable {
                 workingDirectory: guestWorkingDirectory
             )
         }
+    }
+
+    /// Builds the one shared policy plan used by shell, MCP, LSP, Git, PTY,
+    /// provider, and adapter subprocesses. The environment is pinned in the
+    /// same operation as the OS wrapper, so a caller cannot accidentally use
+    /// a sandboxed cwd with an unsanitized inherited environment.
+    public func plan(
+        role: Role = .shell,
+        command: [String],
+        workingDirectory: FilePath? = nil,
+        environment: ShellEnvironment = .inherit,
+        alsoUnsetting: Set<String> = []
+    ) throws(DoMoError) -> LaunchPlan {
+        let launch = try launch(command: command, workingDirectory: workingDirectory)
+        return LaunchPlan(
+            role: role,
+            backend: backend,
+            executable: launch.executable,
+            arguments: launch.arguments,
+            workingDirectory: launch.workingDirectory,
+            environment: environment.pinnedForSandbox(
+                workspace: root,
+                alsoUnsetting: alsoUnsetting
+            )
+        )
     }
 
     /// The root used when a caller did not provide a cwd. A sandboxed process

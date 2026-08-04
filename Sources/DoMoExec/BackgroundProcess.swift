@@ -126,21 +126,20 @@ public actor BackgroundProcessManager {
                         allowedDurationToNextStep: BackgroundProcessManager.terminationGrace
                     )
                 ]
-                let launch = try sandbox?.launch(
+                let plan = try sandbox?.plan(
+                    role: .background,
                     command: ["/bin/bash", "-c", command],
-                    workingDirectory: workingDirectory
+                    workingDirectory: workingDirectory,
+                    environment: environment
                 )
-                let childEnvironment = sandbox == nil
-                    ? environment
-                    : environment.pinnedForSandbox(workspace: sandbox?.root)
                 var configuration = Subprocess.Configuration(
-                    executable: launch.map { .path(.init($0.executable.string)) } ?? .name("bash"),
-                    arguments: Subprocess.Arguments(launch?.arguments ?? ["-c", command]),
-                    environment: childEnvironment.subprocessEnvironment,
+                    executable: plan.map { .path(.init($0.executable.string)) } ?? .name("bash"),
+                    arguments: Subprocess.Arguments(plan?.arguments ?? ["-c", command]),
+                    environment: plan?.environment.subprocessEnvironment ?? environment.subprocessEnvironment,
                     platformOptions: platformOptions
                 )
                 configuration.workingDirectory = .init(
-                    (launch?.workingDirectory ?? workingDirectory).string
+                    (plan?.workingDirectory ?? workingDirectory).string
                 )
 
                 let result = try await Subprocess.run(

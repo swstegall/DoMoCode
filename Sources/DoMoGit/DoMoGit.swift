@@ -209,14 +209,15 @@ public struct DoMoGit: Sendable {
             "core.quotepath=false",
         ] + arguments).map(Self.quote).joined(separator: " ")
         let request = ShellRequest(
-            command,
-            workingDirectory: cwd,
-            environment: .inherit([
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_OPTIONAL_LOCKS": "0",
-                "LC_ALL": "C",
-            ]),
-            timeout: .seconds(30),
+                command,
+                workingDirectory: cwd,
+                environment: .inherit([
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "LC_ALL": "C",
+                ]),
+                sandboxRole: .git,
+                timeout: .seconds(30),
             limits: ShellOutputLimits(head: 256 * 1024, tail: 256 * 1024)
         )
         return try await shell.run(request)

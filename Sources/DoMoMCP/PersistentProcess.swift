@@ -108,6 +108,8 @@ actor PersistentProcess {
         var sensitiveEnvKeys: Set<String> = []
         /// Optional OS-level confinement for the server and all of its descendants.
         var sandbox: ProcessSandbox?
+        /// The adapter role carried into the shared sandbox launch plan.
+        var sandboxRole: ProcessSandbox.Role = .mcp
         /// Grace between SIGTERM and SIGKILL on teardown.
         var terminationGrace: Duration = .seconds(2)
     }
@@ -170,18 +172,17 @@ actor PersistentProcess {
             stringOverrides[key] = value
             subprocessOverrides.updateValue(value, forKey: Subprocess.Environment.Key(stringLiteral: key))
         }
-        let launch = try spawn.sandbox?.launch(
+        let inheritedEnvironment = ShellEnvironment.inherit(stringOverrides)
+        let plan = try spawn.sandbox?.plan(
+            role: spawn.sandboxRole,
             command: spawn.command,
-            workingDirectory: spawn.workingDirectory.map { FilePath($0) }
+            workingDirectory: spawn.workingDirectory.map { FilePath($0) },
+            environment: inheritedEnvironment,
+            alsoUnsetting: spawn.sensitiveEnvKeys
         )
         let subprocessEnvironment: Subprocess.Environment
-        if let sandbox = spawn.sandbox {
-            let inheritedEnvironment = ShellEnvironment.inherit(stringOverrides)
-            let childEnvironment = inheritedEnvironment.pinnedForSandbox(
-                workspace: sandbox.root,
-                alsoUnsetting: spawn.sensitiveEnvKeys
-            )
-            subprocessEnvironment = childEnvironment.subprocessEnvironment
+        if let plan {
+            subprocessEnvironment = plan.environment.subprocessEnvironment
         } else {
             // Keep the unsandboxed path byte-for-byte with the established MCP
             // launcher behavior. The sandboxed path above additionally pins the
@@ -190,12 +191,12 @@ actor PersistentProcess {
             subprocessEnvironment = .inherit.updating(subprocessOverrides)
         }
         var configuration = Subprocess.Configuration(
-            executable: launch.map { .path(.init($0.executable.string)) } ?? .name(spawn.command[0]),
-            arguments: Subprocess.Arguments(launch?.arguments ?? Array(spawn.command.dropFirst())),
+            executable: plan.map { .path(.init($0.executable.string)) } ?? .name(spawn.command[0]),
+            arguments: Subprocess.Arguments(plan?.arguments ?? Array(spawn.command.dropFirst())),
             environment: subprocessEnvironment,
             platformOptions: platformOptions
         )
-        if let cwd = launch?.workingDirectory ?? spawn.workingDirectory.map({ FilePath($0) }) {
+        if let cwd = plan?.workingDirectory ?? spawn.workingDirectory.map({ FilePath($0) }) {
             // `.init` picks System.FilePath contextually (Subprocess re-exports it,
             // which would otherwise clash with SystemPackage.FilePath).
             configuration.workingDirectory = .init(cwd.string)

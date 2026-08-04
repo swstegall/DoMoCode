@@ -267,7 +267,8 @@ public actor ACPClient {
             environment: configuration.environment,
             workingDirectory: configuration.workingDirectory,
             sensitiveEnvKeys: configuration.sensitiveEnvironmentKeys,
-            sandbox: configuration.sandbox
+            sandbox: configuration.sandbox,
+            sandboxRole: .provider
         ))
         readerTask = Task { [weak self] in await self?.readLoop() }
 

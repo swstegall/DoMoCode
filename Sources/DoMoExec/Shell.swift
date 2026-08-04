@@ -181,6 +181,11 @@ public struct ShellRequest: Sendable, Hashable {
 
     public var environment: ShellEnvironment
 
+    /// The sandbox capability owner for this command. The default preserves
+    /// the public shell API; Git, formatter, and setup callers opt into their
+    /// more specific role at the boundary.
+    public var sandboxRole: ProcessSandbox.Role
+
     public var standardInput: ShellInput
 
     /// Wall-clock budget. `nil` means no limit, matching pi's bash tool, whose
@@ -204,11 +209,13 @@ public struct ShellRequest: Sendable, Hashable {
         standardInput: ShellInput = .none,
         timeout: Duration? = nil,
         terminationGracePeriod: Duration = .seconds(2),
-        limits: ShellOutputLimits = .default
+        limits: ShellOutputLimits = .default,
+        sandboxRole: ProcessSandbox.Role = .shell
     ) {
         self.command = command
         self.workingDirectory = workingDirectory
         self.environment = environment
+        self.sandboxRole = sandboxRole
         self.standardInput = standardInput
         self.timeout = timeout
         self.terminationGracePeriod = terminationGracePeriod
@@ -392,20 +399,19 @@ extension SubprocessShell {
         // `SystemPackage.FilePath` this module's API and `DoMoError.file` speak.
         // Importing both would make every bare `FilePath` in this file
         // ambiguous, so the conversion rides on the contextual type instead.
-        let launch = try sandbox?.launch(
+        let plan = try sandbox?.plan(
+            role: request.sandboxRole,
             command: [shellPath.string, "-c", request.command],
-            workingDirectory: request.workingDirectory
+            workingDirectory: request.workingDirectory,
+            environment: request.environment
         )
-        let environment = sandbox == nil
-            ? request.environment
-            : request.environment.pinnedForSandbox(workspace: sandbox?.root)
         var configuration = Configuration(
-            executable: .path(.init(launch?.executable.string ?? shellPath.string)),
-            arguments: Subprocess.Arguments(launch?.arguments ?? ["-c", request.command]),
-            environment: environment.subprocessEnvironment,
+            executable: .path(.init(plan?.executable.string ?? shellPath.string)),
+            arguments: Subprocess.Arguments(plan?.arguments ?? ["-c", request.command]),
+            environment: plan?.environment.subprocessEnvironment ?? request.environment.subprocessEnvironment,
             platformOptions: platformOptions
         )
-        if let workingDirectory = launch?.workingDirectory ?? request.workingDirectory {
+        if let workingDirectory = plan?.workingDirectory ?? request.workingDirectory {
             configuration = Configuration(
                 executable: configuration.executable,
                 arguments: configuration.arguments,

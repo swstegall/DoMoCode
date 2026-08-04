@@ -169,14 +169,16 @@ public actor PTYInteractiveTerminalProvider: InteractiveTerminalProvider {
 
         let size = request.size ?? .fallback
         let rawCommand = ["/bin/bash", "-lc", command]
-        let launch = try request.sandbox?.launch(
+        let plan = try request.sandbox?.plan(
+            role: .pty,
             command: rawCommand,
-            workingDirectory: FilePath(request.workingDirectory)
+            workingDirectory: FilePath(request.workingDirectory),
+            environment: request.environment
         )
         let id = try await service.start(.init(
-            command: launch.map { [$0.executable.string] + $0.arguments } ?? rawCommand,
-            workingDirectory: launch?.workingDirectory.string ?? request.workingDirectory,
-            environment: request.environment,
+            command: plan.map { [$0.executable.string] + $0.arguments } ?? rawCommand,
+            workingDirectory: plan?.workingDirectory.string ?? request.workingDirectory,
+            environment: plan?.environment ?? request.environment,
             size: size
         ))
         let attachment = try await service.beginAttach(sessionID: id)

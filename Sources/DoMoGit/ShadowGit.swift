@@ -416,6 +416,7 @@ public actor DoMoShadowGit: WorkspaceSnapshotSource {
                     "GIT_OPTIONAL_LOCKS": "0",
                     "LC_ALL": "C",
                 ]),
+                sandboxRole: .git,
                 standardInput: input,
                 timeout: .seconds(30),
                 limits: ShellOutputLimits(head: 4 * 1024 * 1024, tail: 4 * 1024 * 1024)

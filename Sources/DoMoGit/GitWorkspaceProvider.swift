@@ -308,6 +308,7 @@ public actor GitWorkspaceProvider: WorkspaceProvider {
                 "GIT_OPTIONAL_LOCKS": "0",
                 "LC_ALL": "C",
             ]).pinnedForSandbox(workspace: FilePath(root)),
+            sandboxRole: .workspaceSetup,
             timeout: .seconds(300),
             limits: ShellOutputLimits(head: 64 * 1024, tail: 64 * 1024)
         )

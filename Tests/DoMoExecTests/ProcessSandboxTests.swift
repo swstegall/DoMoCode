@@ -114,6 +114,33 @@ struct ProcessSandboxPlanTests {
         #expect(launch.arguments.suffix(4).elementsEqual(["--", "bash", "-c", "pwd"]))
     }
 
+    @Test("The shared launch plan carries the process role and pinned environment together")
+    func sharedLaunchPlan() throws {
+        let scratch = try SandboxScratch()
+        let sandbox = try ProcessSandbox(
+            forTestingBackend: .bubblewrap,
+            root: scratch.path,
+            executable: FilePath("/usr/bin/bwrap")
+        )
+        let plan = try sandbox.plan(
+            role: .provider,
+            command: ["/bin/echo", "hello"],
+            workingDirectory: scratch.path,
+            environment: .inherit(["DOMOCODE_API_KEY": "secret"])
+        )
+
+        #expect(plan.role == .provider)
+        #expect(plan.backend == .bubblewrap)
+        #expect(plan.workingDirectory == scratch.path)
+        #expect(plan.arguments.suffix(3).elementsEqual(["--", "/bin/echo", "hello"]))
+        if let apiKey = plan.environment.overrides["DOMOCODE_API_KEY"] {
+            #expect(apiKey == nil)
+        } else {
+            Issue.record("shared launch plan omitted the explicit credential unset")
+        }
+        #expect(plan.environment.overrides["HOME"] == sandbox.root.string)
+    }
+
     #if os(macOS)
     @Test("The available Seatbelt backend confines a shell without spawning an unwrapped fallback")
     func seatbeltShellRunsConfined() async throws {

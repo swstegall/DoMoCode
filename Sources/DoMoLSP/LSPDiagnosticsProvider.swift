@@ -220,25 +220,27 @@ private actor PersistentLSPProcess {
         sandbox: ProcessSandbox?
     ) throws(DoMoError) {
         guard runTask == nil, let executable = command.first else { return }
-        let launch = try sandbox?.launch(command: command, workingDirectory: workingDirectory)
+        let plan = try sandbox?.plan(
+            role: .lsp,
+            command: command,
+            workingDirectory: workingDirectory,
+            environment: environment
+        )
         var platformOptions = PlatformOptions()
         platformOptions.createSession = true
         platformOptions.teardownSequence = [
             .send(signal: .terminate, toProcessGroup: true, allowedDurationToNextStep: .seconds(2))
         ]
-        let executableForm: Subprocess.Executable = if let launch {
-            .path(.init(launch.executable.string))
+        let executableForm: Subprocess.Executable = if let plan {
+            .path(.init(plan.executable.string))
         } else {
             executable.hasPrefix("/") ? .path(.init(executable)) : .name(executable)
         }
-        let childEnvironment = sandbox == nil
-            ? environment
-            : environment.pinnedForSandbox(workspace: sandbox?.root)
         let configuration = Subprocess.Configuration(
             executable: executableForm,
-            arguments: Subprocess.Arguments(launch?.arguments ?? Array(command.dropFirst())),
-            environment: childEnvironment.subprocessEnvironment,
-            workingDirectory: .init((launch?.workingDirectory ?? workingDirectory).string),
+            arguments: Subprocess.Arguments(plan?.arguments ?? Array(command.dropFirst())),
+            environment: plan?.environment.subprocessEnvironment ?? environment.subprocessEnvironment,
+            workingDirectory: .init((plan?.workingDirectory ?? workingDirectory).string),
             platformOptions: platformOptions
         )
         let outgoing = self.outgoing
