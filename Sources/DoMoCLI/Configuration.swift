@@ -1012,9 +1012,9 @@ public struct ResolvedConfiguration: Sendable {
             baseRetryDelay: retryBaseDelay,
             maxRetryDelay: retryMaxDelay,
             retryDelayBudget: retryDelayBudget,
-            retryWallClockBudget: retryWallClockBudget,
             timeout: timeout,
-            streamIdleTimeout: streamTimeout
+            streamIdleTimeout: streamTimeout,
+            retryWallClockBudget: retryWallClockBudget
         )
     }
 }
