@@ -97,9 +97,11 @@ struct SecretHygieneEndToEndTests {
             workspace: workspace
         )
 
-        // The run failed on the 401 and did not retry it (401 never clears itself).
+        // The run failed on the 401 and did not retry it (401 never clears
+        // itself). The one bounded recovery diagnostic is a separate request;
+        // it never replays the original turn.
         #expect(result.exitCode == 1, "stderr: \(result.standardError)")
-        #expect(gateway.requestCount == 1)
+        #expect(gateway.requestCount == 2)
 
         // CONTROL: the gateway's own prose DID reach the user. Without this the
         // "no secret on stderr" expectation below would also pass for a binary
