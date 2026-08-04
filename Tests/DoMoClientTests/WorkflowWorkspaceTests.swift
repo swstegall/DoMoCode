@@ -15,6 +15,7 @@ struct WorkflowWorkspaceTests {
     private static let escape: [UInt8] = [0x1b]
     private static let approve: [UInt8] = [0x61]
     private static let deny: [UInt8] = [0x64]
+    private static let save: [UInt8] = [0x73]
 
     private func workspace() -> WorkflowWorkspaceController {
         WorkflowWorkspaceController(phases: [
@@ -103,5 +104,20 @@ struct WorkflowWorkspaceTests {
         view.handleInput(Self.deny)
         #expect(approvals == 1)
         #expect(denials == 1)
+    }
+
+    @Test("The save shortcut is forwarded from every navigation level")
+    func saveShortcut() {
+        let view = workspace()
+        var saves = 0
+        view.onSave = { saves += 1 }
+
+        view.handleInput(Self.save)
+        view.handleInput(Self.enter)
+        view.handleInput(Self.save)
+        view.handleInput(Self.enter)
+        view.handleInput(Self.save)
+
+        #expect(saves == 3)
     }
 }

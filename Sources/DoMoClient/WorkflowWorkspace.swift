@@ -80,6 +80,8 @@ final class WorkflowWorkspaceController: @MainActor Focusable {
     /// Called by the dedicated content pane's approval shortcuts.
     var onApprove: (() -> Void)?
     var onDeny: (() -> Void)?
+    /// Called by the dedicated workspace's replay-export shortcut.
+    var onSave: (() -> Void)?
 
     private let keybindings = Keybindings()
 
@@ -141,7 +143,9 @@ final class WorkflowWorkspaceController: @MainActor Focusable {
     }
 
     func handleInput(_ data: [UInt8]) {
-        if level == .agentContent, data == [0x61] {
+        if data == [0x73] {
+            onSave?()
+        } else if level == .agentContent, data == [0x61] {
             onApprove?()
         } else if level == .agentContent, data == [0x64] {
             onDeny?()
@@ -220,7 +224,7 @@ private final class WorkflowNavigationPane: Component {
         )]
 
         if controller.level == .phases {
-            lines.append(truncateToWidth(dim("Enter open · Esc close"), width, ellipsis: ""))
+            lines.append(truncateToWidth(dim("Enter open · s save · Esc close"), width, ellipsis: ""))
             lines.append(String(repeating: "─", count: width))
             if controller.phases.isEmpty {
                 lines.append(truncateToWidth(dim("  (none)"), width, ellipsis: ""))
@@ -238,7 +242,7 @@ private final class WorkflowNavigationPane: Component {
         } else {
             let phaseTitle = controller.selectedPhase?.title ?? "phase"
             lines.append(truncateToWidth(dim("Phase: " + sanitizeUntrustedText(phaseTitle)), width, ellipsis: ""))
-            lines.append(truncateToWidth(dim("↑/↓ choose · Enter open · Esc back"), width, ellipsis: ""))
+            lines.append(truncateToWidth(dim("↑/↓ choose · Enter open · s save · Esc back"), width, ellipsis: ""))
             lines.append(String(repeating: "─", count: width))
             let agents = controller.selectedPhase?.agents ?? []
             if agents.isEmpty {
@@ -312,8 +316,9 @@ private final class WorkflowContentPane: Component {
             ))
             lines.append(truncateToWidth(
                 dim(
-                    "Phase: " + sanitizeUntrustedText(phase?.title ?? "unknown")
+                        "Phase: " + sanitizeUntrustedText(phase?.title ?? "unknown")
                         + " · Esc back"
+                        + " · s save"
                         + (phase?.status == .waitingForApproval ? " · a approve · d deny" : "")
                 ),
                 width,

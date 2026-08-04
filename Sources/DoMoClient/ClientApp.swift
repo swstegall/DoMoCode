@@ -55,6 +55,7 @@ public final class ClientApp {
     /// the ordinary session view.
     private var workflowWorkspace: WorkflowWorkspaceController?
     private var workflowRefreshTask: Task<Void, Never>?
+    private var workflowID: String?
     private var workflowRunID: String?
     private var workflowApprovals: [WorkflowApprovalRequest] = []
     /// Command metadata is fetched from the runtime at bootstrap. The client
@@ -2954,7 +2955,9 @@ public final class ClientApp {
         workspace.onExit = { [weak self] in self?.closeWorkflow() }
         workspace.onApprove = { [weak self] in self?.resolveSelectedWorkflowApproval(decision: "approved") }
         workspace.onDeny = { [weak self] in self?.resolveSelectedWorkflowApproval(decision: "denied") }
+        workspace.onSave = { [weak self] in self?.saveWorkflowExport() }
         if let phaseID { workspace.selectPhase(id: phaseID) }
+        workflowID = nil
         workflowRunID = nil
         workflowApprovals = []
         workflowWorkspace = workspace
@@ -2969,6 +2972,7 @@ public final class ClientApp {
         workflowWorkspace = nil
         workflowRefreshTask?.cancel()
         workflowRefreshTask = nil
+        workflowID = nil
         workflowRunID = nil
         workflowApprovals = []
         focus.unregister(workspace)
@@ -2998,6 +3002,7 @@ public final class ClientApp {
                         let selectedRun = self.workflowRunID.flatMap { runID in
                             runs.first(where: { $0.id == runID })
                         } ?? latest
+                        self.workflowID = definition.id
                         let approvals: [WorkflowApprovalRequest]
                         if let selectedRun {
                             approvals = (try? await self.client.workflowApprovals(
@@ -3062,6 +3067,56 @@ public final class ClientApp {
         actionTasks.append(task)
     }
 
+    private func saveWorkflowExport() {
+        guard let workflowID,
+              let runID = workflowRunID,
+              let sessionID = store.selectedSessionID,
+              let session = store.sessions.first(where: { $0.id == sessionID })
+        else {
+            post(notice: "no durable workflow run is available to save")
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let records = try await self.client.workflowExport(
+                    workflowID: workflowID,
+                    runID: runID
+                )
+                var encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                let data = try encoder.encode(records)
+                let fileName = Self.workflowExportFileName(
+                    workflowID: workflowID,
+                    runID: runID
+                )
+                let path = URL(fileURLWithPath: session.cwd, isDirectory: true)
+                    .appendingPathComponent(".domocode/exports", isDirectory: true)
+                    .appendingPathComponent(fileName)
+                    .path
+                try AtomicFileWrite.replace(
+                    at: path,
+                    with: String(decoding: data, as: UTF8.self)
+                )
+                self.post(notice: "saved workflow replay: \(path)")
+            } catch {
+                self.postError("Could not save workflow replay", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private static func workflowExportFileName(workflowID: String, runID: String) -> String {
+        let safe: (String) -> String = { value in
+            value.map { character in
+                character.isLetter || character.isNumber || character == "-" || character == "_"
+                    ? String(character)
+                    : "_"
+            }.joined()
+        }
+        return "\(safe(workflowID))--\(safe(runID)).json"
+    }
+
     /// Admit a workflow from a slash-command argument. The workflow workspace is
     /// mounted before the request so a slow server still gives the user the
     /// phase/agent surface immediately; the durable run then replaces the local
@@ -3091,6 +3146,7 @@ public final class ClientApp {
                     input: .string(prompt)
                 )
                 guard self.workflowWorkspace != nil else { return }
+                self.workflowID = definition.id
                 self.workflowRunID = run.id
                 self.surface?.requestRender()
             } catch {
