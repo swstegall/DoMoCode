@@ -661,7 +661,7 @@ public final class ClientApp {
             parts.append(
                 "^P: palette   ^S: sessions   ^L: model   ^T: tree   ^E: edit prompt   "
                 + "^G: diagnostics   ^O: detail   F6: images   ^V: paste image   "
-                + "Tab: pane   Ctrl+Tab: mode   Enter: send   Shift+↵/^J: newline   "
+                + "Tab: pane   Ctrl+Tab: mode   Enter: send   Shift+Enter/^J: newline   "
                 + "↑/↓: history/list   PgUp/PgDn: scroll   Esc: abort   ^C: quit   "
                 + "Ctrl+B/F: cursor   Alt+←/→/B/F: word   Home/End: line   ^A: line start   "
                 + "Ctrl+]/Ctrl+Alt+]: jump   Backspace/Delete: char delete   "
