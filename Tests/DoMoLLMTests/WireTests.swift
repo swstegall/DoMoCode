@@ -452,7 +452,11 @@ struct RequestTests {
         #expect(wireID == toolWire.toolCallID)
         #expect(wireID != originalID)
         #expect(ToolCallIDPolicy.isWireSafe(wireID))
-        #expect(ToolCallIDPolicy.wireID(wireID) == wireID)
+        #expect(wireID == ToolCallIDPolicy.wireID(originalID))
+        // `wireID` is an outbound representation. The normalized transcript
+        // retains `originalID`, so a later request derives the same mapping
+        // rather than feeding this reserved representation back through the
+        // encoder.
     }
 
     @Test("Safe tool-call ids remain unchanged while the policy owns its prefix")
