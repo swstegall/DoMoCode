@@ -215,6 +215,8 @@ final class ServeProcess: @unchecked Sendable {
     private let errorPipe = Pipe()
     private let lock = NSLock()
     private var standardErrorText = ""
+    private let clientID = "serve-process-test"
+    private let clientOwner = "serve-process-test"
 
     init(arguments: [String], workspace: Workspace) throws {
         process.executableURL = domoBinaryURL()
@@ -299,6 +301,22 @@ final class ServeProcess: @unchecked Sendable {
         guard let id = json["id"]?.stringValue else {
             throw MockGatewayError("POST /session had no id: \(String(decoding: data, as: UTF8.self))")
         }
+        let attachment = try JSONSerialization.data(withJSONObject: [
+            "clientID": clientID,
+            "owner": clientOwner,
+            "requestAuthority": true,
+        ])
+        let (attachmentData, attachmentStatus) = try await send(
+            ready,
+            method: "POST",
+            path: "/session/\(id)/client/attach",
+            body: attachment
+        )
+        guard attachmentStatus == 200 else {
+            throw MockGatewayError(
+                "POST client attach -> \(attachmentStatus): \(String(decoding: attachmentData, as: UTF8.self))"
+            )
+        }
         return id
     }
 
@@ -337,6 +355,8 @@ final class ServeProcess: @unchecked Sendable {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(ready.port)\(path)")!)
         request.httpMethod = method
         request.setValue("Bearer \(ready.token)", forHTTPHeaderField: "Authorization")
+        request.setValue(clientID, forHTTPHeaderField: "x-domocode-client-id")
+        request.setValue(clientOwner, forHTTPHeaderField: "x-domocode-client-owner")
         if let body {
             request.httpBody = body
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")

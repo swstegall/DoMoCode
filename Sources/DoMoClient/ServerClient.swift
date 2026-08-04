@@ -196,7 +196,9 @@ public struct ServerClient: Sendable {
         let body = try resume.map { try JSONEncoder().encode(CreateBody(resume: $0)) }
         let (status, data) = try await send(.post, "/session", body: body)
         try expect(status, 201, "/session", body: data)
-        return try JSONDecoder().decode(SessionRef.self, from: data)
+        let session = try JSONDecoder().decode(SessionRef.self, from: data)
+        try await attachIfSupported(sessionID: session.id)
+        return session
     }
 
     /// List every known session for the sidebar. `GET /sessions` → 200.
@@ -831,6 +833,7 @@ public struct ServerClient: Sendable {
     /// Submit a prompt. Fire-and-forget: the run streams over the event channel.
     /// `POST /session/{id}/prompt` → 202.
     public func sendPrompt(sessionID: String, prompt: String, images: [ImageBlock] = []) async throws {
+        try await attachIfSupported(sessionID: sessionID)
         let path = "/session/\(sessionID)/prompt"
         let body = try JSONEncoder().encode(PromptBody(prompt: prompt, images: images.isEmpty ? nil : images))
         let (status, data) = try await send(.post, path, body: body)
@@ -840,6 +843,7 @@ public struct ServerClient: Sendable {
     /// Queue a prompt for the active run. `POST /session/{id}/steer` → 202.
     /// The accepted count arrives asynchronously as a `queue_update` SSE frame.
     public func sendSteer(sessionID: String, prompt: String, images: [ImageBlock] = []) async throws {
+        try await attachIfSupported(sessionID: sessionID)
         let path = "/session/\(sessionID)/steer"
         let body = try JSONEncoder().encode(PromptBody(prompt: prompt, images: images.isEmpty ? nil : images))
         let (status, data) = try await send(.post, path, body: body)
@@ -1042,7 +1046,7 @@ public struct ServerClient: Sendable {
                         // ignored so the client remains backward compatible;
                         // runtimes with the ledger now have an authority owner
                         // before the first prompt arrives.
-                        _ = try? await client.attachClient(sessionID: sessionID)
+                        _ = try? await client.attachIfSupported(sessionID: sessionID)
                         var request = HTTPClientRequest(url: baseURL + path)
                         request.method = .GET
                         request.headers.add(name: "authorization", value: "Bearer \(token)")
@@ -1150,6 +1154,18 @@ public struct ServerClient: Sendable {
     }
 
     // MARK: Plumbing
+
+    /// Register before the first operation that needs session authority. The
+    /// endpoint is additive, so a client can still talk to a pre-ledger server
+    /// when it answers the registration route with 404; every other failure is
+    /// meaningful and must reach the caller instead of becoming a later 403.
+    private func attachIfSupported(sessionID: String) async throws {
+        do {
+            _ = try await attachClient(sessionID: sessionID)
+        } catch ServerClientError.unexpectedStatus(404, _, _) {
+            // Backward compatibility with servers predating the client ledger.
+        }
+    }
 
     private static func percentEncode(_ value: String) -> String {
         var allowed = CharacterSet.urlQueryAllowed
