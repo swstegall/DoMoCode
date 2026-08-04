@@ -1205,7 +1205,8 @@ public actor ServerRuntime {
             if let manager, let jobID {
                 let operation: JobOperation = { context in
                     try await context.reportProgress(
-                        JobProgress(fraction: 0, message: "Workflow running")
+                        JobProgress(fraction: 0),
+                        "Workflow running"
                     )
                     do {
                         let result: WorkflowRunRecord
@@ -1219,7 +1220,8 @@ public actor ServerRuntime {
                             )
                         }
                         try await context.reportProgress(
-                            JobProgress(fraction: 1, message: "Workflow complete")
+                            JobProgress(fraction: 1),
+                            "Workflow complete"
                         )
                         return JobResult(
                             output: try JSONValue(parsing: JSONEncoder().encode(result))

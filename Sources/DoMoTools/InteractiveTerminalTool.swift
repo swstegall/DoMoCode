@@ -173,7 +173,7 @@ public actor PTYInteractiveTerminalProvider: InteractiveTerminalProvider {
             role: .pty,
             command: rawCommand,
             workingDirectory: FilePath(request.workingDirectory),
-            environment: request.environment
+            environment: Self.shellEnvironment(request.environment)
         )
         let id = try await service.start(.init(
             command: plan.map { [$0.executable.string] + $0.arguments } ?? rawCommand,
@@ -367,6 +367,13 @@ public struct InteractiveTerminalTool: Tool {
 
     private static func ptyEnvironment(_ environment: ShellEnvironment) -> PTYEnvironment {
         PTYEnvironment(
+            base: environment.base == .inherited ? .inherited : .empty,
+            overrides: environment.overrides
+        )
+    }
+
+    private static func shellEnvironment(_ environment: PTYEnvironment) -> ShellEnvironment {
+        ShellEnvironment(
             base: environment.base == .inherited ? .inherited : .empty,
             overrides: environment.overrides
         )
