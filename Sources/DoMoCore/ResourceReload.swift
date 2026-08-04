@@ -72,6 +72,50 @@ public enum ResourceReloadError: Error, Sendable, Equatable {
     case turnAlreadyActive(String)
     case noActiveTurn
     case wrongTurn(String)
+    case watcherAlreadyRunning
+}
+
+/// A platform-specific watcher feeds facts into the shared reload boundary.
+/// The source may be a DispatchSource, editor bridge, repository watcher, or a
+/// remote event stream; it must not reload resources or mutate a live turn.
+public protocol ResourceWatchSource: Sendable {
+    func events() -> AsyncStream<ResourceReloadEvent>
+}
+
+/// Owns cancellation for one watcher subscription. Keeping this outside the
+/// coordinator makes a dropped client harmless: the stream task is cancelled
+/// before the source can deliver late events into a new session.
+public actor ResourceWatchSubscription {
+    private let source: any ResourceWatchSource
+    private let coordinator: ResourceReloadCoordinator
+    private var task: Task<Void, Never>?
+
+    public init(
+        source: any ResourceWatchSource,
+        coordinator: ResourceReloadCoordinator
+    ) {
+        self.source = source
+        self.coordinator = coordinator
+    }
+
+    public var isRunning: Bool { task != nil }
+
+    public func start() throws(ResourceReloadError) {
+        guard task == nil else { throw .watcherAlreadyRunning }
+        let stream = source.events()
+        let coordinator = self.coordinator
+        task = Task {
+            for await event in stream {
+                guard !Task.isCancelled else { return }
+                await coordinator.observe(event)
+            }
+        }
+    }
+
+    public func stop() {
+        task?.cancel()
+        task = nil
+    }
 }
 
 /// A single coalescing point for every resource watcher. The callback is the

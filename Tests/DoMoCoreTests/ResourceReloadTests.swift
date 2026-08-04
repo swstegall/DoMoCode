@@ -94,6 +94,29 @@ struct ResourceReloadTests {
             try await coordinator.endTurn(id: "turn-3")
         }
     }
+
+    @Test("watcher subscriptions forward events and stop cleanly")
+    func watcherSubscriptionLifecycle() async throws {
+        let source = TestWatchSource()
+        let coordinator = ResourceReloadCoordinator(debounceMilliseconds: 60_000)
+        let subscription = ResourceWatchSubscription(source: source, coordinator: coordinator)
+
+        try await subscription.start()
+        #expect(await subscription.isRunning)
+        await #expect(throws: ResourceReloadError.watcherAlreadyRunning) {
+            try await subscription.start()
+        }
+        await source.emit(ResourceReloadEvent(
+            path: "/project/App.swift",
+            kind: .workspace,
+            observedAt: "5"
+        ))
+        try await Task.sleep(for: .milliseconds(10))
+        #expect(await coordinator.flush()?.changes.count == 1)
+
+        await subscription.stop()
+        #expect(await subscription.isRunning == false)
+    }
 }
 
 private actor NoticeSink {
@@ -101,5 +124,22 @@ private actor NoticeSink {
 
     func append(_ notice: ResourceReloadNotice) {
         values.append(notice)
+    }
+}
+
+private actor TestWatchSource: ResourceWatchSource {
+    nonisolated let stream: AsyncStream<ResourceReloadEvent>
+    private let continuation: AsyncStream<ResourceReloadEvent>.Continuation
+
+    init() {
+        let pair = AsyncStream<ResourceReloadEvent>.makeStream()
+        stream = pair.stream
+        continuation = pair.continuation
+    }
+
+    nonisolated func events() -> AsyncStream<ResourceReloadEvent> { stream }
+
+    func emit(_ event: ResourceReloadEvent) {
+        continuation.yield(event)
     }
 }
