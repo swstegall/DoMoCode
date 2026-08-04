@@ -274,6 +274,8 @@ struct ServerRuntimeTests {
             tools: [],
             model: "test-model",
             streamFn: textStream("default findings"),
+            toolExecution: .sequential,
+            maxTurns: 5,
             modelOptions: [ModelOption(id: "test-model"), ModelOption(id: alternate)],
             modelStreamFactory: { model in
                 { _ in
@@ -369,7 +371,7 @@ struct ServerRuntimeTests {
         #expect(evidence["sourceSessionID"]?.stringValue == parent.id)
         #expect(evidence["untrustedData"]?.boolValue == true)
         let planPath = dirs.cwd.appendingPathComponent(".domocode/plans/standard.md")
-        #expect(try String(contentsOf: planPath).contains("edited plan from the user"))
+        #expect(try String(contentsOf: planPath, encoding: .utf8).contains("edited plan from the user"))
         let executeID = try #require(run.stage(withID: "execute")?.agentIDs.first)
         let executeMessages = try await runtime.messages(sessionID: executeID)
         #expect(executeMessages.contains { message in
