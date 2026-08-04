@@ -169,11 +169,14 @@ public struct WorkflowDefinition: Sendable, Codable, Hashable {
             if let maxTokens = stage.budget.maxTokens, maxTokens <= 0 {
                 issues.append("stage \(stage.id) maxTokens must be positive")
             }
-            if let maxCost = stage.budget.maxCostUSD, maxCost < 0 {
-                issues.append("stage \(stage.id) maxCostUSD must not be negative")
+            if let maxCost = stage.budget.maxCostUSD, !maxCost.isFinite || maxCost < 0 {
+                issues.append("stage \(stage.id) maxCostUSD must be finite and not negative")
             }
-            if let timeout = stage.timeoutSeconds, timeout <= 0 {
-                issues.append("stage \(stage.id) timeoutSeconds must be positive")
+            if let wallClock = stage.budget.wallClockSeconds, !wallClock.isFinite || wallClock <= 0 {
+                issues.append("stage \(stage.id) wallClockSeconds must be finite and positive")
+            }
+            if let timeout = stage.timeoutSeconds, !timeout.isFinite || timeout <= 0 {
+                issues.append("stage \(stage.id) timeoutSeconds must be finite and positive")
             }
         }
 

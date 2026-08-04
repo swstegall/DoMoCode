@@ -3,6 +3,8 @@
 
 import DoMoCore
 import DoMoHarness
+import Foundation
+import SystemPackage
 import Testing
 
 private actor WorkflowExecutionLog {
@@ -18,6 +20,19 @@ private actor WorkflowStartSignal {
 
     func isStarted() -> Bool { started }
 }
+
+private actor WorkflowAttempts {
+    private var values: [String: Int] = [:]
+
+    func increment(_ id: String) -> Int {
+        values[id, default: 0] += 1
+        return values[id] ?? 0
+    }
+
+    func value(for id: String) -> Int { values[id] ?? 0 }
+}
+
+private struct TestWorkflowFailure: Error, Sendable {}
 
 @Suite("Workflow runner", .serialized)
 struct WorkflowRunnerTests {
@@ -108,5 +123,104 @@ struct WorkflowRunnerTests {
         #expect(run.status == .cancelled)
         #expect(run.cancellationRequested)
         #expect(run.error?.contains("cancellation") == true)
+    }
+
+    @Test("approval boundaries wait before executing a stage")
+    func approvalBoundary() async throws {
+        let definition = WorkflowDefinition(
+            id: "approval",
+            stages: [WorkflowStageDefinition(
+                id: "execute",
+                kind: .execute,
+                approvalBoundary: .beforeMutation
+            )]
+        )
+        let approvals = WorkflowExecutionLog()
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" },
+            approvalHandler: { request in
+                await approvals.append(request.stage.id)
+                return .approved
+            }
+        ) { request in
+            return WorkflowStageResult(output: "approved")
+        }
+
+        let run = try await runner.run(runID: "approval-run")
+        #expect(run.status == .succeeded)
+        #expect(await approvals.values == ["execute"])
+    }
+
+    @Test("a timed-out stage becomes a durable failure")
+    func timeout() async throws {
+        let definition = WorkflowDefinition(
+            id: "timeout",
+            stages: [WorkflowStageDefinition(
+                id: "slow",
+                kind: .debug,
+                budget: WorkflowBudget(wallClockSeconds: 0.01)
+            )]
+        )
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { _ in
+            try await Task.sleep(nanoseconds: 200_000_000)
+            return WorkflowStageResult(output: "too late")
+        }
+
+        do {
+            _ = try await runner.run(runID: "timeout-run")
+            Issue.record("expected timeout failure")
+        } catch let error as WorkflowRunnerError {
+            guard case .stageFailed(let id, let message) = error else {
+                Issue.record("unexpected runner error: \(error)")
+                return
+            }
+            #expect(id == "slow")
+            #expect(message.contains("timed out"))
+        }
+        #expect(await runner.snapshot()?.stage(withID: "slow")?.status == .failed)
+    }
+
+    @Test("resume reuses successful stage outputs without repeating them")
+    func resume() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("domo-runner-resume-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try WorkflowStore.create(directory: FilePath(root.path))
+        let definition = WorkflowDefinition(
+            id: "resume",
+            stages: [
+                WorkflowStageDefinition(id: "research", kind: .research),
+                WorkflowStageDefinition(id: "plan", kind: .plan, dependencies: ["research"]),
+            ]
+        )
+        let attempts = WorkflowAttempts()
+        let runner = WorkflowRunner(
+            definition: definition,
+            store: store,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { request in
+            let attempt = await attempts.increment(request.stage.id)
+            if request.stage.id == "plan", attempt == 1 { throw TestWorkflowFailure() }
+            return WorkflowStageResult(output: request.stage.id == "research" ? "evidence" : "plan")
+        }
+
+        do {
+            _ = try await runner.run(runID: "resume-run")
+            Issue.record("expected the first plan attempt to fail")
+        } catch let error as WorkflowRunnerError {
+            guard case .stageFailed("plan", _) = error else {
+                Issue.record("unexpected runner error: \(error)")
+                return
+            }
+        }
+        let resumed = try await runner.resume(runID: "resume-run")
+        #expect(resumed.status == .succeeded)
+        #expect(resumed.output == "plan")
+        #expect(await attempts.value(for: "research") == 1)
+        #expect(await attempts.value(for: "plan") == 2)
     }
 }

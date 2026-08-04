@@ -43,9 +43,32 @@ public struct WorkflowStageResult: Sendable, Hashable {
 
 public typealias WorkflowStageExecutor = @Sendable (WorkflowStageRequest) async throws -> WorkflowStageResult
 
+public struct WorkflowApprovalRequest: Sendable, Hashable {
+    public let workflowID: String
+    public let runID: String
+    public let stage: WorkflowStageDefinition
+
+    public init(workflowID: String, runID: String, stage: WorkflowStageDefinition) {
+        self.workflowID = workflowID
+        self.runID = runID
+        self.stage = stage
+    }
+}
+
+public enum WorkflowApprovalDecision: Sendable, Hashable {
+    case approved
+    case denied(String)
+    case cancelled
+    case requiresApproval
+}
+
+public typealias WorkflowApprovalHandler = @Sendable (WorkflowApprovalRequest) async -> WorkflowApprovalDecision
+
 public enum WorkflowRunnerError: Error, Sendable, Equatable {
     case invalidDefinition([String])
     case alreadyRunning
+    case runNotFound(String)
+    case notResumableRun(String)
     case stageFailed(id: String, message: String)
     case unresolvedStages([String])
 }
@@ -59,6 +82,7 @@ public actor WorkflowRunner {
 
     private let store: WorkflowStore?
     private let executor: WorkflowStageExecutor
+    private let approvalHandler: WorkflowApprovalHandler?
     private let now: @Sendable () -> String
     private var currentRun: WorkflowRunRecord?
     private var running = false
@@ -69,12 +93,14 @@ public actor WorkflowRunner {
         executionMode: WorkflowExecutionMode = .serial,
         store: WorkflowStore? = nil,
         now: @escaping @Sendable () -> String = { WorkflowStore.timestamp() },
+        approvalHandler: WorkflowApprovalHandler? = nil,
         executor: @escaping WorkflowStageExecutor
     ) {
         self.definition = definition
         self.executionMode = executionMode
         self.store = store
         self.now = now
+        self.approvalHandler = approvalHandler
         self.executor = executor
     }
 
@@ -87,11 +113,7 @@ public actor WorkflowRunner {
             throw WorkflowRunnerError.invalidDefinition(definition.validationIssues)
         }
 
-        running = true
-        cancellationRequested = false
-        defer { running = false }
-
-        var run = WorkflowRunRecord(
+        let run = WorkflowRunRecord(
             id: runID,
             workflowID: definition.id,
             createdAt: now(),
@@ -99,9 +121,59 @@ public actor WorkflowRunner {
             stageIDs: definition.stages.map(\.id),
             status: .running
         )
+        return try await execute(initialRun: run, outputs: [:])
+    }
+
+    /// Resume a failed, cancelled, paused, or interrupted run from its latest
+    /// durable snapshot. Successful stages are retained and their outputs are
+    /// passed to downstream work; unfinished stages are reset to pending so a
+    /// user makes the explicit decision to retry them.
+    public func resume(runID: String) async throws -> WorkflowRunRecord {
+        guard !running else { throw WorkflowRunnerError.alreadyRunning }
+        guard definition.isValid else {
+            throw WorkflowRunnerError.invalidDefinition(definition.validationIssues)
+        }
+        guard let store, let stored = try store.latestRun(withID: runID) else {
+            throw WorkflowRunnerError.runNotFound(runID)
+        }
+        guard stored.workflowID == definition.id,
+              [.failed, .cancelled, .paused, .running].contains(stored.status)
+        else {
+            throw WorkflowRunnerError.notResumableRun(runID)
+        }
+
+        let successful = Dictionary(
+            uniqueKeysWithValues: stored.stages
+                .filter { $0.status == .succeeded }
+                .map { ($0.stageID, $0.output) }
+        )
+        var recovered = stored
+        recovered.status = .running
+        recovered.error = nil
+        recovered.cancellationRequested = false
+        recovered.updatedAt = now()
+        recovered.stages = definition.stages.map { stage in
+            guard let prior = stored.stage(withID: stage.id), prior.status == .succeeded else {
+                return WorkflowStageRunRecord(stageID: stage.id, metadata: stored.stage(withID: stage.id)?.metadata ?? [:])
+            }
+            return prior
+        }
+        return try await execute(initialRun: recovered, outputs: successful)
+    }
+
+    private func execute(
+        initialRun: WorkflowRunRecord,
+        outputs initialOutputs: [String: JSONValue]
+    ) async throws -> WorkflowRunRecord {
+        running = true
+        cancellationRequested = false
+        defer { running = false }
+
+        var run = initialRun
+        run.status = .running
         try persist(&run)
 
-        var outputs: [String: JSONValue] = [:]
+        var outputs = initialOutputs
         while true {
             if cancellationRequested || Task.isCancelled {
                 for stage in definition.stages where run.stage(withID: stage.id)?.status == .pending || run.stage(withID: stage.id)?.status == .ready {
@@ -150,6 +222,17 @@ public actor WorkflowRunner {
             case .serial:
                 var serial: [StageOutcome] = []
                 for stage in ready {
+                    if stage.approvalBoundary != .none {
+                        _ = run.updateStage(stage.id, status: .waitingForApproval, timestamp: now())
+                        try persist(&run)
+                        let decision = await approvalDecision(for: stage, runID: run.id)
+                        if let failure = approvalFailure(decision, stageID: stage.id) {
+                            serial.append(StageOutcome(stageID: stage.id, result: nil, failure: failure))
+                            break
+                        }
+                        _ = run.updateStage(stage.id, status: .ready, timestamp: now())
+                        try persist(&run)
+                    }
                     // A serial wave can contain several independent stages, so
                     // only expose the stage that has actually entered the
                     // executor as running. The remaining siblings stay ready.
@@ -160,12 +243,31 @@ public actor WorkflowRunner {
                 }
                 outcomes = serial
             case .parallel:
-                // All members of a parallel wave enter the executor together.
-                for stage in ready {
-                    _ = run.updateStage(stage.id, status: .running, timestamp: now())
+                // Approval is resolved before the wave starts. This keeps a
+                // mutation boundary serial and deterministic even when the
+                // approved stages themselves execute in parallel.
+                var blocked: StageOutcome?
+                for stage in ready where stage.approvalBoundary != .none {
+                    _ = run.updateStage(stage.id, status: .waitingForApproval, timestamp: now())
+                    try persist(&run)
+                    let decision = await approvalDecision(for: stage, runID: run.id)
+                    if let failure = approvalFailure(decision, stageID: stage.id) {
+                        blocked = StageOutcome(stageID: stage.id, result: nil, failure: failure)
+                        break
+                    }
+                    _ = run.updateStage(stage.id, status: .ready, timestamp: now())
+                    try persist(&run)
                 }
-                try persist(&run)
-                outcomes = await executeParallel(stages: ready, run: run, outputs: outputs)
+                if let blocked {
+                    outcomes = [blocked]
+                } else {
+                    // All members of a parallel wave enter the executor together.
+                    for stage in ready {
+                        _ = run.updateStage(stage.id, status: .running, timestamp: now())
+                    }
+                    try persist(&run)
+                    outcomes = await executeParallel(stages: ready, run: run, outputs: outputs)
+                }
             }
 
             for outcome in outcomes {
@@ -236,10 +338,49 @@ public actor WorkflowRunner {
         let isCancellation: Bool
     }
 
+    private struct StageTimedOut: Error, Sendable {
+        let seconds: Double
+    }
+
     private struct StageOutcome: Sendable {
         let stageID: String
         let result: WorkflowStageResult?
         let failure: StageFailure?
+    }
+
+    private func approvalDecision(
+        for stage: WorkflowStageDefinition,
+        runID: String
+    ) async -> WorkflowApprovalDecision {
+        guard let approvalHandler else { return .requiresApproval }
+        return await approvalHandler(WorkflowApprovalRequest(
+            workflowID: definition.id,
+            runID: runID,
+            stage: stage
+        ))
+    }
+
+    private func approvalFailure(
+        _ decision: WorkflowApprovalDecision,
+        stageID: String
+    ) -> StageFailure? {
+        switch decision {
+        case .approved:
+            return nil
+        case .denied(let reason):
+            let safeReason = Redaction.diagnostic(reason.trimmingCharacters(in: .whitespacesAndNewlines))
+            return StageFailure(
+                message: safeReason.isEmpty ? "Stage \(stageID) approval denied." : safeReason,
+                isCancellation: false
+            )
+        case .cancelled:
+            return StageFailure(message: "Stage approval cancelled.", isCancellation: true)
+        case .requiresApproval:
+            return StageFailure(
+                message: "Stage \(stageID) requires approval, but no approval handler is configured.",
+                isCancellation: false
+            )
+        }
     }
 
     private func execute(
@@ -257,7 +398,39 @@ public actor WorkflowRunner {
             }
         )
         do {
-            return StageOutcome(stageID: stage.id, result: try await executor(request), failure: nil)
+            let result: WorkflowStageResult
+            if let seconds = stage.timeoutSeconds ?? stage.budget.wallClockSeconds {
+                let executor = self.executor
+                result = try await withThrowingTaskGroup(of: WorkflowStageResult.self) { group in
+                    group.addTask { try await executor(request) }
+                    group.addTask {
+                        let boundedMilliseconds = min(
+                            Double(Int.max),
+                            max(0.001, seconds) * 1_000
+                        )
+                        let milliseconds = max(1, Int(boundedMilliseconds.rounded(.up)))
+                        try await Task.sleep(for: .milliseconds(milliseconds))
+                        throw StageTimedOut(seconds: seconds)
+                    }
+                    defer { group.cancelAll() }
+                    guard let first = try await group.next() else {
+                        throw CancellationError()
+                    }
+                    return first
+                }
+            } else {
+                result = try await executor(request)
+            }
+            return StageOutcome(stageID: stage.id, result: result, failure: nil)
+        } catch let timeout as StageTimedOut {
+            return StageOutcome(
+                stageID: stage.id,
+                result: nil,
+                failure: StageFailure(
+                    message: "Stage timed out after \(timeout.seconds) seconds.",
+                    isCancellation: false
+                )
+            )
         } catch is CancellationError {
             return StageOutcome(
                 stageID: stage.id,
