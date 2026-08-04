@@ -82,6 +82,10 @@ final class WorkflowWorkspaceController: @MainActor Focusable {
     var onDeny: (() -> Void)?
     /// Called by the dedicated workspace's replay-export shortcut.
     var onSave: (() -> Void)?
+    /// Called by the stop/pause/restart workflow controls.
+    var onStop: (() -> Void)?
+    var onPause: (() -> Void)?
+    var onRestart: (() -> Void)?
 
     private let keybindings = Keybindings()
 
@@ -143,7 +147,13 @@ final class WorkflowWorkspaceController: @MainActor Focusable {
     }
 
     func handleInput(_ data: [UInt8]) {
-        if data == [0x73] {
+        if data == [0x78] {
+            onStop?()
+        } else if data == [0x70] {
+            onPause?()
+        } else if data == [0x72] {
+            onRestart?()
+        } else if data == [0x73] {
             onSave?()
         } else if level == .agentContent, data == [0x61] {
             onApprove?()
@@ -224,7 +234,7 @@ private final class WorkflowNavigationPane: Component {
         )]
 
         if controller.level == .phases {
-            lines.append(truncateToWidth(dim("Enter open · s save · Esc close"), width, ellipsis: ""))
+            lines.append(truncateToWidth(dim("Enter open · x stop · p pause · s save · Esc close"), width, ellipsis: ""))
             lines.append(String(repeating: "─", count: width))
             if controller.phases.isEmpty {
                 lines.append(truncateToWidth(dim("  (none)"), width, ellipsis: ""))
@@ -242,7 +252,7 @@ private final class WorkflowNavigationPane: Component {
         } else {
             let phaseTitle = controller.selectedPhase?.title ?? "phase"
             lines.append(truncateToWidth(dim("Phase: " + sanitizeUntrustedText(phaseTitle)), width, ellipsis: ""))
-            lines.append(truncateToWidth(dim("↑/↓ choose · Enter open · s save · Esc back"), width, ellipsis: ""))
+            lines.append(truncateToWidth(dim("↑/↓ choose · Enter open · x stop · p pause · s save · Esc back"), width, ellipsis: ""))
             lines.append(String(repeating: "─", count: width))
             let agents = controller.selectedPhase?.agents ?? []
             if agents.isEmpty {
@@ -317,8 +327,7 @@ private final class WorkflowContentPane: Component {
             lines.append(truncateToWidth(
                 dim(
                         "Phase: " + sanitizeUntrustedText(phase?.title ?? "unknown")
-                        + " · Esc back"
-                        + " · s save"
+                        + " · x stop · p pause · r restart · s save · Esc back"
                         + (phase?.status == .waitingForApproval ? " · a approve · d deny" : "")
                 ),
                 width,

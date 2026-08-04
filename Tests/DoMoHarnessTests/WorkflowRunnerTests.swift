@@ -136,6 +136,39 @@ struct WorkflowRunnerTests {
         #expect(run.error?.contains("cancellation") == true)
     }
 
+    @Test("pause preserves successful checkpoints and leaves later stages resumable")
+    func pause() async throws {
+        let definition = WorkflowDefinition(
+            id: "pause",
+            stages: [
+                WorkflowStageDefinition(id: "research", kind: .research),
+                WorkflowStageDefinition(id: "plan", kind: .plan, dependencies: ["research"]),
+            ]
+        )
+        let signal = WorkflowStartSignal()
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { request in
+            await signal.markStarted()
+            try await Task.sleep(nanoseconds: 20_000_000)
+            return WorkflowStageResult(output: request.stage.id)
+        }
+
+        let task = Task { try await runner.run(runID: "pause-run") }
+        for _ in 0..<100 {
+            if await signal.isStarted() { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(await signal.isStarted())
+        try await runner.pause()
+        let run = try await task.value
+        #expect(run.status == .paused)
+        #expect(!run.cancellationRequested)
+        #expect(run.stage(withID: "research")?.status == .succeeded)
+        #expect(run.stage(withID: "plan")?.status == .pending)
+    }
+
     @Test("approval boundaries wait before executing a stage")
     func approvalBoundary() async throws {
         let definition = WorkflowDefinition(

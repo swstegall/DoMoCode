@@ -263,6 +263,15 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
     }
 
+    /// Pause a workflow at a resumable boundary while retaining successful
+    /// checkpoints.
+    public func pauseWorkflow(workflowID: String, runID: String) async throws -> WorkflowRunRecord {
+        let path = "/workflow/\(workflowID)/run/\(runID)/pause"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
+    }
+
     /// List stage approvals that are waiting for an explicit client decision.
     public func workflowApprovals(
         workflowID: String,

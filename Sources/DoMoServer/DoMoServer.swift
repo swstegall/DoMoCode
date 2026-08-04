@@ -302,6 +302,14 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        router.post("/workflow/:id/run/:runID/pause") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let runID = try context.parameters.require("runID")
+                return try Self.json(try await self.runtime.pauseWorkflow(workflowID: id, runID: runID))
+            }
+        }
+
         router.get("/workflow/:id/run/:runID/approvals") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")

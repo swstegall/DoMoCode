@@ -65,6 +65,7 @@ public enum WorkflowApprovalDecision: Sendable, Hashable {
     case approved
     case denied(String)
     case cancelled
+    case paused
     case requiresApproval
 }
 
@@ -94,6 +95,7 @@ public actor WorkflowRunner {
     private var currentRun: WorkflowRunRecord?
     private var running = false
     private var cancellationRequested = false
+    private var pauseRequested = false
 
     public init(
         definition: WorkflowDefinition,
@@ -162,6 +164,7 @@ public actor WorkflowRunner {
         recovered.status = .running
         recovered.error = nil
         recovered.cancellationRequested = false
+        recovered.metadata.removeValue(forKey: "pauseRequested")
         recovered.updatedAt = now()
         recovered.stages = definition.stages.map { stage in
             guard let prior = stored.stage(withID: stage.id), prior.status == .succeeded else {
@@ -178,6 +181,7 @@ public actor WorkflowRunner {
     ) async throws -> WorkflowRunRecord {
         running = true
         cancellationRequested = false
+        pauseRequested = false
         defer { running = false }
 
         var run = initialRun
@@ -193,6 +197,18 @@ public actor WorkflowRunner {
                 run.cancellationRequested = true
                 run.status = .cancelled
                 run.error = "Workflow cancellation requested."
+                try persist(&run)
+                return run
+            }
+            if pauseRequested {
+                for stage in definition.stages {
+                    guard let record = run.stage(withID: stage.id),
+                          record.status == .ready || record.status == .waitingForApproval
+                    else { continue }
+                    _ = run.updateStage(stage.id, status: .pending, timestamp: now())
+                }
+                run.status = .paused
+                run.error = "Workflow pause requested."
                 try persist(&run)
                 return run
             }
@@ -302,6 +318,24 @@ public actor WorkflowRunner {
                         run.stages[index].metadata.merge(result.metadata) { _, latest in latest }
                     }
                 } else if let failure = outcome.failure {
+                    if failure.isPause {
+                        _ = run.updateStage(
+                            outcome.stageID,
+                            status: .pending,
+                            timestamp: now()
+                        )
+                        run.status = .paused
+                        run.error = failure.message
+                        run.cancellationRequested = false
+                        for stage in definition.stages {
+                            guard let record = run.stage(withID: stage.id),
+                                  record.status == .ready || record.status == .waitingForApproval
+                            else { continue }
+                            _ = run.updateStage(stage.id, status: .pending, timestamp: now())
+                        }
+                        try persist(&run)
+                        return run
+                    }
                     let status: WorkflowStageRunStatus = failure.isCancellation ? .cancelled : .failed
                     _ = run.updateStage(
                         outcome.stageID,
@@ -343,8 +377,21 @@ public actor WorkflowRunner {
     public func cancel() throws {
         guard running else { return }
         cancellationRequested = true
+        pauseRequested = false
         if var run = currentRun {
             run.cancellationRequested = true
+            try persist(&run)
+        }
+    }
+
+    /// Pauses at the next stage boundary. Successful stages remain checkpoints;
+    /// the current stage is allowed to finish, while pending and approval-bound
+    /// stages remain resumable instead of being marked cancelled.
+    public func pause() throws {
+        guard running else { return }
+        pauseRequested = true
+        if var run = currentRun {
+            run.metadata["pauseRequested"] = .bool(true)
             try persist(&run)
         }
     }
@@ -354,6 +401,7 @@ public actor WorkflowRunner {
     private struct StageFailure: Sendable {
         let message: String
         let isCancellation: Bool
+        let isPause: Bool
     }
 
     private struct StageTimedOut: Error, Sendable {
@@ -389,14 +437,22 @@ public actor WorkflowRunner {
             let safeReason = Redaction.diagnostic(reason.trimmingCharacters(in: .whitespacesAndNewlines))
             return StageFailure(
                 message: safeReason.isEmpty ? "Stage \(stageID) approval denied." : safeReason,
-                isCancellation: false
+                isCancellation: false,
+                isPause: false
             )
         case .cancelled:
-            return StageFailure(message: "Stage approval cancelled.", isCancellation: true)
+            return StageFailure(message: "Stage approval cancelled.", isCancellation: true, isPause: false)
+        case .paused:
+            return StageFailure(
+                message: "Workflow paused before stage \(stageID).",
+                isCancellation: false,
+                isPause: true
+            )
         case .requiresApproval:
             return StageFailure(
                 message: "Stage \(stageID) requires approval, but no approval handler is configured.",
-                isCancellation: false
+                isCancellation: false,
+                isPause: false
             )
         }
     }
@@ -452,14 +508,15 @@ public actor WorkflowRunner {
                 result: nil,
                 failure: StageFailure(
                     message: "Stage timed out after \(timeout.seconds) seconds.",
-                    isCancellation: false
+                    isCancellation: false,
+                    isPause: false
                 )
             )
         } catch is CancellationError {
             return StageOutcome(
                 stageID: stage.id,
                 result: nil,
-                failure: StageFailure(message: "Stage cancelled.", isCancellation: true)
+                failure: StageFailure(message: "Stage cancelled.", isCancellation: true, isPause: false)
             )
         } catch {
             return StageOutcome(
@@ -467,7 +524,8 @@ public actor WorkflowRunner {
                 result: nil,
                 failure: StageFailure(
                     message: Redaction.diagnostic(String(describing: error)),
-                    isCancellation: false
+                    isCancellation: false,
+                    isPause: false
                 )
             )
         }

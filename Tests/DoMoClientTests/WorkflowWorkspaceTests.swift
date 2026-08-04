@@ -16,6 +16,9 @@ struct WorkflowWorkspaceTests {
     private static let approve: [UInt8] = [0x61]
     private static let deny: [UInt8] = [0x64]
     private static let save: [UInt8] = [0x73]
+    private static let stop: [UInt8] = [0x78]
+    private static let pause: [UInt8] = [0x70]
+    private static let restart: [UInt8] = [0x72]
 
     private func workspace() -> WorkflowWorkspaceController {
         WorkflowWorkspaceController(phases: [
@@ -119,5 +122,29 @@ struct WorkflowWorkspaceTests {
         view.handleInput(Self.save)
 
         #expect(saves == 3)
+    }
+
+    @Test("Stop, pause, and restart controls are forwarded")
+    func workflowControls() {
+        let view = workspace()
+        var stops = 0
+        var pauses = 0
+        var restarts = 0
+        view.onStop = { stops += 1 }
+        view.onPause = { pauses += 1 }
+        view.onRestart = { restarts += 1 }
+
+        view.handleInput(Self.stop)
+        view.handleInput(Self.pause)
+        view.handleInput(Self.restart)
+        view.handleInput(Self.enter)
+        view.handleInput(Self.enter)
+        view.handleInput(Self.stop)
+        view.handleInput(Self.pause)
+        view.handleInput(Self.restart)
+
+        #expect(stops == 2)
+        #expect(pauses == 2)
+        #expect(restarts == 2)
     }
 }

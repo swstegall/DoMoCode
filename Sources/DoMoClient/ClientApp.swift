@@ -2956,6 +2956,9 @@ public final class ClientApp {
         workspace.onApprove = { [weak self] in self?.resolveSelectedWorkflowApproval(decision: "approved") }
         workspace.onDeny = { [weak self] in self?.resolveSelectedWorkflowApproval(decision: "denied") }
         workspace.onSave = { [weak self] in self?.saveWorkflowExport() }
+        workspace.onStop = { [weak self] in self?.controlWorkflow(action: .stop) }
+        workspace.onPause = { [weak self] in self?.controlWorkflow(action: .pause) }
+        workspace.onRestart = { [weak self] in self?.controlWorkflow(action: .restart) }
         if let phaseID { workspace.selectPhase(id: phaseID) }
         workflowID = nil
         workflowRunID = nil
@@ -3062,6 +3065,38 @@ public final class ClientApp {
                 self.surface?.requestRender()
             } catch {
                 self.postError("Could not resolve workflow approval", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private enum WorkflowControlAction {
+        case stop
+        case pause
+        case restart
+    }
+
+    private func controlWorkflow(action: WorkflowControlAction) {
+        guard let workflowID, let runID = workflowRunID else {
+            post(notice: "no durable workflow run is available")
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let run: WorkflowRunRecord
+                switch action {
+                case .stop:
+                    run = try await self.client.cancelWorkflow(workflowID: workflowID, runID: runID)
+                case .pause:
+                    run = try await self.client.pauseWorkflow(workflowID: workflowID, runID: runID)
+                case .restart:
+                    run = try await self.client.resumeWorkflow(workflowID: workflowID, runID: runID)
+                }
+                self.workflowRunID = run.id
+                self.surface?.requestRender()
+            } catch {
+                self.postError("Could not control workflow", error)
             }
         }
         actionTasks.append(task)

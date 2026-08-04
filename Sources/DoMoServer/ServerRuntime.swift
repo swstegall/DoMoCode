@@ -793,6 +793,28 @@ public actor ServerRuntime {
         return stored
     }
 
+    /// Requests a resumable pause at the next workflow boundary. An approval
+    /// continuation is released with a pause decision so a disconnected UI
+    /// cannot leave the run parked indefinitely.
+    public func pauseWorkflow(workflowID: String, runID: String) async throws -> WorkflowRunRecord {
+        guard let stored = try workflowRun(workflowID: workflowID, runID: runID) else {
+            throw ServerRuntimeError.workflowRunNotFound
+        }
+        if let runner = workflowRunners[runID] {
+            resolvePendingWorkflowApprovals(runID: runID, decision: .paused)
+            try await runner.pause()
+            return try workflowRun(workflowID: workflowID, runID: runID) ?? stored
+        }
+        guard stored.status == .running, let store = config.workflowStore else { return stored }
+        var paused = stored
+        paused.status = .paused
+        paused.error = "Workflow pause requested."
+        paused.metadata["pauseRequested"] = .bool(true)
+        paused.updatedAt = WorkflowStore.timestamp()
+        try store.append(run: paused)
+        return paused
+    }
+
     /// Return approval boundaries that are currently parked behind the remote
     /// workflow control surface.
     public func workflowApprovals(
