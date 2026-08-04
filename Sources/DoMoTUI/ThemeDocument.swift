@@ -5,7 +5,7 @@ import Foundation
 
 /// A portable custom-theme document. The document carries a fallback palette so
 /// inherited colors and backgrounds are resolved before a client renders it.
-public struct ThemeDocument: Sendable, Codable, Hashable {
+public nonisolated struct ThemeDocument: Sendable, Codable, Hashable {
     public var schemaVersion: Int
     public var id: String
     public var displayName: String
@@ -34,7 +34,7 @@ public struct ThemeDocument: Sendable, Codable, Hashable {
     }
 }
 
-public struct ThemeContrastResult: Sendable, Codable, Hashable {
+public nonisolated struct ThemeContrastResult: Sendable, Codable, Hashable {
     public let appearance: String
     public let foreground: Double
     public let accent: Double
@@ -63,7 +63,7 @@ public struct ThemeContrastResult: Sendable, Codable, Hashable {
     }
 }
 
-public struct ThemeValidationReport: Sendable, Codable, Hashable {
+public nonisolated struct ThemeValidationReport: Sendable, Codable, Hashable {
     public let contrasts: [ThemeContrastResult]
     public let issues: [String]
 
@@ -75,12 +75,12 @@ public struct ThemeValidationReport: Sendable, Codable, Hashable {
     public var isAccessible: Bool { issues.isEmpty }
 }
 
-public enum ThemeDocumentError: Error, Sendable, Equatable {
+public nonisolated enum ThemeDocumentError: Error, Sendable, Equatable {
     case invalid(String)
     case inaccessible(ThemeValidationReport)
 }
 
-public struct ThemeRenderCapabilities: Sendable, Codable, Hashable {
+public nonisolated struct ThemeRenderCapabilities: Sendable, Codable, Hashable {
     public var trueColor: Bool
 
     public init(trueColor: Bool = true) {
@@ -88,7 +88,7 @@ public struct ThemeRenderCapabilities: Sendable, Codable, Hashable {
     }
 }
 
-public enum ThemeDocumentCodec {
+public nonisolated enum ThemeDocumentCodec {
     public static func encode(_ document: ThemeDocument) throws(ThemeDocumentError) -> Data {
         try validate(document)
         do {
