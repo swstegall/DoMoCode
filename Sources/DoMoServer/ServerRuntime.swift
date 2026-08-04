@@ -940,7 +940,7 @@ public actor ServerRuntime {
         sessionID: String,
         input: JSONValue = .null,
         runID requestedRunID: String? = nil
-    ) throws -> WorkflowRunRecord {
+    ) async throws -> WorkflowRunRecord {
         guard sessions[sessionID] != nil else { throw ServerRuntimeError.sessionNotFound }
         guard let store = config.workflowStore,
               let definition = try store.definition(withID: workflowID)
@@ -969,14 +969,41 @@ public actor ServerRuntime {
             status: .running,
             metadata: metadata
         )
-        try store.append(run: admitted)
+        let jobID: String? = config.jobManager == nil
+            ? nil
+            : Self.workflowJobID(runID: runID, resume: false)
+        if let manager = config.jobManager, let jobID {
+            do {
+                _ = try await manager.admit(Self.workflowJobAdmission(
+                    id: jobID,
+                    workflowID: workflowID,
+                    runID: runID,
+                    sessionID: sessionID,
+                    metadata: metadata
+                ))
+            } catch {
+                throw Self.mapJobError(error)
+            }
+        }
+        do {
+            try store.append(run: admitted)
+        } catch {
+            if let manager = config.jobManager, let jobID {
+                _ = try? await manager.cancel(jobID: jobID, owner: sessionID)
+            }
+            throw error
+        }
         let runner = makeWorkflowRunner(definition: definition, sessionID: sessionID)
         workflowRunners[runID] = runner
-        let task = Task { [weak self, runner] in
-            _ = try? await runner.run(input: input, runID: runID, metadata: metadata)
-            await self?.finishWorkflow(runID: runID)
-        }
-        workflowTasks[runID] = task
+        workflowTasks[runID] = makeWorkflowTask(
+            runner: runner,
+            runID: runID,
+            sessionID: sessionID,
+            input: input,
+            metadata: metadata,
+            jobID: jobID,
+            resume: false
+        )
         return admitted
     }
 
@@ -987,7 +1014,7 @@ public actor ServerRuntime {
         workflowID: String,
         runID: String,
         sessionID requestedSessionID: String? = nil
-    ) throws -> WorkflowRunRecord {
+    ) async throws -> WorkflowRunRecord {
         guard let store = config.workflowStore,
               let definition = try store.definition(withID: workflowID),
               let stored = try store.latestRun(withID: runID),
@@ -1009,11 +1036,39 @@ public actor ServerRuntime {
 
         let runner = makeWorkflowRunner(definition: definition, sessionID: sessionID)
         workflowRunners[runID] = runner
-        let task = Task { [weak self, runner] in
-            _ = try? await runner.resume(runID: runID)
-            await self?.finishWorkflow(runID: runID)
+        let jobID: String?
+        if let manager = config.jobManager {
+            let newJobID = Self.workflowJobID(runID: runID, resume: true)
+            do {
+                _ = try await manager.admit(Self.workflowJobAdmission(
+                    id: newJobID,
+                    workflowID: workflowID,
+                    runID: runID,
+                    sessionID: sessionID,
+                    metadata: [
+                        "workflowID": .string(workflowID),
+                        "workflowRunID": .string(runID),
+                        "sessionID": .string(sessionID),
+                        "resumes": .bool(true),
+                    ]
+                ))
+            } catch {
+                workflowRunners.removeValue(forKey: runID)
+                throw Self.mapJobError(error)
+            }
+            jobID = newJobID
+        } else {
+            jobID = nil
         }
-        workflowTasks[runID] = task
+        workflowTasks[runID] = makeWorkflowTask(
+            runner: runner,
+            runID: runID,
+            sessionID: sessionID,
+            input: stored.input,
+            metadata: stored.metadata,
+            jobID: jobID,
+            resume: true
+        )
         return stored
     }
 
@@ -1108,6 +1163,88 @@ public actor ServerRuntime {
                 return try await self.executeWorkflowStage(request)
             }
         )
+    }
+
+    private static func workflowJobID(runID: String, resume: Bool) -> String {
+        if resume {
+            return "workflow:\(runID):resume:\(UUIDv7.generate().description)"
+        }
+        return "workflow:\(runID)"
+    }
+
+    private static func workflowJobAdmission(
+        id: String,
+        workflowID: String,
+        runID: String,
+        sessionID: String,
+        metadata: [String: JSONValue]
+    ) -> JobAdmission {
+        JobAdmission(
+            id: id,
+            correlationID: runID,
+            sessionID: sessionID,
+            taskID: "workflow:\(workflowID):\(runID)",
+            kind: "workflow",
+            owner: sessionID,
+            retryPolicy: JobRetryPolicy(maxAttempts: 1),
+            metadata: metadata
+        )
+    }
+
+    private func makeWorkflowTask(
+        runner: WorkflowRunner,
+        runID: String,
+        sessionID: String,
+        input: JSONValue,
+        metadata: [String: JSONValue],
+        jobID: String?,
+        resume: Bool
+    ) -> Task<Void, Never> {
+        let manager = config.jobManager
+        return Task { [weak self, runner] in
+            if let manager, let jobID {
+                let operation: JobOperation = { context in
+                    try await context.reportProgress(
+                        JobProgress(fraction: 0, message: "Workflow running")
+                    )
+                    do {
+                        let result: WorkflowRunRecord
+                        if resume {
+                            result = try await runner.resume(runID: runID)
+                        } else {
+                            result = try await runner.run(
+                                input: input,
+                                runID: runID,
+                                metadata: metadata
+                            )
+                        }
+                        try await context.reportProgress(
+                            JobProgress(fraction: 1, message: "Workflow complete")
+                        )
+                        return JobResult(
+                            output: try JSONValue(parsing: JSONEncoder().encode(result))
+                        )
+                    } catch let failure as JobOperationFailure {
+                        throw failure
+                    } catch {
+                        throw JobOperationFailure(
+                            message: String(describing: error),
+                            cancelled: Task.isCancelled
+                        )
+                    }
+                }
+                _ = try? await manager.run(
+                    jobID: jobID,
+                    owner: sessionID,
+                    operation: operation
+                )
+            } else if resume {
+                _ = try? await runner.resume(runID: runID)
+            } else {
+                _ = try? await runner.run(input: input, runID: runID, metadata: metadata)
+            }
+            await self?.finishWorkflow(runID: runID)
+        }
     }
 
     private struct WorkflowStageExecutionError: Error, Sendable {
