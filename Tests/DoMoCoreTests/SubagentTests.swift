@@ -17,6 +17,7 @@ struct SubagentTests {
             prompt: "inspect the parser",
             agent: "explore",
             mode: .ask,
+            model: "research-model",
             background: true
         )
         let result = SubagentTaskResult(
@@ -32,6 +33,7 @@ struct SubagentTests {
             description: request.prompt,
             agent: request.agent,
             mode: request.mode,
+            model: request.model,
             status: .completed,
             output: result.output,
             depth: 1

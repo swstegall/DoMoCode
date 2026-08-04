@@ -26,6 +26,9 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
     /// default; workflow stages set this explicitly after applying their own
     /// tool-policy boundary.
     public let mode: AgentMode?
+    /// An optional model override selected by the parent workflow/profile.
+    /// Nil keeps the runtime's current model.
+    public let model: String?
     public let background: Bool
 
     public init(
@@ -34,6 +37,7 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
         prompt: String,
         agent: String? = nil,
         mode: AgentMode? = nil,
+        model: String? = nil,
         background: Bool = false
     ) {
         self.taskID = taskID
@@ -41,6 +45,7 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
         self.prompt = prompt
         self.agent = agent
         self.mode = mode
+        self.model = model
         self.background = background
     }
 }
@@ -98,6 +103,8 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
     /// readable. Workflow child sessions use it to preserve their policy after
     /// a restart.
     public let mode: AgentMode?
+    /// Optional for lifecycle events written before workflow model selection.
+    public let model: String?
     public let status: SubagentTaskStatus
     public let output: String?
     public let error: String?
@@ -110,6 +117,7 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         description: String,
         agent: String? = nil,
         mode: AgentMode? = nil,
+        model: String? = nil,
         status: SubagentTaskStatus,
         output: String? = nil,
         error: String? = nil,
@@ -121,6 +129,7 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         self.description = description
         self.agent = agent
         self.mode = mode
+        self.model = model
         self.status = status
         self.output = output
         self.error = error

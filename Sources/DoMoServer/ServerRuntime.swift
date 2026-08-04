@@ -587,6 +587,7 @@ public actor ServerRuntime {
         let depth: Int
         var agent: String?
         var mode: AgentMode
+        var model: String?
         var description: String
         var background: Bool
     }
@@ -867,6 +868,7 @@ public actor ServerRuntime {
             prompt: workflowStagePrompt(request),
             agent: request.stage.profile,
             mode: workflowStageMode(request.stage),
+            model: request.stage.model,
             background: false
         ))
         switch child.status {
@@ -879,6 +881,9 @@ public actor ServerRuntime {
                 "sourceSessionID": .string(sessionID),
                 "untrustedData": .bool(request.stage.kind == .research || AgentModePolicy.isReadOnly(workflowStageMode(request.stage))),
             ]
+            if let model = request.stage.model {
+                metadata["model"] = .string(model)
+            }
             if let artifact = request.stage.outputArtifact {
                 metadata["outputArtifact"] = .string(artifact)
                 let artifactPath = try workflowArtifactPath(artifact)
@@ -1693,6 +1698,9 @@ public actor ServerRuntime {
                 "Subagent depth limit reached (maximum \(config.maxSubagentDepth))"
             )
         }
+        if let model = request.model, !models().contains(where: { $0.id == model }) {
+            return .failure(taskID: request.taskID, "Unknown workflow model: \(model)")
+        }
 
         if let record = subagents[request.taskID] {
             guard record.parentSessionID == request.parentSessionID else {
@@ -1720,6 +1728,7 @@ public actor ServerRuntime {
                 depth: record.depth,
                 agent: request.agent ?? record.agent,
                 mode: request.mode ?? record.mode,
+                model: request.model ?? record.model,
                 description: resumedPrompt,
                 background: request.background
             )
@@ -1732,6 +1741,7 @@ public actor ServerRuntime {
                         description: resumedPrompt,
                         agent: updated.agent,
                         mode: updated.mode,
+                        model: updated.model,
                         status: .started,
                     depth: record.depth
                 )
@@ -1761,6 +1771,7 @@ public actor ServerRuntime {
                     depth: event.depth,
                     agent: request.agent ?? event.agent,
                     mode: request.mode ?? event.mode ?? .plan,
+                    model: request.model ?? event.model,
                     description: resumedPrompt,
                     background: request.background
                 )
@@ -1773,6 +1784,7 @@ public actor ServerRuntime {
                         description: resumedPrompt,
                         agent: record.agent,
                         mode: record.mode,
+                        model: record.model,
                         status: .started,
                         depth: event.depth
                     )
@@ -1839,6 +1851,7 @@ public actor ServerRuntime {
                 depth: childDepth,
                 agent: request.agent ?? profile?.name,
                 mode: request.mode ?? profile?.mode ?? .plan,
+                model: request.model,
                 description: prompt,
                 background: request.background
             )
@@ -1851,6 +1864,7 @@ public actor ServerRuntime {
                     description: prompt,
                     agent: record.agent,
                     mode: record.mode,
+                    model: record.model,
                     status: .started,
                     depth: childDepth
                 )
@@ -1909,6 +1923,40 @@ public actor ServerRuntime {
         let depth = record.depth
         let description = record.description
         let background = request.background
+        let model = request.model ?? record.model
+        if let model {
+            guard let option = models().first(where: { $0.id == model }) else {
+                return .failure(
+                    taskID: request.taskID,
+                    childSessionID: record.childSessionID,
+                    "Unknown workflow model: \(model)"
+                )
+            }
+            do {
+                if await childHarness.currentModel != option.id {
+                    try await childHarness.selectModel(
+                        provider: option.provider,
+                        modelId: option.id,
+                        streamFn: config.modelStreamFactory?(option.id),
+                        contextWindow: option.contextWindow
+                            ?? config.modelContextWindow?(option.id)
+                            ?? config.contextWindow
+                    )
+                }
+            } catch let error as DoMoError {
+                return .failure(
+                    taskID: request.taskID,
+                    childSessionID: record.childSessionID,
+                    error.description
+                )
+            } catch {
+                return .failure(
+                    taskID: request.taskID,
+                    childSessionID: record.childSessionID,
+                    "Could not select workflow model"
+                )
+            }
+        }
         child.runSink = childSink
         child.runStartedAt = Date()
         let resultTask = Task { [weak self] () -> SubagentTaskResult in
@@ -2011,6 +2059,7 @@ public actor ServerRuntime {
             description: description,
             agent: subagents[taskID]?.agent,
             mode: subagents[taskID]?.mode,
+            model: subagents[taskID]?.model,
             status: result.status,
             output: result.output,
             error: result.error,

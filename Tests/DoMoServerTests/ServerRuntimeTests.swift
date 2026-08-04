@@ -264,6 +264,47 @@ struct ServerRuntimeTests {
         #expect(header.parentSession == parent.path)
     }
 
+    @Test("workflow model selection is applied to the child session")
+    func subagentModelSelection() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let alternate = "alternate-model"
+        let runtime = ServerRuntime(config: .init(
+            systemPrompt: "test",
+            tools: [],
+            model: "test-model",
+            streamFn: textStream("default findings"),
+            modelOptions: [ModelOption(id: "test-model"), ModelOption(id: alternate)],
+            modelStreamFactory: { model in
+                { _ in
+                    AsyncThrowingStream { continuation in
+                        continuation.yield(.start(AssistantSnapshot(model: model)))
+                        continuation.yield(.done(AssistantMessage(
+                            content: [.text("\(model) findings")],
+                            model: model,
+                            stopReason: .stop
+                        )))
+                        continuation.finish()
+                    }
+                }
+            },
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path
+        ))
+        let parent = try await runtime.createSession()
+        let result = await runtime.runSubagent(SubagentTaskRequest(
+            taskID: "task-model",
+            parentSessionID: parent.id,
+            prompt: "inspect with the alternate model",
+            model: alternate
+        ))
+
+        #expect(result.status == .completed)
+        #expect(result.output == "alternate-model findings")
+        let childID = try #require(result.childSessionID)
+        #expect(try await runtime.status(sessionID: childID).model == alternate)
+    }
+
     @Test("workflow runs stages through child sessions and waits at approval boundaries")
     func workflowExecution() async throws {
         let dirs = try Dirs()
