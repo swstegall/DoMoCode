@@ -640,6 +640,15 @@ struct StatusLineTrailingTests {
     }
 
     @Test
+    func actionableInlineTextCanTakePriorityOverAccounting() {
+        let line = StatusLine()
+        line.preservesTextWhenCrowded = true
+        line.text = "  @ file · / command · enter to send · esc to interrupt"
+        line.trailing = "tok 10 · $0.00? · ctx 10 (?)"
+        #expect(line.render(width: 60) == [line.text])
+    }
+
+    @Test
     func aTrailingWiderThanTheRowNeverProducesAnOverWideLine() {
         let line = StatusLine()
         line.text = "hints"

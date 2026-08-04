@@ -542,6 +542,7 @@ public actor ServerRuntime {
         let parentSessionID: String?
         let taskID: String?
         let agent: String?
+        let toolAllowlist: Set<String>?
         var runTask: Task<Void, Never>?
         /// The typed result task for a delegated child. The ordinary `runTask`
         /// remains a `Task<Void, Never>` so abort/status keep one invariant for
@@ -573,7 +574,8 @@ public actor ServerRuntime {
             depth: Int = 0,
             parentSessionID: String? = nil,
             taskID: String? = nil,
-            agent: String? = nil
+            agent: String? = nil,
+            toolAllowlist: Set<String>? = nil
         ) {
             self.token = token
             self.harness = harness
@@ -584,6 +586,7 @@ public actor ServerRuntime {
             self.parentSessionID = parentSessionID
             self.taskID = taskID
             self.agent = agent
+            self.toolAllowlist = toolAllowlist
         }
     }
 
@@ -598,6 +601,7 @@ public actor ServerRuntime {
         var agent: String?
         var mode: AgentMode
         var model: String?
+        var toolAllowlist: [String]?
         var description: String
         var background: Bool
     }
@@ -901,7 +905,10 @@ public actor ServerRuntime {
             agent: request.stage.profile,
             mode: workflowStageMode(request.stage),
             model: request.stage.model,
-            background: false
+            background: false,
+            toolAllowlist: request.stage.toolPolicy.allowedTools.isEmpty
+                ? nil
+                : request.stage.toolPolicy.allowedTools
         ))
         switch child.status {
         case .completed:
@@ -1171,17 +1178,21 @@ public actor ServerRuntime {
         let policyHidden = config.permissions == nil
             ? Set<String>()
             : disabledTools(names, ruleset)
+        let stageHidden = session.toolAllowlist.map { allowlist in
+            Set(names.filter { !allowlist.contains($0) })
+        } ?? []
 
         return candidates.map { tool in
             let name = tool.definition.name
             let modeHidden = (name == "plan_exit" && mode != .plan)
                 || (name == "task" && mode == .build)
+            let stageToolHidden = stageHidden.contains(name)
             let action = config.permissions == nil
                 ? PermissionAction.allow
                 : evaluate(name, "*", rulesets: [ruleset]).action
-            let hidden = modeHidden || policyHidden.contains(name) || action == .deny
+            let hidden = modeHidden || stageToolHidden || policyHidden.contains(name) || action == .deny
             let permission: ToolPermissionState
-            if modeHidden {
+            if modeHidden || stageToolHidden {
                 permission = .unavailable
             } else {
                 switch action {
@@ -1208,7 +1219,9 @@ public actor ServerRuntime {
                 hiddenReason: hidden
                     ? (modeHidden
                         ? (name == "plan_exit" ? "Available only in plan mode" : "Unavailable in build mode")
-                        : "Denied by the current permission policy")
+                        : stageToolHidden
+                            ? "Restricted by the workflow stage tool policy"
+                            : "Denied by the current permission policy")
                     : nil,
                 metadata: metadata
             )
@@ -1330,7 +1343,8 @@ public actor ServerRuntime {
         depth: Int = 0,
         parentSessionID: String? = nil,
         taskID: String? = nil,
-        agent: String? = nil
+        agent: String? = nil,
+        toolAllowlist: Set<String>? = nil
     ) -> SessionState {
         let token = nextToken
         nextToken += 1
@@ -1343,7 +1357,8 @@ public actor ServerRuntime {
             depth: depth,
             parentSessionID: parentSessionID,
             taskID: taskID,
-            agent: agent
+            agent: agent,
+            toolAllowlist: toolAllowlist
         )
     }
 
@@ -1362,7 +1377,8 @@ public actor ServerRuntime {
         permissionSessionID: String? = nil,
         derivedPermissions: Bool = false,
         profileRules: Ruleset = [],
-        promptWorkspaceOverride: PromptWorkspace? = nil
+        promptWorkspaceOverride: PromptWorkspace? = nil,
+        toolAllowlist: Set<String>? = nil
     ) -> AgentHarness.Configuration {
         let steeringReader: @Sendable () async -> [Message] = { [weak self, steeringBox] in
             guard let self else { return steeringBox.drain() }
@@ -1417,7 +1433,8 @@ public actor ServerRuntime {
             let mode = modeState.get()
             let hidden = disabledTools(tools.map(\.definition.name), rulesetForCurrentMode())
             return tools.filter { tool in
-                (mode == .plan || tool.definition.name != "plan_exit")
+                (toolAllowlist == nil || toolAllowlist?.contains(tool.definition.name) == true)
+                    && (mode == .plan || tool.definition.name != "plan_exit")
                     && (mode != .build || tool.definition.name != "task")
                     && !hidden.contains(tool.definition.name)
             }
@@ -1697,7 +1714,8 @@ public actor ServerRuntime {
                     permissionSessionID: child ? parentSessionID : nil,
                     derivedPermissions: child,
                     profileRules: profile?.permissionRules ?? [],
-                    promptWorkspaceOverride: child ? subagentWorkspace(named: profileName) : nil
+                    promptWorkspaceOverride: child ? subagentWorkspace(named: profileName) : nil,
+                    toolAllowlist: latestEvent?.toolAllowlist.map(Set.init)
                 )
             )
             id = resumedID
@@ -1729,7 +1747,8 @@ public actor ServerRuntime {
             depth: depth,
             parentSessionID: parentSessionID,
             taskID: taskID,
-            agent: agent
+            agent: agent,
+            toolAllowlist: latestEvent?.toolAllowlist.map(Set.init)
         )
         return SessionRef(id: id, path: path.string)
     }
@@ -1821,6 +1840,7 @@ public actor ServerRuntime {
                 agent: request.agent ?? record.agent,
                 mode: request.mode ?? record.mode,
                 model: request.model ?? record.model,
+                toolAllowlist: request.toolAllowlist ?? record.toolAllowlist,
                 description: resumedPrompt,
                 background: request.background
             )
@@ -1835,7 +1855,8 @@ public actor ServerRuntime {
                         mode: updated.mode,
                         model: updated.model,
                         status: .started,
-                    depth: record.depth
+                        depth: record.depth,
+                        toolAllowlist: updated.toolAllowlist
                 )
             )
             return await launchSubagentRun(request: request, record: updated, child: child, prompt: resumedPrompt)
@@ -1864,6 +1885,7 @@ public actor ServerRuntime {
                     agent: request.agent ?? event.agent,
                     mode: request.mode ?? event.mode ?? .plan,
                     model: request.model ?? event.model,
+                    toolAllowlist: request.toolAllowlist ?? event.toolAllowlist,
                     description: resumedPrompt,
                     background: request.background
                 )
@@ -1878,7 +1900,8 @@ public actor ServerRuntime {
                         mode: record.mode,
                         model: record.model,
                         status: .started,
-                        depth: event.depth
+                        depth: event.depth,
+                        toolAllowlist: record.toolAllowlist
                     )
                 )
                 return await launchSubagentRun(request: request, record: record, child: child, prompt: resumedPrompt)
@@ -1913,7 +1936,8 @@ public actor ServerRuntime {
             permissionSessionID: request.parentSessionID,
             derivedPermissions: true,
             profileRules: profile?.permissionRules ?? [],
-            promptWorkspaceOverride: childWorkspace
+            promptWorkspaceOverride: childWorkspace,
+            toolAllowlist: request.toolAllowlist.map(Set.init)
         )
         do {
             let parentPath = await parent.harness.sessionFilePath
@@ -1933,7 +1957,8 @@ public actor ServerRuntime {
                 depth: childDepth,
                 parentSessionID: request.parentSessionID,
                 taskID: request.taskID,
-                agent: childAgent
+                agent: childAgent,
+                toolAllowlist: request.toolAllowlist.map(Set.init)
             )
             sessions[childID] = child
             let record = SubagentRecord(
@@ -1944,6 +1969,7 @@ public actor ServerRuntime {
                 agent: request.agent ?? profile?.name,
                 mode: request.mode ?? profile?.mode ?? .plan,
                 model: request.model,
+                toolAllowlist: request.toolAllowlist,
                 description: prompt,
                 background: request.background
             )
@@ -1958,7 +1984,8 @@ public actor ServerRuntime {
                     mode: record.mode,
                     model: record.model,
                     status: .started,
-                    depth: childDepth
+                    depth: childDepth,
+                    toolAllowlist: record.toolAllowlist
                 )
             )
             return await launchSubagentRun(request: request, record: record, child: child, prompt: prompt)
@@ -2155,7 +2182,8 @@ public actor ServerRuntime {
             status: result.status,
             output: result.output,
             error: result.error,
-            depth: depth
+            depth: depth,
+            toolAllowlist: subagents[taskID]?.toolAllowlist
         )
         await publishSubagentEvent(event)
         guard background, let parent = sessions[parentSessionID] else { return }

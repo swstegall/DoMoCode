@@ -30,6 +30,10 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
     /// Nil keeps the runtime's current model.
     public let model: String?
     public let background: Bool
+    /// An optional narrowing allowlist for workflow-owned children. Nil means
+    /// the ordinary mode/profile policy decides visibility; an empty list is a
+    /// valid fail-closed projection that exposes no tools.
+    public let toolAllowlist: [String]?
 
     public init(
         taskID: String,
@@ -38,7 +42,8 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
         agent: String? = nil,
         mode: AgentMode? = nil,
         model: String? = nil,
-        background: Bool = false
+        background: Bool = false,
+        toolAllowlist: [String]? = nil
     ) {
         self.taskID = taskID
         self.parentSessionID = parentSessionID
@@ -47,6 +52,7 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
         self.mode = mode
         self.model = model
         self.background = background
+        self.toolAllowlist = toolAllowlist.map { Array(Set($0)).sorted() }
     }
 }
 
@@ -105,6 +111,9 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
     public let mode: AgentMode?
     /// Optional for lifecycle events written before workflow model selection.
     public let model: String?
+    /// Optional for lifecycle events written before workflow stage tool
+    /// policies were persisted.
+    public let toolAllowlist: [String]?
     public let status: SubagentTaskStatus
     public let output: String?
     public let error: String?
@@ -121,7 +130,8 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         status: SubagentTaskStatus,
         output: String? = nil,
         error: String? = nil,
-        depth: Int
+        depth: Int,
+        toolAllowlist: [String]? = nil
     ) {
         self.taskID = taskID
         self.childSessionID = childSessionID
@@ -130,6 +140,7 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         self.agent = agent
         self.mode = mode
         self.model = model
+        self.toolAllowlist = toolAllowlist.map { Array(Set($0)).sorted() }
         self.status = status
         self.output = output
         self.error = error

@@ -143,8 +143,8 @@ final class MutableBlock: @MainActor Component {
 /// agent runs — that Escape interrupts. Always exactly one line, always clipped to
 /// width, so it can never be the over-wide line the renderer treats as fatal.
 ///
-/// ``trailing`` is the session's accounting, right-aligned against the same row.
-/// It is dropped WHOLE when it does not fit rather than truncated with the left
+    /// ``trailing`` is the session's accounting, right-aligned against the same row.
+    /// It is dropped WHOLE when it does not fit rather than truncated with the left
 /// side, because half of `$0.0312` is `$0.03` — a smaller number that still looks
 /// like a number, which is exactly the class of quiet lie Phase 5a exists to
 /// remove. Nothing on this strip is load-bearing enough to be worth showing
@@ -155,6 +155,10 @@ final class StatusLine: @MainActor Component {
     /// The right-aligned accounting strip. Empty renders the row exactly as it
     /// rendered before there was one.
     var trailing: String = ""
+    /// Inline controls are actionable affordances, so the production REPL keeps
+    /// them intact when accounting would force a marquee window. Other callers
+    /// may prefer the older meter-first behavior for dense diagnostic rows.
+    var preservesTextWhenCrowded = false
     /// Injectable for deterministic marquee tests; production uses wall time.
     var clock: () -> Double = { Date().timeIntervalSinceReferenceDate }
     private var marqueeState = MarqueeState()
@@ -171,6 +175,9 @@ final class StatusLine: @MainActor Component {
         }
         let trailingWidth = visibleWidth(trailing)
         let available = width - trailingWidth - Self.gap
+        if preservesTextWhenCrowded, visibleWidth(text) <= width, visibleWidth(text) > available {
+            return [Marquee.render(text, width: width, identity: identity, now: clock(), state: &marqueeState)]
+        }
         guard available >= 0 else {
             return [Marquee.render(text, width: width, identity: identity, now: clock(), state: &marqueeState)]
         }
@@ -618,6 +625,7 @@ final class InteractiveCoordinator {
         tui.addChild(statusLine)
         tui.addChild(prompt)
         tui.setFocus(prompt)
+        statusLine.preservesTextWhenCrowded = true
         statusLine.text = idleStatus
     }
 

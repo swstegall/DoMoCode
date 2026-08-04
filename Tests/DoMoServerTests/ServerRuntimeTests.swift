@@ -271,6 +271,54 @@ struct ServerRuntimeTests {
         #expect(header.parentSession == parent.path)
     }
 
+    @Test("workflow child tool allowlists restrict the model projection and catalog")
+    func workflowChildToolAllowlist() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let observedTools = Mutex<[String]>([])
+        let runtime = ServerRuntime(config: .init(
+            systemPrompt: "test",
+            tools: [],
+            model: "test-model",
+            streamFn: { context in
+                observedTools.withLock { $0 = context.tools.map(\.name) }
+                return AsyncThrowingStream { continuation in
+                    continuation.yield(.start(AssistantSnapshot(model: "test-model")))
+                    continuation.yield(.done(AssistantMessage(
+                        content: [.text("restricted child")],
+                        model: "test-model",
+                        stopReason: .stop
+                    )))
+                    continuation.finish()
+                }
+            },
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path,
+            toolsForSession: { _, _ in
+                [
+                    CatalogProbeTool(toolName: "readme", source: .builtIn),
+                    CatalogProbeTool(toolName: "write", source: .builtIn),
+                ]
+            }
+        ))
+        let parent = try await runtime.createSession()
+        let result = await runtime.runSubagent(SubagentTaskRequest(
+            taskID: "task-restricted",
+            parentSessionID: parent.id,
+            prompt: "inspect only the readme",
+            mode: .ask,
+            toolAllowlist: ["readme"]
+        ))
+
+        #expect(result.status == .completed)
+        #expect(observedTools.withLock { $0 } == ["readme"])
+        let childID = try #require(result.childSessionID)
+        let entries = try await runtime.toolCatalog(sessionID: childID)
+        let write = try #require(entries.first { $0.name == "write" })
+        #expect(write.permission == .unavailable)
+        #expect(write.hiddenReason == "Restricted by the workflow stage tool policy")
+    }
+
     @Test("workflow model selection is applied to the child session")
     func subagentModelSelection() async throws {
         let dirs = try Dirs()
