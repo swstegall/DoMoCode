@@ -430,9 +430,9 @@ applicable, and a release build under Swift 6.3.
   provenance, no proprietary/PolyForm subtree, no secrets, and a matching
   NOTICES.md entry. Add a separate package-license check that permits
   approved non-MIT dependencies from public GitHub.
-- [ ] Define provider, backend, workflow, tool-catalog, and theme protocols
-  without baking LiteLLM, macOS, JSONL, or the full-screen client into the
-  abstractions.
+- [ ] Define provider, backend, workflow, tool-catalog, adapter, extension,
+  and theme protocols without baking LiteLLM, macOS, JSONL, or the
+  full-screen client into the abstractions.
 
 #### Phase 23 — TUI theme contract, divider, and marquees — P0
 
@@ -461,7 +461,7 @@ The current theme value type and dark/light palettes are Phase 5c
 foundations. This phase is the missing renderer/layout behavior, not a claim
 that the existing theme work was absent.
 
-#### Phase 24 — Live tool catalog and tool parity — P0
+#### Phase 24 — Live tool catalog, lifecycle hooks, and remote MCP — P0
 
 - [ ] Pressing / in the full-screen prompt opens a tool catalog. Keep slash
   commands available through their existing completion path, and provide an
@@ -474,6 +474,17 @@ that the existing theme work was absent.
   change, or an MCP tools/list_changed notification arrives. The catalog
   must never advertise a tool that the model cannot receive on the next
   request.
+- [ ] Add a deterministic tool lifecycle around built-in, MCP, ACP, and
+  adapter-backed tools: resolve, preflight, permission, invoke, result,
+  postflight, cancellation, and failure. Hooks may observe, reject, or add
+  safe metadata, but may never silently widen permissions or mutate a
+  committed tool result. Keep ordering, idempotence, redaction, and hook
+  timeouts explicit.
+- [ ] Extend MCP beyond today's stdio client to remote HTTP/SSE or
+  streamable-HTTP servers. Add capability negotiation, reconnect/backoff,
+  OAuth or other credential references, resources, resource templates,
+  health/test calls, network policy, and secret redaction. Remote MCP must
+  enter the same permission and tool-catalog path as local MCP.
 - [ ] Add focused parity tools in priority order: a canonical apply_patch
   or patch tool with the existing mutation safety; websearch behind an
   injectable provider or MCP; MCP resource/template inspection; a skill
@@ -485,13 +496,15 @@ that the existing theme work was absent.
   convenient tool bypass permission, checkpoint, or approval policy.
 - [ ] Preserve parallel dispatch, sequential overrides, per-turn snapshots,
   schema validation, and stable registration order. Test tool visibility in
-  build, plan, headless, child, denied, and MCP-refresh states.
+  build, plan, ask, debug, review, headless, child, denied, local-MCP,
+  remote-MCP, and MCP-refresh states. Test lifecycle hook ordering,
+  cancellation, timeout, and permission non-escalation.
 
 The audit found that DoMoCode already has more of the OpenCode/Pi tool
 surface than the old README implied. This phase makes it inspectable and
 fills only the high-value gaps.
 
-#### Phase 25 — Research, plan, execute, and synthesize workflows — P0
+#### Phase 25 — Ask, debug, review, research, plan, execute, and synthesize workflows — P0
 
 - [ ] Add a durable workflow definition and run record. A workflow is a
   sequence or DAG of named stages with a tool policy, model/profile,
@@ -501,6 +514,13 @@ fills only the high-value gaps.
   implementation: /research gathers evidence, /plan writes a reviewable
   plan, /execute performs approved work, and /synthesize produces the final
   answer. Existing plan mode remains the safety boundary.
+- [ ] Add explicit Ask, Debug, and Review modes alongside Build and Plan.
+  Ask is read-only question/research work; Debug emphasizes reproduction,
+  isolation, test execution, and evidence; Review is a read-only diff,
+  checkpoint, or worktree audit that produces findings with severity,
+  locations, evidence, and suggested fixes. Each mode gets a named profile
+  containing its prompt, model, tool visibility, permission policy, budget,
+  and output contract.
 - [ ] Research stages use read-only tools by default and can fan out to
   child sessions for repository search, web/MCP search, LSP inspection, and
   document comparison. Each result carries source/session provenance and an
@@ -515,9 +535,10 @@ fills only the high-value gaps.
 - [ ] Synthesis stages combine stage outputs, cite their evidence, distinguish
   observed facts from inference, and return through the normal assistant
   response structure. The workflow itself must be exportable and replayable.
-- [ ] Add serial/parallel DAG tests, approval tests, cancellation tests,
-  failure/resume tests, prompt-injection tests, and a complete
-  research-to-synthesis end-to-end test.
+- [ ] Add serial/parallel DAG tests, mode-policy tests for Ask/Debug/Review,
+  approval tests, cancellation tests, failure/resume tests,
+  prompt-injection tests, and a complete research-to-synthesis end-to-end
+  test.
 
 #### Phase 26 — Long-scale retry and LLM-assisted failure recovery — P0
 
@@ -571,7 +592,7 @@ LiteLLM response
   whether the user approved an action. Redaction happens before persistence,
   display, or model input.
 
-#### Phase 27 — Provider-neutral transport and Claude subscription feasibility — P1
+#### Phase 27 — Provider profiles, fallback, explicit adapters, and ACP — P1
 
 - [ ] Introduce a provider protocol around the existing normalized
   AssistantMessage, tool calls/results, usage, thinking/reasoning,
@@ -581,10 +602,25 @@ LiteLLM response
   OpenAI-compatible Chat/Responses and Anthropic Messages. Consider Gemini
   and Bedrock only after the source/license admission gate; provider breadth
   is not a reason to accept opaque or unreviewed code.
-- [ ] Add provider profiles, model capabilities, credential references,
-  usage/cost, cache controls, context-window metadata, and provider-specific
-  error normalization. A model switch must cancel retry backoff and rebuild
+- [ ] Add named provider profiles containing endpoint, model, credential
+  reference, capabilities, usage/cost policy, cache controls, context-window
+  metadata, and provider-specific error normalization. Keep secrets outside
+  profiles and make profiles inspectable without exposing credential values.
+- [ ] Add ordered, permissioned provider fallback routes and a circuit-breaker
+  state. Fallback is allowed only for pre-commit transient failures or an
+  explicitly approved route change; never replay a committed stream or tool
+  call automatically. A model/provider switch cancels backoff and rebuilds
   the correct tool/schema projection.
+- [ ] Ship explicit adapter tooling: an adapter registry and
+  `domo adapters list`, `domo adapters doctor`, and handshake/test surfaces
+  (or their equivalent API). Show adapter kind, capabilities, health,
+  credential requirements, source/license metadata, and supported event
+  mappings. Provider, MCP, ACP, backend, browser, and notebook integrations
+  must be adapters with the same permission and redaction contract.
+- [ ] Make Agent Client Protocol (ACP) a first-class adapter boundary for
+  external agents. Support bounded stdio JSON-RPC lifecycle, capabilities,
+  permissions, tool calls, task/plan events, cancellation, resume, and
+  correlation IDs rather than treating ACP as a Claude-only special case.
 - [ ] Investigate direct use of a Claude subscription through a supported
   Claude Code/Claude Agent ACP or equivalent stdio client. The external
   client owns login, subscription entitlement, and proprietary protocol
@@ -604,7 +640,7 @@ This is the only technically credible subscription path found in the audit.
 Pi has provider-specific OAuth/subscription code and OpenHands has an ACP
 integration; neither justifies reimplementing a private subscription API.
 
-#### Phase 28 — Portable execution, worktrees, and backend isolation — P1
+#### Phase 28 — Portable execution, worktrees, conflict-aware orchestration, and backend lifecycle — P1
 
 - [ ] Separate workspace/backend selection from the current macOS/Linux
   process implementation. Retain fail-closed local Seatbelt/bubblewrap and
@@ -616,30 +652,41 @@ integration; neither justifies reimplementing a private subscription API.
   checkpoint integration, diff/review, promotion, cleanup, and conflict
   reporting. A child agent must never accidentally mutate its parent's
   worktree.
+- [ ] Add conflict-aware orchestration for parallel workflow stages: assign
+  declared file/resource ownership, schedule non-overlapping waves, detect
+  unexpected overlap before mutation, and require an explicit merge or
+  promotion step for competing changes. Preserve per-agent checkpoints and
+  make unresolved conflicts visible to the user and the parent workflow.
 - [ ] Make sandbox policy cover shell, background processes, MCP, LSP,
   formatter, Git, PTY, browser, notebook, and provider subprocesses through
   one launch-plan contract.
-- [ ] Add backend health, pause/resume, lifecycle, capability, and cleanup
-  events. A paused or stopped backend must not be presented as a healthy
-  running session.
+- [ ] Add a backend registry and lifecycle manager with health, capability,
+  authentication, start/stop, pause/resume, reconnect, cleanup, and truthful
+  state events. A paused or stopped backend must not be presented as a
+  healthy running session, and an adapter must report when required isolation
+  is unavailable.
 - [ ] Add platform adapters incrementally, with capability negotiation rather
   than compile-time assumptions. Every backend has a testable refusal when
   its required isolation cannot be established.
 
-#### Phase 29 — Durable background sessions, handoff, and automation — P1
+#### Phase 29 — Durable jobs, session handoff, and local automation — P1
 
-- [ ] Promote child sessions and background agents into durable jobs with
-  correlation, progress, cancellation, retry, notification, and restart
-  recovery. Reuse the existing session tree and task IDs.
+- [ ] Promote child sessions and background agents into a durable job manager
+  with job records, correlation, progress, cancellation, retry, notification,
+  event cursors, ownership, and restart recovery. Reuse the existing session
+  tree and task IDs, and make job state truthful across headless, inline, and
+  full-screen clients.
 - [ ] Add explicit session handoff: attach another client, continue in a
   different worktree/backend/provider, or transfer a plan and artifacts to a
   new session without losing provenance.
 - [ ] Replace the current single-client-first server assumption with safe
   multi-client mirroring, resumable event cursors, conflict-free writes, and
   permission prompts routed to one authoritative owner.
-- [ ] Add opt-in local schedules and webhooks only after the job/security
-  model is complete. Automations must run with a named profile, bounded
-  budget, explicit workspace, sandbox, secret scope, and audit trail.
+- [ ] Add opt-in local automation after the job/security model is complete:
+  schedules, manual/CLI triggers, filesystem or repository triggers, and
+  optional authenticated webhooks. Automations must run with a named
+  profile, bounded budget, explicit workspace, sandbox, secret scope,
+  cancellation policy, and audit trail.
 - [ ] Provide machine-readable activity logs, run export, failure replay,
   and a clear distinction between a user prompt, a scheduled trigger, and
   a child-agent result.
@@ -648,30 +695,41 @@ OpenHands supplies the automation model; OpenCode and Kilo supply the
 handoff, server, and worktree patterns. DoMoCode should adopt the state
 contracts, not their web application or cloud assumptions.
 
-#### Phase 30 — Safe resource distribution and dynamic UI resources — P2
+#### Phase 30 — Safe resource packages and permissioned out-of-process extensions — P1
 
 - [ ] Allow GitHub-hosted, MIT-licensed skills, commands, and themes to be
   fetched into a content-addressed, reviewable cache. Installation is data
-  loading, not arbitrary code execution.
+  loading, not arbitrary code execution. Pin commits, record license and
+  provenance metadata, validate schemas, and require explicit trust before a
+  code-bearing resource can affect a session.
 - [ ] Add theme import/export and live reload with a fallback palette,
   background coverage, semantic colors, accessibility contrast checks, and
   terminal capability negotiation.
-- [ ] Keep arbitrary in-process plugins out of the core. Where extension is
-  valuable, use permissioned MCP, ACP, or another out-of-process protocol
-  whose executable and license are explicit.
+- [ ] Add a permissioned out-of-process extension host. Extensions must have
+  a manifest, versioned protocol, declared capabilities, resource limits,
+  executable/source/license metadata, lifecycle health, and explicit user or
+  project approval. Use MCP, ACP, or a compatible JSON-RPC adapter boundary;
+  do not load arbitrary code into the DoMoCode process or let an extension
+  bypass tool permissions.
 - [ ] Add file watching for trusted resource and workspace changes, with
   debounce, cancellation, and a prompt-visible reload notice. A changed
   skill, command, theme, or tool must not silently mutate a running turn's
   snapshot.
 
-#### Phase 31 — Indexing, browser, notebook, and richer code intelligence — P2
+#### Phase 31 — Indexing, richer code intelligence, browser, and notebook — P2
 
 - [ ] Add an index provider protocol and an incremental file watcher. Start
   with symbol/LSP/search indexes; add semantic embeddings only when an
   acceptable SwiftPM library with a reviewed license and provider path are
   available.
-- [ ] Expose OpenCode/Kilo-style search, references, call hierarchy, and
-  repository navigation through the / catalog and tool policy.
+- [ ] Extend DoMoLSP and the / catalog with definitions, declarations,
+  references, implementations, document/workspace symbols, call hierarchy,
+  diagnostics, rename/related locations where the server supports them, and
+  repository navigation. Keep each operation permission-aware, cancellable,
+  bounded, and usable by Ask, Debug, Review, and research workflows.
+- [ ] Add incremental symbol and dependency indexes with explicit freshness
+  state, invalidation, ignored paths, and a graceful search-only fallback.
+  Never present stale index results as current source facts.
 - [ ] Integrate browser automation and notebook kernels through MCP/ACP first,
   including screenshot/image results, approvals, sandboxing, and output
   truncation. A native implementation needs a demonstrated GitHub/SPM
