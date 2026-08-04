@@ -136,6 +136,28 @@ public struct RecoveryEnvelope: Sendable, Hashable, Codable {
         return copy
     }
 
+    /// Returns a copy with a bounded, redacted recent-session projection.
+    /// Existing context wins so a producer that supplied a more authoritative
+    /// safe context cannot be overwritten by a later UI projection.
+    public func withSessionContext(_ context: String?) -> RecoveryEnvelope {
+        guard sessionContext == nil, let context, !context.isEmpty else { return self }
+        var copy = self
+        copy = RecoveryEnvelope(
+            originalKind: copy.originalKind,
+            status: copy.status,
+            error: copy.error,
+            providerMetadata: copy.providerMetadata,
+            model: copy.model,
+            retryHistory: copy.retryHistory,
+            sessionContext: context,
+            attemptedRemedies: copy.attemptedRemedies,
+            diagnosis: copy.diagnosis,
+            userApprovedAction: copy.userApprovedAction,
+            recursionPrevented: true
+        )
+        return copy
+    }
+
     private static func safe(_ value: String, limit: Int) -> String {
         DoMoError.truncating(Redaction.diagnostic(value), to: max(0, limit))
     }

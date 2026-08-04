@@ -258,6 +258,9 @@ struct PrintEventSink: AgentEventSink {
     /// one when this turn failed. See ``RunGuard`` and this file's header note on
     /// the harness gap.
     let runGuard: RunGuard
+    /// Captures the final typed recovery envelope so the terminal JSON error
+    /// record carries the same durable diagnostic as the UI and session file.
+    let recoveryBox: RecoveryBox
     /// Whether this run's alias has a price table at all.
     ///
     /// The sink sees only ``DoMoLLM/Usage``, whose zero `cost` is the same value
@@ -369,6 +372,10 @@ struct PrintEventSink: AgentEventSink {
             // leaves the `--json` event vocabulary — a published contract with no
             // `notice` member — untouched, while a human watching a CI log still
             // learns why nothing is happening.
+            if notice.code == "recovery", let recovery = notice.recovery {
+                recoveryBox.record(recovery)
+                break
+            }
             guard notice.code == "retry" else { break }
             channel.writeErr("… \(notice.text)\n")
 
@@ -501,6 +508,20 @@ final class RunGuard: Sendable {
     /// The recorded failure, or `nil` when no failing turn has been seen. When
     /// non-`nil`, the stream seam must not start another turn.
     var blockingError: DoMoError? { blocked.withLock { $0 } }
+}
+
+/// Carries the final typed recovery notice to print mode's terminal event. The
+/// event sink is intentionally stateless for ordinary output, but recovery is
+/// emitted before `agent_end` and must be joined to the terminal `error` record
+/// without inventing a second JSON event type.
+final class RecoveryBox: Sendable {
+    private let storage = Mutex<RecoveryEnvelope?>(nil)
+
+    func record(_ envelope: RecoveryEnvelope) {
+        storage.withLock { if $0 == nil { $0 = envelope } }
+    }
+
+    var value: RecoveryEnvelope? { storage.withLock { $0 } }
 }
 
 // MARK: - Session source
@@ -720,6 +741,7 @@ public struct PrintMode: Sendable {
             },
             model: model,
             streamFn: streamFunction(counter: turnCounter, runGuard: runGuard),
+            recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: modelRuntime),
             // Installing one is not only about spending less on compaction. The
             // harness's built-in fallback summarizer runs its request through
             // `configuration.streamFn` — which here is the seam below — so a
@@ -753,6 +775,7 @@ public struct PrintMode: Sendable {
         let harness = try await makeHarness(configuration: configuration)
 
         let graphics = detectImageGraphics()
+        let recoveryBox = RecoveryBox()
         let sink = PrintEventSink(
             channel: channel,
             mode: mode,
@@ -760,6 +783,7 @@ public struct PrintMode: Sendable {
             workingDirectory: workingDirectory,
             toolNames: tools.map(\.definition.name),
             runGuard: runGuard,
+            recoveryBox: recoveryBox,
             ratesConfigured: modelRuntime.rates != nil,
             imageCapabilities: graphics.capabilities,
             cell: graphics.cell,
@@ -828,7 +852,12 @@ public struct PrintMode: Sendable {
         // print it and exit 0 if that resolution fails. The totals are then
         // OMITTED from the `result` event rather than reported as zeros.
         let accounting = try? await harness.accounting()
-        return finish(result: result, turns: turnCounter.value, accounting: accounting)
+        return finish(
+            result: result,
+            turns: turnCounter.value,
+            accounting: accounting,
+            recovery: recoveryBox.value
+        )
     }
 
     /// Builds the harness for this run's ``SessionSource``: a new file, an opened
@@ -961,7 +990,12 @@ public struct PrintMode: Sendable {
     ///   could not be read. `nil` omits them from the `result` event; it never
     ///   substitutes zeros, which would be a confident claim that the run was
     ///   free.
-    private func finish(result: AgentRunResult, turns: Int, accounting: SessionAccounting?) -> Int32 {
+    private func finish(
+        result: AgentRunResult,
+        turns: Int,
+        accounting: SessionAccounting?,
+        recovery: RecoveryEnvelope?
+    ) -> Int32 {
         let lastAssistant = Self.lastAssistant(in: result.messages)
 
         switch result.stopReason {
@@ -972,7 +1006,7 @@ public struct PrintMode: Sendable {
             // that decision lives (`.length` is not a failure; `.unknown` is), so
             // defer to it rather than re-deciding here.
             if let lastAssistant, lastAssistant.failure != nil {
-                return fail(lastAssistant)
+                return fail(lastAssistant, recovery: recovery)
             }
             if let lastAssistant { finishText(lastAssistant) }
             // `text` and `turns` keep their existing names and meanings; the
@@ -995,7 +1029,7 @@ public struct PrintMode: Sendable {
             return 0
 
         case .errored, .aborted:
-            return fail(lastAssistant)
+            return fail(lastAssistant, recovery: recovery)
 
         case .maxTurnsReached:
             // The model still wanted to act when the turn budget ran out. A
@@ -1041,12 +1075,47 @@ public struct PrintMode: Sendable {
     /// Emits the `error` event for a failed terminal turn and returns exit `1`.
     /// The stop reason and message come from the turn itself so a scripted caller
     /// reads the same values Phase 1 reported.
-    private func fail(_ assistant: AssistantMessage?) -> Int32 {
+    private func fail(_ assistant: AssistantMessage?, recovery: RecoveryEnvelope?) -> Int32 {
         let stopReason = assistant?.stopReason.rawValue ?? "error"
         let message = assistant?.errorMessage ?? "Request \(stopReason)"
-        log.emit("error", ["message": .string(message), "stopReason": .string(stopReason)])
+        var fields: [String: JSONValue] = [
+            "message": .string(message),
+            "stopReason": .string(stopReason),
+        ]
+        if let recovery {
+            fields["recovery"] = recoveryValue(recovery)
+        }
+        log.emit("error", fields)
         channel.writeErr(message + "\n")
+        if let diagnosis = recovery?.diagnosis, !diagnosis.isEmpty {
+            channel.writeErr("diagnostic: \(diagnosis)\n")
+        }
         return 1
+    }
+
+    private func recoveryValue(_ envelope: RecoveryEnvelope) -> JSONValue {
+        .object([
+            "version": .int(envelope.version),
+            "originalKind": .string(envelope.originalKind),
+            "status": envelope.status.map(JSONValue.int) ?? .null,
+            "error": .string(envelope.error),
+            "providerMetadata": .object(envelope.providerMetadata.mapValues(JSONValue.string)),
+            "model": envelope.model.map(JSONValue.string) ?? .null,
+            "retryHistory": .array(envelope.retryHistory.map { retry in
+                .object([
+                    "number": .int(retry.number),
+                    "requestNumber": .int(retry.requestNumber),
+                    "maxAttempts": .int(retry.maxAttempts),
+                    "reason": .string(retry.reason),
+                    "delayMilliseconds": .int(retry.delayMilliseconds),
+                ])
+            }),
+            "sessionContext": envelope.sessionContext.map(JSONValue.string) ?? .null,
+            "attemptedRemedies": .array(envelope.attemptedRemedies.map(JSONValue.string)),
+            "diagnosis": envelope.diagnosis.map(JSONValue.string) ?? .null,
+            "userApprovedAction": envelope.userApprovedAction.map(JSONValue.bool) ?? .null,
+            "recursionPrevented": .bool(envelope.recursionPrevented),
+        ])
     }
 
     /// Tells a human what the session has spent, on **stderr**, in text mode.

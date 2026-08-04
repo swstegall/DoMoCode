@@ -1325,6 +1325,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 }
                 return makeStreamFn(client: client, runtime: selected)
             },
+            recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: modelRuntime),
             modelContextWindow: { alias in configuration.modelRuntime(for: alias).contextWindow },
             steeringMode: steeringMode,
             maxCostPerRun: maxCostPerRun,

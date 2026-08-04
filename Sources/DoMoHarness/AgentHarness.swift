@@ -238,6 +238,17 @@ public actor AgentHarness {
         /// Returning a string keeps the definitions and prompt listing in sync.
         public var systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)?
 
+        /// Optional bounded, non-recursive interpretation of a final provider
+        /// failure. It is kept outside the ordinary stream function so a
+        /// diagnostic request cannot accidentally become another agent turn.
+        public var recoveryDiagnostic: RecoveryDiagnosticFn?
+
+        /// Wall-clock cap for the optional recovery diagnostic sub-turn.
+        public var recoveryDiagnosticTimeout: Duration
+
+        /// Maximum completion tokens requested by the diagnostic sub-turn.
+        public var recoveryDiagnosticMaxOutputTokens: Int
+
         /// The model name stamped onto synthesized messages and used for
         /// compaction's summarization request. Model *selection* is the injected
         /// ``streamFn``'s job.
@@ -384,13 +395,19 @@ public actor AgentHarness {
             toolLifecycleTimeout: Duration = .seconds(2),
             onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
             maxCostPerRun: Decimal? = nil,
-            sessionStartHead: String? = nil
+            sessionStartHead: String? = nil,
+            recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
+            recoveryDiagnosticTimeout: Duration = .seconds(8),
+            recoveryDiagnosticMaxOutputTokens: Int = 512
         ) {
             self.systemPrompt = systemPrompt
             self.systemPromptForPrompt = systemPromptForPrompt
             self.tools = tools
             self.getTools = getTools
             self.systemPromptForPromptAndTools = systemPromptForPromptAndTools
+            self.recoveryDiagnostic = recoveryDiagnostic
+            self.recoveryDiagnosticTimeout = recoveryDiagnosticTimeout
+            self.recoveryDiagnosticMaxOutputTokens = max(1, min(2_048, recoveryDiagnosticMaxOutputTokens))
             self.model = model
             self.streamFn = streamFn
             self.streamFnForModel = streamFnForModel
@@ -1224,7 +1241,10 @@ public actor AgentHarness {
             onNoProgress: configuration.onNoProgress,
             maxCostPerRun: configuration.maxCostPerRun,
             getTools: configuration.getTools,
-            systemPromptForTools: systemPromptForTools
+            systemPromptForTools: systemPromptForTools,
+            recoveryDiagnostic: configuration.recoveryDiagnostic,
+            recoveryDiagnosticTimeout: configuration.recoveryDiagnosticTimeout,
+            recoveryDiagnosticMaxOutputTokens: configuration.recoveryDiagnosticMaxOutputTokens
         )
         let errorBox = PersistenceErrorBox()
         let streamFn = runOverride?.streamFn ?? activeStreamFn

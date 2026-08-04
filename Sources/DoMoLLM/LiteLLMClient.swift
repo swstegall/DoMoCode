@@ -383,6 +383,23 @@ public struct LiteLLMClient: Sendable {
             )
     }
 
+    /// Returns a client for one bounded diagnostic request.
+    ///
+    /// It preserves the configured endpoint, credentials, and injected
+    /// transport, but removes the ordinary retry budget. A failure explanation
+    /// must never turn into another ten-request outage or a second retry storm;
+    /// the caller's timeout is the only cross-request bound.
+    public func diagnosticClient(timeout: Duration) -> LiteLLMClient {
+        var bounded = configuration
+        bounded.maxRetries = 0
+        bounded.maxPreConnectRetries = 0
+        bounded.retryDelayBudget = .zero
+        bounded.retryWallClockBudget = timeout > .zero ? timeout : .milliseconds(1)
+        bounded.timeout = timeout > .zero ? timeout : .milliseconds(1)
+        bounded.streamIdleTimeout = timeout > .zero ? timeout : .milliseconds(1)
+        return LiteLLMClient(configuration: bounded, transport: transport)
+    }
+
     // MARK: Streaming completion
 
     /// Streams a completion as ``AssemblyEvent``s.

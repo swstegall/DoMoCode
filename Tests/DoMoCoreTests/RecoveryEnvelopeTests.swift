@@ -65,4 +65,17 @@ struct RecoveryEnvelopeTests {
         #expect(diagnosed.userApprovedAction == false)
         #expect(diagnosed.recursionPrevented)
     }
+
+    @Test("session context is added only once and remains redacted")
+    func sessionContextIsAddedOnce() {
+        let secret = "recovery-session-secret"
+        Redaction.register(secret)
+        let envelope = RecoveryEnvelope(
+            originalKind: "provider",
+            error: "busy"
+        )
+        let enriched = envelope.withSessionContext("user: token=\(secret)")
+        #expect(enriched.sessionContext == "user: token=\(Redaction.placeholder)")
+        #expect(enriched.withSessionContext("replacement") == enriched)
+    }
 }

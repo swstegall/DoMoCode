@@ -760,8 +760,15 @@ public final class EventStore {
     /// Re-capped after joining rather than trusting the producer's per-field cap,
     /// because two fields each within budget are not one field within budget.
     private static func noticeBody(_ notice: ServerNotice) -> String {
-        guard let detail = notice.detail, !detail.isEmpty else { return notice.text }
-        return DoMoError.truncating(notice.text + "\n" + detail)
+        var parts = [notice.text]
+        if let detail = notice.detail, !detail.isEmpty { parts.append(detail) }
+        if let diagnosis = notice.recovery?.diagnosis, !diagnosis.isEmpty {
+            parts.append("Diagnosis: \(diagnosis)")
+        }
+        if let remedies = notice.recovery?.attemptedRemedies, !remedies.isEmpty {
+            parts.append("Remedies: \(remedies.joined(separator: "; "))")
+        }
+        return DoMoError.truncating(parts.joined(separator: "\n"))
     }
 
     /// Put a failure row on the transcript, sanitizing all three parts.

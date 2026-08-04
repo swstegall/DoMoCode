@@ -45,6 +45,7 @@ public func runAgentLoop(
     // this run added, which is what pi returns as `newMessages`.
     var transcript = context.messages
     var produced: [Message] = []
+    var recoveryDiagnosticAttempted = false
 
     /// Ends the run: reports the failure if there is one, closes the stream, and
     /// returns the result.
@@ -73,8 +74,39 @@ public func runAgentLoop(
         } else {
             carried = nil
         }
+        var finalRecovery = recovery
         if let recovery {
-            await sink.emit(.notice(AgentNotice(recovery)))
+            let enriched = recovery.withSessionContext(
+                recoverySessionContext(from: transcript)
+            )
+            finalRecovery = enriched
+            if !recoveryDiagnosticAttempted,
+               enriched.diagnosis == nil,
+               let diagnostic = config.recoveryDiagnostic,
+               config.recoveryDiagnosticTimeout > .zero
+            {
+                recoveryDiagnosticAttempted = true
+                let request = RecoveryDiagnosticRequest(
+                    envelope: enriched,
+                    model: config.model,
+                    maxOutputTokens: config.recoveryDiagnosticMaxOutputTokens,
+                    timeout: config.recoveryDiagnosticTimeout
+                )
+                if let result = await runRecoveryDiagnostic(
+                    diagnostic,
+                    request: request,
+                    timeout: config.recoveryDiagnosticTimeout
+                ) {
+                    finalRecovery = enriched.diagnosed(
+                        result.diagnosis,
+                        attemptedRemedies: result.attemptedRemedies,
+                        userApprovedAction: result.userApprovedAction
+                    )
+                }
+            }
+        }
+        if let finalRecovery {
+            await sink.emit(.notice(AgentNotice(finalRecovery)))
         } else if let carried {
             await sink.emit(
                 .notice(
@@ -385,6 +417,63 @@ public func runAgentLoop(
     }
 
     return await settle(lastBatchTerminated ? .terminatedByTool : .completed)
+}
+
+// MARK: - Recovery diagnostics
+
+/// A tiny, cancellation-aware race around the optional diagnostic callback.
+/// The callback is expected to use a transport that honors cancellation; the
+/// normal CLI implementation does, so cancelling the losing child releases the
+/// request rather than letting it spend a second turn after the envelope was
+/// already settled.
+private enum RecoveryDiagnosticRace: Sendable {
+    case result(RecoveryDiagnosticResult?)
+    case timedOut
+}
+
+private func runRecoveryDiagnostic(
+    _ diagnostic: @escaping RecoveryDiagnosticFn,
+    request: RecoveryDiagnosticRequest,
+    timeout: Duration
+) async -> RecoveryDiagnosticResult? {
+    await withTaskGroup(of: RecoveryDiagnosticRace.self) { group in
+        group.addTask {
+            .result(await diagnostic(request))
+        }
+        group.addTask {
+            do {
+                try await Task.sleep(for: timeout)
+                return .timedOut
+            } catch {
+                return .timedOut
+            }
+        }
+        guard let winner = await group.next() else { return nil }
+        group.cancelAll()
+        if case .result(let result) = winner { return result }
+        return nil
+    }
+}
+
+/// Builds a small, redacted context window for a diagnostic request. Tool
+/// output and tool arguments are omitted because they are both noisy and the
+/// most likely place for command output to smuggle instructions into a second
+/// model call. User/assistant prose still gives a provider diagnosis useful
+/// local context without turning the recovery record into a transcript replay.
+private func recoverySessionContext(from messages: [Message]) -> String? {
+    let lines = messages.suffix(8).compactMap { message -> String? in
+        switch message {
+        case .user(let user) where !user.text.isEmpty:
+            return "user: \(user.text)"
+        case .assistant(let assistant) where !assistant.text.isEmpty:
+            return "assistant: \(assistant.text)"
+        case .system, .tool, .user, .assistant:
+            return nil
+        }
+    }
+    guard !lines.isEmpty else { return nil }
+    let redacted = Redaction.diagnostic(lines.joined(separator: "\n"))
+    return DoMoError.truncating(redacted, to: 2_048)
 }
 
 /// Which ``AgentNotice/code`` family a classified failure belongs to.

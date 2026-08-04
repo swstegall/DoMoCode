@@ -459,6 +459,19 @@ public struct AgentLoopConfig: Sendable {
     /// static ``AgentContext/systemPrompt``.
     public var systemPromptForTools: (@Sendable (String, [String]) -> String?)?
 
+    /// Optional one-shot interpretation of a final provider failure. It is
+    /// deliberately a separate callback rather than another agent-loop turn:
+    /// the callback receives bounded untrusted data, must not recurse, and the
+    /// returned conclusion is attached to the typed recovery notice.
+    public var recoveryDiagnostic: RecoveryDiagnosticFn?
+
+    /// Hard wall-clock cap for the diagnostic callback. A non-positive value
+    /// disables the sub-turn and preserves the original failure.
+    public var recoveryDiagnosticTimeout: Duration
+
+    /// Maximum output requested from the diagnostic model.
+    public var recoveryDiagnosticMaxOutputTokens: Int
+
     public init(
         model: String = "unknown",
         toolExecution: ToolExecutionMode = .parallel,
@@ -475,7 +488,10 @@ public struct AgentLoopConfig: Sendable {
         onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
         maxCostPerRun: Decimal? = nil,
         getTools: (@Sendable (String) async -> [any AgentTool])? = nil,
-        systemPromptForTools: (@Sendable (String, [String]) -> String?)? = nil
+        systemPromptForTools: (@Sendable (String, [String]) -> String?)? = nil,
+        recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
+        recoveryDiagnosticTimeout: Duration = .seconds(8),
+        recoveryDiagnosticMaxOutputTokens: Int = 512
     ) {
         self.model = model
         self.toolExecution = toolExecution
@@ -493,6 +509,9 @@ public struct AgentLoopConfig: Sendable {
         self.onNoProgress = onNoProgress
         self.getTools = getTools
         self.systemPromptForTools = systemPromptForTools
+        self.recoveryDiagnostic = recoveryDiagnostic
+        self.recoveryDiagnosticTimeout = recoveryDiagnosticTimeout
+        self.recoveryDiagnosticMaxOutputTokens = max(1, min(2_048, recoveryDiagnosticMaxOutputTokens))
     }
 }
 

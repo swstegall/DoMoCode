@@ -313,6 +313,85 @@ private struct WidgetFault: Error {}
     #expect(sink.kinds.last == "agentEnd")
 }
 
+@Test func aFinalProviderFailureGetsOneBoundedDiagnosticSubturn() async {
+    let sink = RecordingSink()
+    let calls = Box(0)
+    let requests = Box<[RecoveryDiagnosticRequest]>([])
+    let diagnostic: RecoveryDiagnosticFn = { request in
+        calls.withLock { $0 += 1 }
+        requests.withLock { $0.append(request) }
+        return RecoveryDiagnosticResult(
+            diagnosis: "the gateway rejected the request before producing a response",
+            attemptedRemedies: ["checked the classified response", "did not mutate configuration"]
+        )
+    }
+    let envelope = RecoveryEnvelope(
+        originalKind: "authentication",
+        status: 401,
+        error: "invalid key",
+        model: "test-model"
+    )
+    let stream: AgentStreamFn = { _ in
+        AsyncThrowingStream { continuation in
+            continuation.yield(.recovery(envelope))
+            continuation.finish(throwing: DoMoError(.authentication, "invalid key"))
+        }
+    }
+
+    let result = await runOnce(
+        prompt: "inspect the gateway",
+        config: AgentLoopConfig(
+            model: "test-model",
+            recoveryDiagnostic: diagnostic,
+            recoveryDiagnosticTimeout: .seconds(1)
+        ),
+        sink: sink,
+        streamFn: stream
+    )
+
+    #expect(result.stopReason == .errored)
+    #expect(calls.value == 1)
+    #expect(requests.value.count == 1)
+    #expect(requests.value[0].untrustedInput.contains("UNTRUSTED DOMOCODE RECOVERY DATA"))
+    #expect(requests.value[0].envelope.sessionContext?.contains("user: inspect the gateway") == true)
+    #expect(sink.errorNotices.count == 1)
+    #expect(sink.errorNotices.first?.recovery?.diagnosis?.contains("gateway rejected") == true)
+    #expect(sink.errorNotices.first?.recovery?.attemptedRemedies.count == 2)
+    #expect((sink.noticeIndices.first ?? .max) < sink.agentEndIndex)
+}
+
+@Test func aDiagnosticCallbackCannotRecurseOrRunWhenItsBudgetIsDisabled() async {
+    let sink = RecordingSink()
+    let calls = Box(0)
+    let diagnostic: RecoveryDiagnosticFn = { _ in
+        calls.withLock { $0 += 1 }
+        return RecoveryDiagnosticResult(diagnosis: "should not be called")
+    }
+    let stream: AgentStreamFn = { _ in
+        AsyncThrowingStream { continuation in
+            continuation.yield(.recovery(RecoveryEnvelope(
+                originalKind: "provider",
+                status: 503,
+                error: "busy"
+            )))
+            continuation.finish(throwing: DoMoError(.provider(status: 503, isRetryable: true), "busy"))
+        }
+    }
+
+    _ = await runOnce(
+        config: AgentLoopConfig(
+            model: "test-model",
+            recoveryDiagnostic: diagnostic,
+            recoveryDiagnosticTimeout: .zero
+        ),
+        sink: sink,
+        streamFn: stream
+    )
+
+    #expect(calls.value == 0)
+    #expect(sink.errorNotices.first?.recovery?.diagnosis == nil)
+}
+
 @Test func aHarnessSideFailureIsFiledAsARuntimeError() async {
     let sink = RecordingSink()
 

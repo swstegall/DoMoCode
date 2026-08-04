@@ -1840,6 +1840,13 @@ final class InteractiveCoordinator {
         if let detail = notice.detail.map(sanitizeUntrustedText), !detail.isEmpty {
             lines.append("    \u{1b}[31m" + detail + Self.sgrReset)
         }
+        if let diagnosis = notice.recovery?.diagnosis.map(sanitizeUntrustedText), !diagnosis.isEmpty {
+            lines.append("    \u{1b}[31mdiagnostic: " + diagnosis + Self.sgrReset)
+        }
+        if let remedies = notice.recovery?.attemptedRemedies, !remedies.isEmpty {
+            let text = remedies.map(sanitizeUntrustedText).joined(separator: "; ")
+            lines.append("    " + Self.dim("remedies: " + text))
+        }
         if let hint = ErrorPresentation.hint(for: kind) {
             lines.append("    " + Self.dim(sanitizeUntrustedText(hint)))
         }
@@ -2519,6 +2526,7 @@ public struct InteractiveMode: Sendable {
             systemPromptForPromptAndTools: promptForTools,
             model: runtime.model,
             streamFn: streamFn,
+            recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: runtime),
             // A distinct small model compacts on its own request rather than through
             // `streamFn`; with none configured this is `nil` and the harness keeps
             // its built-in summarizer, unchanged.

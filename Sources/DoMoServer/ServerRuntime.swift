@@ -270,6 +270,9 @@ public actor ServerRuntime {
         /// Resolves a selected alias to the concrete stream function owned by the
         /// CLI's LLM client.
         public var modelStreamFactory: (@Sendable (String) -> AgentStreamFn)?
+        /// Optional one-shot diagnostic resolver. It must use a bounded client,
+        /// no mutation-capable tools, and never call the agent loop recursively.
+        public var recoveryDiagnostic: RecoveryDiagnosticFn?
         public var modelContextWindow: (@Sendable (String) -> Int?)?
         public var tools: [any AgentTool]
         /// Optional per-session resolver. The session id is part of the seam so
@@ -389,6 +392,7 @@ public actor ServerRuntime {
             commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)? = nil,
             modelOptions: [ModelOption] = [],
             modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
+            recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
             modelContextWindow: (@Sendable (String) -> Int?)? = nil,
             steeringMode: QueueDeliveryMode = .oneAtATime,
             maxCostPerRun: Decimal? = nil,
@@ -413,6 +417,7 @@ public actor ServerRuntime {
             self.commandStreamFactory = commandStreamFactory
             self.modelOptions = modelOptions
             self.modelStreamFactory = modelStreamFactory
+            self.recoveryDiagnostic = recoveryDiagnostic
             self.modelContextWindow = modelContextWindow
             self.tools = tools
             self.toolsForSession = toolsForSession
@@ -1441,6 +1446,7 @@ public actor ServerRuntime {
             model: config.model,
             streamFn: config.streamFn,
             streamFnForModel: config.modelStreamFactory,
+            recoveryDiagnostic: config.recoveryDiagnostic,
             contextWindowForModel: config.modelContextWindow,
             // The three below are the whole reason `Config` carries them: a value
             // that stops here is a knob a user can set and nothing reads. The
