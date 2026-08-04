@@ -188,6 +188,41 @@ public struct LSPIndexProvider: DoMoIndexProvider {
     }
 }
 
+/// Maps the bounded code-intelligence contract onto LSP requests. The caller
+/// still owns authorization through ``CodeIntelligenceCoordinator``; this
+/// adapter only translates values and parses the server response.
+public struct LSPCodeIntelligenceProvider: DoMoCodeIntelligenceProvider {
+    public let root: FilePath
+    public let configuration: LSPServerConfiguration
+    public let codeIntelligenceID: String
+    private let pool: LSPClientPool
+
+    public init(
+        root: FilePath,
+        configuration: LSPServerConfiguration,
+        pool: LSPClientPool = LSPClientPool(),
+        providerID: String? = nil
+    ) {
+        self.root = root
+        self.configuration = configuration
+        self.pool = pool
+        self.codeIntelligenceID = providerID ?? "(configuration.languageID)-lsp-code"
+    }
+
+    public func perform(_ request: CodeIntelligenceRequest) async throws -> CodeIntelligenceResult {
+        try await pool.performCodeIntelligence(
+            root: root,
+            configuration: configuration,
+            request: request,
+            providerID: codeIntelligenceID
+        )
+    }
+
+    public func shutdown() async {
+        await pool.shutdown()
+    }
+}
+
 /// Owns one LSP client per root/command key. Keeping the pool outside the
 /// provider makes it possible for several tools or sessions to share a warm
 /// language server without sharing diagnostics between roots.
@@ -238,6 +273,18 @@ public actor LSPClientPool {
             throw IndexCoordinatorError.unavailable
         }
         return try await client.refreshIndex(paths: paths)
+    }
+
+    public func performCodeIntelligence(
+        root: FilePath,
+        configuration: LSPServerConfiguration,
+        request: CodeIntelligenceRequest,
+        providerID: String
+    ) async throws -> CodeIntelligenceResult {
+        guard let client = client(root: root, configuration: configuration) else {
+            throw IndexCoordinatorError.unavailable
+        }
+        return try await client.performCodeIntelligence(request, providerID: providerID)
     }
 
     public func shutdown() async {
@@ -511,6 +558,123 @@ private actor LSPClient {
         )
     }
 
+    func performCodeIntelligence(
+        _ codeRequest: CodeIntelligenceRequest,
+        providerID: String
+    ) async throws -> CodeIntelligenceResult {
+        try await startIfNeeded()
+        switch codeRequest.operation {
+        case .diagnostics:
+            guard let path = codeRequest.path else { throw LSPError.invalidResponse }
+            let report = await check(changedPath: FilePath(path))
+            let diagnostics = report.diagnostics.map { diagnostic in
+                CodeIntelligenceDiagnostic(
+                    message: diagnostic.message,
+                    location: diagnostic.file.flatMap { file in
+                        guard let line = diagnostic.line else { return nil }
+                        return IndexLocation(
+                            path: Self.normalizedPath(file),
+                            line: max(0, line - 1),
+                            column: max(0, (diagnostic.column ?? 1) - 1)
+                        )
+                    },
+                    source: diagnostic.source
+                )
+            }
+            return CodeIntelligenceResult(
+                operation: codeRequest.operation,
+                providerID: providerID,
+                diagnostics: diagnostics,
+                freshness: report.status == .unavailable ? .unavailable : .current,
+                warning: report.note
+            )
+
+        case .workspaceSymbols:
+            let query = IndexSearchQuery(
+                text: codeRequest.query ?? "",
+                rootPath: codeRequest.rootPath,
+                limit: codeRequest.limit
+            )
+            let response = try await request(
+                "workspace/symbol",
+                params: .object(["query": .string(query.text)])
+            )
+            let symbols = Self.parseWorkspaceSymbols(
+                response.arrayValue ?? [],
+                query: query,
+                root: codeRequest.rootPath
+            )
+            return CodeIntelligenceResult(
+                operation: codeRequest.operation,
+                providerID: providerID,
+                items: Array(symbols.prefix(codeRequest.limit)),
+                freshness: .current
+            )
+
+        case .documentSymbols:
+            let params = try Self.textDocumentParams(codeRequest, root: root)
+            let response = try await request("textDocument/documentSymbol", params: params)
+            let symbols = Self.parseSymbolLocations(
+                response.arrayValue ?? [],
+                root: codeRequest.rootPath,
+                defaultPath: codeRequest.path
+            )
+            return CodeIntelligenceResult(
+                operation: codeRequest.operation,
+                providerID: providerID,
+                items: Array(symbols.prefix(codeRequest.limit)),
+                freshness: .current
+            )
+
+        case .rename:
+            let params = try Self.textDocumentParams(codeRequest, root: root)
+            let object: JSONValue = .object([
+                "textDocument": params["textDocument"] ?? .null,
+                "position": params["position"] ?? .null,
+                "newName": .string(codeRequest.newName ?? "")
+            ])
+            let response = try await request("textDocument/rename", params: object)
+            return CodeIntelligenceResult(
+                operation: codeRequest.operation,
+                providerID: providerID,
+                edits: Self.parseWorkspaceEdits(response, root: codeRequest.rootPath),
+                freshness: .current
+            )
+
+        case .definition, .declaration, .references, .implementation,
+             .callHierarchy, .relatedLocations:
+            let params = try Self.textDocumentParams(codeRequest, root: root)
+            let method: String
+            switch codeRequest.operation {
+            case .definition: method = "textDocument/definition"
+            case .declaration: method = "textDocument/declaration"
+            case .references, .relatedLocations: method = "textDocument/references"
+            case .implementation: method = "textDocument/implementation"
+            case .callHierarchy: method = "textDocument/prepareCallHierarchy"
+            default: method = "textDocument/definition"
+            }
+            let requestParams: JSONValue
+            if codeRequest.operation == .references || codeRequest.operation == .relatedLocations {
+                requestParams = .object([
+                    "textDocument": params["textDocument"] ?? .null,
+                    "position": params["position"] ?? .null,
+                    "context": .object(["includeDeclaration": .bool(true)])
+                ])
+            } else {
+                requestParams = params
+            }
+            let response = try await request(method, params: requestParams)
+            let values = response.arrayValue ?? (response == .null ? [] : [response])
+            let symbols = Self.parseSymbolLocations(values, root: codeRequest.rootPath)
+            return CodeIntelligenceResult(
+                operation: codeRequest.operation,
+                providerID: providerID,
+                items: Array(symbols.prefix(codeRequest.limit)),
+                freshness: .current
+            )
+        }
+    }
+
     func shutdown() async {
         readerTask?.cancel()
         readerTask = nil
@@ -725,6 +889,23 @@ private extension LSPClient {
         URL(fileURLWithPath: path).standardizedFileURL.path
     }
 
+    static func textDocumentParams(
+        _ request: CodeIntelligenceRequest,
+        root: FilePath
+    ) throws -> JSONValue {
+        guard let path = request.path,
+              let position = request.position
+        else { throw LSPClient.LSPError.invalidResponse }
+        let absolutePath = normalizedPath(absolutePath(FilePath(path), root: root))
+        return .object([
+            "textDocument": .object(["uri": .string(fileURI(absolutePath))]),
+            "position": .object([
+                "line": .int(position.line),
+                "character": .int(position.column)
+            ])
+        ])
+    }
+
     static func fileURI(_ path: String) -> String {
         URL(fileURLWithPath: path).absoluteString
     }
@@ -787,6 +968,90 @@ private extension LSPClient {
                 ),
                 containerName: value["containerName"]?.stringValue,
                 detail: value["detail"]?.stringValue
+            )
+        }
+    }
+
+    static func parseSymbolLocations(
+        _ values: [JSONValue],
+        root: String,
+        defaultPath: String? = nil
+    ) -> [IndexSymbol] {
+        let normalizedRoot = normalizedPath(root)
+        return values.compactMap { value in
+            let location = value["location"] ?? value
+            let rawPath: String
+            if let uri = location["uri"]?.stringValue {
+                rawPath = URL(string: uri)?.path.removingPercentEncoding ?? uri
+            } else if let defaultPath {
+                rawPath = defaultPath
+            } else {
+                return nil
+            }
+            let path = normalizedPath(rawPath)
+            guard path == normalizedRoot || path.hasPrefix(normalizedRoot + "/") else {
+                return nil
+            }
+            let range = location["range"] ?? value["range"]
+            let start = range?["start"]
+            let end = range?["end"]
+            return IndexSymbol(
+                name: value["name"]?.stringValue ?? "location",
+                kind: indexKind(value["kind"]?.intValue ?? 0),
+                location: IndexLocation(
+                    path: path,
+                    line: start?["line"]?.intValue ?? 0,
+                    column: start?["character"]?.intValue ?? 0,
+                    endLine: end?["line"]?.intValue,
+                    endColumn: end?["character"]?.intValue
+                ),
+                containerName: value["containerName"]?.stringValue,
+                detail: value["detail"]?.stringValue
+            )
+        }
+    }
+
+    static func parseWorkspaceEdits(
+        _ value: JSONValue,
+        root: String
+    ) -> [CodeIntelligenceTextEdit] {
+        let normalizedRoot = normalizedPath(root)
+        var edits: [CodeIntelligenceTextEdit] = []
+        if let changes = value["changes"]?.objectValue {
+            for (uri, fileEdits) in changes {
+                let path = normalizedPath(URL(string: uri)?.path.removingPercentEncoding ?? uri)
+                guard path == normalizedRoot || path.hasPrefix(normalizedRoot + "/") else { continue }
+                edits.append(contentsOf: parseTextEdits(fileEdits, path: path))
+            }
+        }
+        if let documentChanges = value["documentChanges"]?.arrayValue {
+            for documentChange in documentChanges {
+                guard let uri = documentChange["textDocument"]?["uri"]?.stringValue else { continue }
+                let path = normalizedPath(URL(string: uri)?.path.removingPercentEncoding ?? uri)
+                guard path == normalizedRoot || path.hasPrefix(normalizedRoot + "/") else { continue }
+                edits.append(contentsOf: parseTextEdits(documentChange["edits"] ?? .null, path: path))
+            }
+        }
+        return edits
+    }
+
+    static func parseTextEdits(
+        _ value: JSONValue,
+        path: String
+    ) -> [CodeIntelligenceTextEdit] {
+        (value.arrayValue ?? []).compactMap { edit in
+            guard let range = edit["range"],
+                  let newText = edit["newText"]?.stringValue,
+                  let startLine = range["start"]?["line"]?.intValue,
+                  let startColumn = range["start"]?["character"]?.intValue,
+                  let endLine = range["end"]?["line"]?.intValue,
+                  let endColumn = range["end"]?["character"]?.intValue
+            else { return nil }
+            return CodeIntelligenceTextEdit(
+                path: path,
+                start: CodeIntelligencePosition(line: startLine, column: startColumn),
+                end: CodeIntelligencePosition(line: endLine, column: endColumn),
+                newText: String(newText.prefix(1_000_000))
             )
         }
     }

@@ -112,12 +112,24 @@ public struct ProviderTool: Sendable, Codable, Hashable {
     }
 }
 
+/// Capability names used by the agent when selecting a model. They describe
+/// behavior, not a vendor, so an adapter can advertise equivalent support
+/// without making the agent loop provider-specific.
+public enum ProviderCapability: String, Sendable, Codable, Hashable, CaseIterable {
+    case images
+    case longContext
+    case tools
+    case reasoning
+    case backgroundRequests
+}
+
 /// A provider-neutral model request. Provider-specific knobs belong in
 /// ``options`` and are interpreted by the adapter that understands them.
 public struct ProviderRequest: Sendable, Codable, Hashable {
     public var model: String
     public var messages: [ProviderMessage]
     public var tools: [ProviderTool]
+    public var requiredCapabilities: [ProviderCapability]
     public var options: JSONValue
     public var metadata: [String: JSONValue]
 
@@ -125,12 +137,14 @@ public struct ProviderRequest: Sendable, Codable, Hashable {
         model: String,
         messages: [ProviderMessage],
         tools: [ProviderTool] = [],
+        requiredCapabilities: [ProviderCapability] = [],
         options: JSONValue = .object([:]),
         metadata: [String: JSONValue] = [:]
     ) {
         self.model = model
         self.messages = messages
         self.tools = tools
+        self.requiredCapabilities = Array(Set(requiredCapabilities)).sorted { $0.rawValue < $1.rawValue }
         self.options = options
         self.metadata = metadata
     }
@@ -197,6 +211,51 @@ public struct ProviderDescriptor: Sendable, Codable, Hashable {
         self.id = id
         self.displayName = displayName
         self.capabilities = capabilities
+    }
+}
+
+public enum ProviderCapabilityError: Error, Sendable, Equatable {
+    case missing(providerID: String, modelID: String, capabilities: [ProviderCapability])
+}
+
+/// Centralizes capability matching so every provider adapter uses the same
+/// model-independent vocabulary and reports an explicit refusal instead of
+/// silently dropping images, tools, reasoning, or background work.
+public enum ProviderCapabilityChecker {
+    public static func missing(
+        required: [ProviderCapability],
+        advertised: [String]
+    ) -> [ProviderCapability] {
+        let available = Set(advertised.map(normalize))
+        return Array(Set(required)).filter { !available.contains(normalize($0.rawValue)) }
+            .sorted { $0.rawValue < $1.rawValue }
+    }
+
+    public static func validate(
+        request: ProviderRequest,
+        descriptor: ProviderDescriptor,
+        model: ProviderModel? = nil
+    ) throws(ProviderCapabilityError) {
+        let advertised = descriptor.capabilities + (model?.capabilities ?? [])
+        let missing = Self.missing(required: request.requiredCapabilities, advertised: advertised)
+        guard missing.isEmpty else {
+            throw .missing(
+                providerID: descriptor.id,
+                modelID: model?.id ?? request.model,
+                capabilities: missing
+            )
+        }
+    }
+
+    private static func normalize(_ value: String) -> String {
+        value.unicodeScalars
+            .filter { scalar in
+                (scalar.value >= 0x41 && scalar.value <= 0x5a)
+                    || (scalar.value >= 0x61 && scalar.value <= 0x7a)
+                    || (scalar.value >= 0x30 && scalar.value <= 0x39)
+            }
+            .map { String($0).lowercased() }
+            .joined()
     }
 }
 

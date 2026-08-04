@@ -667,6 +667,13 @@ public struct ACPProviderAdapter: DoMoProvider, DoMoAdapterHealthChecking {
     }
 
     public func stream(_ request: ProviderRequest) -> AsyncThrowingStream<ProviderEvent, any Error> {
+        do {
+            try ProviderCapabilityChecker.validate(request: request, descriptor: providerDescriptor)
+        } catch {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: error)
+            }
+        }
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {

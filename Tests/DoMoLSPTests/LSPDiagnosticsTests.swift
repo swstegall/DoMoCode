@@ -1,3 +1,4 @@
+import DoMoCore
 import Foundation
 import SystemPackage
 import Testing
@@ -126,6 +127,51 @@ struct LSPContentLengthFramerTests {
                             "containerName": "main"
                         }]
                     })
+                elif method == "textDocument/documentSymbol":
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": [{
+                            "name": "value",
+                            "kind": 13,
+                            "range": {
+                                "start": {"line": 0, "character": 4},
+                                "end": {"line": 0, "character": 9}
+                            },
+                            "selectionRange": {
+                                "start": {"line": 0, "character": 4},
+                                "end": {"line": 0, "character": 9}
+                            }
+                        }]
+                    })
+                elif method == "textDocument/definition":
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": [{
+                            "uri": "\(mainURI)",
+                            "range": {
+                                "start": {"line": 0, "character": 4},
+                                "end": {"line": 0, "character": 9}
+                            }
+                        }]
+                    })
+                elif method == "textDocument/rename":
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {
+                            "changes": {
+                                "\(mainURI)": [{
+                                    "range": {
+                                        "start": {"line": 0, "character": 4},
+                                        "end": {"line": 0, "character": 9}
+                                    },
+                                    "newText": message["params"]["newName"]
+                                }]
+                            }
+                        }
+                    })
                 elif method == "textDocument/diagnostic":
                     send({
                         "jsonrpc": "2.0",
@@ -189,6 +235,42 @@ struct LSPContentLengthFramerTests {
         let refresh = try await index.refresh(paths: [fixture.path("main.swift")])
         #expect(refresh.paths == [fixture.path("main.swift")])
         #expect(refresh.freshness == .current)
+        let codeProvider = LSPCodeIntelligenceProvider(
+            root: fixture.root,
+            configuration: LSPServerConfiguration(
+                command: [command],
+                languageID: "swift",
+                environment: .inherit,
+                timeout: .seconds(2)
+            ),
+            pool: pool
+        )
+        let code = try CodeIntelligenceCoordinator(
+            rootPath: fixture.root.string,
+            provider: codeProvider
+        )
+        let definition = try await code.perform(CodeIntelligenceRequest(
+            operation: .definition,
+            rootPath: fixture.root.string,
+            path: fixture.path("main.swift"),
+            position: .init(line: 0, column: 4)
+        ))
+        #expect(definition.items.first?.location.path == fixture.path("main.swift"))
+        let documentSymbols = try await code.perform(CodeIntelligenceRequest(
+            operation: .documentSymbols,
+            rootPath: fixture.root.string,
+            path: fixture.path("main.swift")
+        ))
+        #expect(documentSymbols.items.first?.name == "value")
+        let rename = try await code.perform(CodeIntelligenceRequest(
+            operation: .rename,
+            rootPath: fixture.root.string,
+            path: fixture.path("main.swift"),
+            position: .init(line: 0, column: 4),
+            newName: "renamed"
+        ))
+        #expect(rename.edits.first?.newText == "renamed")
+        await codeProvider.shutdown()
         await index.shutdown()
     }
 }

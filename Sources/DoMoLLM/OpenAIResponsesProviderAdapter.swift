@@ -78,6 +78,11 @@ public struct OpenAIResponsesProviderAdapter: DoMoProvider, DoMoAdapterHealthChe
     }
 
     public func stream(_ request: ProviderRequest) -> AsyncThrowingStream<ProviderEvent, any Error> {
+        if let error = capabilityError(for: request) {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: error)
+            }
+        }
         let body: [UInt8]
         let httpRequest: HTTPRequest
         do {
@@ -370,6 +375,15 @@ public struct OpenAIResponsesProviderAdapter: DoMoProvider, DoMoAdapterHealthChe
             default:
                 yield(.unknown, payload)
             }
+        }
+    }
+
+    private func capabilityError(for request: ProviderRequest) -> ProviderCapabilityError? {
+        do {
+            try ProviderCapabilityChecker.validate(request: request, descriptor: providerDescriptor)
+            return nil
+        } catch {
+            return error
         }
     }
 

@@ -65,6 +65,43 @@ struct CapabilityProtocolsTests {
         await provider.stop()
     }
 
+    @Test("provider capability checks cover model-level requirements")
+    func capabilityChecks() throws {
+        let request = ProviderRequest(
+            model: "vision-model",
+            messages: [],
+            requiredCapabilities: [.images, .longContext]
+        )
+        let descriptor = ProviderDescriptor(
+            id: "provider",
+            displayName: "Provider",
+            capabilities: ["images"]
+        )
+        let model = ProviderModel(id: "vision-model", capabilities: ["long_context"])
+        try ProviderCapabilityChecker.validate(request: request, descriptor: descriptor, model: model)
+
+        let missing = ProviderCapabilityChecker.missing(
+            required: [.images, .reasoning],
+            advertised: ["images"]
+        )
+        #expect(missing == [.reasoning])
+        #expect(throws: ProviderCapabilityError.missing(
+            providerID: "provider",
+            modelID: "vision-model",
+            capabilities: [.reasoning]
+        )) {
+            try ProviderCapabilityChecker.validate(
+                request: ProviderRequest(
+                    model: "vision-model",
+                    messages: [],
+                    requiredCapabilities: [.reasoning]
+                ),
+                descriptor: descriptor,
+                model: model
+            )
+        }
+    }
+
     @Test("themes and extension registrations remain renderer-independent")
     func themeAndExtensionSeams() async throws {
         let theme = ThemeDefinition(

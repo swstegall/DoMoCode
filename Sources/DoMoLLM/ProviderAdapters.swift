@@ -8,6 +8,18 @@ import HTTPTypes
 // MARK: - Provider-neutral conversion
 
 enum ProviderAdapterConversion {
+    static func capabilityError(
+        request: ProviderRequest,
+        descriptor: ProviderDescriptor
+    ) -> ProviderCapabilityError? {
+        do {
+            try ProviderCapabilityChecker.validate(request: request, descriptor: descriptor)
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     static func text(_ value: JSONValue) -> String {
         if let text = value.stringValue { return text }
         if let text = value["text"]?.stringValue { return text }
@@ -258,6 +270,14 @@ public struct LiteLLMProviderAdapter: DoMoProvider, DoMoAdapterHealthChecking {
     }
 
     public func stream(_ request: ProviderRequest) -> AsyncThrowingStream<ProviderEvent, any Error> {
+        if let error = ProviderAdapterConversion.capabilityError(
+            request: request,
+            descriptor: providerDescriptor
+        ) {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: error)
+            }
+        }
         let context: Context
         do {
             context = try ProviderAdapterConversion.context(from: request)
@@ -388,6 +408,14 @@ public struct AnthropicMessagesProviderAdapter: DoMoProvider, DoMoAdapterHealthC
     }
 
     public func stream(_ request: ProviderRequest) -> AsyncThrowingStream<ProviderEvent, any Error> {
+        if let error = ProviderAdapterConversion.capabilityError(
+            request: request,
+            descriptor: providerDescriptor
+        ) {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: error)
+            }
+        }
         let body: [UInt8]
         let httpRequest: HTTPRequest
         do {

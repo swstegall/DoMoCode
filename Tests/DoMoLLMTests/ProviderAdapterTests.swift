@@ -187,6 +187,44 @@ struct ProviderAdapterTests {
         #expect(body["tools"]?[0]?["parameters"]?["type"] == .string("object"))
         #expect(transport.lastRequest?.headerFields[HTTPField.Name("authorization")!] == "Bearer secret-value")
     }
+
+    @Test("provider adapters refuse unsupported model capabilities before transport")
+    func capabilityRefusal() async {
+        let transport = FixtureTransport(status: 200, chunks: [])
+        let client = LiteLLMClient(
+            configuration: LiteLLMClient.Configuration(baseURL: "http://localhost:4000/v1"),
+            transport: transport
+        )
+        let adapter = LiteLLMProviderAdapter(
+            profile: ProviderProfile(
+                id: "gateway",
+                displayName: "Gateway",
+                adapterID: "litellm",
+                endpoint: "http://localhost:4000/v1",
+                capabilities: ["chat", "streaming"]
+            ),
+            client: client
+        )
+
+        var error: ProviderCapabilityError?
+        do {
+            for try await _ in adapter.stream(ProviderRequest(
+                model: "text-only",
+                messages: [],
+                requiredCapabilities: [.images]
+            )) {}
+        } catch let thrown as ProviderCapabilityError {
+            error = thrown
+        } catch {
+            Issue.record("unexpected capability error: \(error)")
+        }
+        #expect(error == .missing(
+            providerID: "gateway",
+            modelID: "text-only",
+            capabilities: [.images]
+        ))
+        #expect(transport.lastRequest == nil)
+    }
 }
 
 private final class FixtureTransport: StreamingTransport {
