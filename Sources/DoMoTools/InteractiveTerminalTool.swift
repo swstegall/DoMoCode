@@ -162,6 +162,20 @@ public actor PTYInteractiveTerminalProvider: InteractiveTerminalProvider {
         await service.shutdown()
     }
 
+    private static func shellEnvironment(_ environment: PTYEnvironment) -> ShellEnvironment {
+        ShellEnvironment(
+            base: environment.base == .inherited ? .inherited : .empty,
+            overrides: environment.overrides
+        )
+    }
+
+    private static func ptyEnvironment(_ environment: ShellEnvironment) -> PTYEnvironment {
+        PTYEnvironment(
+            base: environment.base == .inherited ? .inherited : .empty,
+            overrides: environment.overrides
+        )
+    }
+
     private func start(_ request: InteractiveTerminalRequest) async throws -> InteractiveTerminalResult {
         guard let command = request.command?.trimmingCharacters(in: .whitespacesAndNewlines),
               !command.isEmpty
@@ -178,7 +192,7 @@ public actor PTYInteractiveTerminalProvider: InteractiveTerminalProvider {
         let id = try await service.start(.init(
             command: plan.map { [$0.executable.string] + $0.arguments } ?? rawCommand,
             workingDirectory: plan?.workingDirectory.string ?? request.workingDirectory,
-            environment: plan?.environment ?? request.environment,
+            environment: plan.map { Self.ptyEnvironment($0.environment) } ?? request.environment,
             size: size
         ))
         let attachment = try await service.beginAttach(sessionID: id)
@@ -367,13 +381,6 @@ public struct InteractiveTerminalTool: Tool {
 
     private static func ptyEnvironment(_ environment: ShellEnvironment) -> PTYEnvironment {
         PTYEnvironment(
-            base: environment.base == .inherited ? .inherited : .empty,
-            overrides: environment.overrides
-        )
-    }
-
-    private static func shellEnvironment(_ environment: PTYEnvironment) -> ShellEnvironment {
-        ShellEnvironment(
             base: environment.base == .inherited ? .inherited : .empty,
             overrides: environment.overrides
         )
