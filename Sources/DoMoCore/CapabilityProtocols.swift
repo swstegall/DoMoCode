@@ -350,6 +350,61 @@ public protocol DoMoToolCatalog: Sendable {
     func entries(for context: ToolCatalogContext) async throws -> [ToolCatalogEntry]
 }
 
+// MARK: - External capabilities
+
+/// A capability that DoMoCode intentionally acquires through a protocol
+/// adapter instead of implementing as a privileged native tool. MCP is the
+/// first concrete transport; ACP can use the same value-level contract when
+/// its bounded JSON-RPC adapter lands.
+public enum ExternalCapabilityKind: String, Sendable, Codable, Hashable, CaseIterable {
+    case browser
+    case notebook
+    case remoteSearch
+}
+
+public enum ExternalCapabilityTransport: String, Sendable, Codable, Hashable, CaseIterable {
+    case mcp
+    case acp
+}
+
+/// Inspectable identity for a browser, notebook, or remote-search adapter.
+/// The descriptor contains no credential values and is safe to persist in a
+/// catalog or display in a diagnostic surface.
+public struct ExternalCapabilityDescriptor: Sendable, Codable, Hashable {
+    public var id: String
+    public var displayName: String
+    public var kind: ExternalCapabilityKind
+    public var transport: ExternalCapabilityTransport
+    public var endpoint: String?
+    public var toolNames: [String]
+
+    public init(
+        id: String,
+        displayName: String,
+        kind: ExternalCapabilityKind,
+        transport: ExternalCapabilityTransport,
+        endpoint: String? = nil,
+        toolNames: [String] = []
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.kind = kind
+        self.transport = transport
+        self.endpoint = endpoint
+        self.toolNames = toolNames.sorted()
+    }
+}
+
+/// Protocol boundary for capabilities supplied by MCP/ACP or another
+/// explicitly admitted adapter. The host remains responsible for permission
+/// decisions; `execute` is the adapter transport, not an authorization grant.
+public protocol DoMoExternalCapabilityAdapter: DoMoAdapter {
+    var capabilityDescriptor: ExternalCapabilityDescriptor { get }
+
+    func catalogEntries(for context: ToolCatalogContext) async throws -> [ToolCatalogEntry]
+    func execute(toolNamed name: String, arguments: JSONValue) async throws -> JSONValue
+}
+
 // MARK: - Extensions
 
 public struct ExtensionDescriptor: Sendable, Codable, Hashable {

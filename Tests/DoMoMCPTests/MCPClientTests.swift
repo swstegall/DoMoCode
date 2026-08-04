@@ -76,13 +76,23 @@ struct MCPClientTests {
     /// for all three. At 4s a loaded CI runner returned NO tools at all and every
     /// test in this suite failed on `tool(tools, …) -> nil`, several steps before
     /// its own subject. Nothing here asserts how FAST anything is.
-    private func fixtureConfig(timeoutMS: Int = 20_000) throws -> (dir: URL, config: MCPServerConfig)? {
+    private func fixtureConfig(
+        timeoutMS: Int = 20_000,
+        adapterKind: MCPAdapterKind? = nil
+    ) throws -> (dir: URL, config: MCPServerConfig)? {
         guard FileManager.default.fileExists(atPath: "/usr/bin/python3") else { return nil }
         let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("domo-mcp-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let script = dir.appendingPathComponent("server.py")
         try Self.fixture.write(to: script, atomically: true, encoding: .utf8)
-        return (dir, MCPServerConfig(command: ["/usr/bin/python3", script.path], timeout: timeoutMS))
+        return (
+            dir,
+            MCPServerConfig(
+                command: ["/usr/bin/python3", script.path],
+                timeout: timeoutMS,
+                adapterKind: adapterKind
+            )
+        )
     }
 
     private func tool(_ tools: [any AgentTool], _ name: String) -> (any AgentTool)? {
@@ -107,6 +117,39 @@ struct MCPClientTests {
         let ok = try await echo.execute(.object(["text": .string("hi")]))
         #expect(ok.output == "echo: hi")
         #expect(!ok.isError)
+    }
+
+    @Test("Declared browser, notebook, and remote-search roles expose MCP adapter views")
+    func externalCapabilityAdapter() async throws {
+        for kind in MCPAdapterKind.allCases {
+            guard let (dir, config) = try fixtureConfig(adapterKind: kind) else { return }
+            defer { try? FileManager.default.removeItem(at: dir) }
+
+            let manager = MCPManager()
+            _ = await manager.connect(servers: ["srv": config], workspaceDirectory: dir.path)
+            let adapters = await manager.externalCapabilityAdapters()
+            let adapter = try #require(adapters.first)
+            #expect(adapter.capabilityDescriptor.kind.rawValue == kind.rawValue)
+            #expect(adapter.capabilityDescriptor.transport == .mcp)
+            #expect(adapter.capabilityDescriptor.endpoint == nil)
+
+            let entries = try await adapter.catalogEntries(
+                for: ToolCatalogContext(sessionID: "adapter-test")
+            )
+            #expect(entries.map(\.name) == ["srv_echo", "srv_boom", "srv_slow", "srv_getenv", "srv_quit"])
+            #expect(entries.allSatisfy { $0.source == .adapter && $0.permission == .requiresApproval })
+            #expect(entries.first?.metadata["capabilityKind"] == .string(kind.rawValue))
+            #expect(entries.first?.metadata["sessionID"] == .string("adapter-test"))
+
+            let result = try await adapter.execute(
+                toolNamed: "srv_echo",
+                arguments: .object(["text": .string("through adapter")])
+            )
+            #expect(result["output"] == .string("echo: through adapter"))
+            #expect(result["isError"] == .bool(false))
+
+            await manager.shutdown()
+        }
     }
 
     @Test("Inspect resources, templates, reads, and health through the manager")

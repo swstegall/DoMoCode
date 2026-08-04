@@ -15,6 +15,15 @@ public enum MCPTransport: String, Sendable, Hashable, Codable {
     case sse
 }
 
+/// Declares the external capability a configured MCP server supplies. The
+/// server remains an ordinary MCP server; this label only gives catalogs and
+/// workflow surfaces an explicit adapter role without guessing from tool names.
+public enum MCPAdapterKind: String, Sendable, Hashable, Codable, CaseIterable {
+    case browser
+    case notebook
+    case remoteSearch
+}
+
 /// One configured stdio-local MCP server.
 public struct MCPServerConfig: Sendable, Hashable, Codable {
     /// argv — `command[0]` is the program (resolved via PATH if bare), the rest args.
@@ -52,6 +61,10 @@ public struct MCPServerConfig: Sendable, Hashable, Codable {
     /// local deployments must opt in explicitly.
     public var allowPrivateNetwork: Bool?
 
+    /// Optional role exposed by this MCP server. A missing role keeps the
+    /// server on the ordinary MCP tool path.
+    public var adapterKind: MCPAdapterKind?
+
     public init(
         command: [String],
         environment: [String: String]? = nil,
@@ -63,7 +76,8 @@ public struct MCPServerConfig: Sendable, Hashable, Codable {
         credentialReference: String? = nil,
         bearerTokenEnvironment: String? = nil,
         allowedHosts: [String]? = nil,
-        allowPrivateNetwork: Bool? = nil
+        allowPrivateNetwork: Bool? = nil,
+        adapterKind: MCPAdapterKind? = nil
     ) {
         self.command = command
         self.environment = environment
@@ -76,6 +90,7 @@ public struct MCPServerConfig: Sendable, Hashable, Codable {
         self.bearerTokenEnvironment = bearerTokenEnvironment
         self.allowedHosts = allowedHosts
         self.allowPrivateNetwork = allowPrivateNetwork
+        self.adapterKind = adapterKind
     }
 
     /// The effective transport, keeping a URL-only entry ergonomic while making

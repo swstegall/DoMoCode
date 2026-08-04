@@ -56,6 +56,11 @@ public protocol AgentTool: Sendable {
     /// built-in from an MCP or adapter-backed tool without guessing from names.
     var catalogSource: ToolCatalogSource { get }
 
+    /// Additional inspectable provenance for adapter-backed tools. Values are
+    /// metadata only; the permission engine still decides whether a call may
+    /// run.
+    var catalogMetadata: [String: JSONValue] { get }
+
     /// Per-tool execution-mode override. When any tool in a batch is
     /// `sequential`, the whole batch runs sequentially — pi's `hasSequentialToolCall`.
     var executionMode: ToolExecutionMode? { get }
@@ -73,6 +78,7 @@ public protocol AgentTool: Sendable {
 extension AgentTool {
     public var executionMode: ToolExecutionMode? { nil }
     public var catalogSource: ToolCatalogSource { .adapter }
+    public var catalogMetadata: [String: JSONValue] { [:] }
 }
 
 /// Executes a completed tool call against a host-provided result stream.

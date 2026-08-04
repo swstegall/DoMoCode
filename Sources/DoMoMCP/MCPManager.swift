@@ -92,6 +92,9 @@ public actor MCPManager {
     private struct ConnectedServer: Sendable {
         let name: String
         let client: MCPClient
+        let adapterKind: MCPAdapterKind?
+        let transport: MCPTransport
+        let endpoint: String?
     }
 
     private var servers: [ConnectedServer] = []
@@ -161,7 +164,15 @@ public actor MCPManager {
                 }
             }
             if connectionError == nil {
-                self.servers.append(ConnectedServer(name: name, client: client))
+                self.servers.append(
+                    ConnectedServer(
+                        name: name,
+                        client: client,
+                        adapterKind: config.adapterKind,
+                        transport: config.effectiveTransport,
+                        endpoint: Self.safeEndpoint(config.url)
+                    )
+                )
                 await rebuildTools()
                 let count = mcpTools.filter { $0.definition.name.hasPrefix(McpTool.sanitize(name) + "_") }.count
                 log?("MCP server '\(name)' connected with \(count) tool(s).")
@@ -205,6 +216,50 @@ public actor MCPManager {
 
     /// The bridged tools connected so far.
     public func tools() -> [any AgentTool] { mcpTools }
+
+    /// The bridged tools belonging to one exact server. The server name is
+    /// required so an adapter cannot accidentally route a call to a different
+    /// MCP peer after a catalog refresh.
+    public func tools(server requestedServer: String) -> [any AgentTool] {
+        let prefix = McpTool.sanitize(requestedServer) + "_"
+        return mcpTools.filter { $0.definition.name.hasPrefix(prefix) }
+    }
+
+    public func isConnected(server requestedServer: String) -> Bool {
+        servers.contains { $0.name == requestedServer }
+    }
+
+    /// Return the explicitly declared browser/notebook/remote-search roles.
+    /// Ordinary MCP servers are intentionally absent; their tools remain
+    /// available through the normal MCP catalog.
+    public func externalCapabilityDescriptors() -> [ExternalCapabilityDescriptor] {
+        servers.compactMap { server in
+            guard let kind = server.adapterKind else { return nil }
+            let toolNames = tools(server: server.name).map { $0.definition.name }
+            return ExternalCapabilityDescriptor(
+                id: "mcp:\(server.name):\(kind.rawValue)",
+                displayName: "\(kind.rawValue) via \(server.name)",
+                kind: kind.externalCapabilityKind,
+                transport: .mcp,
+                endpoint: server.endpoint,
+                toolNames: toolNames
+            )
+        }
+    }
+
+    /// Build adapter views over the same connected MCP clients. The views do
+    /// not own the manager or shut down its servers; the run owner remains the
+    /// single lifecycle authority.
+    public func externalCapabilityAdapters() -> [MCPExternalCapabilityAdapter] {
+        servers.compactMap { server in
+            guard let kind = server.adapterKind,
+                  let descriptor = externalCapabilityDescriptors().first(where: {
+                      $0.id == "mcp:\(server.name):\(kind.rawValue)"
+                  })
+            else { return nil }
+            return MCPExternalCapabilityAdapter(manager: self, descriptor: descriptor, server: server.name)
+        }
+    }
 
     /// Inspect resources from the connected servers. A broken or capability-less
     /// server contributes no entries and does not make another server disappear.
@@ -317,7 +372,9 @@ public actor MCPManager {
                         serverName: server.name,
                         info: info,
                         nameOverride: exposedName,
-                        parameters: parameters
+                        parameters: parameters,
+                        adapterKind: server.adapterKind,
+                        transport: server.transport
                     )
                 )
             }
@@ -330,5 +387,25 @@ public actor MCPManager {
         for server in servers { await server.client.shutdown() }
         servers.removeAll()
         mcpTools.removeAll()
+    }
+
+    private static func safeEndpoint(_ rawURL: String?) -> String? {
+        guard let rawURL, let url = URL(string: rawURL),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host
+        else { return nil }
+        var endpoint = "\(scheme)://\(host)"
+        if let port = url.port { endpoint += ":\(port)" }
+        return endpoint
+    }
+}
+
+private extension MCPAdapterKind {
+    var externalCapabilityKind: ExternalCapabilityKind {
+        switch self {
+        case .browser: return .browser
+        case .notebook: return .notebook
+        case .remoteSearch: return .remoteSearch
+        }
     }
 }

@@ -1191,10 +1191,9 @@ public actor ServerRuntime {
                 }
             }
 
-            var metadata: [String: JSONValue] = [
-                "schemaSummary": .string(Self.schemaSummary(tool.definition.parameters.jsonValue)),
-                "model": .string(model),
-            ]
+            var metadata = tool.catalogMetadata
+            metadata["schemaSummary"] = .string(Self.schemaSummary(tool.definition.parameters.jsonValue))
+            metadata["model"] = .string(model)
             if let executionMode = tool.executionMode {
                 metadata["executionMode"] = .string(
                     executionMode == .sequential ? "sequential" : "parallel"

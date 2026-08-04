@@ -32,6 +32,7 @@ struct ServerRuntimeTests {
     private struct CatalogProbeTool: AgentTool {
         let toolName: String
         let source: ToolCatalogSource
+        var metadata: [String: JSONValue] = [:]
 
         var definition: ToolDefinition {
             ToolDefinition(
@@ -42,6 +43,7 @@ struct ServerRuntimeTests {
         }
 
         var catalogSource: ToolCatalogSource { source }
+        var catalogMetadata: [String: JSONValue] { metadata }
 
         func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
             AgentToolResult(output: "ok")
@@ -147,7 +149,11 @@ struct ServerRuntimeTests {
                 [
                     CatalogProbeTool(toolName: "readme", source: .builtIn),
                     CatalogProbeTool(toolName: "blocked", source: .mcp),
-                    CatalogProbeTool(toolName: "task", source: .adapter),
+                    CatalogProbeTool(
+                        toolName: "task",
+                        source: .adapter,
+                        metadata: ["adapterKind": .string("browser")]
+                    ),
                 ]
             }
         ))
@@ -163,6 +169,7 @@ struct ServerRuntimeTests {
         #expect(entries[1].hiddenReason == "Denied by the current permission policy")
         #expect(entries[2].permission == .unavailable)
         #expect(entries[2].hiddenReason == "Available only in plan mode")
+        #expect(entries[2].metadata["adapterKind"] == .string("browser"))
     }
 
     @Test("Resuming a live session returns the same session, not a second harness")

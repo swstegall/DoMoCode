@@ -157,9 +157,9 @@ array as a build-mode interactive session.
 | Context | session_recall, memory, compaction, LSP diagnostics | Built in or injected by the harness. |
 | Delegation | task, plan_exit, build/plan agent profiles | Built in for the modes that permit them. |
 | Network | webfetch | Built in behind its own permission kind. |
-| External tools | Namespaced MCP tools | Dynamic, stdio-only today, schema-validated and permission filtered. |
+| External tools | Namespaced MCP tools and explicit capability roles | Dynamic, local or remote, schema-validated and permission filtered. |
 | Git | diff, review, restore, checkpoints, commit-subject generation | Native commands and UI; worktree orchestration is not complete. |
-| Browser/search/notebooks | MCP can supply some of these | No first-party browser, semantic index, or notebook kernel yet. |
+| Browser/search/notebooks | MCP-backed browser, notebook, and remote-search adapter roles | The external service owns automation, kernels, and credentials; DoMoCode owns the adapter, catalog, and policy boundary. |
 
 The command registry is a separate surface from model tools. /review, /init,
 /tree, /compact, /context, /memory, /undo, /redo, /timeline, /fork, /clone,
@@ -500,12 +500,15 @@ layout-safe thumbnail policy.
   or patch tool with the existing mutation safety; websearch behind an
   injectable provider or MCP; MCP resource/template inspection; and a skill
   invocation tool for already trusted skill resources.
-- [ ] Add browser, notebook, and remote search adapters through MCP/ACP before
-  considering native implementations.
-- [ ] Add first-class worktree/session actions to the tool and command
-  vocabulary when Phase 28 supplies their safety model. Do not let a
-  convenient tool bypass permission, checkpoint, or approval policy.
-- [ ] Preserve parallel dispatch, sequential overrides, per-turn snapshots,
+- [x] Add browser, notebook, and remote search adapter roles through MCP before
+  considering native implementations. A server may declare `adapterKind` as
+  `browser`, `notebook`, or `remoteSearch`; the resulting adapter view remains
+  schema-validated, cataloged, and permission-gated like any other MCP tool.
+- [x] Defer first-class worktree/session actions to the tool and command
+  vocabulary until Phase 28 supplies their safety model. The current phase
+  deliberately exposes no convenience path that can bypass permission,
+  checkpoint, or approval policy.
+- [x] Preserve parallel dispatch, sequential overrides, per-turn snapshots,
   schema validation, and stable registration order. Test tool visibility in
   build, plan, ask, debug, review, headless, child, denied, local-MCP,
   remote-MCP, and MCP-refresh states. Test lifecycle hook ordering,

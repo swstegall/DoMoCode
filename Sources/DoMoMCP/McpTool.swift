@@ -17,20 +17,34 @@ struct McpTool: AgentTool {
     private let client: MCPClient
     private let rawName: String
     private let namespacedName: String
+    private let serverName: String
     private let toolDescription: String
     private let parameters: JSONSchema
+    private let adapterKind: MCPAdapterKind?
+    private let transport: MCPTransport
 
     /// `nameOverride` lets the manager substitute a de-collided name when two servers'
     /// tools namespace to the same string (otherwise the default `namespaced` name is used).
     /// `parameters` is the pre-validated schema (see ``makeParameters``) — the manager
     /// builds it first so it can DROP a tool whose schema won't convert rather than
     /// advertise a misleading parameterless tool.
-    init(client: MCPClient, serverName: String, info: MCPClient.ToolInfo, nameOverride: String? = nil, parameters: JSONSchema) {
+    init(
+        client: MCPClient,
+        serverName: String,
+        info: MCPClient.ToolInfo,
+        nameOverride: String? = nil,
+        parameters: JSONSchema,
+        adapterKind: MCPAdapterKind? = nil,
+        transport: MCPTransport = .stdio
+    ) {
         self.client = client
         self.rawName = info.name
         self.namespacedName = nameOverride ?? McpTool.namespaced(server: serverName, tool: info.name)
+        self.serverName = serverName
         self.toolDescription = info.description
         self.parameters = parameters
+        self.adapterKind = adapterKind
+        self.transport = transport
     }
 
     /// Convert an MCP tool's (untrusted) input schema into a `JSONSchema`. Throws when the
@@ -46,7 +60,18 @@ struct McpTool: AgentTool {
         ToolDefinition(name: namespacedName, description: toolDescription, parameters: parameters)
     }
 
-    var catalogSource: ToolCatalogSource { .mcp }
+    var catalogSource: ToolCatalogSource { adapterKind == nil ? .mcp : .adapter }
+
+    var catalogMetadata: [String: JSONValue] {
+        var metadata: [String: JSONValue] = [
+            "mcpServer": .string(serverName),
+            "mcpTransport": .string(transport.rawValue),
+        ]
+        if let adapterKind {
+            metadata["adapterKind"] = .string(adapterKind.rawValue)
+        }
+        return metadata
+    }
 
     func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
         let result: MCPClient.CallResult
