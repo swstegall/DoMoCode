@@ -340,6 +340,10 @@ struct ServerRuntimeTests {
                 runID: "workflow-run"
             )
             for approval in approvals {
+                if approval.stage.id == "execute" {
+                    let planPath = dirs.cwd.appendingPathComponent(".domocode/plans/standard.md")
+                    try "edited plan from the user".write(to: planPath, atomically: true, encoding: .utf8)
+                }
                 try await runtime.resolveWorkflowApproval(
                     workflowID: approval.workflowID,
                     runID: approval.runID,
@@ -365,7 +369,15 @@ struct ServerRuntimeTests {
         #expect(evidence["sourceSessionID"]?.stringValue == parent.id)
         #expect(evidence["untrustedData"]?.boolValue == true)
         let planPath = dirs.cwd.appendingPathComponent(".domocode/plans/standard.md")
-        #expect(try String(contentsOf: planPath).contains("stage output"))
+        #expect(try String(contentsOf: planPath).contains("edited plan from the user"))
+        let executeID = try #require(run.stage(withID: "execute")?.agentIDs.first)
+        let executeMessages = try await runtime.messages(sessionID: executeID)
+        #expect(executeMessages.contains { message in
+            if case .user(let user) = message {
+                return user.text.contains("edited plan from the user")
+            }
+            return false
+        })
     }
 
     @Test("background results enter the parent queue and can start an idle parent")

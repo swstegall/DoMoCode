@@ -10,6 +10,7 @@ public struct WorkflowStageRequest: Sendable, Hashable {
     public let stage: WorkflowStageDefinition
     public let input: JSONValue
     public let dependencyOutputs: [String: JSONValue]
+    public let dependencyArtifacts: [String: String]
 
     public init(
         workflowID: String,
@@ -17,7 +18,8 @@ public struct WorkflowStageRequest: Sendable, Hashable {
         sessionID: String? = nil,
         stage: WorkflowStageDefinition,
         input: JSONValue,
-        dependencyOutputs: [String: JSONValue]
+        dependencyOutputs: [String: JSONValue],
+        dependencyArtifacts: [String: String] = [:]
     ) {
         self.workflowID = workflowID
         self.runID = runID
@@ -25,6 +27,7 @@ public struct WorkflowStageRequest: Sendable, Hashable {
         self.stage = stage
         self.input = input
         self.dependencyOutputs = dependencyOutputs
+        self.dependencyArtifacts = dependencyArtifacts
     }
 }
 
@@ -411,6 +414,11 @@ public actor WorkflowRunner {
             input: run.input,
             dependencyOutputs: stage.dependencies.reduce(into: [String: JSONValue]()) { result, dependency in
                 if let output = outputs[dependency] { result[dependency] = output }
+            },
+            dependencyArtifacts: stage.dependencies.reduce(into: [String: String]()) { result, dependency in
+                if let artifact = definition.stages.first(where: { $0.id == dependency })?.outputArtifact {
+                    result[dependency] = artifact
+                }
             }
         )
         do {

@@ -41,7 +41,11 @@ struct WorkflowRunnerTests {
         let definition = WorkflowDefinition(
             id: "serial",
             stages: [
-                WorkflowStageDefinition(id: "research", kind: .research),
+                WorkflowStageDefinition(
+                    id: "research",
+                    kind: .research,
+                    outputArtifact: ".domocode/evidence.json"
+                ),
                 WorkflowStageDefinition(id: "plan", kind: .plan, dependencies: ["research"]),
             ]
         )
@@ -58,6 +62,9 @@ struct WorkflowRunnerTests {
             if request.stage.id == "plan" {
                 guard request.dependencyOutputs["research"] == .string("evidence") else {
                     return WorkflowStageResult(output: "missing dependency")
+                }
+                guard request.dependencyArtifacts["research"] == ".domocode/evidence.json" else {
+                    return WorkflowStageResult(output: "missing artifact")
                 }
             }
             return WorkflowStageResult(output: request.stage.id == "research" ? "evidence" : "plan")

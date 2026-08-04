@@ -865,7 +865,7 @@ public actor ServerRuntime {
         let child = await runSubagent(SubagentTaskRequest(
             taskID: taskID,
             parentSessionID: sessionID,
-            prompt: workflowStagePrompt(request),
+            prompt: try workflowStagePrompt(request),
             agent: request.stage.profile,
             mode: workflowStageMode(request.stage),
             model: request.stage.model,
@@ -883,6 +883,11 @@ public actor ServerRuntime {
             ]
             if let model = request.stage.model {
                 metadata["model"] = .string(model)
+            }
+            if !request.dependencyArtifacts.isEmpty {
+                metadata["dependencyArtifacts"] = .object(
+                    request.dependencyArtifacts.mapValues { .string($0) }
+                )
             }
             if let artifact = request.stage.outputArtifact {
                 metadata["outputArtifact"] = .string(artifact)
@@ -956,13 +961,21 @@ public actor ServerRuntime {
         }
     }
 
-    private func workflowStagePrompt(_ request: WorkflowStageRequest) -> String {
+    private func workflowStagePrompt(_ request: WorkflowStageRequest) throws -> String {
         var context: [String: JSONValue] = [:]
         let requested = Set(request.stage.contextInputs.map { $0.lowercased() })
         if requested.isEmpty || requested.contains("prompt") || requested.contains("input") {
             context["prompt"] = request.input
         }
         for dependency in request.stage.dependencies where requested.isEmpty || requested.contains(dependency.lowercased()) {
+            if let artifact = request.dependencyArtifacts[dependency] {
+                let artifactPath = try workflowArtifactPath(artifact)
+                if FileManager.default.fileExists(atPath: artifactPath),
+                   let contents = try? String(contentsOfFile: artifactPath, encoding: .utf8) {
+                    context[dependency] = .string(contents)
+                    continue
+                }
+            }
             if let output = request.dependencyOutputs[dependency] {
                 context[dependency] = output
             }
