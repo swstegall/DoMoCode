@@ -245,6 +245,7 @@ struct LSPContentLengthFramerTests {
             ),
             pool: pool
         )
+        #expect(codeProvider.codeIntelligenceID == "swift-lsp-code")
         let code = try CodeIntelligenceCoordinator(
             rootPath: fixture.root.string,
             provider: codeProvider

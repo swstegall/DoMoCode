@@ -206,7 +206,7 @@ public struct LSPCodeIntelligenceProvider: DoMoCodeIntelligenceProvider {
         self.root = root
         self.configuration = configuration
         self.pool = pool
-        self.codeIntelligenceID = providerID ?? "(configuration.languageID)-lsp-code"
+        self.codeIntelligenceID = providerID ?? "\(configuration.languageID)-lsp-code"
     }
 
     public func perform(_ request: CodeIntelligenceRequest) async throws -> CodeIntelligenceResult {

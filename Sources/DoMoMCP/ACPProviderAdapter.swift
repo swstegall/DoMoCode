@@ -674,7 +674,7 @@ public struct ACPProviderAdapter: DoMoProvider, DoMoAdapterHealthChecking {
                 continuation.finish(throwing: error)
             }
         }
-        AsyncThrowingStream { continuation in
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     let stream = await client.stream(request)
