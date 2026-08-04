@@ -1681,6 +1681,7 @@ public actor ServerRuntime {
         var parentSessionID: String?
         var taskID: String?
         var agent: String?
+        var resumedToolAllowlist: Set<String>?
         if let resume {
             let path = try await resolveResume(resume)
             let resumedID = try await Self.readSessionID(at: path)
@@ -1692,6 +1693,7 @@ public actor ServerRuntime {
             }
             let metadata = try? await Self.loadDelegationMetadata(at: path)
             let latestEvent = metadata?.latestEvent
+            resumedToolAllowlist = latestEvent?.toolAllowlist.map { Set($0) }
             let child = metadata?.header.parentSession != nil
             if child {
                 depth = max(1, latestEvent?.depth ?? 1)
@@ -1715,7 +1717,7 @@ public actor ServerRuntime {
                     derivedPermissions: child,
                     profileRules: profile?.permissionRules ?? [],
                     promptWorkspaceOverride: child ? subagentWorkspace(named: profileName) : nil,
-                    toolAllowlist: latestEvent?.toolAllowlist.map(Set.init)
+                    toolAllowlist: resumedToolAllowlist
                 )
             )
             id = resumedID
@@ -1748,7 +1750,7 @@ public actor ServerRuntime {
             parentSessionID: parentSessionID,
             taskID: taskID,
             agent: agent,
-            toolAllowlist: latestEvent?.toolAllowlist.map(Set.init)
+            toolAllowlist: resumedToolAllowlist
         )
         return SessionRef(id: id, path: path.string)
     }
