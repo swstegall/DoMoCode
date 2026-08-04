@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Sam Stegall. MIT license.
 // SPDX-License-Identifier: MIT
 
+import Foundation
+
 /// The kind of external boundary an adapter owns. Keeping this in the core
 /// contract lets the CLI, server, and diagnostics describe an adapter without
 /// importing its implementation module.
@@ -188,7 +190,8 @@ public struct ProviderProfile: Sendable, Codable, Hashable {
     public var inspectableSummary: String {
         let model = defaultModel ?? "(none)"
         let credential = credential.kind == .none ? "none" : credential.name
-        return "(displayName) [(id)] · (adapterID) · model (model) · credential (credential)"
+        return displayName + " [" + id + "] · " + adapterID
+            + " · model " + model + " · credential " + credential
     }
 }
 
@@ -244,6 +247,96 @@ public struct ProviderCircuitSnapshot: Sendable, Codable, Hashable {
     }
 }
 
+public enum ProviderRouteValidationError: Error, Sendable, Equatable {
+    case emptyRoute
+    case duplicateProfile(String)
+    case missingProfile(String)
+}
+
+public enum ProviderRouteValidator {
+    public static func validate(
+        _ route: ProviderRoute,
+        profiles: [String: ProviderProfile]
+    ) throws(ProviderRouteValidationError) {
+        guard !route.profileIDs.isEmpty else { throw .emptyRoute }
+        var seen: Set<String> = []
+        for profileID in route.profileIDs {
+            guard seen.insert(profileID).inserted else { throw .duplicateProfile(profileID) }
+            guard profiles[profileID] != nil else { throw .missingProfile(profileID) }
+        }
+    }
+}
+
+/// A deterministic circuit-breaker state machine. Time and persistence belong
+/// to the caller; after its cooldown it calls `beginProbe` to move an open
+/// circuit into half-open. This keeps tests and replay independent of wall-clock
+/// time and prevents a provider switch from silently replaying a committed turn.
+public actor ProviderCircuitBreaker {
+    private let failureThreshold: Int
+    private var states: [String: ProviderCircuitSnapshot] = [:]
+
+    public init(failureThreshold: Int = 3) {
+        self.failureThreshold = max(1, failureThreshold)
+    }
+
+    public func snapshot(for profileID: String) -> ProviderCircuitSnapshot {
+        states[profileID] ?? ProviderCircuitSnapshot(profileID: profileID)
+    }
+
+    public func canAttempt(profileID: String) -> Bool {
+        snapshot(for: profileID).state != .open
+    }
+
+    /// Returns true when the caller is allowed to issue a half-open probe. An
+    /// already half-open circuit rejects a second concurrent probe.
+    public func beginProbe(profileID: String) -> Bool {
+        var state = snapshot(for: profileID)
+        switch state.state {
+        case .closed:
+            return true
+        case .open:
+            state.state = .halfOpen
+            states[profileID] = state
+            return true
+        case .halfOpen:
+            return false
+        }
+    }
+
+    @discardableResult
+    public func recordSuccess(profileID: String) -> ProviderCircuitSnapshot {
+        let state = ProviderCircuitSnapshot(profileID: profileID)
+        states[profileID] = state
+        return state
+    }
+
+    @discardableResult
+    public func recordFailure(
+        profileID: String,
+        reason: String,
+        transient: Bool
+    ) -> ProviderCircuitSnapshot {
+        var state = snapshot(for: profileID)
+        state.lastFailure = reason
+        guard transient else {
+            states[profileID] = state
+            return state
+        }
+        state.consecutiveFailures = min(Int.max, state.consecutiveFailures + 1)
+        if state.consecutiveFailures >= failureThreshold {
+            state.state = .open
+        } else {
+            state.state = .closed
+        }
+        states[profileID] = state
+        return state
+    }
+
+    public func reset(profileID: String) {
+        states[profileID] = ProviderCircuitSnapshot(profileID: profileID)
+    }
+}
+
 public enum ProviderFallbackDecision: Sendable, Hashable {
     case use(profileID: String)
     case requireApproval(profileID: String, reason: String)
@@ -262,7 +355,7 @@ public enum ProviderFallbackRouter {
         approved: Bool
     ) -> ProviderFallbackDecision {
         guard let currentIndex = route.profileIDs.firstIndex(of: currentProfileID) else {
-            return .stop(reason: "Provider route does not contain (currentProfileID)")
+            return .stop(reason: "Provider route does not contain " + currentProfileID)
         }
         let nextIndex = route.profileIDs.index(after: currentIndex)
         guard route.profileIDs.indices.contains(nextIndex) else {

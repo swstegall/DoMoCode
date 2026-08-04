@@ -69,6 +69,43 @@ struct ProviderProfilesTests {
             try await registry.register(TestAdapter(id: "first"))
         }
     }
+
+    @Test("circuit breaker opens after transient failures and permits one probe")
+    func circuitBreaker() async {
+        let breaker = ProviderCircuitBreaker(failureThreshold: 2)
+        _ = await breaker.recordFailure(profileID: "gateway", reason: "503", transient: true)
+        #expect(await breaker.canAttempt(profileID: "gateway"))
+        let open = await breaker.recordFailure(profileID: "gateway", reason: "503", transient: true)
+        #expect(open.state == .open)
+        #expect(await breaker.canAttempt(profileID: "gateway") == false)
+        #expect(await breaker.beginProbe(profileID: "gateway"))
+        #expect(await breaker.beginProbe(profileID: "gateway") == false)
+        _ = await breaker.recordSuccess(profileID: "gateway")
+        #expect(await breaker.snapshot(for: "gateway").state == .closed)
+    }
+
+    @Test("route validation rejects duplicates and missing profiles")
+    func routeValidation() {
+        let profile = ProviderProfile(
+            id: "one",
+            displayName: "One",
+            adapterID: "litellm",
+            endpoint: "http://localhost"
+        )
+        let profiles = ["one": profile]
+        #expect(throws: ProviderRouteValidationError.self) {
+            try ProviderRouteValidator.validate(
+                ProviderRoute(id: "bad", displayName: "Bad", profileIDs: ["one", "one"]),
+                profiles: profiles
+            )
+        }
+        #expect(throws: ProviderRouteValidationError.self) {
+            try ProviderRouteValidator.validate(
+                ProviderRoute(id: "bad", displayName: "Bad", profileIDs: ["missing"]),
+                profiles: profiles
+            )
+        }
+    }
 }
 
 private struct TestAdapter: DoMoAdapter {
