@@ -77,6 +77,9 @@ final class WorkflowWorkspaceController: @MainActor Focusable {
     var onChange: (() -> Void)?
     /// Called when Escape is pressed from the top-level phase list.
     var onExit: (() -> Void)?
+    /// Called by the dedicated content pane's approval shortcuts.
+    var onApprove: (() -> Void)?
+    var onDeny: (() -> Void)?
 
     private let keybindings = Keybindings()
 
@@ -138,7 +141,11 @@ final class WorkflowWorkspaceController: @MainActor Focusable {
     }
 
     func handleInput(_ data: [UInt8]) {
-        if keybindings.matches(data, .selectUp) || data == [0x6b] {
+        if level == .agentContent, data == [0x61] {
+            onApprove?()
+        } else if level == .agentContent, data == [0x64] {
+            onDeny?()
+        } else if keybindings.matches(data, .selectUp) || data == [0x6b] {
             moveSelection(by: -1)
         } else if keybindings.matches(data, .selectDown) || data == [0x6a] {
             moveSelection(by: 1)
@@ -258,7 +265,7 @@ private final class WorkflowNavigationPane: Component {
         selected: Bool,
         width: Int
     ) -> String {
-        let value = "(marker) (WorkflowStatusGlyph.value(for: status)) (sanitizeUntrustedText(title))"
+        let value = "\(marker) \(WorkflowStatusGlyph.value(for: status)) \(sanitizeUntrustedText(title))"
         let clipped = truncateToWidth(value, width, ellipsis: "", pad: true)
         return selected && controller.focused ? inverse(clipped) : clipped
     }
@@ -304,7 +311,11 @@ private final class WorkflowContentPane: Component {
                 ellipsis: ""
             ))
             lines.append(truncateToWidth(
-                dim("Phase: " + sanitizeUntrustedText(phase?.title ?? "unknown") + " · Esc back"),
+                dim(
+                    "Phase: " + sanitizeUntrustedText(phase?.title ?? "unknown")
+                        + " · Esc back"
+                        + (phase?.status == .waitingForApproval ? " · a approve · d deny" : "")
+                ),
                 width,
                 ellipsis: ""
             ))
@@ -327,7 +338,7 @@ private final class WorkflowContentPane: Component {
         width: Int
     ) {
         lines.append(truncateToWidth(
-            "status: (WorkflowStatusGlyph.value(for: phase.status)) (phase.status.rawValue)",
+            "status: \(WorkflowStatusGlyph.value(for: phase.status)) \(phase.status.rawValue)",
             width,
             ellipsis: ""
         ))

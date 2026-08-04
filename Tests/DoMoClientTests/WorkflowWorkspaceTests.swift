@@ -13,6 +13,8 @@ struct WorkflowWorkspaceTests {
     private static let enter: [UInt8] = [0x0d]
     private static let down: [UInt8] = [0x1b, 0x5b, 0x42]
     private static let escape: [UInt8] = [0x1b]
+    private static let approve: [UInt8] = [0x61]
+    private static let deny: [UInt8] = [0x64]
 
     private func workspace() -> WorkflowWorkspaceController {
         WorkflowWorkspaceController(phases: [
@@ -80,5 +82,26 @@ struct WorkflowWorkspaceTests {
         #expect(frame.contains("Workflow workspace"))
         #expect(frame.contains("│"))
         #expect(view.render(width: 40).allSatisfy { visibleWidth($0) <= 40 })
+    }
+
+    @Test("Approval shortcuts are available only from the selected agent content")
+    func approvalShortcuts() {
+        let view = workspace()
+        var approvals = 0
+        var denials = 0
+        view.onApprove = { approvals += 1 }
+        view.onDeny = { denials += 1 }
+
+        view.handleInput(Self.approve)
+        view.handleInput(Self.deny)
+        #expect(approvals == 0)
+        #expect(denials == 0)
+
+        view.handleInput(Self.enter)
+        view.handleInput(Self.enter)
+        view.handleInput(Self.approve)
+        view.handleInput(Self.deny)
+        #expect(approvals == 1)
+        #expect(denials == 1)
     }
 }

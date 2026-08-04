@@ -222,6 +222,7 @@ public actor WorkflowRunner {
 
             for stage in ready {
                 _ = run.updateStage(stage.id, status: .ready, timestamp: now())
+                setProgress(stage.id, "Queued for execution…", run: &run)
             }
             try persist(&run)
 
@@ -232,6 +233,7 @@ public actor WorkflowRunner {
                 for stage in ready {
                     if stage.approvalBoundary != .none {
                         _ = run.updateStage(stage.id, status: .waitingForApproval, timestamp: now())
+                        setProgress(stage.id, "Waiting for approval…", run: &run)
                         try persist(&run)
                         let decision = await approvalDecision(for: stage, runID: run.id)
                         if let failure = approvalFailure(decision, stageID: stage.id) {
@@ -239,12 +241,14 @@ public actor WorkflowRunner {
                             break
                         }
                         _ = run.updateStage(stage.id, status: .ready, timestamp: now())
+                        setProgress(stage.id, "Approval received; starting…", run: &run)
                         try persist(&run)
                     }
                     // A serial wave can contain several independent stages, so
                     // only expose the stage that has actually entered the
                     // executor as running. The remaining siblings stay ready.
                     _ = run.updateStage(stage.id, status: .running, timestamp: now())
+                    setProgress(stage.id, "Running \(stage.displayName)…", run: &run)
                     try persist(&run)
                     serial.append(await execute(stage: stage, run: run, outputs: outputs))
                     if serial.last?.failure != nil { break }
@@ -257,6 +261,7 @@ public actor WorkflowRunner {
                 var blocked: StageOutcome?
                 for stage in ready where stage.approvalBoundary != .none {
                     _ = run.updateStage(stage.id, status: .waitingForApproval, timestamp: now())
+                    setProgress(stage.id, "Waiting for approval…", run: &run)
                     try persist(&run)
                     let decision = await approvalDecision(for: stage, runID: run.id)
                     if let failure = approvalFailure(decision, stageID: stage.id) {
@@ -264,6 +269,7 @@ public actor WorkflowRunner {
                         break
                     }
                     _ = run.updateStage(stage.id, status: .ready, timestamp: now())
+                    setProgress(stage.id, "Approval received; starting…", run: &run)
                     try persist(&run)
                 }
                 if let blocked {
@@ -272,6 +278,7 @@ public actor WorkflowRunner {
                     // All members of a parallel wave enter the executor together.
                     for stage in ready {
                         _ = run.updateStage(stage.id, status: .running, timestamp: now())
+                        setProgress(stage.id, "Running \(stage.displayName)…", run: &run)
                     }
                     try persist(&run)
                     outcomes = await executeParallel(stages: ready, run: run, outputs: outputs)
@@ -478,5 +485,14 @@ public actor WorkflowRunner {
     private func persist(_ run: inout WorkflowRunRecord) throws {
         currentRun = run
         try store?.append(run: run)
+    }
+
+    private func setProgress(
+        _ stageID: String,
+        _ message: String,
+        run: inout WorkflowRunRecord
+    ) {
+        guard let index = run.stages.firstIndex(where: { $0.stageID == stageID }) else { return }
+        run.stages[index].metadata["progress"] = .string(message)
     }
 }

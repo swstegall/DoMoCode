@@ -56,6 +56,7 @@ public final class ClientApp {
     private var workflowWorkspace: WorkflowWorkspaceController?
     private var workflowRefreshTask: Task<Void, Never>?
     private var workflowRunID: String?
+    private var workflowApprovals: [WorkflowApprovalRequest] = []
     /// Command metadata is fetched from the runtime at bootstrap. The client
     /// uses local actions immediately and forwards prompt commands unchanged so
     /// the server remains the authority for template expansion.
@@ -2951,8 +2952,11 @@ public final class ClientApp {
         let workspace = WorkflowWorkspaceController(phases: Self.standardWorkflowPhases)
         workspace.onChange = { [weak self] in self?.surface?.requestRender() }
         workspace.onExit = { [weak self] in self?.closeWorkflow() }
+        workspace.onApprove = { [weak self] in self?.resolveSelectedWorkflowApproval(decision: "approved") }
+        workspace.onDeny = { [weak self] in self?.resolveSelectedWorkflowApproval(decision: "denied") }
         if let phaseID { workspace.selectPhase(id: phaseID) }
         workflowRunID = nil
+        workflowApprovals = []
         workflowWorkspace = workspace
         focus.register(workspace)
         focus.setCurrent(workspace)
@@ -2966,6 +2970,7 @@ public final class ClientApp {
         workflowRefreshTask?.cancel()
         workflowRefreshTask = nil
         workflowRunID = nil
+        workflowApprovals = []
         focus.unregister(workspace)
         focus.setCurrent(promptInput)
         surface?.requestFullRedraw()
@@ -2993,7 +2998,21 @@ public final class ClientApp {
                         let selectedRun = self.workflowRunID.flatMap { runID in
                             runs.first(where: { $0.id == runID })
                         } ?? latest
-                        workspace.setPhases(Self.workflowPhases(definition: definition, run: selectedRun))
+                        let approvals: [WorkflowApprovalRequest]
+                        if let selectedRun {
+                            approvals = (try? await self.client.workflowApprovals(
+                                workflowID: definition.id,
+                                runID: selectedRun.id
+                            )) ?? []
+                        } else {
+                            approvals = []
+                        }
+                        self.workflowApprovals = approvals
+                        workspace.setPhases(Self.workflowPhases(
+                            definition: definition,
+                            run: selectedRun,
+                            approvals: approvals
+                        ))
                         if let preferredPhaseID { workspace.selectPhase(id: preferredPhaseID) }
                         self.surface?.requestRender()
                     }
@@ -3012,6 +3031,34 @@ public final class ClientApp {
             }
         }
         workflowRefreshTask = task
+        actionTasks.append(task)
+    }
+
+    private func resolveSelectedWorkflowApproval(decision: String) {
+        guard let workspace = workflowWorkspace,
+              let runID = workflowRunID,
+              let phaseID = workspace.selectedPhase?.id,
+              let approval = workflowApprovals.first(where: { $0.stage.id == phaseID })
+        else {
+            post(notice: "no pending approval for the selected stage")
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.resolveWorkflowApproval(
+                    workflowID: approval.workflowID,
+                    runID: runID,
+                    stageID: approval.stage.id,
+                    decision: decision,
+                    reason: decision == "denied" ? "Denied from the workflow workspace." : nil
+                )
+                self.workflowApprovals.removeAll { $0.stage.id == approval.stage.id }
+                self.surface?.requestRender()
+            } catch {
+                self.postError("Could not resolve workflow approval", error)
+            }
+        }
         actionTasks.append(task)
     }
 
@@ -3069,7 +3116,8 @@ public final class ClientApp {
 
     private static func workflowPhases(
         definition: WorkflowDefinition,
-        run: WorkflowRunRecord?
+        run: WorkflowRunRecord?,
+        approvals: [WorkflowApprovalRequest] = []
     ) -> [WorkflowWorkspacePhase] {
         definition.stages.map { stage in
             let stageRun = run?.stage(withID: stage.id)
@@ -3093,6 +3141,9 @@ public final class ClientApp {
             if !stage.dependencies.isEmpty {
                 summary += " · after: " + stage.dependencies.joined(separator: ", ")
             }
+            if approvals.contains(where: { $0.stage.id == stage.id }) {
+                summary += " · approval required"
+            }
             return WorkflowWorkspacePhase(
                 id: stage.id,
                 title: stage.displayName,
@@ -3104,7 +3155,9 @@ public final class ClientApp {
     }
 
     private static func workflowOutputText(_ stage: WorkflowStageRunRecord) -> String {
-        guard stage.output != .null else { return "" }
+        guard stage.output != .null else {
+            return stage.metadata["progress"]?.stringValue ?? ""
+        }
         if let string = stage.output.stringValue { return string }
         guard let data = try? JSONEncoder().encode(stage.output) else { return "" }
         return String(data: data, encoding: .utf8) ?? ""

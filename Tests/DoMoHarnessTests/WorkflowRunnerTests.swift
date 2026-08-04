@@ -156,6 +156,32 @@ struct WorkflowRunnerTests {
         #expect(await approvals.values == ["execute"])
     }
 
+    @Test("stage progress is persisted before execution and completion")
+    func progressMetadata() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("domo-runner-progress-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try WorkflowStore.create(directory: FilePath(root.path))
+        let definition = WorkflowDefinition(
+            id: "progress",
+            stages: [WorkflowStageDefinition(id: "research", kind: .research)]
+        )
+        let runner = WorkflowRunner(
+            definition: definition,
+            store: store,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { _ in
+            WorkflowStageResult(output: "evidence")
+        }
+
+        let run = try await runner.run(runID: "progress-run")
+        #expect(run.status == .succeeded)
+        #expect(run.stage(withID: "research")?.metadata["progress"] == .string("Running Research…"))
+        let snapshots = try store.records().compactMap { $0.run }
+        #expect(snapshots.contains { $0.stage(withID: "research")?.metadata["progress"] == .string("Queued for execution…") })
+        #expect(snapshots.contains { $0.stage(withID: "research")?.metadata["progress"] == .string("Running Research…") })
+    }
+
     @Test("missing approval handlers fail closed")
     func missingApprovalHandler() async throws {
         let definition = WorkflowDefinition(
