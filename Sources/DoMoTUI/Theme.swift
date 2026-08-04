@@ -6,7 +6,7 @@ import Foundation
 /// A terminal colour that can be expressed without assuming true-colour
 /// support. `inherit` intentionally emits no SGR sequence: the terminal then
 /// keeps the colour supplied by the component underneath it.
-public enum ThemeColor: Sendable, Hashable, Codable {
+public nonisolated enum ThemeColor: Sendable, Hashable, Codable {
     case rgb(red: UInt8, green: UInt8, blue: UInt8)
     case ansiIndex(UInt8)
     case inherit
@@ -129,7 +129,7 @@ public enum ThemeColor: Sendable, Hashable, Codable {
 /// keeps `background` as ``ThemeColor/inherit`` is making an explicit choice to
 /// preserve the terminal's background rather than relying on an accidental blank
 /// cell in the renderer.
-public struct ThemePalette: Sendable, Hashable, Codable {
+public nonisolated struct ThemePalette: Sendable, Hashable, Codable {
     public var foreground: ThemeColor
     public var accent: ThemeColor
     public var muted: ThemeColor
@@ -221,7 +221,7 @@ public struct ThemePalette: Sendable, Hashable, Codable {
     )
 }
 
-public enum ThemeAppearance: String, CaseIterable, Sendable, Hashable, Codable {
+public nonisolated enum ThemeAppearance: String, CaseIterable, Sendable, Hashable, Codable {
     case dark
     case light
     case gruvboxDark = "gruvbox-dark"
@@ -249,7 +249,7 @@ public enum ThemeAppearance: String, CaseIterable, Sendable, Hashable, Codable {
 }
 
 /// A complete theme with independent dark and light palettes.
-public struct Theme: Sendable, Hashable, Codable {
+public nonisolated struct Theme: Sendable, Hashable, Codable {
     public var dark: ThemePalette
     public var light: ThemePalette
 
