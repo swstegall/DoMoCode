@@ -1019,6 +1019,7 @@ public struct ServerClient: Sendable {
         let idle = streamIdleTimeout
         let clientID = clientID
         let clientOwner = clientOwner
+        let client = self
         let path = "/session/\(sessionID)/events"
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -1036,6 +1037,12 @@ public struct ServerClient: Sendable {
                 let readerTask = Task {
                     defer { completionContinuation.yield(()) }
                     do {
+                        // Register before opening the event stream. Older
+                        // servers simply answer 404, which is intentionally
+                        // ignored so the client remains backward compatible;
+                        // runtimes with the ledger now have an authority owner
+                        // before the first prompt arrives.
+                        _ = try? await client.attachClient(sessionID: sessionID)
                         var request = HTTPClientRequest(url: baseURL + path)
                         request.method = .GET
                         request.headers.add(name: "authorization", value: "Bearer \(token)")

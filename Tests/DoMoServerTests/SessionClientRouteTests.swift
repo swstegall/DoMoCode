@@ -138,6 +138,17 @@ struct SessionClientRouteTests {
         #expect(authority.status == 200)
         #expect(try JSONDecoder().decode(SessionClientAttachment.self, from: authority.body).clientID == "client-b")
 
+        let observerWrite = try await send(
+            http,
+            port: port,
+            method: .post,
+            path: "/session/\(session.id)/prompt",
+            body: Data(#"{"prompt":"observer must not write"}"#.utf8),
+            clientID: "client-a",
+            owner: "owner-a"
+        )
+        #expect(observerWrite.status == 403)
+
         let cursor = try await send(
             http,
             port: port,
@@ -186,11 +197,19 @@ struct SessionClientRouteTests {
         port: Int,
         method: Method,
         path: String,
-        body: Data? = nil
+        body: Data? = nil,
+        clientID: String? = nil,
+        owner: String? = nil
     ) async throws -> Reply {
         var request = HTTPClientRequest(url: "http://127.0.0.1:\(port)\(path)")
         request.method = method == .get ? .GET : .POST
         request.headers.add(name: "authorization", value: "Bearer \(Self.token)")
+        if let clientID {
+            request.headers.add(name: "x-domocode-client-id", value: clientID)
+        }
+        if let owner {
+            request.headers.add(name: "x-domocode-client-owner", value: owner)
+        }
         if let body {
             request.headers.add(name: "content-type", value: "application/json")
             request.body = .bytes(Array(body))

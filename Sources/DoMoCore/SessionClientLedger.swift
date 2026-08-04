@@ -234,6 +234,12 @@ public actor SessionClientManager {
             // A stale durable role can never displace a live authority.
             attachment.role = .observer
         }
+        if let existing,
+           existing.active == attachment.active,
+           existing.role == attachment.role,
+           existing.eventCursor == attachment.eventCursor {
+            return existing
+        }
         let kind: SessionClientEventKind
         if existing == nil {
             kind = attachment.role == .authority ? .authorityClaimed : .attached

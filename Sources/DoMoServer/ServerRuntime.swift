@@ -874,6 +874,30 @@ public actor ServerRuntime {
         }
     }
 
+    /// Enforce the current session authority for a mutating client route. The
+    /// check is a no-op for embedded runtimes that did not opt into the ledger,
+    /// preserving the legacy direct API used by tests and in-process callers.
+    public func authorizeSessionClient(
+        sessionID: String,
+        clientID: String?,
+        owner: String?
+    ) async throws {
+        guard sessions[sessionID] != nil else { throw ServerRuntimeError.sessionNotFound }
+        guard let manager = config.sessionClients else { return }
+        guard let clientID, let owner else {
+            throw ServerRuntimeError.sessionClientAuthorityRequired
+        }
+        do {
+            _ = try await manager.requireAuthority(
+                sessionID: sessionID,
+                clientID: clientID,
+                owner: owner
+            )
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
     // MARK: Session handoff
 
     /// List durable handoffs, optionally scoped to their source session. This

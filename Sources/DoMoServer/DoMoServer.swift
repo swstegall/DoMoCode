@@ -801,6 +801,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/diff/revert") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(DiffRevertBody.self, request)
                 try await self.runtime.restoreDiffFile(sessionID: id, path: body.path, base: body.base)
                 return Response(status: .ok)
@@ -817,9 +818,10 @@ public struct DoMoServer: Sendable {
 
         // Force one checkpoint even when automatic compaction is disabled. The
         // runtime rejects this with 409 while a turn owns the session.
-        router.post("/session/:id/compact") { _, context in
+        router.post("/session/:id/compact") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 return try Self.json(try await self.runtime.compact(sessionID: id), status: .ok)
             }
         }
@@ -853,16 +855,18 @@ public struct DoMoServer: Sendable {
             }
         }
 
-        router.post("/session/:id/undo") { _, context in
+        router.post("/session/:id/undo") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 return try Self.json(try await self.runtime.undo(sessionID: id), status: .ok)
             }
         }
 
-        router.post("/session/:id/redo") { _, context in
+        router.post("/session/:id/redo") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 return try Self.json(try await self.runtime.redo(sessionID: id), status: .ok)
             }
         }
@@ -870,6 +874,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/model") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(ModelBody.self, request)
                 try await self.runtime.changeModel(sessionID: id, modelID: body.modelID)
                 return Response(status: .ok)
@@ -879,6 +884,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/mode") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(ModeBody.self, request)
                 guard let mode = AgentMode(rawValue: body.mode.lowercased()) else {
                     throw HTTPError(.badRequest)
@@ -891,15 +897,17 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/rename") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(RenameBody.self, request)
                 try await self.runtime.renameSession(sessionID: id, name: body.name)
                 return Response(status: .ok)
             }
         }
 
-        router.post("/session/:id/title") { _, context in
+        router.post("/session/:id/title") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let title = try await self.runtime.autoTitle(sessionID: id)
                 return try Self.json(SessionTitleResult(title: title), status: .ok)
             }
@@ -908,6 +916,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/label") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(LabelBody.self, request)
                 try await self.runtime.label(sessionID: id, targetID: body.targetID, label: body.label)
                 return Response(status: .ok)
@@ -917,6 +926,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/leaf") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(LeafBody.self, request)
                 try await self.runtime.moveLeaf(sessionID: id, targetID: body.targetID)
                 return Response(status: .ok)
@@ -926,6 +936,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/prompt") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 // The ONLY route with the large cap: a prompt carries base64 image
                 // attachments, and the 4 MiB default 413s anything over ~3 MiB raw
                 // — a dropped screenshot, silently refused.
@@ -942,6 +953,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/steer") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(
                     PromptBody.self, request, upTo: Self.maximumPromptBodyBytes
                 )
@@ -950,9 +962,10 @@ public struct DoMoServer: Sendable {
             }
         }
 
-        router.post("/session/:id/abort") { _, context in
+        router.post("/session/:id/abort") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let aborted = try await self.runtime.abort(sessionID: id)
                 return try Self.json(AbortResult(aborted: aborted), status: .ok)
             }
@@ -962,6 +975,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/permission") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(PermissionReplyBody.self, request)
                 let reply: PermissionReply
                 switch body.reply {
@@ -989,6 +1003,7 @@ public struct DoMoServer: Sendable {
         router.post("/session/:id/question") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let body = try await Self.requiredBody(QuestionReplyBody.self, request)
                 try await self.runtime.resolveQuestion(
                     sessionID: id,
@@ -1027,24 +1042,27 @@ public struct DoMoServer: Sendable {
 
         // The escape hatch for a run that can never settle. Destructive by design:
         // see `ForceClearResult`.
-        router.post("/session/:id/force-clear") { _, context in
+        router.post("/session/:id/force-clear") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 let cleared = try await self.runtime.forceClearRun(sessionID: id)
                 return try Self.json(ForceClearResult(cleared: cleared), status: .ok)
             }
         }
 
-        router.post("/session/:id/fork") { _, context in
+        router.post("/session/:id/fork") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 return try Self.json(try await self.runtime.fork(sessionID: id), status: .created)
             }
         }
 
-        router.post("/session/:id/clone") { _, context in
+        router.post("/session/:id/clone") { request, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
                 return try Self.json(try await self.runtime.clone(sessionID: id), status: .created)
             }
         }
@@ -1179,6 +1197,27 @@ public struct DoMoServer: Sendable {
                 throw HTTPError(.badRequest)
             }
         }
+    }
+
+    /// The bearer token authenticates the process; these headers identify the
+    /// particular mirror that is allowed to mutate a session. They are optional
+    /// when the runtime has no session-client ledger, preserving older clients.
+    private static func clientIdentity(_ request: Request) -> (clientID: String, owner: String)? {
+        guard let clientID = request.headers[HTTPField.Name("x-domocode-client-id")!],
+              let owner = request.headers[HTTPField.Name("x-domocode-client-owner")!],
+              !clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return (clientID, owner)
+    }
+
+    private func authorizeSessionClient(_ request: Request, sessionID: String) async throws {
+        let identity = Self.clientIdentity(request)
+        try await runtime.authorizeSessionClient(
+            sessionID: sessionID,
+            clientID: identity?.clientID,
+            owner: identity?.owner
+        )
     }
 
     private static func json<T: Encodable>(_ value: T, status: HTTPResponse.Status = .ok) throws -> Response {
