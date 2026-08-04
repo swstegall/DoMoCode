@@ -29,6 +29,7 @@ public enum EnvName {
     public static let retryBaseMS = "DOMOCODE_RETRY_BASE_MS"
     public static let retryMaxMS = "DOMOCODE_RETRY_MAX_MS"
     public static let retryBudgetMS = "DOMOCODE_RETRY_BUDGET_MS"
+    public static let retryWallClockMS = "DOMOCODE_RETRY_WALL_CLOCK_MS"
     public static let configDir = "DOMOCODE_CONFIG_DIR"
     public static let sessionDir = "DOMOCODE_SESSION_DIR"
     public static let logLevel = "DOMOCODE_LOG_LEVEL"
@@ -106,6 +107,7 @@ public struct Settings: Sendable, Hashable, Codable {
     public var retryBaseMS: Int?
     public var retryMaxMS: Int?
     public var retryBudgetMS: Int?
+    public var retryWallClockMS: Int?
     public var logLevel: String?
     public var sessionDir: String?
 
@@ -166,7 +168,8 @@ public struct Settings: Sendable, Hashable, Codable {
         compaction: CompactionOverrides? = nil,
         contextWindow: Int? = nil,
         agentModes: [String: Ruleset]? = nil,
-        autoFormat: AutoFormatSettings? = nil
+        autoFormat: AutoFormatSettings? = nil,
+        retryWallClockMS: Int? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -189,6 +192,7 @@ public struct Settings: Sendable, Hashable, Codable {
         self.contextWindow = contextWindow
         self.agentModes = agentModes
         self.autoFormat = autoFormat
+        self.retryWallClockMS = retryWallClockMS
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -204,6 +208,7 @@ public struct Settings: Sendable, Hashable, Codable {
         case retryBaseMS = "retryBaseMs"
         case retryMaxMS = "retryMaxMs"
         case retryBudgetMS = "retryBudgetMs"
+        case retryWallClockMS = "retryWallClockMs"
         case logLevel
         case sessionDir
         case apiKeyEnv
@@ -786,6 +791,9 @@ public struct ResolvedConfiguration: Sendable {
     /// Total time one request may spend asleep between retries. `nil` disables
     /// the budget; `DOMOCODE_RETRY_BUDGET_MS=0` is how an operator spells that.
     public var retryDelayBudget: Duration?
+    /// Wall-clock budget across the complete request and all retries. nil
+    /// disables the bound; zero in configuration resolves to nil.
+    public var retryWallClockBudget: Duration?
     public var configDirectory: FilePath
     public var sessionDirectory: FilePath
     public var logLevel: Logger.Level
@@ -856,6 +864,7 @@ public struct ResolvedConfiguration: Sendable {
         retryBaseDelay: Duration = ResolvedConfiguration.defaultRetryBaseDelay,
         retryMaxDelay: Duration = ResolvedConfiguration.defaultRetryMaxDelay,
         retryDelayBudget: Duration? = ResolvedConfiguration.defaultRetryDelayBudget,
+        retryWallClockBudget: Duration? = ResolvedConfiguration.defaultRetryWallClockBudget,
         configDirectory: FilePath,
         sessionDirectory: FilePath,
         logLevel: Logger.Level,
@@ -882,6 +891,7 @@ public struct ResolvedConfiguration: Sendable {
         self.retryBaseDelay = retryBaseDelay
         self.retryMaxDelay = retryMaxDelay
         self.retryDelayBudget = retryDelayBudget
+        self.retryWallClockBudget = retryWallClockBudget
         self.configDirectory = configDirectory
         self.sessionDirectory = sessionDirectory
         self.logLevel = logLevel
@@ -979,6 +989,7 @@ public struct ResolvedConfiguration: Sendable {
     public static let defaultRetryBaseDelay = Duration.seconds(1)
     public static let defaultRetryMaxDelay = Duration.seconds(60)
     public static let defaultRetryDelayBudget: Duration? = .seconds(300)
+    public static let defaultRetryWallClockBudget: Duration? = .seconds(600)
     public static let defaultLogLevel = Logger.Level.warning
 
     // There is deliberately no `defaultContextWindow` here. One existed, equal
@@ -1001,6 +1012,7 @@ public struct ResolvedConfiguration: Sendable {
             baseRetryDelay: retryBaseDelay,
             maxRetryDelay: retryMaxDelay,
             retryDelayBudget: retryDelayBudget,
+            retryWallClockBudget: retryWallClockBudget,
             timeout: timeout,
             streamIdleTimeout: streamTimeout
         )
@@ -1102,6 +1114,14 @@ extension ResolvedConfiguration {
             default: defaultRetryDelayBudget ?? .zero
         )
         let retryDelayBudget: Duration? = retryBudget == .zero ? nil : retryBudget
+        let retryWallClockRaw = try durationMS(
+            environment[EnvName.retryWallClockMS],
+            project: project?.retryWallClockMS, user: user?.retryWallClockMS,
+            envName: EnvName.retryWallClockMS, key: "retryWallClockMs",
+            default: defaultRetryWallClockBudget ?? .zero
+        )
+        let retryWallClockBudget: Duration? =
+            retryWallClockRaw == .zero ? nil : retryWallClockRaw
 
         // An unparseable level is reported and then skipped, rather than being
         // fatal (nobody should lose a session over a typo in a log knob) and
@@ -1196,6 +1216,7 @@ extension ResolvedConfiguration {
             retryBaseDelay: retryBaseDelay,
             retryMaxDelay: retryMaxDelay,
             retryDelayBudget: retryDelayBudget,
+            retryWallClockBudget: retryWallClockBudget,
             configDirectory: configDirectory,
             sessionDirectory: sessionDirectory,
             logLevel: logLevel,

@@ -30,12 +30,14 @@ struct RetryConfigurationTests {
         #expect(ResolvedConfiguration.defaultRetryBaseDelay == .seconds(1))
         #expect(ResolvedConfiguration.defaultRetryMaxDelay == .seconds(60))
         #expect(ResolvedConfiguration.defaultRetryDelayBudget == .seconds(300))
+        #expect(ResolvedConfiguration.defaultRetryWallClockBudget == .seconds(600))
 
         let config = try resolve()
         #expect(config.maxRetries == 10)
         #expect(config.retryBaseDelay == .seconds(1))
         #expect(config.retryMaxDelay == .seconds(60))
         #expect(config.retryDelayBudget == .seconds(300))
+        #expect(config.retryWallClockBudget == .seconds(600))
 
         // The wire client is what actually retries; a default that stops at the
         // resolver is a default nobody gets.
@@ -45,6 +47,7 @@ struct RetryConfigurationTests {
         #expect(client.baseRetryDelay == .seconds(1))
         #expect(client.maxRetryDelay == .seconds(60))
         #expect(client.retryDelayBudget == .seconds(300))
+        #expect(client.retryWallClockBudget == .seconds(600))
         #expect(client.maxPreConnectRetries == 1)
     }
 
@@ -56,6 +59,7 @@ struct RetryConfigurationTests {
         #expect(library.baseRetryDelay == ResolvedConfiguration.defaultRetryBaseDelay)
         #expect(library.maxRetryDelay == ResolvedConfiguration.defaultRetryMaxDelay)
         #expect(library.retryDelayBudget == ResolvedConfiguration.defaultRetryDelayBudget)
+        #expect(library.retryWallClockBudget == ResolvedConfiguration.defaultRetryWallClockBudget)
     }
 
     // MARK: Environment overrides
@@ -67,13 +71,16 @@ struct RetryConfigurationTests {
             EnvName.retryBaseMS: "250",
             EnvName.retryMaxMS: "5000",
             EnvName.retryBudgetMS: "30000",
+            EnvName.retryWallClockMS: "90000",
         ])
         #expect(config.maxRetries == 4)
         #expect(config.retryBaseDelay == .milliseconds(250))
         #expect(config.retryMaxDelay == .milliseconds(5000))
         #expect(config.retryDelayBudget == .milliseconds(30000))
+        #expect(config.retryWallClockBudget == .milliseconds(90000))
         #expect(config.clientConfiguration.baseRetryDelay == .milliseconds(250))
         #expect(config.clientConfiguration.retryDelayBudget == .milliseconds(30000))
+        #expect(config.clientConfiguration.retryWallClockBudget == .milliseconds(90000))
     }
 
     /// Zero means "no budget", not "never sleep" — a zero ceiling would make
@@ -84,11 +91,18 @@ struct RetryConfigurationTests {
         #expect(config.retryDelayBudget == nil)
         #expect(config.maxRetries == 10)
         #expect(config.clientConfiguration.retryDelayBudget == nil)
+        #expect(config.clientConfiguration.retryWallClockBudget == .seconds(600))
     }
 
     @Test("Settings-file values are honoured and the environment still beats them")
     func settingsFileAndPrecedence() throws {
-        let user = Settings(maxRetries: 2, retryBaseMS: 100, retryMaxMS: 1000, retryBudgetMS: 2000)
+        let user = Settings(
+            maxRetries: 2,
+            retryBaseMS: 100,
+            retryMaxMS: 1000,
+            retryBudgetMS: 2000,
+            retryWallClockMS: 5000
+        )
         let project = Settings(retryBaseMS: 200)
 
         let fromFiles = try resolve(project: project, user: user)
@@ -96,6 +110,7 @@ struct RetryConfigurationTests {
         #expect(fromFiles.retryBaseDelay == .milliseconds(200), "project must beat user")
         #expect(fromFiles.retryMaxDelay == .milliseconds(1000))
         #expect(fromFiles.retryDelayBudget == .milliseconds(2000))
+        #expect(fromFiles.retryWallClockBudget == .milliseconds(5000))
 
         let fromEnv = try resolve(
             env: [EnvName.retryBaseMS: "50", EnvName.maxRetries: "9"], project: project, user: user)
@@ -105,7 +120,12 @@ struct RetryConfigurationTests {
 
     @Test(
         "A malformed retry knob is rejected rather than silently defaulted",
-        arguments: [EnvName.retryBaseMS, EnvName.retryMaxMS, EnvName.retryBudgetMS]
+        arguments: [
+            EnvName.retryBaseMS,
+            EnvName.retryMaxMS,
+            EnvName.retryBudgetMS,
+            EnvName.retryWallClockMS,
+        ]
     )
     func malformedValuesThrow(name: String) {
         #expect(throws: DoMoError.self) { try resolve(env: [name: "-1"]) }
@@ -116,16 +136,18 @@ struct RetryConfigurationTests {
     func negativeSettingsValueThrows() {
         #expect(throws: DoMoError.self) { try resolve(user: Settings(retryBaseMS: -1)) }
         #expect(throws: DoMoError.self) { try resolve(user: Settings(retryBudgetMS: -5)) }
+        #expect(throws: DoMoError.self) { try resolve(user: Settings(retryWallClockMS: -5)) }
     }
 
     @Test("The retry knobs round-trip through settings.json")
     func settingsCodingKeys() throws {
-        let json = #"{"maxRetries":6,"retryBaseMs":300,"retryMaxMs":9000,"retryBudgetMs":45000}"#
+        let json = #"{"maxRetries":6,"retryBaseMs":300,"retryMaxMs":9000,"retryBudgetMs":45000,"retryWallClockMs":90000}"#
         let settings = try JSONDecoder().decode(Settings.self, from: Data(json.utf8))
         #expect(settings.maxRetries == 6)
         #expect(settings.retryBaseMS == 300)
         #expect(settings.retryMaxMS == 9000)
         #expect(settings.retryBudgetMS == 45000)
+        #expect(settings.retryWallClockMS == 90000)
 
         let encoded = try JSONEncoder().encode(settings)
         let decoded = try JSONDecoder().decode(Settings.self, from: encoded)
@@ -140,5 +162,6 @@ struct RetryConfigurationTests {
         #expect(EnvName.retryBaseMS == "DOMOCODE_RETRY_BASE_MS")
         #expect(EnvName.retryMaxMS == "DOMOCODE_RETRY_MAX_MS")
         #expect(EnvName.retryBudgetMS == "DOMOCODE_RETRY_BUDGET_MS")
+        #expect(EnvName.retryWallClockMS == "DOMOCODE_RETRY_WALL_CLOCK_MS")
     }
 }

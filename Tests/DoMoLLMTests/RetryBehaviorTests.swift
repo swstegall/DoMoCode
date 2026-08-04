@@ -119,6 +119,41 @@ private final class ConnectThenDropTransport: StreamingTransport {
     }
 }
 
+private final class RetryTestClock: Sendable {
+    private let value = Mutex(ContinuousClock().now)
+
+    var now: ContinuousClock.Instant {
+        value.withLock { $0 }
+    }
+
+    func advance(_ duration: Duration) {
+        value.withLock { $0 = $0.advanced(by: duration) }
+    }
+}
+
+private final class AdvancingTransport: StreamingTransport {
+    private let wrapped: any StreamingTransport
+    private let clock: RetryTestClock
+    private let elapsed: Duration
+    private let timeouts = Mutex<[Duration?]>([])
+
+    init(wrapping wrapped: any StreamingTransport, clock: RetryTestClock, elapsed: Duration) {
+        self.wrapped = wrapped
+        self.clock = clock
+        self.elapsed = elapsed
+    }
+
+    var timeoutHistory: [Duration?] {
+        timeouts.withLock { $0 }
+    }
+
+    func execute(request: HTTPRequest, body: [UInt8]?, timeout: Duration?) async throws -> StreamingResponse {
+        timeouts.withLock { $0.append(timeout) }
+        clock.advance(elapsed)
+        return try await wrapped.execute(request: request, body: body, timeout: timeout)
+    }
+}
+
 private final class Sleeps: Sendable {
     private let recorded = Mutex<[Duration]>([])
     func record(_ delay: Duration) { recorded.withLock { $0.append(delay) } }
@@ -249,6 +284,70 @@ struct StreamingRetryBudgetTests {
         #expect(events.last?.terminalMessage?.text == "ok")
         #expect(sleeps.all == [.seconds(1), .seconds(2)])
         #expect(transport.executeCount == 3)
+    }
+}
+
+@Suite("Wall-clock retry budget")
+struct RetryWallClockTests {
+
+    @Test("The wall-clock budget includes the time spent sleeping between attempts")
+    func backoffConsumesWallClockBudget() async {
+        let clock = RetryTestClock()
+        let sleeps = Sleeps()
+        var configuration = LiteLLMClient.Configuration(
+            maxRetries: 10,
+            baseRetryDelay: .seconds(1),
+            maxRetryDelay: .seconds(60),
+            retryDelayBudget: nil,
+            retryWallClockBudget: .seconds(3),
+            jitter: { 1.0 },
+            now: { clock.now }
+        )
+        configuration.sleep = { delay in
+            sleeps.record(delay)
+            clock.advance(delay)
+        }
+        let transport = ReplayTransport([
+            .error(503, #"{"error":{"message":"unavailable"}}"#)
+        ])
+        let subject = LiteLLMClient(configuration: configuration, transport: transport)
+
+        let (_, error) = await drain(
+            subject.streamCompletion(model: "m", context: retryContext)
+        )
+
+        #expect(transport.executeCount == 2)
+        #expect(sleeps.all == [.seconds(1)])
+        #expect(error?.kind == .provider(status: 503, isRetryable: true))
+    }
+
+    @Test("Connection time is included before a retry is scheduled")
+    func connectionTimeConsumesWallClockBudget() async {
+        let clock = RetryTestClock()
+        let base = ReplayTransport([
+            .error(503, #"{"error":{"message":"unavailable"}}"#)
+        ])
+        let transport = AdvancingTransport(
+            wrapping: base,
+            clock: clock,
+            elapsed: .seconds(2)
+        )
+        let configuration = LiteLLMClient.Configuration(
+            maxRetries: 10,
+            retryDelayBudget: nil,
+            retryWallClockBudget: .seconds(3),
+            jitter: { 1.0 },
+            now: { clock.now }
+        )
+
+        let (_, error) = await drain(
+            LiteLLMClient(configuration: configuration, transport: transport)
+                .streamCompletion(model: "m", context: retryContext)
+        )
+
+        #expect(base.executeCount == 1)
+        #expect(transport.timeoutHistory == [.seconds(3)])
+        #expect(error?.kind == .provider(status: 503, isRetryable: true))
     }
 }
 

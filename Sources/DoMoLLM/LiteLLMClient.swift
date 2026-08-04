@@ -187,6 +187,11 @@ public struct LiteLLMClient: Sendable {
         /// injected ``sleep``, so the budget is testable without a clock.
         public var retryDelayBudget: Duration?
 
+        /// Wall-clock budget for the whole request, including connection time,
+        /// response/stream time, scheduled backoff, and Retry-After. nil
+        /// disables this cross-attempt bound.
+        public var retryWallClockBudget: Duration?
+
         /// The jitter multiplier applied to a *computed* backoff, never to a
         /// server-supplied `retry-after` — the server named a time, and second
         /// -guessing it is how a client turns a polite throttle into a stampede.
@@ -230,6 +235,10 @@ public struct LiteLLMClient: Sendable {
         /// time. Throwing (e.g. on cancellation) aborts the retry.
         public var sleep: @Sendable (Duration) async throws -> Void
 
+        /// Clock used for the wall-clock retry budget. Injectable so elapsed
+        /// connection and sleep time can be tested without waiting.
+        public var now: @Sendable () -> ContinuousClock.Instant
+
         public init(
             baseURL: String = "http://localhost:4000/v1",
             apiKey: String? = nil,
@@ -243,7 +252,9 @@ public struct LiteLLMClient: Sendable {
             jitter: @escaping @Sendable () -> Double = { Double.random(in: Configuration.defaultJitterRange) },
             timeout: Duration? = nil,
             streamIdleTimeout: Duration? = nil,
-            sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+            sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+            retryWallClockBudget: Duration? = .seconds(600),
+            now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock().now }
         ) {
             self.streamIdleTimeout = streamIdleTimeout
             self.baseURL = baseURL
@@ -258,11 +269,16 @@ public struct LiteLLMClient: Sendable {
             self.jitter = jitter
             self.timeout = timeout
             self.sleep = sleep
+            self.retryWallClockBudget = retryWallClockBudget
+            self.now = now
         }
 
         /// Hard ceiling for total network attempts in one completion. Ten is a
         /// request count, not a retry count: the initial call is included.
         public static let maxNetworkAttempts = 10
+
+        /// Default wall-clock budget for one request and all of its retries.
+        public static let defaultRetryWallClockBudget: Duration? = .seconds(600)
 
         /// The multiplier range the default jitter draws from.
         public static let defaultJitterRange: ClosedRange<Double> = 0.5...1.0
@@ -441,14 +457,19 @@ public struct LiteLLMClient: Sendable {
         var retryCount = 0
         var everConnected = false
         var spentOnRetries = Duration.zero
+        let retryStartedAt = configuration.now()
 
         while true {
+            guard !retryWallClockExpired(since: retryStartedAt) else {
+                continuation.finish(throwing: retryWallClockBudgetError())
+                return
+            }
             let response: StreamingResponse
             do {
                 response = try await transport.execute(
                     request: request,
                     body: body,
-                    timeout: configuration.timeout
+                    timeout: retryTimeout(since: retryStartedAt)
                 )
                 everConnected = true
             } catch let error where DoMoError.isCancellation(error) {
@@ -484,7 +505,8 @@ public struct LiteLLMClient: Sendable {
                     let delay = nextRetryDelay(
                         attempt: retryCount + 1,
                         retryAfter: classified.retryAfter,
-                        spent: &spentOnRetries)
+                        spent: &spentOnRetries,
+                        startedAt: retryStartedAt)
                 {
                     retryCount += 1
                     continuation.yield(
@@ -519,7 +541,8 @@ public struct LiteLLMClient: Sendable {
                     let delay = nextRetryDelay(
                         attempt: retryCount + 1,
                         retryAfter: serverDelay,
-                        spent: &spentOnRetries)
+                        spent: &spentOnRetries,
+                        startedAt: retryStartedAt)
                 {
                     retryCount += 1
                     continuation.yield(
@@ -674,13 +697,17 @@ public struct LiteLLMClient: Sendable {
         var retryCount = 0
         var everConnected = false
         var spentOnRetries = Duration.zero
+        let retryStartedAt = configuration.now()
         while true {
+            guard !retryWallClockExpired(since: retryStartedAt) else {
+                throw retryWallClockBudgetError()
+            }
             let response: StreamingResponse
             do {
                 response = try await transport.execute(
                     request: built.request,
                     body: built.body,
-                    timeout: configuration.timeout
+                    timeout: retryTimeout(since: retryStartedAt)
                 )
                 everConnected = true
             } catch let error where DoMoError.isCancellation(error) {
@@ -698,7 +725,8 @@ public struct LiteLLMClient: Sendable {
                     let delay = nextRetryDelay(
                         attempt: retryCount + 1,
                         retryAfter: classified.retryAfter,
-                        spent: &spentOnRetries)
+                        spent: &spentOnRetries,
+                        startedAt: retryStartedAt)
                 {
                     retryCount += 1
                     onRetry?(
@@ -726,7 +754,8 @@ public struct LiteLLMClient: Sendable {
                     let delay = nextRetryDelay(
                         attempt: retryCount + 1,
                         retryAfter: serverDelay,
-                        spent: &spentOnRetries)
+                        spent: &spentOnRetries,
+                        startedAt: retryStartedAt)
                 {
                     retryCount += 1
                     onRetry?(
@@ -888,15 +917,49 @@ public struct LiteLLMClient: Sendable {
     /// A delay that would push past the budget is *not* charged and *not*
     /// truncated to fit: a half-length backoff is worse than no backoff, and
     /// spending the budget on a shortened wait just fails a step later.
-    private func nextRetryDelay(attempt: Int, retryAfter: Duration?, spent: inout Duration) -> Duration? {
+    private func nextRetryDelay(
+        attempt: Int,
+        retryAfter: Duration?,
+        spent: inout Duration,
+        startedAt: ContinuousClock.Instant
+    ) -> Duration? {
         let delay = configuration.retryDelay(
             attempt: attempt,
             retryAfter: retryAfter,
             jitter: configuration.jitter()
         )
         if let budget = configuration.retryDelayBudget, spent + delay > budget { return nil }
+        if let budget = configuration.retryWallClockBudget {
+            let elapsed = max(.zero, configuration.now() - startedAt)
+            if elapsed >= budget || delay >= budget - elapsed { return nil }
+        }
         spent += delay
         return delay
+    }
+
+    /// The remaining deadline passed to the transport. AsyncHTTPClient uses
+    /// this value for time-to-head and for the committed body guard, so one
+    /// request cannot consume a fresh full timeout after every retry.
+    private func retryTimeout(since startedAt: ContinuousClock.Instant) -> Duration? {
+        guard let budget = configuration.retryWallClockBudget else {
+            return configuration.timeout
+        }
+        let remaining = budget - max(.zero, configuration.now() - startedAt)
+        guard remaining > .zero else { return .zero }
+        guard let timeout = configuration.timeout else { return remaining }
+        return min(timeout, remaining)
+    }
+
+    private func retryWallClockExpired(since startedAt: ContinuousClock.Instant) -> Bool {
+        guard let budget = configuration.retryWallClockBudget else { return false }
+        return configuration.now() - startedAt >= budget
+    }
+
+    private func retryWallClockBudgetError() -> DoMoError {
+        DoMoError(
+            .transport,
+            "The retry wall-clock budget was exhausted before another request could start"
+        )
     }
 
     /// Sleeps `delay`, returning `false` if the sleep was interrupted so the

@@ -767,6 +767,9 @@ Until Phase 26 lands, the current LiteLLM adapter behaves as follows:
 - exponential backoff starts at 1 second, caps at 60 seconds, and uses
   jitter; Retry-After is honored within the cap;
 - the total scheduled sleep budget defaults to 300 seconds;
+- a six-hundred-second wall-clock budget covers connection, committed-stream,
+  backoff, and retry time; DOMOCODE_RETRY_WALL_CLOCK_MS=0 disables that
+  cross-attempt bound;
 - a request that never receives a response head has a smaller pre-connect
   retry cap, while a gateway that has answered earns the full request budget;
 - 429/5xx, transient transport failures, and narrowly matched LiteLLM
@@ -800,6 +803,7 @@ then built-in defaults. Current environment names:
 | DOMOCODE_RETRY_BASE_MS | Current initial backoff. |
 | DOMOCODE_RETRY_MAX_MS | Current backoff ceiling. |
 | DOMOCODE_RETRY_BUDGET_MS | Current scheduled-sleep budget. |
+| DOMOCODE_RETRY_WALL_CLOCK_MS | Wall-clock budget for the request, response stream, backoff, and all retries; zero disables this bound. |
 | DOMOCODE_CONFIG_DIR | Settings, trust, commands, skills, and project memory root. |
 | DOMOCODE_SESSION_DIR | Session JSONL and prompt-history root. |
 
