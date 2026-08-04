@@ -66,6 +66,11 @@ public enum WorkflowCancellationPolicy: String, Sendable, Codable, Hashable, Cas
     case checkpointAndStop
 }
 
+public enum WorkflowExecutionMode: String, Sendable, Codable, Hashable, CaseIterable {
+    case serial
+    case parallel
+}
+
 /// One node in a workflow sequence or DAG. Dependencies refer to other stage
 /// ids in the same definition and are validated before a run can be scheduled.
 public struct WorkflowStageDefinition: Sendable, Codable, Hashable {

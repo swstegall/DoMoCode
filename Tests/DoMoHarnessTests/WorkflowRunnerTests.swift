@@ -1,0 +1,112 @@
+// Copyright (c) 2026 Sam Stegall. MIT license.
+// SPDX-License-Identifier: MIT
+
+import DoMoCore
+import DoMoHarness
+import Testing
+
+private actor WorkflowExecutionLog {
+    private(set) var values: [String] = []
+
+    func append(_ value: String) { values.append(value) }
+}
+
+private actor WorkflowStartSignal {
+    private var started = false
+
+    func markStarted() { started = true }
+
+    func isStarted() -> Bool { started }
+}
+
+@Suite("Workflow runner", .serialized)
+struct WorkflowRunnerTests {
+    @Test("serial execution passes dependency outputs to the next stage")
+    func serialDependencies() async throws {
+        let definition = WorkflowDefinition(
+            id: "serial",
+            stages: [
+                WorkflowStageDefinition(id: "research", kind: .research),
+                WorkflowStageDefinition(id: "plan", kind: .plan, dependencies: ["research"]),
+            ]
+        )
+        let log = WorkflowExecutionLog()
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { request in
+            await log.append(request.stage.id)
+            if request.stage.id == "plan" {
+                guard request.dependencyOutputs["research"] == .string("evidence") else {
+                    return WorkflowStageResult(output: "missing dependency")
+                }
+            }
+            return WorkflowStageResult(output: request.stage.id == "research" ? "evidence" : "plan")
+        }
+
+        let run = try await runner.run(runID: "serial-run")
+        #expect(run.status == .succeeded)
+        #expect(run.output == "plan")
+        #expect(run.stages.map(\.status) == [.succeeded, .succeeded])
+        #expect(await log.values == ["research", "plan"])
+    }
+
+    @Test("parallel execution completes independent stages before their join")
+    func parallelJoin() async throws {
+        let definition = WorkflowDefinition(
+            id: "parallel",
+            stages: [
+                WorkflowStageDefinition(id: "a", kind: .research),
+                WorkflowStageDefinition(id: "b", kind: .research),
+                WorkflowStageDefinition(id: "synthesize", kind: .synthesize, dependencies: ["a", "b"]),
+            ]
+        )
+        let runner = WorkflowRunner(
+            definition: definition,
+            executionMode: .parallel,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { request in
+            if request.stage.id == "synthesize" {
+                guard request.dependencyOutputs.keys.sorted() == ["a", "b"] else {
+                    return WorkflowStageResult(output: "missing inputs")
+                }
+            }
+            return WorkflowStageResult(output: request.stage.id)
+        }
+
+        let run = try await runner.run(runID: "parallel-run")
+        #expect(run.status == .succeeded)
+        #expect(run.stages.allSatisfy { $0.status == .succeeded })
+        #expect(run.output == "synthesize")
+    }
+
+    @Test("cancellation persists a truthful cancelled run")
+    func cancellation() async throws {
+        let definition = WorkflowDefinition(
+            id: "cancel",
+            stages: [WorkflowStageDefinition(id: "slow", kind: .debug)]
+        )
+        let signal = WorkflowStartSignal()
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { _ in
+            await signal.markStarted()
+            try await Task.sleep(nanoseconds: 250_000_000)
+            return WorkflowStageResult(output: "finished")
+        }
+
+        let task = Task { try await runner.run(runID: "cancel-run") }
+        for _ in 0..<100 {
+            if await signal.isStarted() { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(await signal.isStarted())
+        #expect(await runner.snapshot()?.stage(withID: "slow")?.status == .running)
+        try await runner.cancel()
+        let run = try await task.value
+        #expect(run.status == .cancelled)
+        #expect(run.cancellationRequested)
+        #expect(run.error?.contains("cancellation") == true)
+    }
+}
