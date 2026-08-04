@@ -7,8 +7,8 @@ import DoMoLLM
 import Foundation
 
 /// Adapter inventory and doctor surfaces. The commands inspect metadata and
-/// configuration by default; `--probe` is the explicit opt-in that performs a
-/// LiteLLM `/models` handshake and therefore may contact the configured gateway.
+/// configuration by default; `--probe` is the explicit opt-in that performs
+/// configured provider handshakes and therefore may contact remote gateways.
 public struct AdaptersCommand: AsyncParsableCommand {
     public static let configuration = CommandConfiguration(
         commandName: "adapters",
@@ -52,7 +52,7 @@ public struct AdaptersListCommand: AsyncParsableCommand {
 public struct AdaptersDoctorCommand: AsyncParsableCommand {
     public static let configuration = CommandConfiguration(
         commandName: "doctor",
-        abstract: "Check adapter configuration and optionally probe LiteLLM."
+        abstract: "Check adapter configuration and optionally probe configured providers."
     )
 
     @Flag(name: .customLong("json"), help: "Emit JSON instead of a table.")
@@ -60,7 +60,7 @@ public struct AdaptersDoctorCommand: AsyncParsableCommand {
 
     @Flag(
         name: .customLong("probe"),
-        help: "Perform a LiteLLM model-catalog handshake; may contact the configured gateway."
+        help: "Perform configured provider handshakes; may contact a gateway."
     )
     public var probe = false
 
@@ -92,7 +92,8 @@ private enum AdapterTooling {
 
     static func makeRegistry(probe: Bool) async throws -> AdapterRegistry {
         let registry = AdapterRegistry()
-        for manifest in manifests() where !(probe && manifest.descriptor.id == "litellm") {
+        let probedIDs: Set<String> = ["litellm", "openai-responses"]
+        for manifest in manifests() where !(probe && probedIDs.contains(manifest.descriptor.id)) {
             try await registry.register(ManifestAdapter(descriptor: manifest.descriptor, health: manifest.health))
         }
         if probe {
@@ -113,6 +114,21 @@ private enum AdapterTooling {
                 apiKey: environment[credentialName]
             ))
             try await registry.register(LiteLLMProviderAdapter(profile: profile, client: client))
+
+            let openAIBaseURL = environment["OPENAI_BASE_URL"] ?? "https://api.openai.com/v1"
+            let openAIProfile = ProviderProfile(
+                id: "openai-responses-default",
+                displayName: "OpenAI Responses",
+                adapterID: "openai-responses",
+                endpoint: openAIBaseURL,
+                defaultModel: environment["OPENAI_MODEL"] ?? environment["DOMOCODE_MODEL"],
+                credential: ProviderCredentialReference(name: "OPENAI_API_KEY"),
+                capabilities: ["responses", "streaming", "tools", "reasoning", "usage"]
+            )
+            try await registry.register(OpenAIResponsesProviderAdapter(
+                profile: openAIProfile,
+                credential: environment["OPENAI_API_KEY"]
+            ))
         }
         return registry
     }
@@ -130,6 +146,9 @@ private enum AdapterTooling {
         let endpointOK = URL(string: baseURL)?.scheme != nil
         let credentialName = credentialName(in: environment)
         let credentialPresent = environment[credentialName]?.isEmpty == false
+        let openAIBaseURL = environment["OPENAI_BASE_URL"] ?? "https://api.openai.com/v1"
+        let openAIEndpointOK = URL(string: openAIBaseURL)?.scheme != nil
+        let openAICredentialPresent = environment["OPENAI_API_KEY"]?.isEmpty == false
         let providerHealth = AdapterHealth(
             status: endpointOK ? (credentialPresent ? .healthy : .degraded) : .unavailable,
             message: endpointOK
@@ -166,6 +185,25 @@ private enum AdapterTooling {
                 providerHealth
             ),
             (
+                descriptor("openai-responses", "OpenAI Responses", .provider,
+                    ["responses", "streaming", "tools", "reasoning", "usage"]),
+                AdapterHealth(
+                    status: openAIEndpointOK
+                        ? (openAICredentialPresent ? .healthy : .degraded)
+                        : .unavailable,
+                    message: openAIEndpointOK
+                        ? (openAICredentialPresent
+                            ? "Configuration is ready; pass --probe for a provider handshake"
+                            : "Endpoint is valid; credential reference OPENAI_API_KEY is not resolved")
+                        : "Configured endpoint is not a valid URL",
+                    supportedEvents: [
+                        "messageStart", "textDelta", "reasoningDelta", "toolCallDelta",
+                        "toolResult", "usage", "retry", "messageEnd", "error", "unknown",
+                    ],
+                    credentialRequired: true
+                )
+            ),
+            (
                 descriptor("anthropic-messages", "Anthropic Messages", .provider,
                     ["messages", "streaming", "tools", "thinking", "usage"]),
                 AdapterHealth(
@@ -185,7 +223,15 @@ private enum AdapterTooling {
             ),
             (
                 descriptor("acp-stdio", "Agent Client Protocol stdio", .acp, ["lifecycle", "tasks", "permissions", "cancellation"]),
-                AdapterHealth(status: .unsupported, message: "ACP transport is not configured in this installation")
+                AdapterHealth(
+                    status: .unsupported,
+                    message: "ACP stdio boundary is available; no external agent command is configured",
+                    supportedEvents: [
+                        "messageStart", "textDelta", "reasoningDelta", "toolCallDelta",
+                        "toolResult", "image", "plan", "task", "usage", "permission",
+                        "retry", "messageEnd", "cancelled", "error", "unknown",
+                    ]
+                )
             ),
             (
                 descriptor("local-process-backend", "Local process backend", .backend, ["process", "pty", "sandbox"]),

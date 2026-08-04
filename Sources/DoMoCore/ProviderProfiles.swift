@@ -385,6 +385,202 @@ public enum ProviderFallbackRouter {
     }
 }
 
+/// A safe, per-turn view of fallback state. The controller never stores a
+/// request or response body, so it can be persisted or shown in diagnostics
+/// without replaying provider data.
+public struct ProviderFallbackSessionSnapshot: Sendable, Codable, Hashable {
+    public var routeID: String
+    public var currentProfileID: String?
+    public var responseCommitted: Bool
+    public var pendingApprovalProfileID: String?
+    public var attemptedProfileIDs: [String]
+
+    public init(
+        routeID: String,
+        currentProfileID: String?,
+        responseCommitted: Bool,
+        pendingApprovalProfileID: String?,
+        attemptedProfileIDs: [String]
+    ) {
+        self.routeID = routeID
+        self.currentProfileID = currentProfileID
+        self.responseCommitted = responseCommitted
+        self.pendingApprovalProfileID = pendingApprovalProfileID
+        self.attemptedProfileIDs = attemptedProfileIDs
+    }
+}
+
+/// Coordinates the route policy and circuit breaker for one provider turn.
+///
+/// This is deliberately a controller, not a retry loop: it returns a decision
+/// to the caller and never replays a request. A caller marks the response
+/// committed as soon as text, a tool call, or a tool result crosses its own
+/// boundary; every later provider switch then requires explicit approval.
+public actor ProviderFallbackController {
+    private struct PendingFailure: Sendable {
+        let transient: Bool
+        let profileID: String
+    }
+
+    public let route: ProviderRoute
+    private let breaker: ProviderCircuitBreaker
+    private var currentIndex = 0
+    private var responseCommitted = false
+    private var attemptedProfileIDs: [String] = []
+    private var pendingFailure: PendingFailure?
+
+    public init(
+        route: ProviderRoute,
+        breaker: ProviderCircuitBreaker = ProviderCircuitBreaker()
+    ) {
+        self.route = route
+        self.breaker = breaker
+    }
+
+    public func snapshot() -> ProviderFallbackSessionSnapshot {
+        ProviderFallbackSessionSnapshot(
+            routeID: route.id,
+            currentProfileID: currentProfileID,
+            responseCommitted: responseCommitted,
+            pendingApprovalProfileID: pendingApprovalProfileID,
+            attemptedProfileIDs: attemptedProfileIDs
+        )
+    }
+
+    public var currentProfileID: String? {
+        guard route.profileIDs.indices.contains(currentIndex) else { return nil }
+        return route.profileIDs[currentIndex]
+    }
+
+    public var pendingApprovalProfileID: String? {
+        pendingFailure?.profileID
+    }
+
+    /// Select the first provider whose circuit is currently allowed to attempt.
+    /// An open circuit is not probed implicitly; call `beginProbe` after the
+    /// caller's cooldown policy says a probe is appropriate.
+    public func start() async -> ProviderFallbackDecision {
+        guard attemptedProfileIDs.isEmpty else {
+            guard let currentProfileID else { return .stop(reason: "Provider route is empty") }
+            return .use(profileID: currentProfileID)
+        }
+        guard let index = await firstUsableIndex(from: 0) else {
+            return .stop(reason: "No provider in the route is currently available")
+        }
+        currentIndex = index
+        markAttempted(route.profileIDs[index])
+        return .use(profileID: route.profileIDs[index])
+    }
+
+    public func markResponseCommitted() {
+        responseCommitted = true
+    }
+
+    public func recordSuccess() async {
+        guard let currentProfileID else { return }
+        _ = await breaker.recordSuccess(profileID: currentProfileID)
+        pendingFailure = nil
+    }
+
+    /// Move the current circuit from open to half-open for one caller-owned
+    /// probe. This method does not start a request.
+    public func beginProbe() async -> Bool {
+        guard let currentProfileID else { return false }
+        return await breaker.beginProbe(profileID: currentProfileID)
+    }
+
+    public func circuitSnapshot(for profileID: String) async -> ProviderCircuitSnapshot {
+        await breaker.snapshot(for: profileID)
+    }
+
+    public func recordFailure(
+        reason: String,
+        transient: Bool,
+        approved: Bool = false
+    ) async -> ProviderFallbackDecision {
+        guard let currentProfileID else { return .stop(reason: "Provider route is empty") }
+        _ = await breaker.recordFailure(
+            profileID: currentProfileID,
+            reason: reason,
+            transient: transient
+        )
+        return await chooseNext(transient: transient, approved: approved)
+    }
+
+    /// Approve the pending route change without invoking the failed provider
+    /// again. The original failure is not recorded a second time.
+    public func approvePendingFallback() async -> ProviderFallbackDecision {
+        guard let pendingFailure else {
+            return .stop(reason: "No provider fallback is awaiting approval")
+        }
+        return await chooseNext(transient: pendingFailure.transient, approved: true)
+    }
+
+    public func rejectPendingFallback() -> ProviderFallbackDecision {
+        pendingFailure = nil
+        return .stop(reason: "Provider fallback was not approved")
+    }
+
+    private func chooseNext(
+        transient: Bool,
+        approved: Bool
+    ) async -> ProviderFallbackDecision {
+        guard let currentProfileID else {
+            pendingFailure = nil
+            return .stop(reason: "Provider route is empty")
+        }
+        let available = await availableProfileIDs(after: currentIndex)
+        guard !available.isEmpty else {
+            pendingFailure = nil
+            return .stop(reason: "No usable provider remains in route " + route.id)
+        }
+
+        var candidateRoute = route
+        candidateRoute.profileIDs = [currentProfileID] + available
+        let decision = ProviderFallbackRouter.decision(
+            route: candidateRoute,
+            currentProfileID: currentProfileID,
+            failureIsTransient: transient,
+            responseCommitted: responseCommitted,
+            approved: approved
+        )
+        switch decision {
+        case .use(let profileID):
+            if let index = route.profileIDs.firstIndex(of: profileID) {
+                currentIndex = index
+                markAttempted(profileID)
+            }
+            pendingFailure = nil
+        case .requireApproval(let profileID, _):
+            pendingFailure = PendingFailure(transient: transient, profileID: profileID)
+        case .stop:
+            pendingFailure = nil
+        }
+        return decision
+    }
+
+    private func firstUsableIndex(from start: Int) async -> Int? {
+        guard start < route.profileIDs.count else { return nil }
+        for index in start..<route.profileIDs.count {
+            if await breaker.canAttempt(profileID: route.profileIDs[index]) { return index }
+        }
+        return nil
+    }
+
+    private func availableProfileIDs(after index: Int) async -> [String] {
+        guard index + 1 < route.profileIDs.count else { return [] }
+        var result: [String] = []
+        for profileID in route.profileIDs.dropFirst(index + 1) {
+            if await breaker.canAttempt(profileID: profileID) { result.append(profileID) }
+        }
+        return result
+    }
+
+    private func markAttempted(_ profileID: String) {
+        if !attemptedProfileIDs.contains(profileID) { attemptedProfileIDs.append(profileID) }
+    }
+}
+
 public enum AdapterRegistryError: Error, Sendable, Equatable {
     case emptyID
     case duplicateID(String)

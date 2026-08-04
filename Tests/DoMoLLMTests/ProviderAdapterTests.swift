@@ -125,6 +125,68 @@ struct ProviderAdapterTests {
             Issue.record("expected provider 404 classification")
         }
     }
+
+    @Test("OpenAI Responses adapter maps response events and uses safe tool result ids")
+    func openAIResponsesNormalization() async throws {
+        let transport = FixtureTransport(
+            status: 200,
+            chunks: [Array([
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-test\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\",\"output_index\":0}\n\n",
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item-1\",\"call_id\":\"call.1\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item-1\",\"call_id\":\"call.1\",\"delta\":\"arg\"}\n\n",
+                "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item-1\",\"call_id\":\"call.1\",\"name\":\"lookup\",\"arguments\":\"{\\\"key\\\":\\\"value\\\"}\"}\n\n",
+                "data: {\"type\":\"response.usage\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\"}}\n\n",
+            ].joined().utf8)]
+        )
+        let adapter = OpenAIResponsesProviderAdapter(
+            profile: ProviderProfile(
+                id: "openai",
+                displayName: "OpenAI",
+                adapterID: "openai-responses",
+                endpoint: "https://api.openai.com/v1",
+                defaultModel: "gpt-test",
+                credential: ProviderCredentialReference(name: "OPENAI_API_KEY"),
+                capabilities: ["responses", "tools", "reasoning"]
+            ),
+            credential: "secret-value",
+            transport: transport
+        )
+
+        var events: [ProviderEvent] = []
+        for try await event in adapter.stream(ProviderRequest(
+            model: "gpt-test",
+            messages: [
+                ProviderMessage(role: .user, content: "find it"),
+                ProviderMessage(
+                    role: .tool,
+                    content: [
+                        "toolCallId": .string("call.1"),
+                        "output": .string("result"),
+                    ]
+                ),
+            ],
+            tools: [ProviderTool(name: "lookup", inputSchema: ["type": "object"])]
+        )) {
+            events.append(event)
+        }
+
+        #expect(events.map(\.kind).contains(.messageStart))
+        #expect(events.map(\.kind).contains(.textDelta))
+        #expect(events.map(\.kind).contains(.reasoningDelta))
+        #expect(events.map(\.kind).contains(.toolCallDelta))
+        #expect(events.map(\.kind).contains(.usage))
+        #expect(events.map(\.kind).filter { $0 == .messageEnd }.count == 1)
+        #expect(events.first(where: { $0.kind == .textDelta })?.payload["delta"] == .string("hello"))
+        #expect(events.last?.payload["stopReason"] == .string("completed"))
+        let bodyData = try #require(transport.lastBody)
+        let body = try JSONValue(parsing: Data(bodyData))
+        #expect(body["input"]?[1]?["call_id"] == .string(ToolCallIDPolicy.wireID("call.1")))
+        #expect(body["tools"]?[0]?["parameters"]?["type"] == .string("object"))
+        #expect(transport.lastRequest?.headerFields[HTTPField.Name("authorization")!] == "Bearer secret-value")
+    }
 }
 
 private final class FixtureTransport: StreamingTransport {

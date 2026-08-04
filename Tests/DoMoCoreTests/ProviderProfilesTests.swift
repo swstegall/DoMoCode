@@ -84,6 +84,42 @@ struct ProviderProfilesTests {
         #expect(await breaker.snapshot(for: "gateway").state == .closed)
     }
 
+    @Test("fallback controller advances before commit and requires approval afterward")
+    func fallbackController() async {
+        let controller = ProviderFallbackController(
+            route: ProviderRoute(id: "route", displayName: "Route", profileIDs: ["one", "two", "three"]),
+            breaker: ProviderCircuitBreaker(failureThreshold: 2)
+        )
+        #expect(await controller.start() == .use(profileID: "one"))
+        #expect(await controller.recordFailure(reason: "503", transient: true) == .use(profileID: "two"))
+
+        await controller.markResponseCommitted()
+        let pending = await controller.recordFailure(reason: "503", transient: true)
+        #expect(pending == .requireApproval(
+            profileID: "three",
+            reason: "A provider switch after response or tool output requires approval"
+        ))
+        let waiting = await controller.snapshot()
+        #expect(waiting.currentProfileID == "two")
+        #expect(waiting.pendingApprovalProfileID == "three")
+
+        #expect(await controller.approvePendingFallback() == .use(profileID: "three"))
+        let finished = await controller.snapshot()
+        #expect(finished.attemptedProfileIDs == ["one", "two", "three"])
+    }
+
+    @Test("fallback controller skips an open circuit without replaying it")
+    func fallbackControllerSkipsOpenCircuit() async {
+        let breaker = ProviderCircuitBreaker(failureThreshold: 1)
+        _ = await breaker.recordFailure(profileID: "one", reason: "503", transient: true)
+        let controller = ProviderFallbackController(
+            route: ProviderRoute(id: "route", displayName: "Route", profileIDs: ["one", "two"]),
+            breaker: breaker
+        )
+        #expect(await controller.start() == .use(profileID: "two"))
+        #expect((await controller.snapshot()).attemptedProfileIDs == ["two"])
+    }
+
     @Test("route validation rejects duplicates and missing profiles")
     func routeValidation() {
         let profile = ProviderProfile(

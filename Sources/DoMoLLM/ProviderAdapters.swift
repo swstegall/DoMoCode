@@ -7,7 +7,7 @@ import HTTPTypes
 
 // MARK: - Provider-neutral conversion
 
-private enum ProviderAdapterConversion {
+enum ProviderAdapterConversion {
     static func text(_ value: JSONValue) -> String {
         if let text = value.stringValue { return text }
         if let text = value["text"]?.stringValue { return text }
