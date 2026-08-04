@@ -140,15 +140,19 @@ public final class ScreenSurface: TerminalApp {
         // Solve to a buffer (not just lines) so the image layer travels with the
         // text grid to the renderer, which paints text around the images.
         let buffer = layoutBuffer(build(), width: width, height: height)
-        var lines = paintFrameBackground(
-            buffer.flatten(),
+        var lines = buffer.flatten()
+        if !overlayStack.isEmpty {
+            lines = compositeOverlays(lines, termWidth: width, termHeight: height)
+        }
+        // Apply the contract after overlays too: their splice intentionally
+        // inserts fresh styled text and resets at both edges, so painting before
+        // compositing would leave overlay cells on the terminal default.
+        lines = paintFrameBackground(
+            lines,
             width: width,
             color: frameBackground,
             trueColor: frameBackgroundTrueColor
         )
-        if !overlayStack.isEmpty {
-            lines = compositeOverlays(lines, termWidth: width, termHeight: height)
-        }
         lastFrameLines = lines
         if let decorateFrame { lines = decorateFrame(lines) }
         let bytes = try core.frame(
