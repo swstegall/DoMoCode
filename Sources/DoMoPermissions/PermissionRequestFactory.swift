@@ -48,6 +48,15 @@ public struct PermissionRequestFactory: Sendable {
                 metadata: ["filepath": .string(path)],
                 configProtected: isProtected(path)
             )
+        case "apply_patch":
+            let paths = patchPaths(arguments)
+            return PermissionRequestSpec(
+                permission: toolName,
+                patterns: paths,
+                always: paths.flatMap { pathGrant($0) },
+                metadata: ["filepaths": .array(paths.map { .string($0) })],
+                configProtected: paths.contains(where: { isProtected($0) })
+            )
         case "read":
             // read keys on the real path so the `.env` secret guard can classify it.
             let path = pathArgument(arguments)
@@ -133,6 +142,9 @@ public struct PermissionRequestFactory: Sendable {
     /// requests separate is important: a saved bash prefix grant must not also
     /// authorize an unrelated absolute path.
     public func makeAll(toolName: String, arguments: JSONValue) -> [PermissionRequestSpec] {
+        if toolName == "apply_patch" {
+            return patchSpecs(arguments)
+        }
         let primary = make(toolName: toolName, arguments: arguments)
         guard toolName == "bash",
               let command = arguments["command"]?.stringValue
@@ -330,6 +342,36 @@ public struct PermissionRequestFactory: Sendable {
     /// The `path` / `file_path` argument, defensively (mirrors the tool layer's alias).
     private func pathArgument(_ arguments: JSONValue) -> String {
         arguments["path"]?.stringValue ?? arguments["file_path"]?.stringValue ?? ""
+    }
+
+    /// The patch parser lives in DoMoTools, so the permission layer only reads
+    /// its file-operation headers. Unknown or malformed patches still produce
+    /// a prompt, while every recognized path receives its own deny/allow check.
+    private func patchPaths(_ arguments: JSONValue) -> [String] {
+        let patch = arguments["patch"]?.stringValue ?? ""
+        let markers = ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+        var paths: [String] = []
+        var seen: Set<String> = []
+        for line in patch.components(separatedBy: .newlines) {
+            for marker in markers where line.hasPrefix(marker) {
+                let path = String(line.dropFirst(marker.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !path.isEmpty, seen.insert(path).inserted { paths.append(path) }
+            }
+        }
+        return paths.isEmpty ? [patch.isEmpty ? "" : "<unparsed patch>"] : paths
+    }
+
+    private func patchSpecs(_ arguments: JSONValue) -> [PermissionRequestSpec] {
+        patchPaths(arguments).map { path in
+            PermissionRequestSpec(
+                permission: "apply_patch",
+                patterns: [path],
+                patternAliases: aliases(for: path),
+                always: pathGrant(path),
+                metadata: ["filepath": .string(path)],
+                configProtected: isProtected(path)
+            )
+        }
     }
 
     /// Whether a write/edit target is a protected config file. Resolves a relative

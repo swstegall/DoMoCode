@@ -12,15 +12,15 @@ struct RegistryTests {
     func builtinSet() {
         let registry = ToolRegistry.builtin
         #expect(registry.names == [
-            "read", "bash", "edit", "write", "grep", "find", "ls",
+            "read", "bash", "edit", "apply_patch", "write", "grep", "find", "ls",
             "todowrite", "glob", "finish", "question", "webfetch", "background_process",
             "interactive_terminal",
         ])
     }
 
-    @Test("the coding set is read/bash/edit/write")
+    @Test("the coding set is read/bash/edit/apply_patch/write")
     func codingSet() {
-        #expect(ToolRegistry.coding.names == ["read", "bash", "edit", "write"])
+        #expect(ToolRegistry.coding.names == ["read", "bash", "edit", "apply_patch", "write"])
     }
 
     @Test("plan mode adds a terminating plan_exit tool")

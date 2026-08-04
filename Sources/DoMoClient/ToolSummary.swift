@@ -28,6 +28,8 @@ nonisolated func toolCallDetail(name: String, arguments: JSONValue) -> String {
         raw = arguments["command"]?.stringValue ?? ""
     case "read", "write", "edit":
         raw = pathArgument(arguments)
+    case "apply_patch":
+        raw = patchPaths(arguments)
     case "ls":
         raw = arguments["path"]?.stringValue ?? "."
     case "grep":
@@ -53,6 +55,19 @@ nonisolated func toolCallDetail(name: String, arguments: JSONValue) -> String {
 /// spellings, so the summary must too or an `edit` row reads blank.
 private func pathArgument(_ arguments: JSONValue) -> String {
     arguments["path"]?.stringValue ?? arguments["file_path"]?.stringValue ?? ""
+}
+
+private func patchPaths(_ arguments: JSONValue) -> String {
+    let patch = arguments["patch"]?.stringValue ?? ""
+    let markers = ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+    var paths: [String] = []
+    for line in patch.components(separatedBy: .newlines) {
+        for marker in markers where line.hasPrefix(marker) {
+            let path = String(line.dropFirst(marker.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !path.isEmpty, !paths.contains(path) { paths.append(path) }
+        }
+    }
+    return paths.isEmpty ? "patch" : paths.joined(separator: ", ")
 }
 
 /// `key=value` for the scalar arguments, sorted by key. Nested objects and arrays

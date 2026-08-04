@@ -647,7 +647,9 @@ public actor ServerRuntime {
             ruleset = []
         }
         let names = candidates.map { $0.definition.name }
-        let policyHidden = config.permissions.map { disabledTools(names, ruleset) } ?? []
+        let policyHidden = config.permissions == nil
+            ? Set<String>()
+            : disabledTools(names, ruleset)
 
         return candidates.map { tool in
             let name = tool.definition.name

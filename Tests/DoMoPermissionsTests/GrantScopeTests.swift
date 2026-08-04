@@ -155,6 +155,41 @@ struct GrantScopeTests {
         #expect(bash.always.contains { $0.contains("*") })
     }
 
+    @Test("apply_patch scopes each touched file independently")
+    func applyPatchGrantScope() {
+        let patch = """
+            *** Begin Patch
+            *** Update File: src/a.swift
+            @@
+            -old
+            +new
+            *** Add File: notes.md
+            +note
+            *** End Patch
+            """
+        let specs = factory.makeAll(toolName: "apply_patch", arguments: ["patch": patch])
+
+        #expect(specs.map(\.patterns) == [["src/a.swift"], ["notes.md"]])
+        #expect(specs.map(\.always) == [["/work/src/a.swift"], ["/work/notes.md"]])
+        #expect(specs.allSatisfy { $0.permission == "apply_patch" })
+    }
+
+    @Test("apply_patch protects a settings file even inside a multi-file patch")
+    func applyPatchProtectsConfig() {
+        let patch = """
+            *** Begin Patch
+            *** Update File: .domocode/settings.json
+            @@
+            -{}
+            +{"permission": {}}
+            *** End Patch
+            """
+        let spec = factory.make(toolName: "apply_patch", arguments: ["patch": patch])
+
+        #expect(spec.configProtected)
+        #expect(spec.always.isEmpty)
+    }
+
     // MARK: Persistence
 
     @Test("A persisted grant never buries a deny the user wrote by hand")

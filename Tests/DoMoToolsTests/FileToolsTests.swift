@@ -415,3 +415,96 @@ struct EditToolTests {
         #expect(bytes == Data("a\r\nB\r\nc\r\n".utf8))
     }
 }
+
+@Suite("apply patch")
+struct ApplyPatchToolTests {
+
+    @Test("updates a file through a context hunk")
+    func updatesContextHunk() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("code.txt", "func greet() {\n    print(\"hi\")\n}\n")
+
+        let patch = """
+            *** Begin Patch
+            *** Update File: code.txt
+            @@
+             func greet() {
+            -    print("hi")
+            +    print("hello")
+             }
+            *** End Patch
+            """
+        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+
+        #expect(!result.isError)
+        #expect(result.details["updated"]?.intValue == 1)
+        let read = try await ReadTool().execute(["path": "code.txt"], in: fixture.context)
+        #expect(read.text == "func greet() {\n    print(\"hello\")\n}\n")
+    }
+
+    @Test("adds and deletes files in one patch")
+    func addsAndDeletesFiles() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("remove.txt", "old")
+
+        let patch = """
+            *** Begin Patch
+            *** Add File: new.txt
+            +first
+            +second
+            *** Delete File: remove.txt
+            *** End Patch
+            """
+        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+
+        #expect(!result.isError)
+        #expect(result.details["added"]?.intValue == 1)
+        #expect(result.details["deleted"]?.intValue == 1)
+        let added = try await ReadTool().execute(["path": "new.txt"], in: fixture.context)
+        #expect(added.text == "first\nsecond")
+        #expect(try await fixture.context.fileSystem.exists(SystemPackage.FilePath("remove.txt")) == false)
+    }
+
+    @Test("rejects an empty insertion hunk without changing the file")
+    func rejectsAmbiguousInsertion() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("unchanged.txt", "one\ntwo\n")
+
+        let patch = """
+            *** Begin Patch
+            *** Update File: unchanged.txt
+            @@
+            +inserted
+            *** End Patch
+            """
+        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+
+        #expect(result.isError)
+        #expect(result.text.contains("empty insertions are ambiguous"))
+        let read = try await ReadTool().execute(["path": "unchanged.txt"], in: fixture.context)
+        #expect(read.text == "one\ntwo\n")
+    }
+
+    @Test("uses the edit engine's unique-match safety")
+    func preservesUniqueMatchSafety() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+        try fixture.write("duplicate.txt", "same\nsame\n")
+
+        let patch = """
+            *** Begin Patch
+            *** Update File: duplicate.txt
+            @@
+            -same
+            +changed
+            *** End Patch
+            """
+        let result = try await ApplyPatchTool().execute(["patch": patch], in: fixture.context)
+
+        #expect(result.isError)
+        #expect(result.text.contains("occurrences"))
+    }
+}

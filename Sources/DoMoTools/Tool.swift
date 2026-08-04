@@ -198,7 +198,7 @@ public struct ToolRegistry: Sendable {
 
     /// The read/write/edit/bash set — pi's `createCodingTools`.
     public static var coding: ToolRegistry {
-        ToolRegistry([ReadTool(), BashTool(), EditTool(), WriteTool()])
+        ToolRegistry([ReadTool(), BashTool(), EditTool(), ApplyPatchTool(), WriteTool()])
     }
 
     /// The read-only search set — pi's `createReadOnlyTools`.
@@ -223,7 +223,7 @@ public struct ToolRegistry: Sendable {
         includeProjectMemory: Bool = false
     ) -> ToolRegistry {
         var tools: [any Tool] = [
-            ReadTool(), BashTool(), EditTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
+            ReadTool(), BashTool(), EditTool(), ApplyPatchTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
             TodoWriteTool(store: todoStore), GlobTool(), FinishTool(), QuestionTool(), WebFetchTool(),
             BackgroundProcessTool(), InteractiveTerminalTool(),
         ]
