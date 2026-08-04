@@ -13,6 +13,17 @@ import Musl
 #endif
 
 #if canImport(Darwin)
+/// Darwin imports the opaque spawn handles as optional pointers. Glibc and
+/// Musl expose the same handles as initialized value structs; keeping that
+/// ABI difference behind one alias lets the PTY launch path stay identical.
+private typealias DomoSpawnFileActions = posix_spawn_file_actions_t?
+private typealias DomoSpawnAttributes = posix_spawnattr_t?
+#else
+private typealias DomoSpawnFileActions = posix_spawn_file_actions_t
+private typealias DomoSpawnAttributes = posix_spawnattr_t
+#endif
+
+#if canImport(Darwin)
 // macOS 10.15–25 exports this non-deprecated-in-practice spelling, while the
 // SDK now marks the newer POSIX name as macOS 26-only. Naming the symbol here
 // keeps the package's macOS 15 deployment target honest without a deprecation
@@ -347,7 +358,11 @@ public actor PTYService {
         }
         _ = close(slaveForResize)
 
-        var actions: posix_spawn_file_actions_t? = nil
+        #if canImport(Darwin)
+        var actions: DomoSpawnFileActions = nil
+        #else
+        var actions = DomoSpawnFileActions()
+        #endif
         guard posix_spawn_file_actions_init(&actions) == 0 else {
             let failure = errno
             _ = close(master)
@@ -355,7 +370,11 @@ public actor PTYService {
             throw PTYError.descriptorFailed(failure)
         }
         defer { _ = posix_spawn_file_actions_destroy(&actions) }
-        var attributes: posix_spawnattr_t? = nil
+        #if canImport(Darwin)
+        var attributes: DomoSpawnAttributes = nil
+        #else
+        var attributes = DomoSpawnAttributes()
+        #endif
         guard posix_spawnattr_init(&attributes) == 0 else {
             let failure = errno
             _ = close(master)
@@ -395,7 +414,10 @@ public actor PTYService {
         #if canImport(Darwin)
         let spawnFlags = Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT)
         #else
-        let spawnFlags = Int16(POSIX_SPAWN_SETSID)
+        // Glibc supports POSIX_SPAWN_SETSID, but its Swift module does not
+        // import the C preprocessor macro. The standardized Linux value keeps
+        // the child a session leader so the opened slave becomes its terminal.
+        let spawnFlags = Int16(0x80)
         #endif
         guard posix_spawnattr_setflags(&attributes, spawnFlags) == 0 else {
             let failure = errno
@@ -737,7 +759,7 @@ public actor PTYService {
     }
 
     private static func addChdir(
-        _ actions: UnsafeMutablePointer<posix_spawn_file_actions_t?>,
+        _ actions: UnsafeMutablePointer<DomoSpawnFileActions>,
         _ directory: UnsafePointer<CChar>
     ) -> Int32 {
         #if canImport(Darwin)
