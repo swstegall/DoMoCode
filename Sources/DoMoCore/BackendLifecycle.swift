@@ -128,7 +128,9 @@ public enum BackendRegistryError: Error, Sendable, Equatable {
     case duplicateID(String)
     case notRegistered(String)
     case missingCapability(backendID: String, capability: String)
+    case noEligibleBackend(requiredCapabilities: [String])
     case isolationUnavailable(String)
+    case notReady(backendID: String, state: BackendLifecycleState)
     case invalidTransition(backendID: String, state: BackendLifecycleState)
     case unavailable(backendID: String, message: String)
     case lifecycleFailed(backendID: String, message: String)
@@ -389,6 +391,58 @@ public actor BackendRegistry {
     public func cancel(id: String, operationID: String) async throws(BackendRegistryError) {
         guard let record = records[id] else { throw .notRegistered(id) }
         await record.backend.cancel(operationID: operationID)
+    }
+
+    /// Selects a backend that is already healthy and satisfies the requested
+    /// capabilities. This is deliberately non-mutating with respect to the
+    /// lifecycle: a caller must start or reconnect an adapter before selection
+    /// can succeed, so an unavailable optional backend is never silently used.
+    public func select(
+        _ request: BackendSelectionRequest = .init()
+    ) async throws(BackendRegistryError) -> BackendSelection {
+        let explicitID = request.backendID
+        let candidates: [String]
+        if let explicitID {
+            guard records[explicitID] != nil else { throw .notRegistered(explicitID) }
+            candidates = [explicitID]
+        } else {
+            candidates = order
+        }
+        guard !candidates.isEmpty else {
+            throw .noEligibleBackend(requiredCapabilities: request.requiredCapabilities)
+        }
+
+        for id in candidates {
+            guard let record = records[id] else {
+                if explicitID != nil { throw .notRegistered(id) }
+                continue
+            }
+
+            var live = record.health
+            if [.starting, .healthy, .degraded, .reconnecting].contains(live.state) {
+                live = await record.backend.health()
+                if live.capabilities.isEmpty { live.capabilities = record.descriptor.capabilities }
+                records[id]?.health = live
+            }
+            guard [.healthy, .degraded].contains(live.state) else {
+                if explicitID != nil { throw .notReady(backendID: id, state: live.state) }
+                continue
+            }
+
+            let capabilities = Set(live.capabilities)
+            if let missing = request.requiredCapabilities.first(where: { !capabilities.contains($0) }) {
+                if explicitID != nil { throw .missingCapability(backendID: id, capability: missing) }
+                continue
+            }
+            if (request.requireIsolation || record.descriptor.requiresIsolation),
+               !live.isolationEstablished {
+                if explicitID != nil { throw .isolationUnavailable(id) }
+                continue
+            }
+            return BackendSelection(descriptor: record.descriptor, health: live)
+        }
+
+        throw .noEligibleBackend(requiredCapabilities: request.requiredCapabilities)
     }
 
     public func stateEvents(after sequence: Int? = nil) -> [BackendStateEvent] {
