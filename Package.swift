@@ -282,6 +282,7 @@ let package = Package(
             dependencies: [
                 "DoMoCore", "DoMoAgent", "DoMoLLM", "DoMoHarness", "DoMoGit", "DoMoPermissions", "DoMoMemory", "DoMoTermIO",
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "Logging", package: "swift-log"),
             ],
             swiftSettings: safeSettings

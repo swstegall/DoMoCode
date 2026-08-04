@@ -8,6 +8,7 @@ import DoMoLLM
 import DoMoPermissions
 import Foundation
 import Hummingbird
+import HTTPTypes
 import Logging
 
 // MARK: - Request bodies
