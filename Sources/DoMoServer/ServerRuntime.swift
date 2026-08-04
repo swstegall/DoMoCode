@@ -734,12 +734,17 @@ public actor ServerRuntime {
         }
         guard sessions[sessionID] != nil else { throw ServerRuntimeError.sessionNotFound }
         do {
-            return try await config.sessionClients!.attach(
+            let attachment = try await config.sessionClients!.attach(
                 sessionID: sessionID,
                 clientID: clientID,
                 owner: owner,
                 requestAuthority: requestAuthority
             )
+            // The session event sink is recreated when a process resumes a
+            // session. Continue after the durable mirror cursor so a reconnect
+            // cannot receive a newly emitted event with an old sequence.
+            sessions[sessionID]?.sink.seedSequence(attachment.eventCursor)
+            return attachment
         } catch {
             throw Self.mapSessionClientError(error)
         }

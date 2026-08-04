@@ -135,6 +135,17 @@ public final class BroadcastEventSink: AgentEventSink {
         state.withLock { $0.nextSequence }
     }
 
+    /// Continue a cursor from durable session-client state after a server
+    /// restart. This only moves the counter forward; it never manufactures a
+    /// replay row, so the next live event remains strictly after the client's
+    /// last acknowledged sequence.
+    public func seedSequence(_ sequence: Int) {
+        guard sequence > 0 else { return }
+        state.withLock { state in
+            state.nextSequence = max(state.nextSequence, sequence)
+        }
+    }
+
     // MARK: AgentEventSink
 
     public func emit(_ event: AgentEvent) async {

@@ -55,6 +55,16 @@ struct BroadcastEventSinkTests {
         #expect(sink.history(after: 1).map(\.sequence) == [2, 3])
     }
 
+    @Test("Durable cursor seeding only moves the live sequence forward")
+    func seedSequence() {
+        let sink = BroadcastEventSink()
+        sink.seedSequence(9)
+        sink.seedSequence(4)
+        sink.broadcast(.turnStart)
+        #expect(sink.currentSequence == 10)
+        #expect(sink.history().first?.sequence == 10)
+    }
+
     @Test("Subscriber count tracks subscribe/unsubscribe")
     func subscriberCount() {
         let sink = BroadcastEventSink()

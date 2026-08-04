@@ -45,6 +45,19 @@ struct SSEFrameDecoderTests {
         #expect(events[1] == .agentEnd(reason: "completed"))
     }
 
+    @Test("A sequenced frame preserves its cursor while exposing the same event")
+    func sequencedFrame() throws {
+        let frame = try JSONEncoder().encode(
+            SequencedServerEvent(sequence: 9, event: .turnStart)
+        )
+        let bytes = Array("data: ".utf8) + Array(frame) + [0x0a, 0x0a]
+        var decoder = SSEFrameDecoder()
+        let events = decoder.pushWithSequence(bytes)
+        #expect(events.count == 1)
+        #expect(events[0].sequence == 9)
+        #expect(events[0].event == .turnStart)
+    }
+
     @Test("The blank-line separator split across chunks still frames correctly")
     func separatorSplitAcrossChunks() throws {
         let bytes = try frameBytes(.turnStart)

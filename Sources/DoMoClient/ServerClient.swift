@@ -197,7 +197,7 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.post, "/session", body: body)
         try expect(status, 201, "/session", body: data)
         let session = try JSONDecoder().decode(SessionRef.self, from: data)
-        try await attachIfSupported(sessionID: session.id)
+        _ = try await attachIfSupported(sessionID: session.id)
         return session
     }
 
@@ -833,7 +833,7 @@ public struct ServerClient: Sendable {
     /// Submit a prompt. Fire-and-forget: the run streams over the event channel.
     /// `POST /session/{id}/prompt` → 202.
     public func sendPrompt(sessionID: String, prompt: String, images: [ImageBlock] = []) async throws {
-        try await attachIfSupported(sessionID: sessionID)
+        _ = try await attachIfSupported(sessionID: sessionID)
         let path = "/session/\(sessionID)/prompt"
         let body = try JSONEncoder().encode(PromptBody(prompt: prompt, images: images.isEmpty ? nil : images))
         let (status, data) = try await send(.post, path, body: body)
@@ -843,7 +843,7 @@ public struct ServerClient: Sendable {
     /// Queue a prompt for the active run. `POST /session/{id}/steer` → 202.
     /// The accepted count arrives asynchronously as a `queue_update` SSE frame.
     public func sendSteer(sessionID: String, prompt: String, images: [ImageBlock] = []) async throws {
-        try await attachIfSupported(sessionID: sessionID)
+        _ = try await attachIfSupported(sessionID: sessionID)
         let path = "/session/\(sessionID)/steer"
         let body = try JSONEncoder().encode(PromptBody(prompt: prompt, images: images.isEmpty ? nil : images))
         let (status, data) = try await send(.post, path, body: body)
