@@ -254,6 +254,9 @@ public actor IndexCoordinator {
         } catch let error as IndexCoordinatorError {
             freshness = .stale
             throw error
+        } catch is CancellationError {
+            freshness = .stale
+            throw .cancelled
         } catch {
             freshness = .stale
             throw .provider(String(describing: error))
@@ -272,11 +275,18 @@ public actor IndexCoordinator {
 
         do {
             let result = try await provider.search(query)
+            if Task.isCancelled { throw IndexCoordinatorError.cancelled }
             return normalize(result)
+        } catch let error as IndexCoordinatorError where error == .cancelled {
+            throw error
+        } catch is CancellationError {
+            throw .cancelled
         } catch {
+            if Task.isCancelled { throw .cancelled }
             guard let fallbackSearch else { throw .provider(String(describing: error)) }
             do {
                 let symbols = try await fallbackSearch(query)
+                if Task.isCancelled { throw IndexCoordinatorError.cancelled }
                 return IndexSearchResult(
                     symbols: Array(symbols.prefix(query.limit)),
                     freshness: .fallback,
@@ -284,6 +294,10 @@ public actor IndexCoordinator {
                     usedFallback: true,
                     warning: "Index provider unavailable; showing search-only results."
                 )
+            } catch is CancellationError {
+                throw .cancelled
+            } catch let error as IndexCoordinatorError {
+                throw error
             } catch {
                 throw .provider(String(describing: error))
             }

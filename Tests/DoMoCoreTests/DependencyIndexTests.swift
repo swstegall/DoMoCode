@@ -68,6 +68,24 @@ struct DependencyIndexTests {
         let result = try await coordinator.searchDependents(of: "/project/Outside.swift")
         #expect(result.sourcePaths.isEmpty)
     }
+
+    @Test("provider cancellation is preserved during refresh")
+    func cancellationIsNotAProviderFailure() async throws {
+        let coordinator = try DependencyIndexCoordinator(
+            rootPath: "/project",
+            provider: CancellationDependencyProvider()
+        )
+        await coordinator.observe(ResourceReloadEvent(
+            path: "/project/App.swift",
+            kind: .workspace,
+            observedAt: "5"
+        ))
+
+        await #expect(throws: DependencyIndexCoordinatorError.cancelled) {
+            try await coordinator.refresh()
+        }
+        #expect((await coordinator.status()).freshness == .stale)
+    }
 }
 
 private actor FakeDependencyProvider: DoMoDependencyIndexProvider {
@@ -79,5 +97,11 @@ private actor FakeDependencyProvider: DoMoDependencyIndexProvider {
             DependencyEdge(sourcePath: "/project/App.swift", targetPath: "/project/Library.swift"),
             DependencyEdge(sourcePath: "/project/App.swift", targetPath: "/outside/Secret.swift"),
         ]
+    }
+}
+
+private actor CancellationDependencyProvider: DoMoDependencyIndexProvider {
+    func refresh(paths: [String]) async throws -> [DependencyEdge] {
+        throw CancellationError()
     }
 }

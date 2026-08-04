@@ -120,6 +120,9 @@ public actor DependencyIndexCoordinator {
         } catch let error as DependencyIndexCoordinatorError {
             freshness = .stale
             throw error
+        } catch is CancellationError {
+            freshness = .stale
+            throw .cancelled
         } catch {
             freshness = .stale
             throw .provider(String(describing: error))
@@ -139,6 +142,7 @@ public actor DependencyIndexCoordinator {
         if let fallbackSearch, freshness != .current || !pendingPaths.isEmpty {
             do {
                 let paths = try await fallbackSearch(normalizedTarget)
+                if Task.isCancelled { throw DependencyIndexCoordinatorError.cancelled }
                 return DependencySearchResult(
                     targetPath: normalizedTarget,
                     sourcePaths: Array(paths.map(Self.normalize).filter { Self.within($0, root: rootPath) }.prefix(boundedLimit)),
@@ -147,6 +151,10 @@ public actor DependencyIndexCoordinator {
                     usedFallback: true,
                     warning: "Dependency index is not current; showing search-only dependents."
                 )
+            } catch is CancellationError {
+                throw .cancelled
+            } catch let error as DependencyIndexCoordinatorError {
+                throw error
             } catch {
                 throw .provider(String(describing: error))
             }

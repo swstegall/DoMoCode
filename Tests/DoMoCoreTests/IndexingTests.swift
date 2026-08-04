@@ -82,6 +82,26 @@ struct IndexingTests {
         }
         #expect(await provider.searchCount == 0)
     }
+
+    @Test("provider cancellation is preserved and does not use fallback search")
+    func cancellationIsNotAnOutage() async throws {
+        let fallbackCalls = CancellationFallbackCounter()
+        let coordinator = IndexCoordinator(
+            provider: CancellationIndexProvider(),
+            fallbackSearch: { _ in
+                await fallbackCalls.increment()
+                return []
+            }
+        )
+
+        await #expect(throws: IndexCoordinatorError.cancelled) {
+            _ = try await coordinator.search(IndexSearchQuery(
+                text: "App",
+                rootPath: "/project"
+            ))
+        }
+        #expect(await fallbackCalls.value == 0)
+    }
 }
 
 private actor FakeIndexProvider: DoMoIndexProvider {
@@ -127,5 +147,28 @@ private actor FakeIndexProvider: DoMoIndexProvider {
             indexedGeneration: 1,
             freshness: .current
         )
+    }
+}
+
+private actor CancellationIndexProvider: DoMoIndexProvider {
+    nonisolated let descriptor = IndexProviderDescriptor(
+        id: "cancelled",
+        displayName: "Cancelled index"
+    )
+
+    func search(_ query: IndexSearchQuery) async throws -> IndexSearchResult {
+        throw CancellationError()
+    }
+
+    func refresh(paths: [String]) async throws -> IndexRefreshResult {
+        throw CancellationError()
+    }
+}
+
+private actor CancellationFallbackCounter {
+    private(set) var value = 0
+
+    func increment() {
+        value += 1
     }
 }
