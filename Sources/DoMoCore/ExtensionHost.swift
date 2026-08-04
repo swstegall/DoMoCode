@@ -323,8 +323,12 @@ public actor ExtensionHost {
             var admitted: [String: ToolCatalogEntry] = [:]
             for tool in handshake.tools {
                 let name = tool.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !name.isEmpty else { throw .protocolError("Extension returned a tool without a name.") }
-                guard admitted[name] == nil else { throw .duplicateTool(name) }
+                guard !name.isEmpty else {
+                    throw ExtensionHostError.protocolError("Extension returned a tool without a name.")
+                }
+                guard admitted[name] == nil else {
+                    throw ExtensionHostError.duplicateTool(name)
+                }
                 admitted[name] = ToolCatalogEntry(
                     name: name,
                     description: tool.description,
@@ -389,13 +393,15 @@ public actor ExtensionHost {
         do {
             let response = try await transport.request(request)
             if let error = response.error {
-                throw ExtensionHostError.protocolError("(error.code): (error.message)")
+                throw ExtensionHostError.protocolError("\(error.code): \(error.message)")
             }
             guard let result = response.result else {
                 throw ExtensionHostError.protocolError("Extension returned no tool result.")
             }
             let bytes = try JSONEncoder().encode(result).count
-            guard bytes <= manifest.limits.maxOutputBytes else { throw .outputTooLarge }
+            guard bytes <= manifest.limits.maxOutputBytes else {
+                throw ExtensionHostError.outputTooLarge
+            }
             return result
         } catch let error as ExtensionHostError {
             throw error
@@ -432,7 +438,7 @@ public actor ExtensionHost {
 
     private func handshake(from response: ExtensionRPCResponse) throws(ExtensionHostError) -> ExtensionHandshake {
         if let error = response.error {
-            throw .protocolError("(error.code): (error.message)")
+            throw ExtensionHostError.protocolError("\(error.code): \(error.message)")
         }
         guard let result = response.result else { throw .protocolError("Extension returned no handshake.") }
         do {
