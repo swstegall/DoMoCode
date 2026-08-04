@@ -68,6 +68,15 @@ struct RegistryTests {
         #expect(result.details["count"]?.intValue == 1)
     }
 
+    @Test("MCP resource inspection and trusted skill invocation are explicit opt-ins")
+    func parityToolsOptIn() {
+        let registry = ToolRegistry.builtin(
+            includeMCPResourceInspection: true,
+            includeSkillInvocation: true
+        )
+        #expect(registry.names.suffix(2) == ["mcp_resource", "skill"])
+    }
+
     @Test("the memory tool lists and writes through its provider")
     func projectMemorySet() async throws {
         let registry = ToolRegistry.builtin(includeProjectMemory: true)

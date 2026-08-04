@@ -2355,36 +2355,12 @@ public struct InteractiveMode: Sendable {
             configDirectory: FilePath(configDirectory),
             cwd: workingDirectory
         )
-        let toolContext = try await ToolContext.rooted(
-            at: workDirectory,
-            shell: shell,
-            environment: toolEnvironment,
-            questionHandler: { await questionBox.ask($0) },
-            backgroundProcesses: backgroundProcesses,
-            processSandbox: sandbox,
-            interactiveTerminal: interactiveTerminal,
-            diagnosticsProvider: CLIDiagnosticsProvider(
-                root: workDirectory,
-                shell: shell,
-                environment: toolEnvironment
-            ),
-            formatterProvider: Self.configuredFormatter(
-                settings: autoFormat,
-                root: workDirectory,
-                shell: shell,
-                environment: toolEnvironment
-            ),
-            sessionRecallProvider: SessionRecallIndex(
-                cwd: workingDirectory,
-                sessionDirectory: sessionDir
-            ),
-            projectMemoryProvider: memoryStore
-        )
-        let registry = ToolRegistry.builtin(
+        var registry = ToolRegistry.builtin(
             includePlanExit: agentMode == .plan,
-            includeSubagent: agentMode == .plan,
+            includeSubagent: agentMode != .build,
             includeSessionRecall: true,
-            includeProjectMemory: true
+            includeProjectMemory: true,
+            includeMCPResourceInspection: !mcpServers.isEmpty
         )
         // MCP tools (Phase 8c): connect the configured stdio servers and append their
         // tools to the built-ins. The manager is held on the session and torn down in
@@ -2429,19 +2405,23 @@ public struct InteractiveMode: Sendable {
             modeRules: modeRules
         )
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: permission.ruleset)
-        let tools = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
         let connectedMCPManager = mcpManager
         let connectedMCPTools = mcpTools
-        let toolResolver: @Sendable (String) async -> [any AgentTool] = { _ in
-            let currentMcp = await connectedMCPManager?.tools() ?? connectedMCPTools
-            let visible = PermissionSetup.visibleMCPTools(currentMcp, ruleset: permission.ruleset)
-            return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visible
-        }
 
         let planPath = AgentModePolicy.planPath(
             workingDirectory: workingDirectory,
             sessionID: "interactive"
         )
+        let initialPromptWorkspace = try SystemPromptBuilder(
+            workingDirectory: workDirectory,
+            configDirectory: FilePath(configDirectory),
+            toolNames: registry.names + visibleMcp.map(\.definition.name),
+            projectTrusted: true,
+            agentName: agentProfile?.name
+        ).build()
+        if !initialPromptWorkspace.skills.isEmpty {
+            registry.register(SkillTool())
+        }
         let promptWorkspace = try SystemPromptBuilder(
             workingDirectory: workDirectory,
             configDirectory: FilePath(configDirectory),
@@ -2449,6 +2429,40 @@ public struct InteractiveMode: Sendable {
             projectTrusted: true,
             agentName: agentProfile?.name
         ).build()
+        let toolContext = try await ToolContext.rooted(
+            at: workDirectory,
+            shell: shell,
+            environment: toolEnvironment,
+            questionHandler: { await questionBox.ask($0) },
+            mcpResourceProvider: mcpManager.map(makeMCPResourceProvider),
+            skillProvider: promptWorkspace.skills.isEmpty ? nil : makeSkillProvider(promptWorkspace),
+            backgroundProcesses: backgroundProcesses,
+            processSandbox: sandbox,
+            interactiveTerminal: interactiveTerminal,
+            diagnosticsProvider: CLIDiagnosticsProvider(
+                root: workDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            ),
+            formatterProvider: Self.configuredFormatter(
+                settings: autoFormat,
+                root: workDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            ),
+            sessionRecallProvider: SessionRecallIndex(
+                cwd: workingDirectory,
+                sessionDirectory: sessionDir
+            ),
+            projectMemoryProvider: memoryStore
+        )
+        let resolvedRegistry = registry
+        let tools = resolvedRegistry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
+        let toolResolver: @Sendable (String) async -> [any AgentTool] = { _ in
+            let currentMcp = await connectedMCPManager?.tools() ?? connectedMCPTools
+            let visible = PermissionSetup.visibleMCPTools(currentMcp, ruleset: permission.ruleset)
+            return resolvedRegistry.all.map { RegistryTool(tool: $0, context: toolContext) } + visible
+        }
         let promptForTools: @Sendable (String, [String]) -> String = { prompt, toolNames in
             let base = (try? SystemPromptBuilder(
                 workingDirectory: workDirectory,
@@ -2457,8 +2471,8 @@ public struct InteractiveMode: Sendable {
                 projectTrusted: true,
                 agentName: agentProfile?.name
             ).build().systemPrompt(for: prompt)) ?? promptWorkspace.systemPrompt(for: prompt)
-            guard agentMode == .plan else { return base }
-            return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+            guard AgentModePolicy.isReadOnly(agentMode) else { return base }
+            return base + "\n\n" + AgentModePolicy.systemPrompt(mode: agentMode, planPath: planPath)
         }
         let commandProcessor = PromptCommandProcessor(
             workspace: promptWorkspace,
@@ -2494,8 +2508,8 @@ public struct InteractiveMode: Sendable {
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         systemPromptForPrompt = { prompt in
             let base = promptWorkspace.systemPrompt(for: prompt)
-            guard agentMode == .plan else { return base }
-            return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+            guard AgentModePolicy.isReadOnly(agentMode) else { return base }
+            return base + "\n\n" + AgentModePolicy.systemPrompt(mode: agentMode, planPath: planPath)
         }
         var configuration = AgentHarness.Configuration(
             systemPrompt: promptWorkspace.baseSystemPrompt,

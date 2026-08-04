@@ -91,6 +91,29 @@ public struct PermissionRequestFactory: Sendable {
                 always: [],
                 metadata: ["query": .string(query)]
             )
+        case "mcp_resource":
+            let action = arguments["action"]?.stringValue?.lowercased() ?? ""
+            let server = arguments["server"]?.stringValue ?? ""
+            let uri = arguments["uri"]?.stringValue ?? ""
+            let target = [action, server, uri].filter { !$0.isEmpty }.joined(separator: ":")
+            return PermissionRequestSpec(
+                permission: "mcp_resource",
+                patterns: [target.isEmpty ? "*" : target],
+                always: [],
+                metadata: [
+                    "action": .string(action),
+                    "server": .string(server),
+                    "uri": .string(uri),
+                ]
+            )
+        case "skill":
+            let name = arguments["name"]?.stringValue ?? ""
+            return PermissionRequestSpec(
+                permission: "skill",
+                patterns: [name],
+                always: name.isEmpty ? [] : [name],
+                metadata: ["name": .string(name)]
+            )
         case "background_process":
             let action = arguments["action"]?.stringValue ?? ""
             let target = arguments["command"]?.stringValue
@@ -436,6 +459,8 @@ public func defaultBaselinePermissionConfig() -> PermissionConfig {
         PermissionConfigEntry(permission: "question", value: .action(.ask)),
         PermissionConfigEntry(permission: "webfetch", value: .action(.ask)),
         PermissionConfigEntry(permission: "websearch", value: .action(.ask)),
+        PermissionConfigEntry(permission: "mcp_resource", value: .action(.ask)),
+        PermissionConfigEntry(permission: "skill", value: .action(.allow)),
         PermissionConfigEntry(permission: "doom_loop", value: .action(.ask)),
     ]
 }

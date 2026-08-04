@@ -653,7 +653,8 @@ public actor ServerRuntime {
 
         return candidates.map { tool in
             let name = tool.definition.name
-            let modeHidden = mode == .build && (name == "plan_exit" || name == "task")
+            let modeHidden = (name == "plan_exit" && mode != .plan)
+                || (name == "task" && mode == .build)
             let action = config.permissions == nil
                 ? PermissionAction.allow
                 : evaluate(name, "*", rulesets: [ruleset]).action
@@ -686,7 +687,7 @@ public actor ServerRuntime {
                 permission: permission,
                 hiddenReason: hidden
                     ? (modeHidden
-                        ? "Available only in plan mode"
+                        ? (name == "plan_exit" ? "Available only in plan mode" : "Unavailable in build mode")
                         : "Denied by the current permission policy")
                     : nil,
                 metadata: metadata
@@ -887,15 +888,17 @@ public actor ServerRuntime {
         if let workspace = promptWorkspace {
             systemPromptForPrompt = { prompt in
                 let base = workspace.systemPrompt(for: prompt)
-                guard modeState.get() == .plan else { return base }
-                return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+                let mode = modeState.get()
+                guard AgentModePolicy.isReadOnly(mode) else { return base }
+                return base + "\n\n" + AgentModePolicy.systemPrompt(mode: mode, planPath: planPath)
             }
         }
         let filterTools: @Sendable ([any AgentTool]) -> [any AgentTool] = { tools in
             let mode = modeState.get()
             let hidden = disabledTools(tools.map(\.definition.name), rulesetForCurrentMode())
             return tools.filter { tool in
-                (mode == .plan || (tool.definition.name != "plan_exit" && tool.definition.name != "task"))
+                (mode == .plan || tool.definition.name != "plan_exit")
+                    && (mode != .build || tool.definition.name != "task")
                     && !hidden.contains(tool.definition.name)
             }
         }
@@ -911,8 +914,9 @@ public actor ServerRuntime {
         if let configured = config.systemPromptForPromptAndTools {
             promptForTools = { prompt, names in
                 let base = configured(prompt, names)
-                guard modeState.get() == .plan else { return base }
-                return base + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+                let mode = modeState.get()
+                guard AgentModePolicy.isReadOnly(mode) else { return base }
+                return base + "\n\n" + AgentModePolicy.systemPrompt(mode: mode, planPath: planPath)
             }
         } else {
             promptForTools = nil
@@ -1674,8 +1678,9 @@ public actor ServerRuntime {
             sessionID: sessionID
         )
         let addModePrompt: @Sendable (String) -> String = { prompt in
-            guard modeState.get() == .plan else { return prompt }
-            return prompt + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+            let mode = modeState.get()
+            guard AgentModePolicy.isReadOnly(mode) else { return prompt }
+            return prompt + "\n\n" + AgentModePolicy.systemPrompt(mode: mode, planPath: planPath)
         }
         session.runSink = sink
         session.runStartedAt = Date()

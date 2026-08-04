@@ -226,6 +226,27 @@ public struct AgentProfileRegistry: Codable, Hashable, Sendable {
             mode: .plan,
             source: .builtin
         ),
+        AgentProfile(
+            name: "ask",
+            description: "Answer questions with read-only workspace research.",
+            systemPrompt: "Answer questions with evidence from read-only workspace and reference tools. Distinguish observed facts from inference and do not claim to have changed files.",
+            mode: .ask,
+            source: .builtin
+        ),
+        AgentProfile(
+            name: "debug",
+            description: "Reproduce and isolate failures with evidence.",
+            systemPrompt: "Reproduce and isolate failures with evidence. Use read-only tools first and request approval before shell or process actions. Do not claim to have applied a fix.",
+            mode: .debug,
+            source: .builtin
+        ),
+        AgentProfile(
+            name: "review",
+            description: "Audit current changes without modifying the workspace.",
+            systemPrompt: "Audit the current diff and workspace state without modifying files. Report severity, locations, evidence, and suggested fixes.",
+            mode: .review,
+            source: .builtin
+        ),
     ])
 
     public func profile(named name: String) -> AgentProfile? {

@@ -32,6 +32,13 @@ nonisolated func toolCallDetail(name: String, arguments: JSONValue) -> String {
         raw = patchPaths(arguments)
     case "websearch":
         raw = arguments["query"]?.stringValue ?? ""
+    case "mcp_resource":
+        let action = arguments["action"]?.stringValue ?? ""
+        let server = arguments["server"]?.stringValue
+        let uri = arguments["uri"]?.stringValue
+        raw = [action, server, uri].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "  ")
+    case "skill":
+        raw = arguments["name"]?.stringValue ?? ""
     case "ls":
         raw = arguments["path"]?.stringValue ?? "."
     case "grep":

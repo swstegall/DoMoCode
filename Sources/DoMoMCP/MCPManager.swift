@@ -14,12 +14,82 @@ import Foundation
 
 /// Connects and owns the run's stdio MCP servers.
 public actor MCPManager {
+    public struct MCPResourceInfo: Sendable, Hashable {
+        public let server: String
+        public let uri: String
+        public let name: String
+        public let description: String?
+        public let mimeType: String?
+
+        public init(
+            server: String,
+            uri: String,
+            name: String,
+            description: String?,
+            mimeType: String?
+        ) {
+            self.server = server
+            self.uri = uri
+            self.name = name
+            self.description = description
+            self.mimeType = mimeType
+        }
+    }
+
+    public struct MCPResourceTemplateInfo: Sendable, Hashable {
+        public let server: String
+        public let uriTemplate: String
+        public let name: String
+        public let description: String?
+        public let mimeType: String?
+
+        public init(
+            server: String,
+            uriTemplate: String,
+            name: String,
+            description: String?,
+            mimeType: String?
+        ) {
+            self.server = server
+            self.uriTemplate = uriTemplate
+            self.name = name
+            self.description = description
+            self.mimeType = mimeType
+        }
+    }
+
+    public struct MCPResourceRead: Sendable, Hashable {
+        public let server: String
+        public let uri: String
+        public let contents: [JSONValue]
+
+        public init(server: String, uri: String, contents: [JSONValue]) {
+            self.server = server
+            self.uri = uri
+            self.contents = contents
+        }
+    }
+
+    public struct MCPServerHealth: Sendable, Hashable {
+        public let server: String
+        public let healthy: Bool
+
+        public init(server: String, healthy: Bool) {
+            self.server = server
+            self.healthy = healthy
+        }
+    }
+
+    public enum MCPManagerError: Error, Sendable, Equatable {
+        case serverNotConnected(String)
+    }
+
     private struct ServerKey: Hashable {
         let server: String
         let tool: String
     }
 
-    private struct ConnectedServer {
+    private struct ConnectedServer: Sendable {
         let name: String
         let client: MCPClient
     }
@@ -135,6 +205,80 @@ public actor MCPManager {
 
     /// The bridged tools connected so far.
     public func tools() -> [any AgentTool] { mcpTools }
+
+    /// Inspect resources from the connected servers. A broken or capability-less
+    /// server contributes no entries and does not make another server disappear.
+    public func resources(server requestedServer: String? = nil) async -> [MCPResourceInfo] {
+        var result: [MCPResourceInfo] = []
+        for server in selectedServers(requestedServer) {
+            do {
+                result.append(contentsOf: try await server.client.listResources().map { info in
+                    MCPResourceInfo(
+                        server: server.name,
+                        uri: info.uri,
+                        name: info.name,
+                        description: info.description,
+                        mimeType: info.mimeType
+                    )
+                })
+            } catch {
+                log?(Redaction.diagnostic("MCP resource listing failed for '\(server.name)': \(error)"))
+            }
+        }
+        return result
+    }
+
+    /// Inspect URI templates from the connected servers using the same manager
+    /// snapshot as tool discovery.
+    public func resourceTemplates(server requestedServer: String? = nil) async -> [MCPResourceTemplateInfo] {
+        var result: [MCPResourceTemplateInfo] = []
+        for server in selectedServers(requestedServer) {
+            do {
+                result.append(contentsOf: try await server.client.listResourceTemplates().map { info in
+                    MCPResourceTemplateInfo(
+                        server: server.name,
+                        uriTemplate: info.uriTemplate,
+                        name: info.name,
+                        description: info.description,
+                        mimeType: info.mimeType
+                    )
+                })
+            } catch {
+                log?(Redaction.diagnostic("MCP resource-template listing failed for '\(server.name)': \(error)"))
+            }
+        }
+        return result
+    }
+
+    /// Read one exact URI from one exact connected server. The server name is
+    /// required so a resource cannot be redirected to a different adapter after
+    /// the model has inspected its catalogue.
+    public func readResource(server requestedServer: String, uri: String) async throws -> MCPResourceRead {
+        guard let server = servers.first(where: { $0.name == requestedServer }) else {
+            throw MCPManagerError.serverNotConnected(requestedServer)
+        }
+        let contents = try await server.client.readResource(uri: uri)
+        return MCPResourceRead(server: requestedServer, uri: uri, contents: contents)
+    }
+
+    /// Ping one server or all connected servers for diagnostics.
+    public func health(server requestedServer: String? = nil) async -> [MCPServerHealth] {
+        await withTaskGroup(of: MCPServerHealth.self, returning: [MCPServerHealth].self) { group in
+            for server in selectedServers(requestedServer) {
+                group.addTask {
+                    MCPServerHealth(server: server.name, healthy: await server.client.health())
+                }
+            }
+            var result: [MCPServerHealth] = []
+            for await health in group { result.append(health) }
+            return result.sorted { $0.server < $1.server }
+        }
+    }
+
+    private func selectedServers(_ requestedServer: String?) -> [ConnectedServer] {
+        guard let requestedServer else { return servers }
+        return servers.filter { $0.name == requestedServer }
+    }
 
     /// Rebuild the bridge after one of the connected clients receives
     /// `notifications/tools/list_changed`. The current server/tool order is

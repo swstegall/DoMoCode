@@ -15,7 +15,9 @@ struct ToolFixture {
         toolLocator: ExternalToolLocator = .pathSearch,
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
-        webSearch: WebSearch? = nil
+        webSearch: WebSearch? = nil,
+        mcpResourceProvider: MCPResourceProvider? = nil,
+        skillProvider: SkillProvider? = nil
     ) async throws -> ToolFixture {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("domotools-\(UUID().uuidString)", isDirectory: true)
@@ -27,7 +29,9 @@ struct ToolFixture {
             toolLocator: toolLocator,
             questionHandler: questionHandler,
             webFetch: webFetch,
-            webSearch: webSearch
+            webSearch: webSearch,
+            mcpResourceProvider: mcpResourceProvider,
+            skillProvider: skillProvider
         )
         return ToolFixture(root: context.workingDirectory, context: context, cleanupURL: base)
     }

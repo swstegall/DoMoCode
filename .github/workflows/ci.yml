@@ -119,6 +119,14 @@ jobs:
               | sed -n "s/^${target}\\.${suite}\\/\\(.*\\)$/\\1/p" \
               | sort -u)"
             if [[ -z "$tests" ]]; then
+              # Swift 6.3 changed the rendered Swift Testing case path on
+              # macOS. The suite filter remains stable, so keep this special
+              # PTY suite covered even when its case names cannot be parsed.
+              if [[ "$target" == "DoMoCLITests" && "$suite" == "FullScreenClientPTYTests" ]]; then
+                swift test --configuration ${{ matrix.configuration }} --no-parallel \
+                  --filter "$suite"
+                return
+              fi
               printf 'No test cases discovered for %s.%s\\n' "$target" "$suite" >&2
               return 1
             fi

@@ -33,7 +33,7 @@ struct MCPClientTests {
             if not line: continue
             m = json.loads(line); method = m.get("method"); mid = m.get("id")
             if method == "initialize":
-                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":pv,"capabilities":{"tools":{"listChanged":False}},"serverInfo":{"name":"fixture","version":"1.0"}}})
+                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":pv,"capabilities":{"tools":{"listChanged":False},"resources":{"listChanged":False}},"serverInfo":{"name":"fixture","version":"1.0"}}})
             elif method == "tools/list":
                 send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
                     {"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
@@ -41,6 +41,16 @@ struct MCPClientTests {
                     {"name":"slow","description":"Never responds","inputSchema":{"type":"object","properties":{}}},
                     {"name":"getenv","description":"Read an env var","inputSchema":{"type":"object","properties":{"name":{"type":"string"}}}},
                     {"name":"quit","description":"Reply then exit","inputSchema":{"type":"object","properties":{}}}]}})
+            elif method == "resources/list":
+                send({"jsonrpc":"2.0","id":mid,"result":{"resources":[
+                    {"uri":"memo://one","name":"One","description":"A note","mimeType":"text/plain"}]}})
+            elif method == "resources/templates/list":
+                send({"jsonrpc":"2.0","id":mid,"result":{"resourceTemplates":[
+                    {"uriTemplate":"memo://{name}","name":"Named note","description":"A named note","mimeType":"text/plain"}]}})
+            elif method == "resources/read":
+                p = m.get("params",{})
+                send({"jsonrpc":"2.0","id":mid,"result":{"contents":[
+                    {"uri":p.get("uri",""),"mimeType":"text/plain","text":"reference only"}]}})
             elif method == "tools/call":
                 p = m.get("params",{}); name = p.get("name"); args = p.get("arguments",{})
                 if name == "echo":
@@ -97,6 +107,30 @@ struct MCPClientTests {
         let ok = try await echo.execute(.object(["text": .string("hi")]))
         #expect(ok.output == "echo: hi")
         #expect(!ok.isError)
+    }
+
+    @Test("Inspect resources, templates, reads, and health through the manager")
+    func resourceInspection() async throws {
+        guard let (dir, config) = try fixtureConfig() else { return }
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let manager = MCPManager()
+        _ = await manager.connect(servers: ["srv": config], workspaceDirectory: dir.path)
+        defer { Task { await manager.shutdown() } }
+
+        let resources = await manager.resources()
+        #expect(resources.map(\.server) == ["srv"])
+        #expect(resources.first?.uri == "memo://one")
+        #expect(resources.first?.mimeType == "text/plain")
+
+        let templates = await manager.resourceTemplates(server: "srv")
+        #expect(templates.first?.uriTemplate == "memo://{name}")
+
+        let read = try await manager.readResource(server: "srv", uri: "memo://one")
+        #expect(read.contents.first?["text"]?.stringValue == "reference only")
+
+        let health = await manager.health(server: "srv")
+        #expect(health == [MCPManager.MCPServerHealth(server: "srv", healthy: true)])
     }
 
     @Test("A tool's isError result is surfaced as an error tool result, not a throw")

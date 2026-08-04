@@ -167,7 +167,7 @@ struct GrantScopeTests {
             +note
             *** End Patch
             """
-        let specs = factory.makeAll(toolName: "apply_patch", arguments: ["patch": patch])
+        let specs = factory.makeAll(toolName: "apply_patch", arguments: .object(["patch": .string(patch)]))
 
         #expect(specs.map(\.patterns) == [["src/a.swift"], ["notes.md"]])
         #expect(specs.map(\.always) == [["/work/src/a.swift"], ["/work/notes.md"]])
@@ -184,7 +184,7 @@ struct GrantScopeTests {
             +{"permission": {}}
             *** End Patch
             """
-        let spec = factory.make(toolName: "apply_patch", arguments: ["patch": patch])
+        let spec = factory.make(toolName: "apply_patch", arguments: .object(["patch": .string(patch)]))
 
         #expect(spec.configProtected)
         #expect(spec.always.isEmpty)
@@ -199,6 +199,29 @@ struct GrantScopeTests {
         #expect(spec.permission == "websearch")
         #expect(spec.patterns == ["swift concurrency"])
         #expect(spec.always.isEmpty)
+    }
+
+    @Test("MCP resource inspection is action/server scoped and never always-granted")
+    func mcpResourcePermission() {
+        let spec = factory.make(
+            toolName: "mcp_resource",
+            arguments: [
+                "action": "read",
+                "server": "docs",
+                "uri": "memo://one",
+            ]
+        )
+        #expect(spec.permission == "mcp_resource")
+        #expect(spec.patterns == ["read:docs:memo://one"])
+        #expect(spec.always.isEmpty)
+    }
+
+    @Test("trusted skill grants stay scoped to the requested name")
+    func skillPermission() {
+        let spec = factory.make(toolName: "skill", arguments: ["name": "review"])
+        #expect(spec.permission == "skill")
+        #expect(spec.patterns == ["review"])
+        #expect(spec.always == ["review"])
     }
 
     // MARK: Persistence

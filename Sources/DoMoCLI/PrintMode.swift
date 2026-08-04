@@ -688,8 +688,8 @@ public struct PrintMode: Sendable {
             sessionID: "print"
         )
         let addModePrompt: @Sendable (String) -> String = { prompt in
-            guard agentMode == .plan else { return prompt }
-            return prompt + "\n\n" + AgentModePolicy.systemPrompt(planPath: planPath)
+            guard AgentModePolicy.isReadOnly(agentMode) else { return prompt }
+            return prompt + "\n\n" + AgentModePolicy.systemPrompt(mode: agentMode, planPath: planPath)
         }
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         if let promptWorkspace {

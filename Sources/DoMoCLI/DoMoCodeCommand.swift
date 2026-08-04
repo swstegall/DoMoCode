@@ -206,7 +206,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
     private static func parseAgentMode(_ raw: String) throws -> AgentMode {
         guard let mode = AgentMode(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
-            throw DoMoError(.configuration, "--mode must be build or plan (got \(raw)).")
+            let allowed = AgentMode.allCases.map(\.rawValue).joined(separator: ", ")
+            throw DoMoError(.configuration, "--mode must be one of \(allowed) (got \(raw)).")
         }
         return mode
     }
@@ -469,7 +470,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             configDirectory: configuration.configDirectory
         )
         let requestedProfileName = agent
-            ?? (agentMode?.lowercased() == AgentMode.plan.rawValue ? AgentMode.plan.rawValue : AgentMode.build.rawValue)
+            ?? agentMode.flatMap { AgentMode(rawValue: $0.lowercased())?.rawValue }
+            ?? AgentMode.build.rawValue
         guard let profile = profileWorkspace.agents.profile(named: requestedProfileName) else {
             let available = profileWorkspace.agents.profiles.map(\.name).joined(separator: ", ")
             throw DoMoError(
@@ -603,37 +605,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
         let shell = try SubprocessShell(sandbox: processSandbox)
         let toolEnvironment = Self.toolEnvironment(configuration, sandboxed: processSandbox != nil)
-        let toolContext = try await ToolContext.rooted(
-            at: workingDirectory,
-            shell: shell,
-            environment: toolEnvironment,
-            backgroundProcesses: BackgroundProcessManager(sandbox: processSandbox),
-            processSandbox: processSandbox,
-            diagnosticsProvider: CLIDiagnosticsProvider(
-                root: workingDirectory,
-                shell: shell,
-                environment: toolEnvironment
-            ),
-            formatterProvider: Self.configuredFormatter(
-                configuration: configuration,
-                root: workingDirectory,
-                shell: shell,
-                environment: toolEnvironment
-            ),
-            sessionRecallProvider: SessionRecallIndex(
-                cwd: workingDirectory.string,
-                sessionDirectory: configuration.sessionDirectory
-            ),
-            projectMemoryProvider: ProjectMemoryStore(
-                configDirectory: configuration.configDirectory,
-                cwd: workingDirectory.string
-            )
-        )
-        let registry = ToolRegistry.builtin(
+        var registry = ToolRegistry.builtin(
             includePlanExit: selectedMode == .plan,
-            includeSubagent: selectedMode == .plan,
+            includeSubagent: selectedMode != .build,
             includeSessionRecall: true,
-            includeProjectMemory: true
+            includeProjectMemory: true,
+            includeMCPResourceInspection: !configuration.mcpServers.isEmpty
         )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
 
@@ -693,6 +670,16 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             mcpTools,
             ruleset: resolvedPermissionRules
         )
+        let initialPromptWorkspace = try SystemPromptBuilder(
+            workingDirectory: workingDirectory,
+            configDirectory: configuration.configDirectory,
+            toolNames: registry.names + visibleMcp.map(\.definition.name),
+            projectTrusted: true,
+            agentName: profile.name
+        ).build()
+        if !initialPromptWorkspace.skills.isEmpty {
+            registry.register(SkillTool())
+        }
         let promptBuilder = SystemPromptBuilder(
             workingDirectory: workingDirectory,
             configDirectory: configuration.configDirectory,
@@ -701,6 +688,34 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             agentName: profile.name
         )
         let promptWorkspace = try promptBuilder.build()
+        let toolContext = try await ToolContext.rooted(
+            at: workingDirectory,
+            shell: shell,
+            environment: toolEnvironment,
+            mcpResourceProvider: configuration.mcpServers.isEmpty ? nil : makeMCPResourceProvider(mcpManager),
+            skillProvider: promptWorkspace.skills.isEmpty ? nil : makeSkillProvider(promptWorkspace),
+            backgroundProcesses: BackgroundProcessManager(sandbox: processSandbox),
+            processSandbox: processSandbox,
+            diagnosticsProvider: CLIDiagnosticsProvider(
+                root: workingDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            ),
+            formatterProvider: Self.configuredFormatter(
+                configuration: configuration,
+                root: workingDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            ),
+            sessionRecallProvider: SessionRecallIndex(
+                cwd: workingDirectory.string,
+                sessionDirectory: configuration.sessionDirectory
+            ),
+            projectMemoryProvider: ProjectMemoryStore(
+                configDirectory: configuration.configDirectory,
+                cwd: workingDirectory.string
+            )
+        )
         let mcpToolResolver: @Sendable () async -> [any AgentTool] = {
             PermissionSetup.visibleMCPTools(
                 await mcpManager.tools(),
@@ -1081,38 +1096,15 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             configDirectory: configuration.configDirectory,
             cwd: workingDirectory.string
         )
-        let toolContext = try await ToolContext.rooted(
-            at: workingDirectory,
-            shell: shell,
-            environment: toolEnvironment,
-            backgroundProcesses: BackgroundProcessManager(sandbox: sandbox),
-            processSandbox: sandbox,
-            diagnosticsProvider: CLIDiagnosticsProvider(
-                root: workingDirectory,
-                shell: shell,
-                environment: toolEnvironment
-            ),
-            formatterProvider: Self.configuredFormatter(
-                configuration: configuration,
-                root: workingDirectory,
-                shell: shell,
-                environment: toolEnvironment
-            ),
-            sessionRecallProvider: SessionRecallIndex(
-                cwd: workingDirectory.string,
-                sessionDirectory: configuration.sessionDirectory
-            ),
-            projectMemoryProvider: memoryStore,
-            subagentCoordinator: subagentCoordinator
-        )
         // Keep plan_exit in the server registry even when the default mode is build;
         // ServerRuntime filters it from build sessions and reveals it when a session
         // switches to plan mode without rebuilding the process.
-        let registry = ToolRegistry.builtin(
+        var registry = ToolRegistry.builtin(
             includePlanExit: true,
             includeSubagent: true,
             includeSessionRecall: true,
-            includeProjectMemory: true
+            includeProjectMemory: true,
+            includeMCPResourceInspection: !configuration.mcpServers.isEmpty
         )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
@@ -1161,14 +1153,66 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         )
         let initialRuleset = rulesetForMode(agentMode, initialPlanPath)
         let visibleMcp = PermissionSetup.visibleMCPTools(mcpTools, ruleset: initialRuleset)
-        let tools: [any AgentTool] = registry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
+        let promptToolNames = registry.names.filter {
+            (agentMode == .plan || $0 != "plan_exit")
+                && (agentMode != .build || $0 != "task")
+        }
+            + visibleMcp.map(\.definition.name)
+        let initialPromptWorkspace = try SystemPromptBuilder(
+            workingDirectory: workingDirectory,
+            configDirectory: configuration.configDirectory,
+            toolNames: promptToolNames,
+            projectTrusted: true,
+            agentName: agentProfile.name
+        ).build()
+        if !initialPromptWorkspace.skills.isEmpty {
+            registry.register(SkillTool())
+        }
+        let promptWorkspace = try SystemPromptBuilder(
+            workingDirectory: workingDirectory,
+            configDirectory: configuration.configDirectory,
+            toolNames: registry.names.filter {
+                (agentMode == .plan || $0 != "plan_exit")
+                    && (agentMode != .build || $0 != "task")
+            } + visibleMcp.map(\.definition.name),
+            projectTrusted: true,
+            agentName: agentProfile.name
+        ).build()
+        let toolContext = try await ToolContext.rooted(
+            at: workingDirectory,
+            shell: shell,
+            environment: toolEnvironment,
+            mcpResourceProvider: configuration.mcpServers.isEmpty ? nil : makeMCPResourceProvider(mcpManager),
+            skillProvider: promptWorkspace.skills.isEmpty ? nil : makeSkillProvider(promptWorkspace),
+            backgroundProcesses: BackgroundProcessManager(sandbox: sandbox),
+            processSandbox: sandbox,
+            diagnosticsProvider: CLIDiagnosticsProvider(
+                root: workingDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            ),
+            formatterProvider: Self.configuredFormatter(
+                configuration: configuration,
+                root: workingDirectory,
+                shell: shell,
+                environment: toolEnvironment
+            ),
+            sessionRecallProvider: SessionRecallIndex(
+                cwd: workingDirectory.string,
+                sessionDirectory: configuration.sessionDirectory
+            ),
+            projectMemoryProvider: memoryStore,
+            subagentCoordinator: subagentCoordinator
+        )
+        let resolvedRegistry = registry
+        let tools: [any AgentTool] = resolvedRegistry.all.map { RegistryTool(tool: $0, context: toolContext) } + visibleMcp
         let toolResolver: @Sendable (String) async -> [any AgentTool] = { _ in
             let currentMcp = await mcpManager.tools()
             // ServerRuntime applies the per-session mode filter after this resolver.
             // Returning the complete current MCP set lets a session that starts in
             // plan mode regain project-approved MCP tools if it later switches back
             // to build mode.
-            return registry.all.map { RegistryTool(tool: $0, context: toolContext) } + currentMcp
+            return resolvedRegistry.all.map { RegistryTool(tool: $0, context: toolContext) } + currentMcp
         }
         let sessionToolResolver: @Sendable (String, String) async -> [any AgentTool] = { sessionID, _ in
             let resources = await backgroundSessions.resources(for: sessionID)
@@ -1177,7 +1221,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 includePlanExit: true,
                 includeSubagent: true,
                 includeSessionRecall: true,
-                includeProjectMemory: true
+                includeProjectMemory: true,
+                includeMCPResourceInspection: !configuration.mcpServers.isEmpty,
+                includeSkillInvocation: !promptWorkspace.skills.isEmpty
             )
             let sessionContext = toolContext.withQuestionHandler({ prompts in
                 let wirePrompts = prompts.map { prompt in
@@ -1203,17 +1249,6 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // can widen only back to the ordinary build policy.
             return sessionRegistry.all.map { RegistryTool(tool: $0, context: sessionContext) } + currentMcp
         }
-        let promptToolNames = registry.names.filter {
-            agentMode == .plan || ($0 != "plan_exit" && $0 != "task")
-        }
-            + visibleMcp.map(\.definition.name)
-        let promptWorkspace = try SystemPromptBuilder(
-            workingDirectory: workingDirectory,
-            configDirectory: configuration.configDirectory,
-            toolNames: promptToolNames,
-            projectTrusted: true,
-            agentName: agentProfile.name
-        ).build()
         let promptForTools: @Sendable (String, [String]) -> String = { prompt, toolNames in
             (try? SystemPromptBuilder(
                 workingDirectory: workingDirectory,

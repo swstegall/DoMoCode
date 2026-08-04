@@ -220,7 +220,9 @@ public struct ToolRegistry: Sendable {
         includePlanExit: Bool = false,
         includeSubagent: Bool = false,
         includeSessionRecall: Bool = false,
-        includeProjectMemory: Bool = false
+        includeProjectMemory: Bool = false,
+        includeMCPResourceInspection: Bool = false,
+        includeSkillInvocation: Bool = false
     ) -> ToolRegistry {
         var tools: [any Tool] = [
             ReadTool(), BashTool(), EditTool(), ApplyPatchTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
@@ -231,6 +233,8 @@ public struct ToolRegistry: Sendable {
         if includeSubagent { tools.append(TaskTool()) }
         if includeSessionRecall { tools.append(SessionRecallTool()) }
         if includeProjectMemory { tools.append(ProjectMemoryTool()) }
+        if includeMCPResourceInspection { tools.append(MCPResourceTool()) }
+        if includeSkillInvocation { tools.append(SkillTool()) }
         return ToolRegistry(tools)
     }
 
@@ -287,6 +291,128 @@ public struct WebSearchHit: Sendable, Hashable {
 /// MCP-backed adapter, or no provider at all; the native tool never guesses at
 /// a search endpoint and never receives a secret value through ``ToolContext``.
 public typealias WebSearch = @Sendable (String, Int) async throws -> [WebSearchHit]
+
+/// A resource advertised by a connected MCP server. The server name stays in the
+/// value so an inspection result can be routed back to the same server for reads.
+public struct MCPResourceDescriptor: Sendable, Hashable {
+    public let server: String
+    public let uri: String
+    public let name: String
+    public let description: String?
+    public let mimeType: String?
+
+    public init(
+        server: String,
+        uri: String,
+        name: String,
+        description: String? = nil,
+        mimeType: String? = nil
+    ) {
+        self.server = server
+        self.uri = uri
+        self.name = name
+        self.description = description
+        self.mimeType = mimeType
+    }
+}
+
+/// A URI template advertised by a connected MCP server.
+public struct MCPResourceTemplateDescriptor: Sendable, Hashable {
+    public let server: String
+    public let uriTemplate: String
+    public let name: String
+    public let description: String?
+    public let mimeType: String?
+
+    public init(
+        server: String,
+        uriTemplate: String,
+        name: String,
+        description: String? = nil,
+        mimeType: String? = nil
+    ) {
+        self.server = server
+        self.uriTemplate = uriTemplate
+        self.name = name
+        self.description = description
+        self.mimeType = mimeType
+    }
+}
+
+/// The contents returned by one MCP `resources/read` call. MCP content is kept as
+/// JSON because servers may return text, blobs, or vendor-specific fields.
+public struct MCPResourceContents: Sendable, Hashable {
+    public let server: String
+    public let uri: String
+    public let contents: [JSONValue]
+
+    public init(server: String, uri: String, contents: [JSONValue]) {
+        self.server = server
+        self.uri = uri
+        self.contents = contents
+    }
+}
+
+/// Health state for one connected MCP server.
+public struct MCPServerHealth: Sendable, Hashable {
+    public let server: String
+    public let healthy: Bool
+
+    public init(server: String, healthy: Bool) {
+        self.server = server
+        self.healthy = healthy
+    }
+}
+
+public enum MCPResourceAction: String, CaseIterable, Sendable, Hashable {
+    case list
+    case templates
+    case read
+    case health
+}
+
+/// A bounded, explicit request made by the model-facing MCP resource tool.
+public struct MCPResourceQuery: Sendable, Hashable {
+    public let action: MCPResourceAction
+    public let server: String?
+    public let uri: String?
+
+    public init(action: MCPResourceAction, server: String? = nil, uri: String? = nil) {
+        self.action = action
+        self.server = server
+        self.uri = uri
+    }
+}
+
+public enum MCPResourceResponse: Sendable, Hashable {
+    case resources([MCPResourceDescriptor])
+    case templates([MCPResourceTemplateDescriptor])
+    case contents(MCPResourceContents)
+    case health([MCPServerHealth])
+}
+
+/// Adapter seam for MCP resource inspection. DoMoTools deliberately does not
+/// import DoMoMCP; CLI/server surfaces bridge their manager into this closure.
+public typealias MCPResourceProvider = @Sendable (MCPResourceQuery) async throws -> MCPResourceResponse
+
+/// A skill that has already passed the host's trust/resource loading policy.
+/// Skill invocation returns its inert Markdown body; it never executes code.
+public struct TrustedSkillResource: Sendable, Hashable {
+    public let name: String
+    public let description: String?
+    public let body: String
+    public let source: String?
+
+    public init(name: String, description: String? = nil, body: String, source: String? = nil) {
+        self.name = name
+        self.description = description
+        self.body = body
+        self.source = source
+    }
+}
+
+/// Looks up one already trusted skill resource by its user-facing name.
+public typealias SkillProvider = @Sendable (String) async -> TrustedSkillResource?
 
 /// One structured multiple-choice option.
 public struct QuestionOption: Sendable, Hashable {
@@ -375,6 +501,14 @@ public struct ToolContext: Sendable {
     /// installations that expose search through MCP instead.
     public let webSearch: WebSearch?
 
+    /// Optional adapter for inspecting resources exposed by local or remote MCP.
+    /// A missing provider keeps the resource tool fail-closed on surfaces that do
+    /// not own an MCP manager.
+    public let mcpResourceProvider: MCPResourceProvider?
+
+    /// Optional lookup for already trusted, inert skill resources.
+    public let skillProvider: SkillProvider?
+
     /// Session-scoped long-running children used by ``BackgroundProcessTool``.
     /// The manager is created with the context so one session can poll a process
     /// from a later tool call without sharing it with another session.
@@ -420,6 +554,8 @@ public struct ToolContext: Sendable {
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         webSearch: WebSearch? = nil,
+        mcpResourceProvider: MCPResourceProvider? = nil,
+        skillProvider: SkillProvider? = nil,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         processSandbox: ProcessSandbox? = nil,
         interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
@@ -438,6 +574,8 @@ public struct ToolContext: Sendable {
         self.questionHandler = questionHandler
         self.webFetch = webFetch
         self.webSearch = webSearch
+        self.mcpResourceProvider = mcpResourceProvider
+        self.skillProvider = skillProvider
         self.backgroundProcesses = backgroundProcesses
         self.processSandbox = processSandbox
         self.interactiveTerminal = interactiveTerminal
@@ -461,6 +599,8 @@ public struct ToolContext: Sendable {
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
         webSearch: WebSearch? = nil,
+        mcpResourceProvider: MCPResourceProvider? = nil,
+        skillProvider: SkillProvider? = nil,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         processSandbox: ProcessSandbox? = nil,
         interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
@@ -480,6 +620,8 @@ public struct ToolContext: Sendable {
             questionHandler: questionHandler,
             webFetch: webFetch,
             webSearch: webSearch,
+            mcpResourceProvider: mcpResourceProvider,
+            skillProvider: skillProvider,
             backgroundProcesses: backgroundProcesses,
             processSandbox: processSandbox,
             interactiveTerminal: interactiveTerminal,
@@ -500,6 +642,8 @@ public struct ToolContext: Sendable {
             handler,
             backgroundProcesses: backgroundProcesses,
             webSearch: webSearch,
+            mcpResourceProvider: mcpResourceProvider,
+            skillProvider: skillProvider,
             processSandbox: processSandbox,
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
@@ -518,6 +662,8 @@ public struct ToolContext: Sendable {
         _ handler: QuestionHandler?,
         backgroundProcesses: BackgroundProcessManager,
         webSearch: WebSearch? = nil,
+        mcpResourceProvider: MCPResourceProvider? = nil,
+        skillProvider: SkillProvider? = nil,
         processSandbox: ProcessSandbox? = nil,
         interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
@@ -536,6 +682,8 @@ public struct ToolContext: Sendable {
             questionHandler: handler,
             webFetch: webFetch,
             webSearch: webSearch ?? self.webSearch,
+            mcpResourceProvider: mcpResourceProvider ?? self.mcpResourceProvider,
+            skillProvider: skillProvider ?? self.skillProvider,
             backgroundProcesses: backgroundProcesses,
             processSandbox: processSandbox ?? self.processSandbox,
             interactiveTerminal: interactiveTerminal ?? self.interactiveTerminal,

@@ -156,6 +156,89 @@ struct UtilityToolTests {
         #expect(result.text.contains("configure a search provider"))
     }
 
+    @Test("mcp_resource inspects and bounds trusted adapter responses")
+    func mcpResourceInspection() async throws {
+        let fixture = try await ToolFixture.make(
+            mcpResourceProvider: { query in
+                switch query.action {
+                case .list:
+                    return .resources([
+                        MCPResourceDescriptor(
+                            server: "docs",
+                            uri: "memo://one",
+                            name: "One",
+                            description: "A note",
+                            mimeType: "text/plain"
+                        )
+                    ])
+                case .templates:
+                    return .templates([
+                        MCPResourceTemplateDescriptor(
+                            server: "docs",
+                            uriTemplate: "memo://{name}",
+                            name: "Named note"
+                        )
+                    ])
+                case .read:
+                    return .contents(
+                        MCPResourceContents(
+                            server: query.server ?? "docs",
+                            uri: query.uri ?? "memo://one",
+                            contents: [["type": "text", "text": "reference only"]]
+                        )
+                    )
+                case .health:
+                    return .health([MCPServerHealth(server: "docs", healthy: true)])
+                }
+            }
+        )
+        defer { fixture.removeCleanup() }
+
+        let list = try await MCPResourceTool().execute(["action": "list"], in: fixture.context)
+        #expect(!list.isError)
+        #expect(list.text.contains("docs: One"))
+        #expect(list.text.contains("trust=\"untrusted\""))
+
+        let templates = try await MCPResourceTool().execute(["action": "templates"], in: fixture.context)
+        #expect(templates.text.contains("memo://{name}"))
+
+        let read = try await MCPResourceTool().execute(
+            ["action": "read", "server": "docs", "uri": "memo://one"],
+            in: fixture.context
+        )
+        #expect(read.text.contains("reference only"))
+        #expect(read.details["contents"]?.arrayValue?.count == 1)
+
+        let health = try await MCPResourceTool().execute(["action": "health"], in: fixture.context)
+        #expect(health.text.contains("docs: healthy"))
+    }
+
+    @Test("skill invokes only an exact trusted resource and never executes it")
+    func trustedSkillInvocation() async throws {
+        let fixture = try await ToolFixture.make(
+            skillProvider: { name in
+                guard name.caseInsensitiveCompare("review") == .orderedSame else { return nil }
+                return TrustedSkillResource(
+                    name: "review",
+                    description: "Read-only review guidance",
+                    body: "Inspect the diff and report evidence.",
+                    source: "project"
+                )
+            }
+        )
+        defer { fixture.removeCleanup() }
+
+        let result = try await SkillTool().execute(["name": " REVIEW "], in: fixture.context)
+        #expect(!result.isError)
+        #expect(result.text.contains("<trusted-skill name=\"review\">"))
+        #expect(result.text.contains("Inspect the diff"))
+        #expect(result.details["source"]?.stringValue == "project")
+
+        let missing = try await SkillTool().execute(["name": "unknown"], in: fixture.context)
+        #expect(missing.isError)
+        #expect(missing.text.contains("No trusted skill"))
+    }
+
     @Test("question returns structured selections through its handler")
     func question() async throws {
         let fixture = try await ToolFixture.make(
