@@ -55,6 +55,7 @@ public final class ClientApp {
     /// the ordinary session view.
     private var workflowWorkspace: WorkflowWorkspaceController?
     private var workflowRefreshTask: Task<Void, Never>?
+    private var workflowRunID: String?
     /// Command metadata is fetched from the runtime at bootstrap. The client
     /// uses local actions immediately and forwards prompt commands unchanged so
     /// the server remains the authority for template expansion.
@@ -2951,6 +2952,7 @@ public final class ClientApp {
         workspace.onChange = { [weak self] in self?.surface?.requestRender() }
         workspace.onExit = { [weak self] in self?.closeWorkflow() }
         if let phaseID { workspace.selectPhase(id: phaseID) }
+        workflowRunID = nil
         workflowWorkspace = workspace
         focus.register(workspace)
         focus.setCurrent(workspace)
@@ -2963,6 +2965,7 @@ public final class ClientApp {
         workflowWorkspace = nil
         workflowRefreshTask?.cancel()
         workflowRefreshTask = nil
+        workflowRunID = nil
         focus.unregister(workspace)
         focus.setCurrent(promptInput)
         surface?.requestFullRedraw()
@@ -2986,7 +2989,11 @@ public final class ClientApp {
                     ) {
                         let runs = try await self.client.workflowRuns(workflowID: definition.id)
                         let latest = runs.max { $0.updatedAt < $1.updatedAt }
-                        workspace.setPhases(Self.workflowPhases(definition: definition, run: latest))
+                        if self.workflowRunID == nil { self.workflowRunID = latest?.id }
+                        let selectedRun = self.workflowRunID.flatMap { runID in
+                            runs.first(where: { $0.id == runID })
+                        } ?? latest
+                        workspace.setPhases(Self.workflowPhases(definition: definition, run: selectedRun))
                         if let preferredPhaseID { workspace.selectPhase(id: preferredPhaseID) }
                         self.surface?.requestRender()
                     }
@@ -3005,6 +3012,44 @@ public final class ClientApp {
             }
         }
         workflowRefreshTask = task
+        actionTasks.append(task)
+    }
+
+    /// Admit a workflow from a slash-command argument. The workflow workspace is
+    /// mounted before the request so a slow server still gives the user the
+    /// phase/agent surface immediately; the durable run then replaces the local
+    /// placeholders on the next bounded snapshot poll.
+    private func startWorkflowFromCommand(
+        prompt: String,
+        preferredPhaseID: String?
+    ) {
+        guard let sessionID = store.selectedSessionID else {
+            post(notice: "open a session before starting a workflow")
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let definitions = try await self.client.workflowDefinitions()
+                guard let definition = Self.workflowDefinition(
+                    from: definitions,
+                    preferredPhaseID: preferredPhaseID
+                ) else {
+                    self.post(notice: "this server has no workflow definitions")
+                    return
+                }
+                let run = try await self.client.startWorkflow(
+                    workflowID: definition.id,
+                    sessionID: sessionID,
+                    input: .string(prompt)
+                )
+                guard self.workflowWorkspace != nil else { return }
+                self.workflowRunID = run.id
+                self.surface?.requestRender()
+            } catch {
+                self.postError("Could not start workflow", error)
+            }
+        }
         actionTasks.append(task)
     }
 
@@ -3155,6 +3200,15 @@ public final class ClientApp {
                     ? commandName.lowercased()
                     : nil
                 openWorkflow(startingAt: phase)
+                let argument = Self.commandArguments(in: trimmed)
+                if !argument.isEmpty {
+                    guard attachments.isEmpty else {
+                        promptInput.restore(text, attachments: attachments)
+                        post(notice: "workflow commands currently accept text only")
+                        return
+                    }
+                    startWorkflowFromCommand(prompt: argument, preferredPhaseID: phase)
+                }
             case .compact:
                 guard let id = store.selectedSessionID else {
                     post(notice: "no session is open")
@@ -3279,6 +3333,15 @@ public final class ClientApp {
         let end = rest.firstIndex(where: { $0.isWhitespace }) ?? rest.endIndex
         let name = String(rest[..<end])
         return name.isEmpty ? nil : name
+    }
+
+    private static func commandArguments(in input: String) -> String {
+        guard let name = commandName(in: input) else { return "" }
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "/" + name
+        guard trimmed.count > prefix.count else { return "" }
+        return String(trimmed.dropFirst(prefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func timelineNotice(_ entries: [SessionTreeEntry]) -> String {
