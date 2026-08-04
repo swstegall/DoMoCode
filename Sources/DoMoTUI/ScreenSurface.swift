@@ -32,6 +32,12 @@ import Foundation
 public final class ScreenSurface: TerminalApp {
     /// Where frames are written. `public` to witness ``TerminalApp/target``.
     public let target: any RenderTarget
+    /// The page-wide background. ``ThemeColor/inherit`` deliberately leaves the
+    /// terminal's existing background untouched; a concrete colour fills every
+    /// cell, including rows and spaces no component wrote.
+    public var frameBackground: ThemeColor = .inherit
+    /// Whether a true-colour SGR should be used for ``frameBackground``.
+    public var frameBackgroundTrueColor = true
     /// The alt-screen differential renderer (absolute CUP, no scroll state).
     private var core: AltScreenCore
     /// Tab-order focus between the regions the app registers.
@@ -134,7 +140,12 @@ public final class ScreenSurface: TerminalApp {
         // Solve to a buffer (not just lines) so the image layer travels with the
         // text grid to the renderer, which paints text around the images.
         let buffer = layoutBuffer(build(), width: width, height: height)
-        var lines = buffer.flatten()
+        var lines = paintFrameBackground(
+            buffer.flatten(),
+            width: width,
+            color: frameBackground,
+            trueColor: frameBackgroundTrueColor
+        )
         if !overlayStack.isEmpty {
             lines = compositeOverlays(lines, termWidth: width, termHeight: height)
         }

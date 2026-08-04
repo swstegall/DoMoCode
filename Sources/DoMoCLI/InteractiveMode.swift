@@ -155,6 +155,9 @@ final class StatusLine: @MainActor Component {
     /// The right-aligned accounting strip. Empty renders the row exactly as it
     /// rendered before there was one.
     var trailing: String = ""
+    /// Injectable for deterministic marquee tests; production uses wall time.
+    var clock: () -> Double = { Date().timeIntervalSinceReferenceDate }
+    private var marqueeState = MarqueeState()
 
     /// Columns of clear space kept between the hints and the accounting, so the
     /// two never read as one sentence.
@@ -162,12 +165,20 @@ final class StatusLine: @MainActor Component {
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [""] }
-        let left = truncateToWidth(text, width, ellipsis: "")
-        guard !trailing.isEmpty else { return [left] }
-        let leftWidth = visibleWidth(left)
+        let identity = text + "\u{0}" + trailing
+        guard !trailing.isEmpty else {
+            return [Marquee.render(text, width: width, identity: identity, now: clock(), state: &marqueeState)]
+        }
         let trailingWidth = visibleWidth(trailing)
-        let padding = width - leftWidth - trailingWidth
-        guard padding >= Self.gap else { return [left] }
+        let available = width - trailingWidth - Self.gap
+        guard available >= 0 else {
+            return [Marquee.render(text, width: width, identity: identity, now: clock(), state: &marqueeState)]
+        }
+        let left = Marquee.render(text, width: available, identity: identity, now: clock(), state: &marqueeState)
+        let padding = width - visibleWidth(left) - trailingWidth
+        guard padding >= Self.gap else {
+            return [Marquee.render(text, width: width, identity: identity, now: clock(), state: &marqueeState)]
+        }
         return [left + String(repeating: " ", count: padding) + trailing]
     }
 }

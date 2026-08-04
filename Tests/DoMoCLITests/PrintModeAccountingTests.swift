@@ -626,8 +626,8 @@ struct StatusLineTrailingTests {
         #expect(rows[0].count == 20)
     }
 
-    /// Dropped whole, never clipped: `$0.03` is a plausible-looking, wrong number
-    /// where a missing segment is merely a missing segment.
+    /// The accounting segment stays whole while the affordance strip becomes a
+    /// marquee window when the row narrows.
     @Test
     func theTrailingIsDroppedWholeRatherThanTruncated() {
         let line = StatusLine()
@@ -635,8 +635,8 @@ struct StatusLineTrailingTests {
         line.trailing = "$0.0312"
         // 4 + 2 columns of gap + 7 = 13, the narrowest row that fits both.
         #expect(line.render(width: 13) == ["left  $0.0312"])
-        // One column narrower and the whole segment goes, rather than `$0.031`.
-        #expect(line.render(width: 12) == ["left"])
+        // One column narrower: the left side scrolls instead of hiding the meter.
+        #expect(line.render(width: 12) == ["lef  $0.0312"])
     }
 
     @Test
@@ -649,22 +649,32 @@ struct StatusLineTrailingTests {
         #expect(rows[0] == "hints")
     }
 
-    /// The left side still wins the row when it alone overflows, and it is still
-    /// clipped rather than allowed to overhang.
+    /// The left side still fits as a marquee window beside a whole accounting
+    /// segment, and the composed row never overhangs.
     @Test
     func anOverlongLeftSideIsStillClippedToWidth() {
         let line = StatusLine()
         line.text = String(repeating: "x", count: 40)
         line.trailing = "tok 0"
         let rows = line.render(width: 10)
-        // Asserted on VISIBLE width, not on the raw string: `truncateToWidth`
-        // appends an SGR reset when it cuts, so a raw comparison would be testing
-        // that helper's escape hygiene rather than this row's fitting. Over-wide
-        // is the failure that matters here — it is what `AltScreenCore.frame`
-        // throws on.
+        // Asserted on VISIBLE width because marquee output may carry ANSI state,
+        // while over-wide is the failure that matters to AltScreenCore.
         #expect(rows.count == 1)
         #expect(visibleWidth(rows[0]) == 10)
-        #expect(rows[0].hasPrefix(String(repeating: "x", count: 10)))
-        #expect(!rows[0].contains("tok 0"))
+        #expect(rows[0].hasPrefix(String(repeating: "x", count: 3)))
+        #expect(rows[0].contains("tok 0"))
+    }
+
+    @Test
+    func anOverlongLeftSideScrollsAfterItsLeadingPause() {
+        let line = StatusLine()
+        line.text = "0123456789"
+        line.clock = { 1.1 }
+        let initial = line.render(width: 5)[0]
+        line.clock = { 2.2 }
+        let moved = line.render(width: 5)[0]
+        #expect(initial == "01234")
+        #expect(moved != initial)
+        #expect(visibleWidth(moved) == 5)
     }
 }

@@ -436,7 +436,7 @@ struct PaneBoundsTests {
         // that pane.
         for promptRows in [1, 3, 7] {
             let layout = ClientLayout(width: 100, height: 24, promptRows: promptRows)
-            for pane in [ClientLayout.Pane.sidebar, .transcript, .mainFooter] {
+            for pane in [ClientLayout.Pane.sidebar, .divider, .transcript, .mainFooter] {
                 let bounds = layout.bounds(of: pane)
                 for row in bounds.rows {
                     for column in bounds.columns {
@@ -454,16 +454,19 @@ struct PaneBoundsTests {
     func boundsFollowTheFooter() {
         let layout = ClientLayout(width: 100, height: 24, promptRows: 5)
         #expect(layout.bounds(of: .sidebar) == ClientLayout.PaneBounds(columns: 0..<25, rows: 0..<24))
-        #expect(layout.bounds(of: .transcript) == ClientLayout.PaneBounds(columns: 25..<100, rows: 0..<18))
-        #expect(layout.bounds(of: .mainFooter) == ClientLayout.PaneBounds(columns: 25..<100, rows: 18..<24))
+        #expect(layout.bounds(of: .divider) == ClientLayout.PaneBounds(columns: 25..<26, rows: 0..<24))
+        #expect(layout.bounds(of: .transcript) == ClientLayout.PaneBounds(columns: 26..<100, rows: 0..<18))
+        #expect(layout.bounds(of: .mainFooter) == ClientLayout.PaneBounds(columns: 26..<100, rows: 18..<24))
     }
 
-    @Test("The three panes tile the screen with no gap and no overlap")
+    @Test("The sidebar, divider and main panes tile the screen with no gap or overlap")
     func boundsTileTheScreen() {
         for (width, height) in [(100, 24), (40, 10), (20, 5), (400, 60)] {
             let layout = ClientLayout(width: width, height: height, promptRows: 2)
             var covered = Set<[Int]>()
-            for pane in [ClientLayout.Pane.sidebar, .transcript, .mainFooter] {
+            var panes: [ClientLayout.Pane] = [.sidebar, .transcript, .mainFooter]
+            if layout.dividerColumn != nil { panes.insert(.divider, at: 1) }
+            for pane in panes {
                 let bounds = layout.bounds(of: pane)
                 for row in bounds.rows {
                     for column in bounds.columns {

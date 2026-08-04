@@ -124,6 +124,11 @@ public enum ThemeColor: Sendable, Hashable, Codable {
 
 /// The semantic colours a component can ask a theme for. Individual values may
 /// be `none`; `resolved(over:)` fills those holes from the selected fallback.
+///
+/// The built-in palettes use concrete page backgrounds. A custom palette that
+/// keeps `background` as ``ThemeColor/inherit`` is making an explicit choice to
+/// preserve the terminal's background rather than relying on an accidental blank
+/// cell in the renderer.
 public struct ThemePalette: Sendable, Hashable, Codable {
     public var foreground: ThemeColor
     public var accent: ThemeColor
@@ -165,7 +170,7 @@ public struct ThemePalette: Sendable, Hashable, Codable {
         muted: ThemeColor(specification: "#7f8791")!,
         error: ThemeColor(specification: "#ff6b6b")!,
         warning: ThemeColor(specification: "#f5c451")!,
-        background: .inherit
+        background: ThemeColor(specification: "#11161c")!
     )
 
     public static let light = ThemePalette(
@@ -174,7 +179,7 @@ public struct ThemePalette: Sendable, Hashable, Codable {
         muted: ThemeColor(specification: "#5d6670")!,
         error: ThemeColor(specification: "#a51d2d")!,
         warning: ThemeColor(specification: "#7a4b00")!,
-        background: .inherit
+        background: ThemeColor(specification: "#f5f7fa")!
     )
 }
 

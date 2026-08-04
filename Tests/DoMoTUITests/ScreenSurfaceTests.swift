@@ -73,6 +73,28 @@ struct ScreenSurfaceTests {
         #expect(oracle.cursor.row == 0)           // caret on the focused region (alpha, row 0)
     }
 
+    @Test("A concrete page background paints blank cells and survives row resets")
+    func pageBackgroundPaintsEveryCell() throws {
+        let width = 12, height = 4
+        let oracle = ScreenOracle(rows: height, cols: width)
+        oracle.feed(enterAltScreen)
+        let target = CaptureTarget(columns: width, rows: height)
+        let probe = LinesComponent(["\u{1b}[31mred\u{1b}[0m", ""])
+        let ring = FocusRing()
+        let surface = ScreenSurface(target: target, focus: ring, showHardwareCursor: false) {
+            Column([probe.layout, FlexSpacer()])
+        }
+        surface.frameBackground = .ansiIndex(24)
+        surface.frameBackgroundTrueColor = false
+        try drive(surface, into: oracle, from: target)
+
+        for row in 0..<height {
+            for column in 0..<width {
+                #expect(oracle.cell(col: column, row: row)?.style.background == .ansi(24), "(row),(column)")
+            }
+        }
+    }
+
     /// Tab moves focus forward, Shift-Tab back — proven by the hardware cursor AND
     /// by which region the next keystroke reaches.
     @Test("Tab and Shift-Tab traverse focus and route input to the focused region")

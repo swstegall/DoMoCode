@@ -40,14 +40,17 @@ struct ScrollAndToolStateTests {
 
     // MARK: Pane geometry
 
-    @Test("Pane hit-testing splits the sidebar, the transcript and the footer")
+    @Test("Pane hit-testing splits the sidebar, divider, transcript and footer")
     func paneHitTest() {
         let layout = ClientLayout(width: 100, height: 24)
         #expect(layout.sidebarWidth == 25)
+        #expect(layout.dividerColumn == 25)
+        #expect(layout.mainColumnStart == 26)
         #expect(layout.transcriptHeight == 22)
         #expect(layout.pane(atColumn: 0, row: 0) == .sidebar)
         #expect(layout.pane(atColumn: 24, row: 10) == .sidebar)
-        #expect(layout.pane(atColumn: 25, row: 0) == .transcript)
+        #expect(layout.pane(atColumn: 25, row: 0) == .divider)
+        #expect(layout.pane(atColumn: 26, row: 0) == .transcript)
         #expect(layout.pane(atColumn: 99, row: 21) == .transcript)
         #expect(layout.pane(atColumn: 60, row: 22) == .mainFooter)   // status line
         #expect(layout.pane(atColumn: 60, row: 23) == .mainFooter)   // prompt

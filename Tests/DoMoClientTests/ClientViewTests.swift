@@ -88,6 +88,37 @@ struct ClientViewTests {
         #expect(returned == parent.id)
     }
 
+    @Test("Hovering a long sidebar row scrolls only its body and keeps marker and id stable")
+    func sidebarHoverMarquee() {
+        let sidebar = SessionSidebar()
+        sidebar.sessions = [summary("abcdef123456", cwd: "/home/a-very-long-project-directory")]
+        sidebar.clock = { 2.0 }
+        sidebar.updateHover(screenRow: 2)
+
+        let initial = sidebar.render(width: 20)[2]
+        #expect(initial.contains("123456"))
+        #expect(initial.hasPrefix("  "))
+
+        sidebar.clock = { 3.1 }
+        let moved = sidebar.render(width: 20)[2]
+        #expect(moved.contains("123456"))
+        #expect(moved != initial)
+        #expect(visibleWidth(moved) == 20)
+    }
+
+    @Test("The full-screen status bar scrolls long controls instead of dropping them")
+    func statusBarMarquee() {
+        let status = StatusBar()
+        status.text = "working — diagnostics — Esc: abort — Tab: mode — Enter: send"
+        status.clock = { 10.0 }
+        let initial = status.render(width: 18)[0]
+        status.clock = { 11.2 }
+        let moved = status.render(width: 18)[0]
+        #expect(visibleWidth(initial) == 18)
+        #expect(visibleWidth(moved) == 18)
+        #expect(initial != moved)
+    }
+
     @Test("The transcript marks roles and renders a tool header")
     func transcriptFormatting() {
         let view = TranscriptView()

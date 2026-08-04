@@ -66,6 +66,12 @@ final class TranscriptView: Component {
     /// truncation right through the middle of the thing being read.
     private let failedToolOutputCap = 24
 
+    /// Ordinary transcript images are thumbnails, not unbounded layout blocks.
+    /// These limits are the safe default; a future explicit image-open action can
+    /// raise them for that one interaction without changing ordinary tool output.
+    private static let thumbnailMaxColumns = 40
+    private static let thumbnailMaxRows = 12
+
     /// The braille spinner, shared with ``DoMoTUI/Loader``'s frame set so every
     /// surface animates identically.
     private static let spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -75,7 +81,7 @@ final class TranscriptView: Component {
     /// an image (base64 + escape) every frame would be very expensive. Keyed on the
     /// content, width, streaming flag, spinner frame, the graphics context, and
     /// the expand toggle.
-    private var cache: (items: [TranscriptItem], running: Bool, spinnerFrame: Int, width: Int, capabilities: TerminalCapabilities, cell: CellDimensions, expandErrors: Bool, rows: [TranscriptVisualRow])?
+    private var cache: (items: [TranscriptItem], running: Bool, spinnerFrame: Int, width: Int, maxHeightRows: Int?, capabilities: TerminalCapabilities, cell: CellDimensions, expandErrors: Bool, rows: [TranscriptVisualRow])?
 
     /// The mixed text/image rows for the main pane, given the terminal's image
     /// capability and cell size.
@@ -84,16 +90,27 @@ final class TranscriptView: Component {
     /// arrive at the bottom, the offset grows by the same amount so the content
     /// under their eyes does not slide away. At offset `0` nothing is adjusted, so
     /// the default "follow the tail" behaviour is unchanged.
-    func visualRows(width: Int, capabilities: TerminalCapabilities, cell: CellDimensions) -> [TranscriptVisualRow] {
+    func visualRows(
+        width: Int,
+        capabilities: TerminalCapabilities,
+        cell: CellDimensions,
+        maxHeightRows: Int? = nil
+    ) -> [TranscriptVisualRow] {
         guard width > 0 else { return [] }
         if let cache, cache.width == width, cache.running == running,
            cache.spinnerFrame == spinnerFrame,
+           cache.maxHeightRows == maxHeightRows,
            cache.capabilities == capabilities, cache.cell == cell,
            cache.expandErrors == expandErrors, cache.items == items {
             return cache.rows
         }
         let previous = cache
-        let rows = buildVisualRows(width: width, capabilities: capabilities, cell: cell)
+        let rows = buildVisualRows(
+            width: width,
+            capabilities: capabilities,
+            cell: cell,
+            maxHeightRows: maxHeightRows
+        )
         // Only an append (rows grew) shifts the anchor, and only when the previous
         // frame had the SAME geometry. A row count is only comparable at one width:
         // re-wrapping at a new width changes it for reasons that have nothing to do
@@ -107,12 +124,13 @@ final class TranscriptView: Component {
         // did not undo it. A toggle is not new content, so it does not move the anchor.
         if scrollOffset > 0,
            let previous,
-           previous.width == width, previous.capabilities == capabilities, previous.cell == cell,
+           previous.width == width, previous.maxHeightRows == maxHeightRows,
+           previous.capabilities == capabilities, previous.cell == cell,
            previous.expandErrors == expandErrors,
            rows.count > previous.rows.count {
             scrollOffset += rows.count - previous.rows.count
         }
-        cache = (items, running, spinnerFrame, width, capabilities, cell, expandErrors, rows)
+        cache = (items, running, spinnerFrame, width, maxHeightRows, capabilities, cell, expandErrors, rows)
         return rows
     }
 
@@ -128,7 +146,12 @@ final class TranscriptView: Component {
             .compactMap { if case .text(let line) = $0 { line } else { nil } }
     }
 
-    private func buildVisualRows(width: Int, capabilities: TerminalCapabilities, cell: CellDimensions) -> [TranscriptVisualRow] {
+    private func buildVisualRows(
+        width: Int,
+        capabilities: TerminalCapabilities,
+        cell: CellDimensions,
+        maxHeightRows: Int?
+    ) -> [TranscriptVisualRow] {
         var rows: [TranscriptVisualRow] = []
         for item in items {
             switch item {
@@ -149,7 +172,14 @@ final class TranscriptView: Component {
                 rows += toolBody(output, width: width, failed: state == .failed)
                     .map(TranscriptVisualRow.text)
             case .image(let block, let imageId):
-                rows += imageRows(block, imageId: imageId, width: width, capabilities: capabilities, cell: cell)
+                rows += imageRows(
+                    block,
+                    imageId: imageId,
+                    width: width,
+                    maxHeightRows: maxHeightRows,
+                    capabilities: capabilities,
+                    cell: cell
+                )
             case .error(let headline, let message, let hint):
                 rows += errorRows(headline: headline, message: message, hint: hint, width: width)
                     .map(TranscriptVisualRow.text)
@@ -196,8 +226,19 @@ final class TranscriptView: Component {
         return frames[((spinnerFrame % frames.count) + frames.count) % frames.count]
     }
 
-    private func imageRows(_ block: ImageBlock, imageId: UInt32, width: Int, capabilities: TerminalCapabilities, cell: CellDimensions) -> [TranscriptVisualRow] {
+    private func imageRows(
+        _ block: ImageBlock,
+        imageId: UInt32,
+        width: Int,
+        maxHeightRows: Int?,
+        capabilities: TerminalCapabilities,
+        cell: CellDimensions
+    ) -> [TranscriptVisualRow] {
         let dimensions = imageDimensions(block.data, mediaType: block.mediaType)
+        let maxRows = min(
+            Self.thumbnailMaxRows,
+            max(1, maxHeightRows ?? Self.thumbnailMaxRows)
+        )
         if let dimensions,
            let rendered = renderImage(
                base64Data: block.data.base64EncodedString(),
@@ -205,7 +246,8 @@ final class TranscriptView: Component {
                mediaType: block.mediaType,
                capabilities: capabilities,
                cell: cell,
-               maxWidthCells: width,
+               maxWidthCells: min(Self.thumbnailMaxColumns, width),
+               maxHeightCells: maxRows,
                imageId: imageId,
                moveCursor: false
            ) {

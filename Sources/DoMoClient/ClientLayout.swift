@@ -19,8 +19,12 @@
 struct ClientLayout {
     let width: Int
     let height: Int
-    /// The sidebar's column count; the main column takes the rest.
+    /// The sidebar's content column count. When there is room, the divider is
+    /// immediately after this column and the main column starts one cell later.
     let sidebarWidth: Int
+
+    /// The theme-colored separator between the sidebar and main column.
+    static let dividerWidth = 1
 
     /// The rows the prompt occupies RIGHT NOW, attachment chip rows INCLUDED.
     ///
@@ -61,7 +65,7 @@ struct ClientLayout {
     init(width: Int, height: Int, promptRows: Int = 1, footerRows: Int = 0) {
         self.width = max(0, width)
         self.height = max(0, height)
-        self.sidebarWidth = Self.sidebarWidth(for: self.width)
+        self.sidebarWidth = min(Self.sidebarWidth(for: self.width), self.width)
         self.promptRows = max(1, promptRows)
         self.footerRows = max(0, min(1, footerRows))
     }
@@ -70,6 +74,26 @@ struct ClientLayout {
     /// has always applied, now named.
     static func sidebarWidth(for width: Int) -> Int {
         min(32, max(16, width / 4))
+    }
+
+    /// The first column available to the main pane. This is the one geometry
+    /// calculation the tree and coordinate-based consumers must share.
+    static func mainColumnStart(for width: Int) -> Int {
+        let clampedWidth = max(0, width)
+        let sidebar = min(sidebarWidth(for: clampedWidth), clampedWidth)
+        return min(clampedWidth, sidebar + (sidebar < clampedWidth ? dividerWidth : 0))
+    }
+
+    /// The first main-pane column for this layout.
+    var mainColumnStart: Int { Self.mainColumnStart(for: width) }
+
+    /// The width left for the transcript, footer, and prompt.
+    var mainWidth: Int { max(0, width - mainColumnStart) }
+
+    /// The divider column, when the terminal is wide enough to show one.
+    var dividerColumn: Int? {
+        guard sidebarWidth < width else { return nil }
+        return sidebarWidth
     }
 
     /// The tallest the prompt may grow to at this terminal height.
@@ -108,6 +132,7 @@ struct ClientLayout {
     /// The panes a pointer can land in.
     enum Pane {
         case sidebar
+        case divider
         case transcript
         /// The status line, the accounting footer and the prompt — the bottom
         /// rows of the main column.
@@ -121,6 +146,7 @@ struct ClientLayout {
     /// dropped scroll event reads to the user as a dead wheel.
     func pane(atColumn column: Int, row: Int) -> Pane {
         if column < sidebarWidth { return .sidebar }
+        if let dividerColumn, column == dividerColumn { return .divider }
         return row < transcriptHeight ? .transcript : .mainFooter
     }
 
@@ -145,10 +171,13 @@ struct ClientLayout {
         switch pane {
         case .sidebar:
             return PaneBounds(columns: 0..<min(sidebarWidth, width), rows: 0..<height)
+        case .divider:
+            guard let dividerColumn else { return PaneBounds(columns: width..<width, rows: 0..<height) }
+            return PaneBounds(columns: dividerColumn..<(dividerColumn + dividerWidth), rows: 0..<height)
         case .transcript:
-            return PaneBounds(columns: min(sidebarWidth, width)..<width, rows: 0..<transcriptHeight)
+            return PaneBounds(columns: mainColumnStart..<width, rows: 0..<transcriptHeight)
         case .mainFooter:
-            return PaneBounds(columns: min(sidebarWidth, width)..<width, rows: transcriptHeight..<height)
+            return PaneBounds(columns: mainColumnStart..<width, rows: transcriptHeight..<height)
         }
     }
 }

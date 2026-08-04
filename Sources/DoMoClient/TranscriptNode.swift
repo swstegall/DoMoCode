@@ -33,7 +33,12 @@ struct TranscriptNode: LayoutNode {
 
     func place(in rect: Rect, into buffer: inout CellBuffer) {
         guard rect.width > 0, rect.height > 0 else { return }
-        let rows = view.visualRows(width: rect.width, capabilities: capabilities, cell: cell)
+        let rows = view.visualRows(
+            width: rect.width,
+            capabilities: capabilities,
+            cell: cell,
+            maxHeightRows: rect.height
+        )
         // The viewport is `rect.height` rows ending `scrollOffset` rows above the
         // newest row. Clamping happens HERE — this is the only place that knows the
         // viewport height — and the clamped value is written back so the app's

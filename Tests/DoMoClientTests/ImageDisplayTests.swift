@@ -64,7 +64,12 @@ struct ImageDisplayTests {
         let view = TranscriptView()
         view.items = [.image(png(width: 90, height: 45), imageId: 42)]
         let kitty = view.visualRows(width: 40, capabilities: TerminalCapabilities(images: .kitty, trueColor: true, hyperlinks: true), cell: .default)
-        #expect(kitty.contains { if case .image = $0 { true } else { false } })
+        #expect(kitty.contains {
+            if case .image(_, _, let cellWidth, let cellRows) = $0 {
+                return cellWidth <= 40 && cellRows <= 12
+            }
+            return false
+        })
         let plain = view.visualRows(width: 40, capabilities: TerminalCapabilities(images: nil, trueColor: false, hyperlinks: false), cell: .default)
         #expect(plain.allSatisfy { if case .text = $0 { true } else { false } })
         #expect(plain.contains { if case .text(let line) = $0 { line.contains("Image") } else { false } })
@@ -85,5 +90,25 @@ struct ImageDisplayTests {
         node.place(in: Rect(x: 0, y: 0, width: 40, height: 30), into: &buffer)
         #expect(!buffer.images.isEmpty)
         #expect(buffer.images.first?.imageId == 42)
+    }
+
+    @Test("Thumbnail sizing respects the available transcript height")
+    func imageClampsToViewportHeight() {
+        let view = TranscriptView()
+        view.items = [.image(png(width: 1000, height: 1000), imageId: 7)]
+        let rows = view.visualRows(
+            width: 80,
+            capabilities: TerminalCapabilities(images: .kitty, trueColor: true, hyperlinks: true),
+            cell: .default,
+            maxHeightRows: 5
+        )
+        guard case .image(_, _, let columns, let height) = rows.first(where: {
+            if case .image = $0 { true } else { false }
+        }) else {
+            Issue.record("expected an image row")
+            return
+        }
+        #expect(columns <= 40)
+        #expect(height <= 5)
     }
 }

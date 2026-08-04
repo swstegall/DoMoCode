@@ -324,6 +324,8 @@ public final class ClientApp {
         let surface = ScreenSurface(target: target, focus: focus) { [weak self] in
             self?.buildTree(width: target.columns, height: target.rows) ?? Column([])
         }
+        surface.frameBackground = theme.palette(for: appearance).background
+        surface.frameBackgroundTrueColor = graphicsCapabilities.trueColor
         self.surface = surface
         self.dialogs = DialogStack(surface: surface)
         // Held for F8. The app can flip its own `mouseOwned` flag all it likes;
@@ -475,14 +477,14 @@ public final class ClientApp {
         statusBar.text = statusText()
         footerBar.model = footerModel()
 
-        let sidebarWidth = ClientLayout.sidebarWidth(for: width)
+        let mainColumnStart = ClientLayout.mainColumnStart(for: width)
         // The width the input will ACTUALLY be placed at: `Row` gives the flexible
-        // main column `width - sidebarWidth`, and `Column` stretches every child to
+        // main column `width - mainColumnStart`, and `Column` stretches every child to
         // the full content width. Measuring at any other width wraps differently than
         // it paints, and the editor's first/last-visual-line tests — the ones that
         // decide whether an arrow recalls history or moves the caret — are computed
         // against the last width it rendered at.
-        let inputWidth = max(0, width - sidebarWidth)
+        let inputWidth = max(0, width - mainColumnStart)
         let footerRows = ClientLayout.footerRows(for: height)
         promptRows = inputWidth > 0
             ? promptInput.height(
@@ -507,10 +509,13 @@ public final class ClientApp {
             mainChildren.append(Fixed(.absolute(layout.footerRows), footerBar.layout))
         }
         mainChildren.append(Fixed(.absolute(layout.promptRows), promptInput.layout))
-        return Row([
-            Fixed(.absolute(layout.sidebarWidth), sidebar.layout),
-            Flexible(1, Column(mainChildren)),
-        ])
+        var rootChildren: [any LayoutNode] = [Fixed(.absolute(layout.sidebarWidth), sidebar.layout)]
+        if layout.dividerColumn != nil {
+            let divider = theme.palette(for: appearance).muted.foreground(trueColor: graphicsCapabilities.trueColor)
+            rootChildren.append(Fixed(.absolute(ClientLayout.dividerWidth), VerticalDividerNode(color: divider)))
+        }
+        rootChildren.append(Flexible(1, Column(mainChildren)))
+        return Row(rootChildren)
     }
 
     /// What the accounting footer should say right now.
@@ -879,12 +884,24 @@ public final class ClientApp {
                     self.surface?.requestRender()
                 }
                 let animating = self.store.runState == .running || self.store.activeToolCall != nil
+                let width = self.surface?.target.columns ?? 0
+                let height = self.surface?.target.rows ?? 0
+                let layout = ClientLayout(
+                    width: width,
+                    height: height,
+                    promptRows: self.promptRows,
+                    footerRows: ClientLayout.footerRows(for: height)
+                )
+                let marqueeAnimating = self.statusBar.marqueeActive(width: layout.mainWidth)
+                    || self.sidebar.marqueeActive(width: layout.sidebarWidth)
                 if animating {
                     self.transcriptView.spinnerFrame &+= 1
+                }
+                if animating || marqueeAnimating {
                     self.surface?.requestRender()
                 }
                 self.pollStatusIfDue()
-                try? await Task.sleep(for: animating ? .milliseconds(100) : .milliseconds(250))
+                try? await Task.sleep(for: animating || marqueeAnimating ? .milliseconds(100) : .milliseconds(250))
             }
         }
     }
@@ -988,7 +1005,7 @@ public final class ClientApp {
         switch pane {
         case .sidebar:
             sidebar.scroll(by: up ? -rows : rows, viewportHeight: layout.height)
-        case .transcript, .mainFooter:
+        case .divider, .transcript, .mainFooter:
             // The transcript is the main column's scrollable body; the status and
             // prompt rows are one line each and scroll it too, so a wheel near the
             // bottom edge is not silently dead.
@@ -1077,6 +1094,15 @@ public final class ClientApp {
             promptRows: promptRows,
             footerRows: ClientLayout.footerRows(for: target.rows)
         )
+
+        if !event.isScroll {
+            switch layout.pane(atColumn: event.column, row: event.row) {
+            case .sidebar:
+                sidebar.updateHover(screenRow: event.row)
+            default:
+                sidebar.clearHover()
+            }
+        }
 
         if event.isScroll {
             guard event.kind == .scrollUp || event.kind == .scrollDown else { return }
@@ -2693,6 +2719,8 @@ public final class ClientApp {
         promptInput.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
         statusBar.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
         footerBar.applyTheme(theme, appearance: value, trueColor: graphicsCapabilities.trueColor)
+        surface?.frameBackground = theme.palette(for: value).background
+        surface?.frameBackgroundTrueColor = graphicsCapabilities.trueColor
         surface?.requestFullRedraw()
         post(notice: "theme: \(value.rawValue)")
     }

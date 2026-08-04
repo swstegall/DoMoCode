@@ -26,6 +26,9 @@ import Foundation
 @MainActor
 final class StatusBar: Component {
     var text = ""
+    /// Injectable for deterministic marquee tests; production uses wall time.
+    var clock: () -> Double = { Date().timeIntervalSinceReferenceDate }
+    private var marqueeState = MarqueeState()
     private var style: (String) -> String = dim
 
     func applyTheme(_ theme: Theme, appearance: ThemeAppearance, trueColor: Bool = true) {
@@ -35,7 +38,18 @@ final class StatusBar: Component {
 
     func render(width: Int) -> [String] {
         guard width > 0 else { return [] }
-        return [truncateToWidth(style(text), width)]
+        let fitted = Marquee.render(
+            text,
+            width: width,
+            identity: text,
+            now: clock(),
+            state: &marqueeState
+        )
+        return [style(fitted)]
+    }
+
+    func marqueeActive(width: Int) -> Bool {
+        Marquee.isNeeded(text, width: width)
     }
 }
 

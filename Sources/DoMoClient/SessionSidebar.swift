@@ -9,6 +9,7 @@
 
 import DoMoServer
 import DoMoTUI
+import Foundation
 
 /// A focusable list of sessions for the sidebar pane.
 @MainActor
@@ -34,6 +35,14 @@ final class SessionSidebar: @MainActor Focusable {
     /// has no way to reach its tail.
     private(set) var scrollOffset = 0
 
+    /// The session currently under the pointer, if any. Hover is independent of
+    /// keyboard focus so a pointer can preview a long label without moving the
+    /// caret into the sidebar.
+    private(set) var hoveredSessionID: String?
+    /// Injectable for deterministic hover-marquee tests; production uses wall time.
+    var clock: () -> Double = { Date().timeIntervalSinceReferenceDate }
+    private var marqueeStates: [String: MarqueeState] = [:]
+
     private static let arrowUp: [UInt8] = [0x1b, 0x5b, 0x41]
     private static let arrowDown: [UInt8] = [0x1b, 0x5b, 0x42]
 
@@ -46,6 +55,30 @@ final class SessionSidebar: @MainActor Focusable {
         let visibleRows = max(1, viewportHeight - Self.headerRows)
         let maxOffset = max(0, sessions.count - visibleRows)
         scrollOffset = min(max(0, scrollOffset + delta), maxOffset)
+        hoveredSessionID = nil
+    }
+
+    /// Update the pointer hover from a screen row. Header rows and empty rows clear
+    /// the hover; session rows are translated through the current scroll offset.
+    func updateHover(screenRow: Int) {
+        let index = scrollOffset + screenRow - Self.headerRows
+        guard index >= 0, index < sessions.count else {
+            hoveredSessionID = nil
+            return
+        }
+        hoveredSessionID = sessions[index].id
+    }
+
+    func clearHover() {
+        hoveredSessionID = nil
+    }
+
+    func marqueeActive(width: Int) -> Bool {
+        guard let hoveredSessionID,
+              let session = sessions.first(where: { $0.id == hoveredSessionID })
+        else { return false }
+        let parts = sessionLabelParts(session)
+        return Marquee.isNeeded(parts.body, width: bodyWidth(for: width, suffix: parts.suffix))
     }
 
     func render(width: Int) -> [String] {
@@ -62,8 +95,7 @@ final class SessionSidebar: @MainActor Focusable {
         // Clamp here too: `sessions` can shrink between a scroll and a render.
         let offset = min(max(0, scrollOffset), max(0, sessions.count - 1))
         for (index, session) in sessions.enumerated().dropFirst(offset) {
-            let marker = session.id == openID ? "• " : "  "
-            let label = padToWidth(truncateToWidth(marker + sessionLabel(session), width), width)
+            let label = sessionRow(session, width: width)
             lines.append(index == clampedCursor && focused ? inverse(label) : label)
         }
         return lines
@@ -96,19 +128,47 @@ final class SessionSidebar: @MainActor Focusable {
         }
     }
 
-    /// A compact one-line label: an explicit session name when present, then the
-    /// working-directory basename and a short id.
+    private func sessionRow(_ session: SessionSummary, width: Int) -> String {
+        let marker = session.id == openID ? "• " : "  "
+        let parts = sessionLabelParts(session)
+        let budget = bodyWidth(for: width, suffix: parts.suffix)
+        let identity = session.id + "\u{0}" + parts.body + "\u{0}" + String(budget)
+        var state = marqueeStates[session.id] ?? MarqueeState()
+        let body: String
+        if session.id == hoveredSessionID {
+            body = Marquee.render(
+                parts.body,
+                width: budget,
+                identity: identity,
+                now: clock(),
+                state: &state
+            )
+        } else {
+            state.reset(identity: identity, now: clock())
+            body = truncateToWidth(parts.body, budget, ellipsis: "", pad: true)
+        }
+        marqueeStates[session.id] = state
+        return truncateToWidth(marker + body + parts.suffix, width, ellipsis: "", pad: true)
+    }
+
+    private func bodyWidth(for width: Int, suffix: String) -> Int {
+        max(0, width - 2 - visibleWidth(suffix))
+    }
+
+    /// A compact one-line label split so the open marker and trailing id stay at
+    /// stable columns while a hovered body scrolls between them.
     ///
     /// Uses the id's TRAILING hex, which is random in a UUIDv7 — the leading hex is
     /// a time-ordered prefix that is identical for sessions created close together,
     /// so a prefix would render same-cwd siblings as indistinguishable rows.
-    private func sessionLabel(_ session: SessionSummary) -> String {
+    private func sessionLabelParts(_ session: SessionSummary) -> (body: String, suffix: String) {
         let shortID = String(session.id.suffix(6))
         let cwdName = session.cwd.split(separator: "/").last.map(String.init) ?? session.cwd
         let childMarker = session.parentSession == nil ? "" : "↳ "
+        let suffix = "  " + shortID
         if let name = session.name, !name.isEmpty {
-            return "\(childMarker)\(sanitizeUntrustedText(name))  ·  \(sanitizeUntrustedText(cwdName))  \(shortID)"
+            return ("\(childMarker)\(sanitizeUntrustedText(name))  ·  \(sanitizeUntrustedText(cwdName))", suffix)
         }
-        return "\(childMarker)\(sanitizeUntrustedText(cwdName))  \(shortID)"
+        return ("\(childMarker)\(sanitizeUntrustedText(cwdName))", suffix)
     }
 }

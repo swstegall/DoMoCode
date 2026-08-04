@@ -32,5 +32,22 @@ struct ThemeTests {
     @Test("dark and light palettes expose different accents")
     func appearancePalettes() {
         #expect(Theme.standard.palette(for: .dark).accent != Theme.standard.palette(for: .light).accent)
+        #expect(Theme.standard.palette(for: .dark).background != .inherit)
+        #expect(Theme.standard.palette(for: .light).background != .inherit)
+    }
+
+    @Test("a concrete frame background restates after component resets")
+    func frameBackgroundRestatesAfterReset() {
+        let lines = paintFrameBackground(
+            ["\u{1b}[31mred\u{1b}[0m tail", ""],
+            width: 10,
+            color: .ansiIndex(24),
+            trueColor: false
+        )
+        #expect(lines.allSatisfy { visibleWidth($0) == 10 })
+        #expect(lines[0].hasPrefix("\u{1b}[48;5;24m"))
+        #expect(lines[0].contains("\u{1b}[0m\u{1b}[48;5;24m"))
+        #expect(lines[1].contains(String(repeating: " ", count: 10)))
+        #expect(paintFrameBackground(["plain"], width: 5, color: .inherit) == ["plain"])
     }
 }
