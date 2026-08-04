@@ -303,6 +303,13 @@ public actor ServerRuntime {
 
         /// Optional hard USD ceiling for each assistant run.
         public var maxCostPerRun: Decimal?
+
+        /// Observes and gates every tool lifecycle after resolution.
+        public var toolLifecycle: ToolLifecycleHook?
+
+        /// Maximum duration for one lifecycle hook snapshot.
+        public var toolLifecycleTimeout: Duration
+
         /// The committed HEAD recorded for each new session, when the serving
         /// process started inside a repository with a commit.
         public var sessionStartHead: String?
@@ -367,6 +374,8 @@ public actor ServerRuntime {
             modelContextWindow: (@Sendable (String) -> Int?)? = nil,
             steeringMode: QueueDeliveryMode = .oneAtATime,
             maxCostPerRun: Decimal? = nil,
+            toolLifecycle: ToolLifecycleHook? = nil,
+            toolLifecycleTimeout: Duration = .seconds(2),
             getTools: (@Sendable (String) async -> [any AgentTool])? = nil,
             systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)? = nil,
             toolsForSession: (@Sendable (String, String) async -> [any AgentTool])? = nil,
@@ -402,6 +411,8 @@ public actor ServerRuntime {
             self.summarizer = summarizer
             self.steeringMode = steeringMode
             self.maxCostPerRun = maxCostPerRun
+            self.toolLifecycle = toolLifecycle
+            self.toolLifecycleTimeout = toolLifecycleTimeout
             self.sessionStartHead = sessionStartHead
             self.git = git
             self.workspaceSnapshots = nil
@@ -926,6 +937,8 @@ public actor ServerRuntime {
             getSteeringMessages: steeringReader,
             steeringBox: steeringBox,
             beforeToolCall: beforeToolCall,
+            toolLifecycle: config.toolLifecycle,
+            toolLifecycleTimeout: config.toolLifecycleTimeout,
             onNoProgress: onNoProgress,
             maxCostPerRun: config.maxCostPerRun,
             sessionStartHead: config.sessionStartHead

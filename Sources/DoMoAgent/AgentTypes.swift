@@ -261,6 +261,84 @@ public typealias BeforeToolCallHook = @Sendable (BeforeToolCallContext) async ->
 /// override parts of the result.
 public typealias AfterToolCallHook = @Sendable (AfterToolCallContext) async -> AfterToolCallResult
 
+/// The stages a tool call crosses. The first six are the normal path; a
+/// cancellation or failure is reported as an additional terminal observation
+/// after the result/postflight boundary that was reached.
+public enum ToolLifecycleStage: String, Sendable, Hashable, Codable {
+    case resolved
+    case preflight
+    case permission
+    case invoke
+    case result
+    case postflight
+    case cancellation
+    case failure
+}
+
+/// A read-only snapshot handed to the lifecycle hook.
+///
+/// `result` is a value snapshot. A hook can inspect it, but it cannot mutate the
+/// result that the tool dispatcher has committed. Metadata returned by the hook
+/// is carried to later lifecycle snapshots and is never added to the model's
+/// tool-result message or used as a permission grant.
+public struct ToolLifecycleEvent: Sendable, Hashable {
+    public var stage: ToolLifecycleStage
+    public var toolCallID: String
+    public var toolName: String
+    public var arguments: JSONValue
+    public var result: AgentToolResult?
+    public var metadata: [String: JSONValue]
+    public var failureReason: String?
+
+    public init(
+        stage: ToolLifecycleStage,
+        toolCallID: String,
+        toolName: String,
+        arguments: JSONValue,
+        result: AgentToolResult? = nil,
+        metadata: [String: JSONValue] = [:],
+        failureReason: String? = nil
+    ) {
+        self.stage = stage
+        self.toolCallID = toolCallID
+        self.toolName = toolName
+        self.arguments = arguments
+        self.result = result
+        self.metadata = metadata
+        self.failureReason = failureReason
+    }
+}
+
+/// The lifecycle hook's decision for one snapshot.
+///
+/// `proceed` and `addMetadata` are observational decisions. Metadata is
+/// deliberately kept outside `AgentToolResult`, so a hook cannot silently alter
+/// committed tool output. A rejection is honored only before invocation; a
+/// rejection observed at result or postflight is recorded as a failure while the
+/// already-produced result remains authoritative.
+public enum ToolLifecycleDecision: Sendable {
+    case allow(metadata: [String: JSONValue])
+    case reject(reason: String)
+
+    public static let proceed = ToolLifecycleDecision.allow(metadata: [:])
+
+    public static func addMetadata(_ metadata: [String: JSONValue]) -> Self {
+        .allow(metadata: metadata)
+    }
+
+    public static func reject(_ reason: String) -> Self {
+        .reject(reason: reason)
+    }
+}
+
+/// Observes and gates the deterministic tool lifecycle.
+///
+/// Hooks should be cancellation-cooperative. If a hook does not finish within
+/// ``AgentLoopConfig/toolLifecycleTimeout``, the dispatcher treats it as a
+/// rejection and cancels the hook task. A timeout cannot grant permission or
+/// alter a result that has already been produced.
+public typealias ToolLifecycleHook = @Sendable (ToolLifecycleEvent) async -> ToolLifecycleDecision
+
 // MARK: - Run configuration
 
 /// Everything the loop knows about the run that is not the transcript itself.
@@ -336,6 +414,13 @@ public struct AgentLoopConfig: Sendable {
     /// After-execution hook; see ``AfterToolCallHook``.
     public var afterToolCall: AfterToolCallHook?
 
+    /// Deterministic lifecycle observer/gate for every tool call.
+    public var toolLifecycle: ToolLifecycleHook?
+
+    /// Maximum time allowed for one lifecycle hook snapshot. A non-positive
+    /// value rejects the snapshot immediately when a lifecycle hook is present.
+    public var toolLifecycleTimeout: Duration
+
     /// Polled at each turn boundary for messages to inject before the next
     /// assistant response. This is "steering" — the user typed while the agent
     /// worked. Contract: must not throw; return `[]` when none.
@@ -381,6 +466,8 @@ public struct AgentLoopConfig: Sendable {
         noProgressLimit: Int? = 12,
         beforeToolCall: BeforeToolCallHook? = nil,
         afterToolCall: AfterToolCallHook? = nil,
+        toolLifecycle: ToolLifecycleHook? = nil,
+        toolLifecycleTimeout: Duration = .seconds(2),
         getSteeringMessages: (@Sendable () async -> [Message])? = nil,
         drainSteeringBeforeFirstTurn: Bool = true,
         getFollowUpMessages: (@Sendable () async -> [Message])? = nil,
@@ -397,6 +484,8 @@ public struct AgentLoopConfig: Sendable {
         self.noProgressLimit = noProgressLimit
         self.beforeToolCall = beforeToolCall
         self.afterToolCall = afterToolCall
+        self.toolLifecycle = toolLifecycle
+        self.toolLifecycleTimeout = toolLifecycleTimeout
         self.getSteeringMessages = getSteeringMessages
         self.drainSteeringBeforeFirstTurn = drainSteeringBeforeFirstTurn
         self.getFollowUpMessages = getFollowUpMessages

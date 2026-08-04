@@ -348,6 +348,13 @@ public actor AgentHarness {
         /// `nil` means "no gate" — every tool runs. Contract: must honor cancellation.
         public var beforeToolCall: BeforeToolCallHook?
 
+        /// Observes and gates the complete tool lifecycle. Metadata from this
+        /// hook is kept out of committed tool results.
+        public var toolLifecycle: ToolLifecycleHook?
+
+        /// Maximum duration for one lifecycle hook snapshot.
+        public var toolLifecycleTimeout: Duration
+
         public init(
             systemPrompt: String? = nil,
             systemPromptForPrompt: (@Sendable (String) -> String)? = nil,
@@ -372,6 +379,8 @@ public actor AgentHarness {
             followUpBox: FollowUpBox? = nil,
             shouldStopAfterTurn: (@Sendable (TurnResult) async -> Bool)? = nil,
             beforeToolCall: BeforeToolCallHook? = nil,
+            toolLifecycle: ToolLifecycleHook? = nil,
+            toolLifecycleTimeout: Duration = .seconds(2),
             onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
             maxCostPerRun: Decimal? = nil,
             sessionStartHead: String? = nil
@@ -407,6 +416,8 @@ public actor AgentHarness {
             self.followUpBox = followUpBox
             self.shouldStopAfterTurn = shouldStopAfterTurn
             self.beforeToolCall = beforeToolCall
+            self.toolLifecycle = toolLifecycle
+            self.toolLifecycleTimeout = toolLifecycleTimeout
             self.onNoProgress = onNoProgress
             self.workspaceSnapshots = nil
         }
@@ -1203,6 +1214,8 @@ public actor AgentHarness {
             toolExecution: configuration.toolExecution,
             maxTurns: configuration.maxTurns,
             beforeToolCall: configuration.beforeToolCall,
+            toolLifecycle: configuration.toolLifecycle,
+            toolLifecycleTimeout: configuration.toolLifecycleTimeout,
             getSteeringMessages: steeringMessages,
             drainSteeringBeforeFirstTurn: drainSteeringBeforeFirstTurn,
             getFollowUpMessages: followUpMessages,

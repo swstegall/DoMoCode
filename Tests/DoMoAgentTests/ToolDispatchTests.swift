@@ -275,3 +275,161 @@ import Testing
     #expect(result.toolResults.first?.output.contains("ghost") == true)
     #expect(result.stopReason == .completed)
 }
+
+// MARK: - Lifecycle
+
+@Test func lifecycleHookRunsInOrderAndCarriesObservationalMetadata() async {
+    let stages = Box<[ToolLifecycleStage]>([])
+    let metadata = Box<[[String: JSONValue]]>([])
+    let tool = FakeTool("read") { _ in
+        AgentToolResult(output: "raw", details: .string("committed"))
+    }
+    let config = AgentLoopConfig(
+        model: "m",
+        toolExecution: .sequential,
+        toolLifecycle: { event in
+            stages.withLock { $0.append(event.stage) }
+            metadata.withLock { $0.append(event.metadata) }
+            if event.stage == .resolved {
+                return .addMetadata(["trace": .string("catalog")])
+            }
+            return .proceed
+        }
+    )
+    let stream = ScriptedStream([
+        assistantTurn(toolCalls: [tc("read")], stopReason: .toolUse),
+        assistantTurn(stopReason: .stop),
+    ])
+
+    let result = await runOnce(
+        context: AgentContext(tools: [tool]),
+        config: config,
+        sink: RecordingSink(),
+        streamFn: stream.fn
+    )
+
+    #expect(stages.value == [.resolved, .preflight, .permission, .invoke, .result, .postflight])
+    #expect(metadata.value.dropFirst().contains { $0["trace"] == .string("catalog") })
+    #expect(result.toolResults.first?.output == "raw")
+    #expect(result.toolResults.first?.isError == false)
+}
+
+@Test func lifecyclePreflightRejectionPreventsInvocationAndReportsFailure() async {
+    let ran = Box(0)
+    let stages = Box<[ToolLifecycleStage]>([])
+    let tool = echoTool("write", ran: ran)
+    let config = AgentLoopConfig(
+        model: "m",
+        toolLifecycle: { event in
+            stages.withLock { $0.append(event.stage) }
+            if event.stage == .preflight { return .reject("preflight blocked") }
+            return .proceed
+        }
+    )
+    let stream = ScriptedStream([
+        assistantTurn(toolCalls: [tc("write")], stopReason: .toolUse),
+        assistantTurn(stopReason: .stop),
+    ])
+
+    let result = await runOnce(
+        context: AgentContext(tools: [tool]),
+        config: config,
+        sink: RecordingSink(),
+        streamFn: stream.fn
+    )
+
+    #expect(ran.value == 0)
+    #expect(result.toolResults.first?.output == "preflight blocked")
+    #expect(result.toolResults.first?.isError == true)
+    #expect(stages.value == [.resolved, .preflight, .failure])
+}
+
+@Test func lifecycleCannotOverrideAnExistingPermissionRejection() async {
+    let ran = Box(0)
+    let stages = Box<[ToolLifecycleStage]>([])
+    let tool = echoTool("write", ran: ran)
+    let config = AgentLoopConfig(
+        model: "m",
+        beforeToolCall: { _ in .reject("permission denied") },
+        toolLifecycle: { event in
+            stages.withLock { $0.append(event.stage) }
+            return .proceed
+        }
+    )
+    let stream = ScriptedStream([
+        assistantTurn(toolCalls: [tc("write")], stopReason: .toolUse),
+        assistantTurn(stopReason: .stop),
+    ])
+
+    let result = await runOnce(
+        context: AgentContext(tools: [tool]),
+        config: config,
+        sink: RecordingSink(),
+        streamFn: stream.fn
+    )
+
+    #expect(ran.value == 0)
+    #expect(result.toolResults.first?.output == "permission denied")
+    #expect(stages.value == [.resolved, .preflight, .permission, .failure])
+}
+
+@Test func lifecycleTimeoutRejectsBeforeTheToolRuns() async {
+    let ran = Box(0)
+    let stages = Box<[ToolLifecycleStage]>([])
+    let tool = echoTool("slow", ran: ran)
+    let config = AgentLoopConfig(
+        model: "m",
+        toolLifecycleTimeout: .milliseconds(10),
+        toolLifecycle: { event in
+            stages.withLock { $0.append(event.stage) }
+            try? await Task.sleep(for: .milliseconds(100))
+            return .proceed
+        }
+    )
+    let stream = ScriptedStream([
+        assistantTurn(toolCalls: [tc("slow")], stopReason: .toolUse),
+        assistantTurn(stopReason: .stop),
+    ])
+
+    let result = await runOnce(
+        context: AgentContext(tools: [tool]),
+        config: config,
+        sink: RecordingSink(),
+        streamFn: stream.fn
+    )
+
+    #expect(ran.value == 0)
+    #expect(result.toolResults.first?.isError == true)
+    #expect(result.toolResults.first?.output.contains("timed out") == true)
+    #expect(stages.value == [.resolved, .failure])
+}
+
+@Test func lifecyclePostflightRejectionCannotMutateCommittedResult() async {
+    let tool = FakeTool("read") { _ in
+        AgentToolResult(output: "committed", details: .string("details"))
+    }
+    let stages = Box<[ToolLifecycleStage]>([])
+    let config = AgentLoopConfig(
+        model: "m",
+        toolLifecycle: { event in
+            stages.withLock { $0.append(event.stage) }
+            if event.stage == .postflight { return .reject("late rejection") }
+            return .proceed
+        }
+    )
+    let stream = ScriptedStream([
+        assistantTurn(toolCalls: [tc("read")], stopReason: .toolUse),
+        assistantTurn(stopReason: .stop),
+    ])
+
+    let result = await runOnce(
+        context: AgentContext(tools: [tool]),
+        config: config,
+        sink: RecordingSink(),
+        streamFn: stream.fn
+    )
+
+    #expect(result.toolResults.first?.output == "committed")
+    #expect(result.toolResults.first?.isError == false)
+    #expect(stages.value == [.resolved, .preflight, .permission, .invoke, .result, .postflight, .failure])
+}

@@ -24,7 +24,7 @@ struct ToolDispatch: Sendable {
     let config: AgentLoopConfig
     let sink: any AgentEventSink
 
-    /// A tool call's outcome after all three phases, paired with the call it
+    /// A tool call's outcome after all lifecycle phases, paired with the call it
     /// answers. `result.isError` is the authoritative error flag.
     struct Finalized: Sendable {
         var toolCall: ToolCallBlock
@@ -36,8 +36,14 @@ struct ToolDispatch: Sendable {
         /// The call resolved to a result without executing — tool not found, a
         /// rejecting before-hook, or cancellation.
         case immediate(AgentToolResult)
-        /// The call is ready to execute.
-        case prepared(tool: any AgentTool, toolCall: ToolCallBlock, arguments: JSONValue)
+        /// The call is ready to execute, carrying only observational metadata
+        /// accumulated before invocation.
+        case prepared(
+            tool: any AgentTool,
+            toolCall: ToolCallBlock,
+            arguments: JSONValue,
+            metadata: [String: JSONValue]
+        )
     }
 
     struct Batch: Sendable {
@@ -115,16 +121,18 @@ struct ToolDispatch: Sendable {
             // A cancelled run still owes every call a result; run none of the
             // remaining tools, answer each with an aborted result instead.
             if Task.isCancelled {
+                await observeCancellation(for: call, metadata: [:])
                 outcome = Finalized(toolCall: call, result: Self.abortedResult(for: call))
             } else {
                 switch await prepare(call, from: assistantMessage) {
                 case .immediate(let result):
                     outcome = Finalized(toolCall: call, result: result)
-                case .prepared(let tool, let toolCall, let arguments):
+                case .prepared(let tool, let toolCall, let arguments, let metadata):
                     outcome = await executeAndFinalize(
                         tool: tool,
                         toolCall: toolCall,
                         arguments: arguments,
+                        metadata: metadata,
                         from: assistantMessage
                     )
                 }
@@ -144,7 +152,12 @@ struct ToolDispatch: Sendable {
     /// or deferred to the concurrent execution phase.
     private enum Slot {
         case done(Finalized)
-        case deferred(tool: any AgentTool, toolCall: ToolCallBlock, arguments: JSONValue)
+        case deferred(
+            tool: any AgentTool,
+            toolCall: ToolCallBlock,
+            arguments: JSONValue,
+            metadata: [String: JSONValue]
+        )
     }
 
     private func runParallel(
@@ -160,6 +173,7 @@ struct ToolDispatch: Sendable {
                 .toolExecutionStart(toolCallID: call.id, toolName: call.name, arguments: JSONValueBox(call.arguments))
             )
             if Task.isCancelled {
+                await observeCancellation(for: call, metadata: [:])
                 let outcome = Finalized(toolCall: call, result: Self.abortedResult(for: call))
                 await emitEnd(outcome)
                 slots.append(.done(outcome))
@@ -170,8 +184,8 @@ struct ToolDispatch: Sendable {
                 let outcome = Finalized(toolCall: call, result: result)
                 await emitEnd(outcome)
                 slots.append(.done(outcome))
-            case .prepared(let tool, let toolCall, let arguments):
-                slots.append(.deferred(tool: tool, toolCall: toolCall, arguments: arguments))
+            case .prepared(let tool, let toolCall, let arguments, let metadata):
+                slots.append(.deferred(tool: tool, toolCall: toolCall, arguments: arguments, metadata: metadata))
             }
         }
 
@@ -184,12 +198,13 @@ struct ToolDispatch: Sendable {
         let (outcomes, outcomeContinuation) = AsyncStream.makeStream(of: (Int, Finalized).self)
         var tasks: [(index: Int, task: Task<Finalized, Never>)] = []
         for (index, slot) in slots.enumerated() {
-            guard case .deferred(let tool, let toolCall, let arguments) = slot else { continue }
+            guard case .deferred(let tool, let toolCall, let arguments, let metadata) = slot else { continue }
             let task = Task {
                 await executeAndFinalize(
                     tool: tool,
                     toolCall: toolCall,
                     arguments: arguments,
+                    metadata: metadata,
                     from: assistantMessage
                 )
             }
@@ -247,27 +262,115 @@ struct ToolDispatch: Sendable {
 
     private func prepare(_ toolCall: ToolCallBlock, from assistantMessage: AssistantMessage) async -> Preparation {
         guard let tool = tool(named: toolCall.name) else {
-            return .immediate(AgentToolResult(output: "Tool \(toolCall.name) not found", isError: true))
+            let result = AgentToolResult(output: "Tool \(toolCall.name) not found", isError: true)
+            await observeLifecycle(
+                stage: .resolved,
+                toolCall: toolCall,
+                arguments: toolCall.arguments,
+                metadata: [:]
+            )
+            await observeFailure(
+                for: toolCall,
+                arguments: toolCall.arguments,
+                result: result,
+                metadata: [:],
+                reason: "Tool \(toolCall.name) not found"
+            )
+            return .immediate(result)
         }
 
         var arguments = toolCall.arguments
+        var metadata: [String: JSONValue] = [:]
+        switch await lifecycleDecision(
+            stage: .resolved,
+            toolCall: toolCall,
+            arguments: arguments,
+            metadata: metadata
+        ) {
+        case .allow(let additions):
+            metadata = Self.merging(metadata, additions)
+        case .reject(let reason):
+            let result = AgentToolResult(output: reason, isError: true)
+            await observeFailure(
+                for: toolCall,
+                arguments: arguments,
+                result: result,
+                metadata: metadata,
+                reason: reason
+            )
+            return .immediate(result)
+        }
+
+        switch await lifecycleDecision(
+            stage: .preflight,
+            toolCall: toolCall,
+            arguments: arguments,
+            metadata: metadata
+        ) {
+        case .allow(let additions):
+            metadata = Self.merging(metadata, additions)
+        case .reject(let reason):
+            let result = AgentToolResult(output: reason, isError: true)
+            await observeFailure(
+                for: toolCall,
+                arguments: arguments,
+                result: result,
+                metadata: metadata,
+                reason: reason
+            )
+            return .immediate(result)
+        }
+
+        var permissionRejection: String?
         if let beforeToolCall = config.beforeToolCall {
             let decision = await beforeToolCall(
                 BeforeToolCallContext(assistantMessage: assistantMessage, toolCall: toolCall, arguments: arguments)
             )
             // The hook is responsible for honoring cancellation; the loop double-
             // checks after it returns, matching pi's post-hook `signal.aborted`.
-            if Task.isCancelled { return .immediate(Self.abortedResult(for: toolCall)) }
+            if Task.isCancelled {
+                await observeCancellation(for: toolCall, arguments: arguments, metadata: metadata)
+                return .immediate(Self.abortedResult(for: toolCall))
+            }
             switch decision.decision {
             case .reject(let reason):
-                return .immediate(AgentToolResult(output: reason, isError: true))
+                permissionRejection = reason
             case .proceed(let argumentsPatch):
                 arguments = argumentsPatch.apply(to: arguments)
             }
         }
-        if Task.isCancelled { return .immediate(Self.abortedResult(for: toolCall)) }
 
-        return .prepared(tool: tool, toolCall: toolCall, arguments: arguments)
+        if Task.isCancelled {
+            await observeCancellation(for: toolCall, arguments: arguments, metadata: metadata)
+            return .immediate(Self.abortedResult(for: toolCall))
+        }
+
+        let lifecyclePermission = await lifecycleDecision(
+            stage: .permission,
+            toolCall: toolCall,
+            arguments: arguments,
+            metadata: metadata
+        )
+        switch lifecyclePermission {
+        case .allow(let additions):
+            metadata = Self.merging(metadata, additions)
+        case .reject(let reason):
+            if permissionRejection == nil { permissionRejection = reason }
+        }
+
+        if let permissionRejection {
+            let result = AgentToolResult(output: permissionRejection, isError: true)
+            await observeFailure(
+                for: toolCall,
+                arguments: arguments,
+                result: result,
+                metadata: metadata,
+                reason: permissionRejection
+            )
+            return .immediate(result)
+        }
+
+        return .prepared(tool: tool, toolCall: toolCall, arguments: arguments, metadata: metadata)
     }
 
     /// Executes a prepared call and runs the after-hook. Never throws: a tool's
@@ -278,16 +381,55 @@ struct ToolDispatch: Sendable {
         tool: any AgentTool,
         toolCall: ToolCallBlock,
         arguments: JSONValue,
+        metadata: [String: JSONValue],
         from assistantMessage: AssistantMessage
     ) async -> Finalized {
+        var metadata = metadata
+        switch await lifecycleDecision(
+            stage: .invoke,
+            toolCall: toolCall,
+            arguments: arguments,
+            metadata: metadata
+        ) {
+        case .allow(let additions):
+            metadata = Self.merging(metadata, additions)
+        case .reject(let reason):
+            let result = AgentToolResult(output: reason, isError: true)
+            await observeFailure(
+                for: toolCall,
+                arguments: arguments,
+                result: result,
+                metadata: metadata,
+                reason: reason
+            )
+            return Finalized(toolCall: toolCall, result: result)
+        }
+
         var result: AgentToolResult
+        var terminalFailure: (stage: ToolLifecycleStage, reason: String)?
         do {
             result = try await tool.execute(arguments)
         } catch {
-            result =
-                error.isCancellation
-                ? Self.abortedResult(for: toolCall)
-                : AgentToolResult(output: error.description, isError: true)
+            if error.isCancellation {
+                result = Self.abortedResult(for: toolCall)
+                terminalFailure = (.cancellation, "Tool call \(toolCall.name) was cancelled.")
+            } else {
+                result = AgentToolResult(output: error.description, isError: true)
+                terminalFailure = (.failure, error.description)
+            }
+        }
+
+        switch await lifecycleDecision(
+            stage: .result,
+            toolCall: toolCall,
+            arguments: arguments,
+            result: result,
+            metadata: metadata
+        ) {
+        case .allow(let additions):
+            metadata = Self.merging(metadata, additions)
+        case .reject(let reason):
+            if terminalFailure == nil { terminalFailure = (.failure, reason) }
         }
 
         if let afterToolCall = config.afterToolCall {
@@ -308,6 +450,30 @@ struct ToolDispatch: Sendable {
             )
         }
 
+        switch await lifecycleDecision(
+            stage: .postflight,
+            toolCall: toolCall,
+            arguments: arguments,
+            result: result,
+            metadata: metadata
+        ) {
+        case .allow(let additions):
+            metadata = Self.merging(metadata, additions)
+        case .reject(let reason):
+            if terminalFailure == nil { terminalFailure = (.failure, reason) }
+        }
+
+        if let terminalFailure {
+            await observeLifecycle(
+                stage: terminalFailure.stage,
+                toolCall: toolCall,
+                arguments: arguments,
+                result: result,
+                metadata: metadata,
+                failureReason: terminalFailure.reason
+            )
+        }
+
         return Finalized(toolCall: toolCall, result: result)
     }
 
@@ -315,6 +481,101 @@ struct ToolDispatch: Sendable {
 
     private func tool(named name: String) -> (any AgentTool)? {
         tools.first { $0.definition.name == name }
+    }
+
+    private func lifecycleDecision(
+        stage: ToolLifecycleStage,
+        toolCall: ToolCallBlock,
+        arguments: JSONValue,
+        result: AgentToolResult? = nil,
+        metadata: [String: JSONValue],
+        failureReason: String? = nil
+    ) async -> ToolLifecycleDecision {
+        guard let hook = config.toolLifecycle else { return .proceed }
+        let event = ToolLifecycleEvent(
+            stage: stage,
+            toolCallID: toolCall.id,
+            toolName: toolCall.name,
+            arguments: arguments,
+            result: result,
+            metadata: metadata,
+            failureReason: failureReason
+        )
+        let timeout = config.toolLifecycleTimeout
+        guard timeout > .zero else {
+            return .reject("Tool lifecycle hook timed out before \(stage.rawValue).")
+        }
+
+        return await withTaskGroup(of: ToolLifecycleDecision.self) { group in
+            group.addTask { await hook(event) }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: timeout)
+                    return .reject("Tool lifecycle hook timed out at \(stage.rawValue).")
+                } catch {
+                    return .proceed
+                }
+            }
+            let decision = await group.next() ?? .proceed
+            group.cancelAll()
+            return decision
+        }
+    }
+
+    private func observeLifecycle(
+        stage: ToolLifecycleStage,
+        toolCall: ToolCallBlock,
+        arguments: JSONValue,
+        result: AgentToolResult? = nil,
+        metadata: [String: JSONValue],
+        failureReason: String? = nil
+    ) async {
+        _ = await lifecycleDecision(
+            stage: stage,
+            toolCall: toolCall,
+            arguments: arguments,
+            result: result,
+            metadata: metadata,
+            failureReason: failureReason
+        )
+    }
+
+    private func observeFailure(
+        for toolCall: ToolCallBlock,
+        arguments: JSONValue,
+        result: AgentToolResult,
+        metadata: [String: JSONValue],
+        reason: String
+    ) async {
+        await observeLifecycle(
+            stage: .failure,
+            toolCall: toolCall,
+            arguments: arguments,
+            result: result,
+            metadata: metadata,
+            failureReason: reason
+        )
+    }
+
+    private func observeCancellation(
+        for toolCall: ToolCallBlock,
+        arguments: JSONValue? = nil,
+        metadata: [String: JSONValue]
+    ) async {
+        await observeLifecycle(
+            stage: .cancellation,
+            toolCall: toolCall,
+            arguments: arguments ?? toolCall.arguments,
+            metadata: metadata,
+            failureReason: "Tool call \(toolCall.name) was cancelled."
+        )
+    }
+
+    private static func merging(
+        _ original: [String: JSONValue],
+        _ additions: [String: JSONValue]
+    ) -> [String: JSONValue] {
+        original.merging(additions) { _, replacement in replacement }
     }
 
     private func emitEnd(_ finalized: Finalized) async {
