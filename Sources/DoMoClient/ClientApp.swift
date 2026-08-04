@@ -76,6 +76,7 @@ public final class ClientApp {
     private var paletteDialog: SearchableSelectDialog?
     private var toolCatalogHandle: ScreenOverlayHandle?
     private var toolCatalogDialog: SearchableSelectDialog?
+    private var toolCatalogRefreshTask: Task<Void, Never>?
     private var sessionPickerDialog: SearchableSelectDialog?
     private var modelPickerDialog: SearchableSelectDialog?
     private var treePickerDialog: TreeDialog?
@@ -413,7 +414,7 @@ public final class ClientApp {
             await self?.bootstrap()
         })
 
-        let tasks = actionTasks + [eventTask, spinnerTask, diffRefreshTask].compactMap { $0 }
+        let tasks = actionTasks + [eventTask, spinnerTask, diffRefreshTask, toolCatalogRefreshTask].compactMap { $0 }
         // Cancellation is the hand-off to the owned HTTPClient below. Waiting for
         // every task here can deadlock on Linux when an async-http-client body
         // reader is already parked on its connection: the reader needs the
@@ -425,6 +426,7 @@ public final class ClientApp {
         eventTask = nil
         spinnerTask = nil
         diffRefreshTask = nil
+        toolCatalogRefreshTask = nil
 
         if let error = driver.startupError { throw error }
         if let error = driver.renderError { throw error }
@@ -1602,6 +1604,7 @@ public final class ClientApp {
     }
 
     private func open(_ sessionID: String) async {
+        if toolCatalogHandle != nil { dismissToolCatalog() }
         if diffReviewSessionID != nil, diffReviewSessionID != sessionID {
             dismissDiffReview()
         }
@@ -1804,6 +1807,11 @@ public final class ClientApp {
                             continue
                         }
                         self.store.apply(event)
+                        if case .permissionRequest = event {
+                            await self.refreshToolCatalog(sessionID: sessionID)
+                        } else if case .permissionResolved = event {
+                            await self.refreshToolCatalog(sessionID: sessionID)
+                        }
                     }
                 } catch {
                     // Fall through to the same retry as a clean end — but KEEP the
@@ -2032,6 +2040,7 @@ public final class ClientApp {
                 )
                 dialog.onCancel = { [weak self] in self?.dismissToolCatalog() }
                 dialog.onSelect = { [weak self] item in
+                    self?.dismissToolCatalog()
                     self?.post(notice: item.description ?? item.value, seconds: 8)
                 }
                 self.toolCatalogDialog = dialog
@@ -2039,6 +2048,7 @@ public final class ClientApp {
                     dialog,
                     options: self.overlayOptions(width: 110, height: 22)
                 )
+                self.startToolCatalogRefresh(for: id)
             } catch {
                 self.postError("Could not load the tool catalog", error)
             }
@@ -2047,9 +2057,53 @@ public final class ClientApp {
     }
 
     private func dismissToolCatalog() {
+        toolCatalogRefreshTask?.cancel()
+        toolCatalogRefreshTask = nil
         dismissDialog(toolCatalogHandle)
         toolCatalogHandle = nil
         toolCatalogDialog = nil
+    }
+
+    /// Keep an open catalog aligned with the runtime's late-bound tool resolver.
+    /// The route is intentionally polled while the dialog is visible: local MCP
+    /// list-changed notifications stay inside the MCP manager, while mode/model
+    /// and permission changes arrive through separate server paths. A short,
+    /// bounded poll gives all three paths one client-side refresh contract without
+    /// advertising a tool during the next request that the runtime has already
+    /// removed.
+    private func startToolCatalogRefresh(for sessionID: String) {
+        toolCatalogRefreshTask?.cancel()
+        toolCatalogRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                } catch {
+                    return
+                }
+                guard let self,
+                      self.toolCatalogHandle != nil,
+                      self.store.selectedSessionID == sessionID
+                else { return }
+                await self.refreshToolCatalog(sessionID: sessionID)
+            }
+        }
+    }
+
+    private func refreshToolCatalog(sessionID: String) async {
+        guard toolCatalogHandle != nil, store.selectedSessionID == sessionID else { return }
+        do {
+            let entries = try await client.toolCatalog(sessionID: sessionID)
+            guard store.selectedSessionID == sessionID, let dialog = toolCatalogDialog else { return }
+            dialog.update(
+                title: "Tool catalog (\(entries.count))",
+                items: entries.map(Self.toolCatalogItem)
+            )
+            surface?.requestRender()
+        } catch {
+            // An open catalog is an inspection surface, not a run. Keep its last
+            // known projection visible and avoid turning a transient poll failure
+            // into a noisy transcript row.
+        }
     }
 
     private static func toolCatalogItem(_ entry: ToolCatalogEntry) -> SelectItem {
@@ -2168,6 +2222,7 @@ public final class ClientApp {
                 try await self.client.changeModel(sessionID: id, modelID: model)
                 self.post(notice: "model selected: \(sanitizeUntrustedText(model))")
                 self.store.markAccountingStale()
+                await self.refreshToolCatalog(sessionID: id)
             } catch {
                 self.postError("Could not change model", error)
             }
@@ -2196,6 +2251,7 @@ public final class ClientApp {
                 self.agentMode = next
                 self.post(notice: "mode: \(next.rawValue)")
                 self.surface?.requestRender()
+                await self.refreshToolCatalog(sessionID: id)
             } catch ServerClientError.unexpectedStatus(409, _, _) {
                 self.refuseAsBusy()
                 await self.reconcileWithServer(id)

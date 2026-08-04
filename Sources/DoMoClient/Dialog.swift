@@ -49,7 +49,7 @@ final class DialogStack {
 /// and width-safe rendering behavior.
 @MainActor
 final class SearchableSelectDialog: Component {
-    private let title: String
+    private var title: String
     private var items: [SelectItem]
     private var list: SelectList
     private var query = ""
@@ -70,10 +70,15 @@ final class SearchableSelectDialog: Component {
     /// possible, the selected value. Session names can change while this picker is
     /// open (for example when automatic titling finishes), so a snapshot-only list
     /// makes the dialog visibly stale until it is dismissed and reopened.
-    func updateItems(_ items: [SelectItem]) {
+    func update(title: String? = nil, items: [SelectItem]) {
+        if let title { self.title = title }
         let selectedValue = list.getSelectedItem()?.value
         self.items = items
         rebuildList(preferredValue: selectedValue)
+    }
+
+    func updateItems(_ items: [SelectItem]) {
+        update(items: items)
     }
 
     func render(width: Int) -> [String] {
