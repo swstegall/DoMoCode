@@ -3118,7 +3118,7 @@ public final class ClientApp {
                     workflowID: workflowID,
                     runID: runID
                 )
-                var encoder = JSONEncoder()
+                let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 let data = try encoder.encode(records)
                 let fileName = Self.workflowExportFileName(
