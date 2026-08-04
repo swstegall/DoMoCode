@@ -54,7 +54,7 @@ struct RetryNoticeTests {
         let notices = Self.notices(sink)
         #expect(notices.count == 1)
         #expect(notices.first?.code == "retry")
-        #expect(notices.first?.text == "Retrying in 8s (attempt 3/10) — provider busy")
+        #expect(notices.first?.text == "Retrying in 8s (request 4/10) — provider busy")
         #expect(notices.first?.detail == "upstream at capacity")
         #expect(notices.first?.ttl == .seconds(8))
     }
@@ -106,9 +106,9 @@ struct RetryNoticeTests {
         let notices = Self.notices(sink)
         #expect(notices.count == 3)
         #expect(notices.map(\.text) == [
-            "Retrying in 1s (attempt 1/10) — provider busy",
-            "Retrying in 2s (attempt 2/10) — provider busy",
-            "Retrying in 3s (attempt 3/10) — provider busy",
+            "Retrying in 1s (request 2/10) — provider busy",
+            "Retrying in 2s (request 3/10) — provider busy",
+            "Retrying in 3s (request 4/10) — provider busy",
         ])
     }
 

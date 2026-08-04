@@ -180,15 +180,15 @@ private func retryNotices(_ events: [AssemblyEvent]) -> [RetryNotice] {
 @Suite("Retry budget — streaming")
 struct StreamingRetryBudgetTests {
 
-    @Test("A provider that stays overloaded is tried eleven times on the exact table")
+    @Test("A provider that stays overloaded is capped at ten total attempts")
     func tenRetriesFollowTheTable() async {
         let sleeps = Sleeps()
         let transport = ReplayTransport([.error(503, #"{"error":{"message":"service unavailable"}}"#)])
         let (_, error) = await drain(
             client(transport, sleeps: sleeps).streamCompletion(model: "m", context: retryContext))
 
-        #expect(transport.executeCount == 11, "expected 1 initial + 10 retries")
-        #expect(sleeps.all == [1, 2, 4, 8, 16, 32, 60, 60, 60, 60].map(Duration.seconds))
+        #expect(transport.executeCount == 10, "expected at most ten total requests")
+        #expect(sleeps.all == [1, 2, 4, 8, 16, 32, 60, 60, 60].map(Duration.seconds))
         #expect(error?.kind == .provider(status: 503, isRetryable: true))
     }
 
@@ -313,8 +313,8 @@ struct RetryAfterHonouringTests {
         ])
         _ = await drain(client(transport, sleeps: sleeps).streamCompletion(model: "m", context: retryContext))
 
-        #expect(sleeps.all == Array(repeating: Duration.milliseconds(100), count: 10))
-        #expect(transport.executeCount == 11)
+        #expect(sleeps.all == Array(repeating: Duration.milliseconds(100), count: 9))
+        #expect(transport.executeCount == 10)
     }
 }
 
@@ -374,8 +374,8 @@ struct PreConnectCapTests {
         let (_, error) = await drain(
             client(transport, sleeps: sleeps).streamCompletion(model: "m", context: retryContext))
 
-        #expect(transport.executeCount == 11)
-        #expect(sleeps.count == 10)
+        #expect(transport.executeCount == 10)
+        #expect(sleeps.count == 9)
         #expect(error?.kind == .transport)
     }
 
@@ -390,8 +390,8 @@ struct PreConnectCapTests {
         #expect(notices.count == 1)
         #expect(notices.first?.reason == .transport)
         // The budget it reports is the one actually in force, not `maxRetries`.
-        #expect(notices.first?.maxAttempts == 1)
-        #expect(notices.first?.summary == "Retrying in 1s (attempt 1/1) — connection problem")
+        #expect(notices.first?.maxAttempts == 2)
+        #expect(notices.first?.summary == "Retrying in 1s (request 2/2) — connection problem")
     }
 }
 
@@ -407,12 +407,12 @@ struct RetryNoticeStreamTests {
             client(transport).streamCompletion(model: "m", context: retryContext))
         let notices = retryNotices(events)
 
-        #expect(notices.count == 10)
-        #expect(notices.map(\.attempt) == Array(1...10))
+        #expect(notices.count == 9)
+        #expect(notices.map(\.attempt) == Array(1...9))
         #expect(notices.allSatisfy { $0.maxAttempts == 10 })
-        #expect(notices.map(\.delay) == [1, 2, 4, 8, 16, 32, 60, 60, 60, 60].map(Duration.seconds))
+        #expect(notices.map(\.delay) == [1, 2, 4, 8, 16, 32, 60, 60, 60].map(Duration.seconds))
         #expect(notices.allSatisfy { $0.reason == .overloaded })
-        #expect(notices[3].summary == "Retrying in 8s (attempt 4/10) — provider busy")
+        #expect(notices[3].summary == "Retrying in 8s (request 5/10) — provider busy")
         #expect(notices[0].message.contains("service unavailable"))
     }
 
@@ -457,7 +457,7 @@ struct RetryNoticeStreamTests {
         #expect(notices.count == 1)
         #expect(notices[0].reason == .rateLimited)
         #expect(notices[0].delay == .seconds(3))
-        #expect(notices[0].summary == "Retrying in 3s (attempt 1/10) — rate limited")
+        #expect(notices[0].summary == "Retrying in 3s (request 2/10) — rate limited")
     }
 
     @Test("A notice's provider text is truncated, not pasted whole into a status line")
@@ -666,9 +666,9 @@ struct CompleteRetryTests {
             Issue.record("wrong error type: \(error)")
         }
 
-        #expect(transport.executeCount == 11)
-        #expect(sleeps.all == [1, 2, 4, 8, 16, 32, 60, 60, 60, 60].map(Duration.seconds))
-        #expect(notices.all.map(\.attempt) == Array(1...10))
+        #expect(transport.executeCount == 10)
+        #expect(sleeps.all == [1, 2, 4, 8, 16, 32, 60, 60, 60].map(Duration.seconds))
+        #expect(notices.all.map(\.attempt) == Array(1...9))
         #expect(notices.all.allSatisfy { $0.reason == .overloaded })
     }
 

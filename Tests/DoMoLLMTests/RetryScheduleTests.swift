@@ -236,13 +236,25 @@ struct RetryAfterClampTests {
 @Suite("Retry defaults")
 struct RetryDefaultsTests {
 
+    @Test("Retry counts normalize to total requests without exceeding the hard ceiling")
+    func normalizedAttemptBudget() {
+        #expect(LiteLLMClient.Configuration(maxRetries: 0).maxAttempts == 1)
+        #expect(LiteLLMClient.Configuration(maxRetries: 3).maxAttempts == 4)
+        #expect(LiteLLMClient.Configuration(maxRetries: 9).maxAttempts == 10)
+        #expect(LiteLLMClient.Configuration(maxRetries: 100).maxAttempts == 10)
+        #expect(LiteLLMClient.Configuration(maxRetries: 100, maxPreConnectRetries: 100).maxPreConnectAttempts == 10)
+        #expect(LiteLLMClient.Configuration(maxRetries: 3, maxPreConnectRetries: 0).maxPreConnectAttempts == 1)
+    }
+
     @Test("The shipped client defaults are the ten-retry budget")
     func shippedDefaults() {
         let config = LiteLLMClient.Configuration()
         #expect(config.maxRetries == 10)
+        #expect(config.maxAttempts == 10)
         #expect(config.baseRetryDelay == .seconds(1))
         #expect(config.maxRetryDelay == .seconds(60))
         #expect(config.maxPreConnectRetries == 1)
+        #expect(config.maxPreConnectAttempts == 2)
         #expect(config.retryDelayBudget == .seconds(300))
     }
 
@@ -274,7 +286,7 @@ struct RetryNoticeTests {
     func summary() {
         let notice = RetryNotice(
             attempt: 4, maxAttempts: 10, delay: .seconds(8), reason: .overloaded, message: "overloaded_error")
-        #expect(notice.summary == "Retrying in 8s (attempt 4/10) — provider busy")
+        #expect(notice.summary == "Retrying in 8s (request 5/10) — provider busy")
     }
 
     @Test("Each reason has its own user-facing wording")
@@ -284,7 +296,7 @@ struct RetryNoticeTests {
         #expect(RetryNotice.Reason.transport.label == "connection problem")
         let limited = RetryNotice(
             attempt: 1, maxAttempts: 10, delay: .seconds(3), reason: .rateLimited, message: "")
-        #expect(limited.summary == "Retrying in 3s (attempt 1/10) — rate limited")
+        #expect(limited.summary == "Retrying in 3s (request 2/10) — rate limited")
     }
 
     @Test(

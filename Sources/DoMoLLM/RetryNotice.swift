@@ -30,11 +30,12 @@ public struct RetryNotice: Sendable, Hashable {
         case transport
     }
 
-    /// 1-based retry number. The first retry is `1`.
+    /// 1-based retry number. The initial request is not represented by a
+    /// notice.
     public var attempt: Int
 
-    /// The budget this call is working against
-    /// (``LiteLLMClient/Configuration/maxRetries``).
+    /// Total network requests this call is working against, including the
+    /// initial request.
     public var maxAttempts: Int
 
     /// How long the client will wait before the next request.
@@ -54,9 +55,11 @@ public struct RetryNotice: Sendable, Hashable {
         self.message = message
     }
 
-    /// One line, ready for a status bar: `"Retrying in 8s (attempt 4/10) — provider busy"`.
+    /// One line, ready for a status bar: the request number makes the initial
+    /// request part of the same visible budget as each retry.
     public var summary: String {
-        "Retrying in \(Self.formatted(delay)) (attempt \(attempt)/\(maxAttempts)) — \(reason.label)"
+        let nextRequest = min(maxAttempts, attempt + 1)
+        return "Retrying in \(Self.formatted(delay)) (request \(nextRequest)/\(maxAttempts)) — \(reason.label)"
     }
 
     /// A short human duration: `"500ms"`, `"1.5s"`, `"8s"`, `"60s"`.

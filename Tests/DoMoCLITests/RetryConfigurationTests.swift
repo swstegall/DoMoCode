@@ -41,6 +41,7 @@ struct RetryConfigurationTests {
         // resolver is a default nobody gets.
         let client = config.clientConfiguration
         #expect(client.maxRetries == 10)
+        #expect(client.maxAttempts == 10)
         #expect(client.baseRetryDelay == .seconds(1))
         #expect(client.maxRetryDelay == .seconds(60))
         #expect(client.retryDelayBudget == .seconds(300))
@@ -51,6 +52,7 @@ struct RetryConfigurationTests {
     func libraryAndCLIAgree() {
         let library = LiteLLMClient.Configuration()
         #expect(library.maxRetries == ResolvedConfiguration.defaultMaxRetries)
+        #expect(library.maxAttempts == 10)
         #expect(library.baseRetryDelay == ResolvedConfiguration.defaultRetryBaseDelay)
         #expect(library.maxRetryDelay == ResolvedConfiguration.defaultRetryMaxDelay)
         #expect(library.retryDelayBudget == ResolvedConfiguration.defaultRetryDelayBudget)

@@ -760,7 +760,10 @@ contracts, not their web application or cloud assumptions.
 
 Until Phase 26 lands, the current LiteLLM adapter behaves as follows:
 
-- DOMOCODE_MAX_RETRIES defaults to 10 for classified retryable failures;
+- DOMOCODE_MAX_RETRIES defaults to 10 for classified retryable failures. The
+  historical name counts retries after the initial request, but the effective
+  network budget is capped at ten total requests; zero means one request and no
+  retry.
 - exponential backoff starts at 1 second, caps at 60 seconds, and uses
   jitter; Retry-After is honored within the cap;
 - the total scheduled sleep budget defaults to 300 seconds;
@@ -793,7 +796,7 @@ then built-in defaults. Current environment names:
 | DOMOCODE_REASONING_EFFORT | Current reasoning effort override. |
 | DOMOCODE_TIMEOUT_MS | Overall request timeout. |
 | DOMOCODE_STREAM_TIMEOUT_MS | Committed-stream idle timeout. |
-| DOMOCODE_MAX_RETRIES | Current retry ceiling. |
+| DOMOCODE_MAX_RETRIES | Historical retry-count setting; the effective ceiling is ten total network attempts including the initial request. |
 | DOMOCODE_RETRY_BASE_MS | Current initial backoff. |
 | DOMOCODE_RETRY_MAX_MS | Current backoff ceiling. |
 | DOMOCODE_RETRY_BUDGET_MS | Current scheduled-sleep budget. |

@@ -111,7 +111,7 @@ struct WedgeSurfaceTests {
                 ServerNotice(
                     level: .warning,
                     code: "retry",
-                    text: "Retrying in 8s (attempt 4/10) — provider busy",
+                    text: "Retrying in 8s (request 5/10) — provider busy",
                     detail: "upstream is at capacity",
                     ttlMilliseconds: 8000
                 )),
@@ -121,7 +121,7 @@ struct WedgeSurfaceTests {
         defer { stub.stop() }
 
         let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, watching: [
-            "Retrying in 8s (attempt 4/10) — provider busy"
+            "Retrying in 8s (request 5/10) — provider busy"
         ])
         _ = await client.waitForAll()
         #expect(client.missing.isEmpty, "never shown: \(client.missing)\n\(client.joined())")
@@ -143,7 +143,7 @@ struct WedgeSurfaceTests {
             .notice(
                 ServerNotice(
                     level: .warning, code: "retry",
-                    text: "Retrying in 60s (attempt 7/10) — rate limited",
+                    text: "Retrying in 60s (request 8/10) — rate limited",
                     ttlMilliseconds: 60000
                 )),
         ])
@@ -158,7 +158,7 @@ struct WedgeSurfaceTests {
         defer { stub.stop() }
 
         let client = try await WedgeClient.make(baseURL: stub.baseURL, token: Self.token, watching: [
-            "Retrying in 60s (attempt 7/10) — rate limited"
+            "Retrying in 60s (request 8/10) — rate limited"
         ])
         // It must be shown at all — otherwise the clearing assertion below is
         // vacuous and would pass against a client that never rendered it.
@@ -184,7 +184,7 @@ struct WedgeSurfaceTests {
             .notice(
                 ServerNotice(
                     level: .warning, code: "retry",
-                    text: "Retrying in 8s (attempt 4/10) — provider busy")))
+                    text: "Retrying in 8s (request 5/10) — provider busy")))
 
         #expect(store.transcript.isEmpty)
         #expect(store.lastNotice?.code == "retry")

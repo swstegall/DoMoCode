@@ -56,7 +56,7 @@ struct NoticeFrameTests {
         let notice = AgentNotice(
             level: .warning,
             code: "retry",
-            text: "Retrying in 8s (attempt 4/10) — provider busy",
+            text: "Retrying in 8s (request 5/10) — provider busy",
             detail: "503 service unavailable",
             kind: DoMoError.Kind.provider(status: 503, isRetryable: true).label,
             ttl: .milliseconds(10_500)
@@ -66,7 +66,7 @@ struct NoticeFrameTests {
                 == .notice(ServerNotice(
                     level: .warning,
                     code: "retry",
-                    text: "Retrying in 8s (attempt 4/10) — provider busy",
+                    text: "Retrying in 8s (request 5/10) — provider busy",
                     detail: "503 service unavailable",
                     kind: "provider",
                     ttlMilliseconds: 10_500

@@ -123,16 +123,22 @@ public struct LiteLLMClient: Sendable {
         /// The scheme prefix. Stays `Bearer` even when the header name changes.
         public var authScheme: String
 
-        /// Client-side retry attempts after the initial call. `0` disables retry.
-        ///
-        /// Ten, because the failure this exists for — "the provider is busy" —
-        /// is one that clears on its own, and giving up after three tries turns
-        /// a provider's bad ninety seconds into a failed turn the user has to
-        /// retype. The cost of ten is bounded from three directions: the delay
-        /// ceiling (``maxRetryDelay``), the total sleep budget
-        /// (``retryDelayBudget``), and the far lower ``maxPreConnectRetries``
-        /// for the case where the gateway never answered at all.
+        /// Historical configuration name for the retry budget. The value
+        /// counts retries after the initial request; maxAttempts below is the
+        /// total network-attempt budget used by the loop. The default remains
+        /// ten for compatibility, but it produces ten total requests rather
+        /// than an eleventh request.
         public var maxRetries: Int
+
+        /// Maximum number of network requests for one completion, including
+        /// the initial request. This is always at least one and never exceeds
+        /// maxNetworkAttempts.
+        public var maxAttempts: Int {
+            let retries = max(0, maxRetries)
+            return retries >= Self.maxNetworkAttempts - 1
+                ? Self.maxNetworkAttempts
+                : retries + 1
+        }
 
         /// First backoff delay; each further attempt doubles it before jitter.
         public var baseRetryDelay: Duration
@@ -144,8 +150,9 @@ public struct LiteLLMClient: Sendable {
         /// Retry budget for a failure that happened *before* any response head
         /// arrived.
         ///
-        /// Deliberately far lower than ``maxRetries``, and the reason raising
-        /// ``maxRetries`` to ten does not change what a dead gateway costs. A
+        /// Deliberately far lower than the effective maxAttempts, and the
+        /// reason raising maxRetries to ten does not change what a dead gateway
+        /// costs. A
         /// pre-connect failure is a different animal from a busy provider: there
         /// is no evidence anything is listening, each attempt burns a whole
         /// connect timeout (`AsyncHTTPClientTransport.defaultConnectTimeout`, 10
@@ -157,6 +164,16 @@ public struct LiteLLMClient: Sendable {
         /// that it is now explicit rather than an implicit `min(maxRetries, 1)`,
         /// so nobody raises `maxRetries` and silently changes it.
         public var maxPreConnectRetries: Int
+
+        /// Total network requests permitted before a gateway has returned any
+        /// response head. maxPreConnectRetries remains a retry count for
+        /// configuration compatibility; this normalized value is what the loop
+        /// and its notices report.
+        public var maxPreConnectAttempts: Int {
+            let retries = max(0, maxPreConnectRetries)
+            let requested = retries >= maxAttempts - 1 ? maxAttempts : retries + 1
+            return min(maxAttempts, requested)
+        }
 
         /// Total time one call may spend *asleep* between attempts. Retrying
         /// stops when the next delay would push past it, even with attempts
@@ -243,7 +260,11 @@ public struct LiteLLMClient: Sendable {
             self.sleep = sleep
         }
 
-        /// The multiplier range the default ``jitter`` draws from.
+        /// Hard ceiling for total network attempts in one completion. Ten is a
+        /// request count, not a retry count: the initial call is included.
+        public static let maxNetworkAttempts = 10
+
+        /// The multiplier range the default jitter draws from.
         public static let defaultJitterRange: ClosedRange<Double> = 0.5...1.0
 
         /// The floor a server-supplied delay is raised to.
@@ -417,7 +438,7 @@ public struct LiteLLMClient: Sendable {
         continuation: AsyncThrowingStream<AssemblyEvent, any Error>.Continuation
     ) async {
         let assembly = StreamingAssembly(model: model, rates: rates)
-        var attempt = 0
+        var retryCount = 0
         var everConnected = false
         var spentOnRetries = Duration.zero
 
@@ -457,17 +478,19 @@ public struct LiteLLMClient: Sendable {
                 // any endpoint that has answered even once — including with a
                 // 503. See ``Configuration/maxPreConnectRetries``.
                 let cap = everConnected
-                    ? configuration.maxRetries
-                    : min(configuration.maxRetries, configuration.maxPreConnectRetries)
-                if classified.isRetryable, attempt < cap,
+                    ? configuration.maxAttempts
+                    : configuration.maxPreConnectAttempts
+                if classified.isRetryable, retryCount + 1 < cap,
                     let delay = nextRetryDelay(
-                        attempt: attempt + 1, retryAfter: classified.retryAfter, spent: &spentOnRetries)
+                        attempt: retryCount + 1,
+                        retryAfter: classified.retryAfter,
+                        spent: &spentOnRetries)
                 {
-                    attempt += 1
+                    retryCount += 1
                     continuation.yield(
                         .retrying(
                             RetryNotice(
-                                attempt: attempt,
+                                attempt: retryCount,
                                 maxAttempts: cap,
                                 delay: delay,
                                 reason: RetryNotice.reason(for: classified),
@@ -492,16 +515,18 @@ public struct LiteLLMClient: Sendable {
                 // `.rateLimit`, so read the head directly rather than silently
                 // falling back to a guess the server already corrected.
                 let serverDelay = error.retryAfter ?? Self.retryAfter(from: response.head)
-                if error.isRetryable, attempt < configuration.maxRetries,
+                if error.isRetryable, retryCount + 1 < configuration.maxAttempts,
                     let delay = nextRetryDelay(
-                        attempt: attempt + 1, retryAfter: serverDelay, spent: &spentOnRetries)
+                        attempt: retryCount + 1,
+                        retryAfter: serverDelay,
+                        spent: &spentOnRetries)
                 {
-                    attempt += 1
+                    retryCount += 1
                     continuation.yield(
                         .retrying(
                             RetryNotice(
-                                attempt: attempt,
-                                maxAttempts: configuration.maxRetries,
+                                attempt: retryCount,
+                                maxAttempts: configuration.maxAttempts,
                                 delay: delay,
                                 reason: RetryNotice.reason(for: error),
                                 message: Self.retryNoticeMessage(error)
@@ -646,7 +671,7 @@ public struct LiteLLMClient: Sendable {
             toolChoice: toolChoice
         )
 
-        var attempt = 0
+        var retryCount = 0
         var everConnected = false
         var spentOnRetries = Duration.zero
         while true {
@@ -667,16 +692,18 @@ public struct LiteLLMClient: Sendable {
                 // so raising `maxRetries` to ten would have made a dead gateway
                 // cost eleven full connect timeouts on this path alone.
                 let cap = everConnected
-                    ? configuration.maxRetries
-                    : min(configuration.maxRetries, configuration.maxPreConnectRetries)
-                if classified.isRetryable, attempt < cap,
+                    ? configuration.maxAttempts
+                    : configuration.maxPreConnectAttempts
+                if classified.isRetryable, retryCount + 1 < cap,
                     let delay = nextRetryDelay(
-                        attempt: attempt + 1, retryAfter: classified.retryAfter, spent: &spentOnRetries)
+                        attempt: retryCount + 1,
+                        retryAfter: classified.retryAfter,
+                        spent: &spentOnRetries)
                 {
-                    attempt += 1
+                    retryCount += 1
                     onRetry?(
                         RetryNotice(
-                            attempt: attempt,
+                            attempt: retryCount,
                             maxAttempts: cap,
                             delay: delay,
                             reason: RetryNotice.reason(for: classified),
@@ -695,15 +722,17 @@ public struct LiteLLMClient: Sendable {
             if !(200..<300).contains(status) {
                 let error = Self.classify(status: status, head: response.head, body: bodyText)
                 let serverDelay = error.retryAfter ?? Self.retryAfter(from: response.head)
-                if error.isRetryable, attempt < configuration.maxRetries,
+                if error.isRetryable, retryCount + 1 < configuration.maxAttempts,
                     let delay = nextRetryDelay(
-                        attempt: attempt + 1, retryAfter: serverDelay, spent: &spentOnRetries)
+                        attempt: retryCount + 1,
+                        retryAfter: serverDelay,
+                        spent: &spentOnRetries)
                 {
-                    attempt += 1
+                    retryCount += 1
                     onRetry?(
                         RetryNotice(
-                            attempt: attempt,
-                            maxAttempts: configuration.maxRetries,
+                            attempt: retryCount,
+                            maxAttempts: configuration.maxAttempts,
                             delay: delay,
                             reason: RetryNotice.reason(for: error),
                             message: Self.retryNoticeMessage(error)
