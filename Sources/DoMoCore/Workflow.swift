@@ -206,6 +206,63 @@ public struct WorkflowDefinition: Sendable, Codable, Hashable {
     }
 
     public var isValid: Bool { validationIssues.isEmpty }
+
+    /// The built-in workflow exposed by a fresh runtime. It is deliberately a
+    /// value rather than executable policy: a host may persist, edit, or replace
+    /// it before a run is admitted.
+    public static let standard = WorkflowDefinition(
+        id: "standard",
+        displayName: "Research → Plan → Execute → Synthesize",
+        stages: [
+            WorkflowStageDefinition(
+                id: "research",
+                displayName: "Research",
+                kind: .research,
+                toolPolicy: .readOnly,
+                profile: "ask",
+                contextInputs: ["prompt"],
+                outputArtifact: ".domocode/evidence/standard.json",
+                budget: WorkflowBudget(wallClockSeconds: 900),
+                cancellationPolicy: .continueIndependent
+            ),
+            WorkflowStageDefinition(
+                id: "plan",
+                displayName: "Plan",
+                kind: .plan,
+                dependencies: ["research"],
+                toolPolicy: .readOnly,
+                profile: "plan",
+                contextInputs: ["prompt", "research"],
+                outputArtifact: ".domocode/plans/standard.md",
+                budget: WorkflowBudget(wallClockSeconds: 900),
+                approvalBoundary: .beforeStage
+            ),
+            WorkflowStageDefinition(
+                id: "execute",
+                displayName: "Execute",
+                kind: .execute,
+                dependencies: ["plan"],
+                toolPolicy: WorkflowToolPolicy(mode: .approvedMutations),
+                profile: "build",
+                contextInputs: ["prompt", "plan"],
+                budget: WorkflowBudget(wallClockSeconds: 1_800),
+                cancellationPolicy: .checkpointAndStop,
+                approvalBoundary: .beforeMutation
+            ),
+            WorkflowStageDefinition(
+                id: "synthesize",
+                displayName: "Synthesize",
+                kind: .synthesize,
+                dependencies: ["execute"],
+                toolPolicy: .readOnly,
+                profile: "review",
+                contextInputs: ["prompt", "research", "plan", "execute"],
+                budget: WorkflowBudget(wallClockSeconds: 600),
+                approvalBoundary: .beforeSynthesis
+            ),
+        ],
+        metadata: ["source": "builtin"]
+    )
 }
 
 public enum WorkflowRunStatus: String, Sendable, Codable, Hashable, CaseIterable {

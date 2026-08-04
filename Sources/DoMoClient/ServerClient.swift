@@ -179,6 +179,30 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode([ModelOption].self, from: data)
     }
 
+    /// Fetch durable workflow definitions exposed by the serving runtime.
+    public func workflowDefinitions() async throws -> [WorkflowDefinition] {
+        let path = "/workflows"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([WorkflowDefinition].self, from: data)
+    }
+
+    /// Fetch the latest level-triggered snapshot for each run of a workflow.
+    public func workflowRuns(workflowID: String) async throws -> [WorkflowRunRecord] {
+        let path = "/workflow/(workflowID)/runs"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([WorkflowRunRecord].self, from: data)
+    }
+
+    /// Fetch one durable run snapshot by id.
+    public func workflowRun(workflowID: String, runID: String) async throws -> WorkflowRunRecord {
+        let path = "/workflow/(workflowID)/run/(runID)"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
+    }
+
     /// Fetch the session's current callable-tool catalog. The runtime resolves
     /// this immediately before responding, so a newly refreshed MCP list or a
     /// mode/model change is visible without client-side tool caching.

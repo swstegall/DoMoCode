@@ -54,6 +54,7 @@ public final class ClientApp {
     /// not an overlay: the workflow owns the full frame until Escape walks back to
     /// the ordinary session view.
     private var workflowWorkspace: WorkflowWorkspaceController?
+    private var workflowRefreshTask: Task<Void, Never>?
     /// Command metadata is fetched from the runtime at bootstrap. The client
     /// uses local actions immediately and forwards prompt commands unchanged so
     /// the server remains the authority for template expansion.
@@ -418,7 +419,13 @@ public final class ClientApp {
             await self?.bootstrap()
         })
 
-        let tasks = actionTasks + [eventTask, spinnerTask, diffRefreshTask, toolCatalogRefreshTask].compactMap { $0 }
+        let tasks = actionTasks + [
+            eventTask,
+            spinnerTask,
+            diffRefreshTask,
+            toolCatalogRefreshTask,
+            workflowRefreshTask,
+        ].compactMap { $0 }
         // Cancellation is the hand-off to the owned HTTPClient below. Waiting for
         // every task here can deadlock on Linux when an async-http-client body
         // reader is already parked on its connection: the reader needs the
@@ -431,6 +438,7 @@ public final class ClientApp {
         spinnerTask = nil
         diffRefreshTask = nil
         toolCatalogRefreshTask = nil
+        workflowRefreshTask = nil
 
         if let error = driver.startupError { throw error }
         if let error = driver.renderError { throw error }
@@ -2946,15 +2954,115 @@ public final class ClientApp {
         workflowWorkspace = workspace
         focus.register(workspace)
         focus.setCurrent(workspace)
+        startWorkflowRefresh(preferredPhaseID: phaseID)
         surface?.requestFullRedraw()
     }
 
     private func closeWorkflow() {
         guard let workspace = workflowWorkspace else { return }
         workflowWorkspace = nil
+        workflowRefreshTask?.cancel()
+        workflowRefreshTask = nil
         focus.unregister(workspace)
         focus.setCurrent(promptInput)
         surface?.requestFullRedraw()
+    }
+
+    /// Poll the level-triggered workflow projection while its dedicated root is
+    /// mounted. The ordinary SSE stream is session-scoped, so treating this as a
+    /// separate, bounded poll keeps workflow progress correct for remote servers
+    /// and for runs that began before the client entered the workspace.
+    private func startWorkflowRefresh(preferredPhaseID: String?) {
+        workflowRefreshTask?.cancel()
+        let task = Task { @MainActor [weak self] in
+            var reportedUnavailable = false
+            while !Task.isCancelled {
+                guard let self, let workspace = self.workflowWorkspace else { return }
+                do {
+                    let definitions = try await self.client.workflowDefinitions()
+                    if let definition = Self.workflowDefinition(
+                        from: definitions,
+                        preferredPhaseID: preferredPhaseID
+                    ) {
+                        let runs = try await self.client.workflowRuns(workflowID: definition.id)
+                        let latest = runs.max { $0.updatedAt < $1.updatedAt }
+                        workspace.setPhases(Self.workflowPhases(definition: definition, run: latest))
+                        if let preferredPhaseID { workspace.selectPhase(id: preferredPhaseID) }
+                        self.surface?.requestRender()
+                    }
+                    reportedUnavailable = false
+                } catch {
+                    // A client can attach to an older server without workflow
+                    // routes. Keep the immediately usable workspace and explain
+                    // the missing live projection once, rather than replacing it
+                    // with a blank pane or spamming the transcript.
+                    if !reportedUnavailable {
+                        self.post(notice: "workflow snapshot unavailable — showing the local phase layout")
+                        reportedUnavailable = true
+                    }
+                }
+                try? await Task.sleep(for: .milliseconds(750))
+            }
+        }
+        workflowRefreshTask = task
+        actionTasks.append(task)
+    }
+
+    private static func workflowDefinition(
+        from definitions: [WorkflowDefinition],
+        preferredPhaseID: String?
+    ) -> WorkflowDefinition? {
+        guard !definitions.isEmpty else { return nil }
+        if let preferredPhaseID,
+           let match = definitions.first(where: { definition in
+               definition.stages.contains { $0.id.caseInsensitiveCompare(preferredPhaseID) == .orderedSame }
+           }) {
+            return match
+        }
+        return definitions.first(where: { $0.id == WorkflowDefinition.standard.id }) ?? definitions[0]
+    }
+
+    private static func workflowPhases(
+        definition: WorkflowDefinition,
+        run: WorkflowRunRecord?
+    ) -> [WorkflowWorkspacePhase] {
+        definition.stages.map { stage in
+            let stageRun = run?.stage(withID: stage.id)
+            let agentIDs = stageRun?.agentIDs.isEmpty == false
+                ? stageRun?.agentIDs ?? []
+                : [stage.id + "-agent"]
+            let output = stageRun.map(workflowOutputText) ?? ""
+            let error = stageRun?.error.map { "\n\nerror: \($0)" } ?? ""
+            let content = output + error
+            let agents = agentIDs.map { agentID in
+                WorkflowWorkspaceAgent(
+                    id: agentID,
+                    title: agentID,
+                    status: stageRun?.status ?? .pending,
+                    content: content
+                )
+            }
+            var summary = "tool policy: (stage.toolPolicy.mode.rawValue)"
+            if let profile = stage.profile { summary += " · profile: (profile)" }
+            if let artifact = stage.outputArtifact { summary += " · artifact: (artifact)" }
+            if !stage.dependencies.isEmpty {
+                summary += " · after: " + stage.dependencies.joined(separator: ", ")
+            }
+            return WorkflowWorkspacePhase(
+                id: stage.id,
+                title: stage.displayName,
+                status: stageRun?.status ?? .pending,
+                summary: summary,
+                agents: agents
+            )
+        }
+    }
+
+    private static func workflowOutputText(_ stage: WorkflowStageRunRecord) -> String {
+        guard stage.output != .null else { return "" }
+        if let string = stage.output.stringValue { return string }
+        guard let data = try? JSONEncoder().encode(stage.output) else { return "" }
+        return String(data: data, encoding: .utf8) ?? ""
     }
 
     private static let standardWorkflowPhases: [WorkflowWorkspacePhase] = [

@@ -343,6 +343,10 @@ public actor ServerRuntime {
         /// Root depth is zero. A child at this depth may not create another
         /// child once the next depth would exceed this cap.
         public var maxSubagentDepth: Int
+        /// Optional append-only workflow definitions and run snapshots. Keeping
+        /// this seam optional preserves lightweight embedded runtimes while the
+        /// serving CLI can opt into project-local durability.
+        public var workflowStore: WorkflowStore?
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -386,7 +390,8 @@ public actor ServerRuntime {
             subagentCoordinator: SubagentCoordinator? = nil,
             maxSubagentDepth: Int = 2,
             projectMemoryProvider: (any ProjectMemoryProvider)? = nil,
-            terminalService: PTYService? = nil
+            terminalService: PTYService? = nil,
+            workflowStore: WorkflowStore? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -423,6 +428,7 @@ public actor ServerRuntime {
             self.maxSubagentDepth = max(0, maxSubagentDepth)
             self.projectMemoryProvider = projectMemoryProvider
             self.terminalService = terminalService
+            self.workflowStore = workflowStore
         }
     }
 
@@ -616,6 +622,37 @@ public actor ServerRuntime {
             return [ModelOption(id: config.model, contextWindow: config.contextWindow)]
         }
         return config.modelOptions
+    }
+
+    /// The durable workflow definitions known to this runtime, ordered by id.
+    /// A missing store is a supported embedded configuration and reports no
+    /// workflows rather than manufacturing an in-memory record that cannot be
+    /// resumed after shutdown.
+    public func workflowDefinitions() throws -> [WorkflowDefinition] {
+        guard let store = config.workflowStore else { return [] }
+        var latest: [String: WorkflowDefinition] = [:]
+        for record in try store.records() where record.kind == .definition {
+            if let definition = record.definition { latest[record.id] = definition }
+        }
+        return latest.values.sorted { $0.id < $1.id }
+    }
+
+    /// The latest snapshot for each run of a definition. Historical rows remain
+    /// in the JSONL store for export/replay, while this projection is what a UI
+    /// needs for a truthful current workspace.
+    public func workflowRuns(workflowID: String) throws -> [WorkflowRunRecord] {
+        guard let store = config.workflowStore else { return [] }
+        return try store.latestRuns()
+            .filter { $0.workflowID == workflowID }
+            .sorted { $0.updatedAt < $1.updatedAt }
+    }
+
+    public func workflowRun(workflowID: String, runID: String) throws -> WorkflowRunRecord? {
+        guard let store = config.workflowStore,
+              let run = try store.latestRun(withID: runID),
+              run.workflowID == workflowID
+        else { return nil }
+        return run
     }
 
     /// Project the same late-bound tool resolver used before the next model

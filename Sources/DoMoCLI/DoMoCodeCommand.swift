@@ -1277,6 +1277,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             let runtime = configuration.modelRuntime(for: alias)
             return ModelOption(id: alias, contextWindow: runtime.contextWindow)
         }
+        let workflowStore = try WorkflowStore.create(
+            directory: workingDirectory.appending(".domocode").appending("workflows")
+        )
+        if try workflowStore.definition(withID: WorkflowDefinition.standard.id) == nil {
+            try workflowStore.append(definition: .standard)
+        }
         let snapshotRoot = configuration.sessionDirectory
             .appending(JSONLSessionStore.sanitizedDirectoryName(forCwd: workingDirectory.string))
             .appending("snapshots")
@@ -1329,7 +1335,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionStartHead: sessionStartHead,
             diffSource: DoMoGit(shell: shell),
             subagentCoordinator: subagentCoordinator,
-            projectMemoryProvider: memoryStore
+            projectMemoryProvider: memoryStore,
+            workflowStore: workflowStore
         )
         runtimeConfiguration.agentProfile = agentProfile
         runtimeConfiguration.agentMode = agentMode

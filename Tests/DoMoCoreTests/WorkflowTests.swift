@@ -8,6 +8,17 @@ import Testing
 
 @Suite("Workflow contracts")
 struct WorkflowTests {
+    @Test("the built-in workflow is a valid durable research-to-synthesis DAG")
+    func standardWorkflowIsValid() throws {
+        let definition = WorkflowDefinition.standard
+        #expect(definition.isValid)
+        #expect(definition.stages.map(\.id) == ["research", "plan", "execute", "synthesize"])
+        #expect(definition.stages[0].toolPolicy.mode == .readOnly)
+        #expect(definition.stages[2].approvalBoundary == .beforeMutation)
+        let data = try JSONEncoder().encode(definition)
+        #expect(try JSONDecoder().decode(WorkflowDefinition.self, from: data) == definition)
+    }
+
     @Test("a valid DAG round-trips with explicit stage policy")
     func validDAGRoundTrip() throws {
         let definition = WorkflowDefinition(

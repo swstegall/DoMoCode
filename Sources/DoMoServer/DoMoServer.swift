@@ -216,6 +216,33 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        // Workflow definitions and run snapshots are read-only projections of
+        // the runtime's append-only store. The client polls these level-triggered
+        // routes so a dropped event cannot leave a phase pane claiming stale work.
+        router.get("/workflows") { _, _ in
+            try await self.mapErrors {
+                try Self.json(try await self.runtime.workflowDefinitions())
+            }
+        }
+
+        router.get("/workflow/:id/runs") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.workflowRuns(workflowID: id))
+            }
+        }
+
+        router.get("/workflow/:id/run/:runID") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let runID = try context.parameters.require("runID")
+                guard let run = try await self.runtime.workflowRun(workflowID: id, runID: runID) else {
+                    throw HTTPError(.notFound)
+                }
+                return try Self.json(run)
+            }
+        }
+
         router.get("/session/:id/tools") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
