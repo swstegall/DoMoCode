@@ -61,6 +61,12 @@ public actor AutomationJobCoordinator {
             "maxOutputBytes": .int(definition.budget.maxOutputBytes),
             "input": invocation.input,
         ]
+        // Preserve adapter-observed facts (for example a repository branch or
+        // filesystem path) without allowing invocation metadata to replace the
+        // coordinator's authoritative policy fields above.
+        for (key, value) in invocation.metadata where metadata[key] == nil {
+            metadata[key] = value
+        }
         if let backendID = definition.backendID {
             metadata["backendID"] = .string(backendID)
         }
