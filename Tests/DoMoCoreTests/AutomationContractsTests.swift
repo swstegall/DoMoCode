@@ -89,28 +89,34 @@ struct AutomationContractsTests {
         await #expect(throws: AutomationRegistryError.invalidDefinition(
             "Schedule triggers require a non-empty expression."
         )) {
-            _ = try await registry.register(base((
-                AutomationTrigger(kind: .schedule),
-                AutomationSecretScope()
-            )))
+            _ = try await registry.register(
+                base(
+                    AutomationTrigger(kind: .schedule),
+                    AutomationSecretScope()
+                )
+            )
         }
 
         await #expect(throws: AutomationRegistryError.invalidDefinition(
             "Webhook triggers require an authenticated webhook id."
         )) {
-            _ = try await registry.register(base((
-                AutomationTrigger(kind: .webhook, webhookID: "hook", authenticated: false),
-                AutomationSecretScope()
-            )))
+            _ = try await registry.register(
+                base(
+                    AutomationTrigger(kind: .webhook, webhookID: "hook", authenticated: false),
+                    AutomationSecretScope()
+                )
+            )
         }
 
         await #expect(throws: AutomationRegistryError.invalidDefinition(
             "Secret scope contains an invalid name or a credential value."
         )) {
-            _ = try await registry.register(base((
-                AutomationTrigger(kind: .manual),
-                AutomationSecretScope(environmentNames: ["DOMOCODE_API_KEY=secret"])
-            )))
+            _ = try await registry.register(
+                base(
+                    AutomationTrigger(kind: .manual),
+                    AutomationSecretScope(environmentNames: ["DOMOCODE_API_KEY=secret"])
+                )
+            )
         }
     }
 
