@@ -50,6 +50,16 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     case handoffDenied
     /// The handoff request or cursor was malformed.
     case handoffInvalid(String)
+    /// The runtime was not configured with a durable job manager.
+    case jobUnavailable
+    /// A durable job id is not known to this runtime.
+    case jobNotFound
+    /// A job transition or cursor was not admissible.
+    case jobConflict
+    /// The caller is not the job owner.
+    case jobDenied
+    /// The job request or cursor was malformed.
+    case jobInvalid(String)
 }
 
 /// A reference to a session, returned by create and fork.
@@ -380,6 +390,9 @@ public actor ServerRuntime {
         /// Optional append-only session handoff ledger. The runtime owns the
         /// route boundary; the ledger owns durable state transitions.
         public var sessionHandoffs: SessionHandoffManager?
+        /// Optional durable manager for background, workflow, and child-agent
+        /// jobs. A nil value keeps embedded runtimes lightweight.
+        public var jobManager: JobManager?
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -427,7 +440,8 @@ public actor ServerRuntime {
             projectMemoryProvider: (any ProjectMemoryProvider)? = nil,
             terminalService: PTYService? = nil,
             workflowStore: WorkflowStore? = nil,
-            sessionHandoffs: SessionHandoffManager? = nil
+            sessionHandoffs: SessionHandoffManager? = nil,
+            jobManager: JobManager? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -468,6 +482,7 @@ public actor ServerRuntime {
             self.terminalService = terminalService
             self.workflowStore = workflowStore
             self.sessionHandoffs = sessionHandoffs
+            self.jobManager = jobManager
         }
     }
 
@@ -790,6 +805,78 @@ public actor ServerRuntime {
             return try await manager.export(id: id)
         } catch {
             throw Self.mapHandoffError(error)
+        }
+    }
+
+    // MARK: Durable jobs
+
+    /// List the manager's latest level-triggered job records. Clients should
+    /// use this snapshot after reconnecting, then resume the event cursor.
+    public func jobs(owner: String? = nil) async throws -> [JobRecord] {
+        guard let manager = config.jobManager else {
+            throw ServerRuntimeError.jobUnavailable
+        }
+        do {
+            return try await manager.list(owner: owner)
+        } catch {
+            throw Self.mapJobError(error)
+        }
+    }
+
+    public func job(id: String) async throws -> JobRecord? {
+        guard let manager = config.jobManager else {
+            throw ServerRuntimeError.jobUnavailable
+        }
+        do {
+            return try await manager.snapshot(jobID: id)
+        } catch {
+            throw Self.mapJobError(error)
+        }
+    }
+
+    public func jobEvents(after sequence: Int = 0, jobID: String? = nil) async throws -> [JobEvent] {
+        guard let manager = config.jobManager else {
+            throw ServerRuntimeError.jobUnavailable
+        }
+        do {
+            return try await manager.events(after: sequence, jobID: jobID)
+        } catch {
+            throw Self.mapJobError(error)
+        }
+    }
+
+    public func jobExport(id: String) async throws -> [JobJournalEntry] {
+        guard let manager = config.jobManager else {
+            throw ServerRuntimeError.jobUnavailable
+        }
+        do {
+            return try await manager.export(jobID: id)
+        } catch {
+            throw Self.mapJobError(error)
+        }
+    }
+
+    public func cancelJob(id: String, owner: String) async throws -> JobRecord {
+        guard let manager = config.jobManager else {
+            throw ServerRuntimeError.jobUnavailable
+        }
+        do {
+            return try await manager.cancel(jobID: id, owner: owner)
+        } catch {
+            throw Self.mapJobError(error)
+        }
+    }
+
+    /// Reclassify interrupted work as paused. Recovery is explicit so a server
+    /// restart never presents a dead subprocess as a healthy running job.
+    public func recoverJobs() async throws -> [JobRecord] {
+        guard let manager = config.jobManager else {
+            throw ServerRuntimeError.jobUnavailable
+        }
+        do {
+            return try await manager.recoverInterruptedJobs()
+        } catch {
+            throw Self.mapJobError(error)
         }
     }
 
@@ -1298,7 +1385,23 @@ public actor ServerRuntime {
         case .invalidRequest(let message):
             return .handoffInvalid(message)
         case .invalidCursor(let cursor):
-            return .handoffInvalid("Invalid handoff cursor (cursor).")
+            return .handoffInvalid("Invalid handoff cursor \(cursor).")
+        }
+    }
+
+    private static func mapJobError(_ error: any Error) -> ServerRuntimeError {
+        guard let error = error as? JobManagerError else {
+            return .jobInvalid("Job operation failed.")
+        }
+        switch error {
+        case .notFound:
+            return .jobNotFound
+        case .duplicateJob, .jobBusy, .invalidTransition:
+            return .jobConflict
+        case .ownershipDenied:
+            return .jobDenied
+        case .invalidAdmission(let message):
+            return .jobInvalid(message)
         }
     }
 

@@ -424,6 +424,18 @@ public actor JobManager {
         }
     }
 
+    /// Export the complete journal history for one job without exposing the
+    /// manager's backing store or allowing a caller to mutate it.
+    public func export(jobID: String) throws -> [JobJournalEntry] {
+        try loadIfNeeded()
+        guard jobs[jobID] != nil else { throw JobManagerError.notFound(jobID) }
+        if let store { return try store.export(jobID: jobID) }
+        return eventLog.compactMap { event in
+            guard event.jobID == jobID, let record = jobs[jobID] else { return nil }
+            return JobJournalEntry(event: event, record: record)
+        }
+    }
+
     public func updateProgress(
         jobID: String,
         owner: String,

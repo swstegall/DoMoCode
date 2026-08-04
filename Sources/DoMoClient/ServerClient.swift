@@ -149,6 +149,7 @@ public struct ServerClient: Sendable {
         let target: SessionHandoffTarget?
         let metadata: [String: JSONValue]
     }
+    private struct JobOwnerBody: Encodable { let owner: String }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -282,6 +283,54 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.post, path, body: body)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode(SessionHandoffRecord.self, from: data)
+    }
+
+    /// List the latest durable job snapshots, optionally scoped to an owner.
+    public func jobs(owner: String? = nil) async throws -> [JobRecord] {
+        var path = "/jobs"
+        if let owner {
+            path += "?owner=\(Self.percentEncode(owner))"
+        }
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([JobRecord].self, from: data)
+    }
+
+    /// Explicitly recover interrupted jobs after a server restart.
+    public func recoverJobs() async throws -> [JobRecord] {
+        let path = "/jobs/recover"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([JobRecord].self, from: data)
+    }
+
+    public func job(id: String) async throws -> JobRecord {
+        let path = "/job/\(Self.percentEncode(id))"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(JobRecord.self, from: data)
+    }
+
+    public func jobEvents(id: String, after sequence: Int = 0) async throws -> [JobEvent] {
+        let path = "/job/\(Self.percentEncode(id))/events?after=\(sequence)"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([JobEvent].self, from: data)
+    }
+
+    public func jobExport(id: String) async throws -> [JobJournalEntry] {
+        let path = "/job/\(Self.percentEncode(id))/export"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([JobJournalEntry].self, from: data)
+    }
+
+    public func cancelJob(id: String, owner: String) async throws -> JobRecord {
+        let path = "/job/\(Self.percentEncode(id))/cancel"
+        let body = try JSONEncoder().encode(JobOwnerBody(owner: owner))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(JobRecord.self, from: data)
     }
 
     /// Fetch durable workflow definitions exposed by the serving runtime.

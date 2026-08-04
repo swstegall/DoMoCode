@@ -101,6 +101,10 @@ private struct HandoffCompleteBody: Decodable {
     var metadata: [String: JSONValue]?
 }
 
+private struct JobOwnerBody: Decodable {
+    var owner: String
+}
+
 // MARK: - Auth middleware
 
 /// Rejects any request that does not present the server's bearer token.
@@ -333,6 +337,64 @@ public struct DoMoServer: Sendable {
                     owner: body.owner,
                     reason: body.reason ?? "Handoff cancelled."
                 ))
+            }
+        }
+
+        router.get("/jobs") { request, _ in
+            try await self.mapErrors {
+                let owner = request.uri.queryParameters["owner"].map(String.init)
+                return try Self.json(try await self.runtime.jobs(owner: owner))
+            }
+        }
+
+        router.post("/jobs/recover") { _, _ in
+            try await self.mapErrors {
+                try Self.json(try await self.runtime.recoverJobs())
+            }
+        }
+
+        router.get("/job/:id") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                guard let job = try await self.runtime.job(id: id) else {
+                    throw HTTPError(.notFound)
+                }
+                return try Self.json(job)
+            }
+        }
+
+        router.get("/job/:id/events") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                guard try await self.runtime.job(id: id) != nil else {
+                    throw HTTPError(.notFound)
+                }
+                let rawAfter = request.uri.queryParameters["after"].map(String.init)
+                let after: Int
+                if let rawAfter {
+                    guard let parsed = Int(rawAfter), parsed >= 0 else {
+                        throw HTTPError(.badRequest)
+                    }
+                    after = parsed
+                } else {
+                    after = 0
+                }
+                return try Self.json(try await self.runtime.jobEvents(after: after, jobID: id))
+            }
+        }
+
+        router.get("/job/:id/export") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.jobExport(id: id))
+            }
+        }
+
+        router.post("/job/:id/cancel") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(JobOwnerBody.self, request)
+                return try Self.json(try await self.runtime.cancelJob(id: id, owner: body.owner))
             }
         }
 
@@ -838,6 +900,14 @@ public struct DoMoServer: Sendable {
             case .handoffDenied:
                 throw HTTPError(.forbidden)
             case .handoffInvalid:
+                throw HTTPError(.badRequest)
+            case .jobUnavailable, .jobNotFound:
+                throw HTTPError(.notFound)
+            case .jobConflict:
+                throw HTTPError(.conflict)
+            case .jobDenied:
+                throw HTTPError(.forbidden)
+            case .jobInvalid:
                 throw HTTPError(.badRequest)
             }
         }
