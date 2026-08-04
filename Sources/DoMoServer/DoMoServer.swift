@@ -216,6 +216,13 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        router.get("/session/:id/tools") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                return try Self.json(try await self.runtime.toolCatalog(sessionID: id))
+            }
+        }
+
         router.get("/session/:id/messages") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")

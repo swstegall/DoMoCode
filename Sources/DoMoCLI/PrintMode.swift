@@ -211,6 +211,8 @@ struct RegistryTool: AgentTool {
         ToolDefinition(name: tool.name, description: tool.description, parameters: tool.parameters)
     }
 
+    var catalogSource: ToolCatalogSource { .builtIn }
+
     func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
         // A tool failure returns an error `ToolResult`, never a throw — only
         // cancellation escapes, and the loop turns that into an aborted result.

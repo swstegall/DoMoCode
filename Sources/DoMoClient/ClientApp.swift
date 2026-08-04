@@ -74,6 +74,8 @@ public final class ClientApp {
     private var autocompleteHandle: ScreenOverlayHandle?
     private var autocompleteDialog: SearchableSelectDialog?
     private var paletteDialog: SearchableSelectDialog?
+    private var toolCatalogHandle: ScreenOverlayHandle?
+    private var toolCatalogDialog: SearchableSelectDialog?
     private var sessionPickerDialog: SearchableSelectDialog?
     private var modelPickerDialog: SearchableSelectDialog?
     private var treePickerDialog: TreeDialog?
@@ -1999,6 +2001,74 @@ public final class ClientApp {
         paletteDialog = nil
     }
 
+    /// Fetch and show the runtime's current tool projection. The endpoint is
+    /// intentionally resolved on demand so a mode/model change or an MCP
+    /// `tools/list_changed` refresh cannot leave this view advertising stale
+    /// model capabilities.
+    private func openToolCatalog() {
+        if toolCatalogHandle != nil {
+            dismissToolCatalog()
+            return
+        }
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        dismissAutocomplete()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let entries = try await self.client.toolCatalog(sessionID: id)
+                guard self.store.selectedSessionID == id else { return }
+                let items = entries.map(Self.toolCatalogItem)
+                guard !items.isEmpty else {
+                    self.post(notice: "the runtime has no registered tools")
+                    return
+                }
+                let dialog = SearchableSelectDialog(
+                    title: "Tool catalog (\(entries.count))",
+                    items: items,
+                    keybindings: self.keybindings
+                )
+                dialog.onCancel = { [weak self] in self?.dismissToolCatalog() }
+                dialog.onSelect = { [weak self] item in
+                    self?.post(notice: item.description ?? item.value, seconds: 8)
+                }
+                self.toolCatalogDialog = dialog
+                self.toolCatalogHandle = self.dialogs?.present(
+                    dialog,
+                    options: self.overlayOptions(width: 110, height: 22)
+                )
+            } catch {
+                self.postError("Could not load the tool catalog", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    private func dismissToolCatalog() {
+        dismissDialog(toolCatalogHandle)
+        toolCatalogHandle = nil
+        toolCatalogDialog = nil
+    }
+
+    private static func toolCatalogItem(_ entry: ToolCatalogEntry) -> SelectItem {
+        let description = sanitizeUntrustedText(collapseToOneLine(entry.description ?? ""))
+        let source = entry.source.rawValue
+        let permission = entry.permission.rawValue
+        let schema = entry.metadata["schemaSummary"]?.stringValue ?? "schema"
+        var details = "\(source) · \(permission) · schema: \(schema)"
+        if let hiddenReason = entry.hiddenReason {
+            details += " · hidden: \(hiddenReason)"
+        }
+        let rowDescription = description.isEmpty ? details : "\(description) · \(details)"
+        return SelectItem(
+            value: entry.name,
+            label: sanitizeUntrustedText(entry.name),
+            description: sanitizeUntrustedText(rowDescription)
+        )
+    }
+
     private func activatePalette(_ value: String) {
         switch value {
         case "session": openSessionPicker()
@@ -2006,6 +2076,7 @@ public final class ClientApp {
         case "title": autoTitleSession()
         case "model": openModelPicker()
         case "mode": toggleAgentMode()
+        case "tools": openToolCatalog()
         case "tree": openTreePicker()
         case "timeline": showTimeline()
         case "undo": moveWorkspaceHistory(.undo)
@@ -2829,6 +2900,8 @@ public final class ClientApp {
             case .help:
                 let names = commandRegistry.commands.map { "/\($0.name)" }.joined(separator: " · ")
                 post(notice: names, seconds: 8)
+            case .tools:
+                openToolCatalog()
             case .memory:
                 let task = Task { @MainActor [weak self] in
                     guard let self else { return }
@@ -3689,7 +3762,8 @@ extension ClientApp: TerminalApp {
         // branch must precede the global Escape/abort interpretation below:
         // Escape dismisses a palette, picker, or rename form, while it still
         // aborts a turn when no dialog owns the surface.
-        if autocompleteHandle != nil || paletteHandle != nil || sessionPickerHandle != nil
+        if autocompleteHandle != nil || paletteHandle != nil || toolCatalogHandle != nil
+            || sessionPickerHandle != nil
             || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
             || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
             || diffReviewHandle != nil || diffRevertHandle != nil
@@ -3781,7 +3855,9 @@ extension ClientApp: TerminalApp {
             toggleAgentMode()
             return
         }
+        let slashCatalogShortcut = data == [0x2f] && promptInput.focused && promptInput.text.isEmpty
         surface?.handleInput(data)
+        if slashCatalogShortcut { openToolCatalog() }
     }
 
     public func stop() {

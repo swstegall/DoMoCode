@@ -607,6 +607,90 @@ public actor ServerRuntime {
         return config.modelOptions
     }
 
+    /// Project the same late-bound tool resolver used before the next model
+    /// request. The projection deliberately includes tools hidden by mode or
+    /// broad denial: an inspection surface needs to explain why a known tool is
+    /// absent rather than making it look as though discovery failed.
+    public func toolCatalog(sessionID: String) async throws -> [ToolCatalogEntry] {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+
+        let model = await session.harness.currentModel
+        let candidates: [any AgentTool]
+        if let resolver = config.toolsForSession {
+            candidates = await resolver(sessionID, model)
+        } else if let resolver = config.getTools {
+            candidates = await resolver(model)
+        } else {
+            candidates = config.tools
+        }
+
+        let mode = session.modeState.get()
+        let ruleset: Ruleset
+        if let permissions = config.permissions {
+            let planPath = AgentModePolicy.planPath(
+                workingDirectory: config.cwd,
+                sessionID: sessionID
+            )
+            ruleset = permissions.rulesetForMode?(mode, planPath) ?? permissions.ruleset
+        } else {
+            ruleset = []
+        }
+        let names = candidates.map { $0.definition.name }
+        let policyHidden = config.permissions.map { disabledTools(names, ruleset) } ?? []
+
+        return candidates.map { tool in
+            let name = tool.definition.name
+            let modeHidden = mode == .build && (name == "plan_exit" || name == "task")
+            let action = config.permissions == nil
+                ? PermissionAction.allow
+                : evaluate(name, "*", rulesets: [ruleset]).action
+            let hidden = modeHidden || policyHidden.contains(name) || action == .deny
+            let permission: ToolPermissionState
+            if modeHidden {
+                permission = .unavailable
+            } else {
+                switch action {
+                case .allow: permission = .allowed
+                case .ask: permission = .requiresApproval
+                case .deny: permission = .denied
+                }
+            }
+
+            var metadata: [String: JSONValue] = [
+                "schemaSummary": .string(Self.schemaSummary(tool.definition.parameters.jsonValue)),
+                "model": .string(model),
+            ]
+            if let executionMode = tool.executionMode {
+                metadata["executionMode"] = .string(
+                    executionMode == .sequential ? "sequential" : "parallel"
+                )
+            }
+            return ToolCatalogEntry(
+                name: name,
+                description: tool.definition.description,
+                source: tool.catalogSource,
+                inputSchema: tool.definition.parameters.jsonValue,
+                permission: permission,
+                hiddenReason: hidden
+                    ? (modeHidden
+                        ? "Available only in plan mode"
+                        : "Denied by the current permission policy")
+                    : nil,
+                metadata: metadata
+            )
+        }
+    }
+
+    private static func schemaSummary(_ schema: JSONValue) -> String {
+        guard let object = schema.objectValue else { return "schema" }
+        let properties = object["properties"]?.objectValue?.keys.sorted() ?? []
+        let required = Set(object["required"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+        guard !properties.isEmpty else { return "{}" }
+        return properties.map { property in
+            required.contains(property) ? property : "\(property)?"
+        }.joined(separator: ", ")
+    }
+
     // MARK: Server-owned terminals
 
     /// Start a PTY owned by one live server session.

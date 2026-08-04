@@ -51,6 +51,11 @@ public protocol AgentTool: Sendable {
     /// addresses.
     var definition: ToolDefinition { get }
 
+    /// Where the tool came from for inspection surfaces. The agent loop does
+    /// not branch on this value; it exists so a catalog can distinguish a
+    /// built-in from an MCP or adapter-backed tool without guessing from names.
+    var catalogSource: ToolCatalogSource { get }
+
     /// Per-tool execution-mode override. When any tool in a batch is
     /// `sequential`, the whole batch runs sequentially — pi's `hasSequentialToolCall`.
     var executionMode: ToolExecutionMode? { get }
@@ -67,6 +72,7 @@ public protocol AgentTool: Sendable {
 
 extension AgentTool {
     public var executionMode: ToolExecutionMode? { nil }
+    public var catalogSource: ToolCatalogSource { .adapter }
 }
 
 /// Executes a completed tool call against a host-provided result stream.

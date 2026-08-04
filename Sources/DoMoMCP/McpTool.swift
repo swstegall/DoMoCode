@@ -46,6 +46,8 @@ struct McpTool: AgentTool {
         ToolDefinition(name: namespacedName, description: toolDescription, parameters: parameters)
     }
 
+    var catalogSource: ToolCatalogSource { .mcp }
+
     func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
         let result: MCPClient.CallResult
         do {

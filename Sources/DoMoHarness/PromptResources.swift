@@ -123,6 +123,7 @@ public enum LocalCommand: String, Codable, Hashable, Sendable {
     case redo
     case review
     case timeline
+    case tools
     case tree
     case undo
 }
@@ -399,6 +400,12 @@ public struct CommandRegistry: Codable, Hashable, Sendable {
             description: "Show the append-only conversation timeline",
             kind: .local,
             action: .timeline
+        ),
+        CommandDescriptor(
+            name: "tools",
+            description: "Inspect tools available to the next model request",
+            kind: .local,
+            action: .tools
         ),
         CommandDescriptor(
             name: "tree",

@@ -319,6 +319,10 @@ public struct ToolCatalogEntry: Sendable, Codable, Hashable {
     public var source: ToolCatalogSource
     public var inputSchema: JSONValue
     public var permission: ToolPermissionState
+    /// Why a known tool is unavailable to the next model request. Keeping this
+    /// separate from `metadata` makes a denied row explainable to every client,
+    /// while `nil` keeps callable rows compact on the wire.
+    public var hiddenReason: String?
     public var metadata: [String: JSONValue]
 
     public init(
@@ -327,6 +331,7 @@ public struct ToolCatalogEntry: Sendable, Codable, Hashable {
         source: ToolCatalogSource,
         inputSchema: JSONValue,
         permission: ToolPermissionState,
+        hiddenReason: String? = nil,
         metadata: [String: JSONValue] = [:]
     ) {
         self.name = name
@@ -334,6 +339,7 @@ public struct ToolCatalogEntry: Sendable, Codable, Hashable {
         self.source = source
         self.inputSchema = inputSchema
         self.permission = permission
+        self.hiddenReason = hiddenReason
         self.metadata = metadata
     }
 }

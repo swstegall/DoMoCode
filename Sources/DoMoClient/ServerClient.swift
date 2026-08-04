@@ -179,6 +179,16 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode([ModelOption].self, from: data)
     }
 
+    /// Fetch the session's current callable-tool catalog. The runtime resolves
+    /// this immediately before responding, so a newly refreshed MCP list or a
+    /// mode/model change is visible without client-side tool caching.
+    public func toolCatalog(sessionID: String) async throws -> [ToolCatalogEntry] {
+        let path = "/session/\(sessionID)/tools"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([ToolCatalogEntry].self, from: data)
+    }
+
     /// The linear root-to-leaf transcript to seed the main pane. `GET
     /// /session/{id}/messages` → 200.
     public func messages(sessionID: String) async throws -> [Message] {

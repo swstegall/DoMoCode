@@ -1002,6 +1002,10 @@ final class InteractiveCoordinator {
             appendStopNotice("/tree is available in the full-screen client")
             render()
             return
+        case .some(.tools):
+            appendStopNotice("/tools is available in the full-screen client")
+            render()
+            return
         case .some(.diff), .some(.review):
             stagedImages = []
             appendStopNotice("/diff review is available in the full-screen client")

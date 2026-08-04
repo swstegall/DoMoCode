@@ -29,6 +29,25 @@ struct ServerRuntimeTests {
         }
     }
 
+    private struct CatalogProbeTool: AgentTool {
+        let toolName: String
+        let source: ToolCatalogSource
+
+        var definition: ToolDefinition {
+            ToolDefinition(
+                name: toolName,
+                description: "Inspect \(toolName)",
+                parameters: JSONSchema.object(.required("path", .string()))
+            )
+        }
+
+        var catalogSource: ToolCatalogSource { source }
+
+        func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
+            AgentToolResult(output: "ok")
+        }
+    }
+
     private struct Dirs {
         let root: URL
         let cwd: URL
@@ -102,6 +121,48 @@ struct ServerRuntimeTests {
                 continuation.finish()
             }
         }
+    }
+
+    @Test("The tool catalog uses the late-bound set and explains hidden entries")
+    func toolCatalogProjectsResolverAndPolicy() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let permissionRules = [
+            PermissionRule(permission: "readme", pattern: "*", action: .allow),
+            PermissionRule(permission: "blocked", pattern: "*", action: .deny),
+        ]
+        let runtime = ServerRuntime(config: .init(
+            systemPrompt: "test",
+            tools: [],
+            model: "test-model",
+            streamFn: { _ in AsyncThrowingStream { $0.finish() } },
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path,
+            permissions: ServerRuntime.PermissionRuntime(
+                ruleset: permissionRules,
+                factory: PermissionRequestFactory(workingDirectory: dirs.cwd.path),
+                persist: { _ in }
+            ),
+            toolsForSession: { _, _ in
+                [
+                    CatalogProbeTool(toolName: "readme", source: .builtIn),
+                    CatalogProbeTool(toolName: "blocked", source: .mcp),
+                    CatalogProbeTool(toolName: "task", source: .adapter),
+                ]
+            }
+        ))
+        let session = try await runtime.createSession()
+
+        let entries = try await runtime.toolCatalog(sessionID: session.id)
+        #expect(entries.map(\.name) == ["readme", "blocked", "task"])
+        #expect(entries[0].source == .builtIn)
+        #expect(entries[0].permission == .allowed)
+        #expect(entries[0].metadata["schemaSummary"]?.stringValue == "path")
+        #expect(entries[1].source == .mcp)
+        #expect(entries[1].permission == .denied)
+        #expect(entries[1].hiddenReason == "Denied by the current permission policy")
+        #expect(entries[2].permission == .unavailable)
+        #expect(entries[2].hiddenReason == "Available only in plan mode")
     }
 
     @Test("Resuming a live session returns the same session, not a second harness")
