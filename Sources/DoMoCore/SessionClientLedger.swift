@@ -429,7 +429,7 @@ public actor SessionClientManager {
     private func validate(sessionID: String, clientID: String, owner: String) throws {
         let fields = [("sessionID", sessionID), ("clientID", clientID), ("owner", owner)]
         for (name, value) in fields where Self.isBlank(value) {
-            throw SessionClientError.invalidRequest("Session client (name) must not be empty.")
+            throw SessionClientError.invalidRequest("Session client \(name) must not be empty.")
         }
     }
 

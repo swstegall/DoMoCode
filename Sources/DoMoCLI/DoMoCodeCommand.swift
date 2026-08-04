@@ -1310,6 +1310,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let automationRegistry = AutomationRegistry(store: try AutomationStore.create(
             directory: durableRoot.appending("automations")
         ))
+        let sessionClients = SessionClientManager(store: try SessionClientStore.create(
+            directory: durableRoot.appending("clients")
+        ))
         let snapshotRoot = configuration.sessionDirectory
             .appending(JSONLSessionStore.sanitizedDirectoryName(forCwd: workingDirectory.string))
             .appending("snapshots")
@@ -1373,7 +1376,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             workflowStore: workflowStore,
             sessionHandoffs: sessionHandoffs,
             jobManager: jobManager,
-            automationRegistry: automationRegistry
+            automationRegistry: automationRegistry,
+            sessionClients: sessionClients
         )
         runtimeConfiguration.agentProfile = agentProfile
         runtimeConfiguration.agentMode = agentMode

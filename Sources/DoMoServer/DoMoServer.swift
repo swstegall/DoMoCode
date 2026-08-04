@@ -109,6 +109,29 @@ private struct AutomationOwnerBody: Decodable {
     var owner: String
 }
 
+private struct SessionClientAttachmentBody: Decodable {
+    var clientID: String
+    var owner: String
+    var requestAuthority: Bool?
+}
+
+private struct SessionClientOwnerBody: Decodable {
+    var clientID: String
+    var owner: String
+}
+
+private struct SessionClientTransferBody: Decodable {
+    var fromClientID: String
+    var toClientID: String
+    var owner: String
+}
+
+private struct SessionClientCursorBody: Decodable {
+    var clientID: String
+    var owner: String
+    var sequence: Int
+}
+
 // MARK: - Auth middleware
 
 /// Rejects any request that does not present the server's bearer token.
@@ -226,6 +249,127 @@ public struct DoMoServer: Sendable {
         router.get("/sessions") { _, _ in
             try await self.mapErrors {
                 try Self.json(try await self.runtime.listSessions())
+            }
+        }
+
+        // Session-client presence and authority are explicit durable records.
+        // A second client can mirror a session immediately, but it cannot
+        // answer a permission prompt or mutate the turn until authority is
+        // transferred by the current owner.
+        router.post("/session/:id/client/attach") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(SessionClientAttachmentBody.self, request)
+                return try Self.json(try await self.runtime.attachClient(
+                    sessionID: id,
+                    clientID: body.clientID,
+                    owner: body.owner,
+                    requestAuthority: body.requestAuthority ?? true
+                ))
+            }
+        }
+
+        router.post("/session/:id/client/detach") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(SessionClientOwnerBody.self, request)
+                return try Self.json(try await self.runtime.detachClient(
+                    sessionID: id,
+                    clientID: body.clientID,
+                    owner: body.owner
+                ))
+            }
+        }
+
+        router.get("/session/:id/clients") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let includeInactive = request.uri.queryParameters["includeInactive"]
+                    .map(String.init)
+                    .map { $0.lowercased() == "true" } ?? false
+                return try Self.json(try await self.runtime.sessionClients(
+                    sessionID: id,
+                    includeInactive: includeInactive
+                ))
+            }
+        }
+
+        router.get("/session/:id/client/authority") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                guard let authority = try await self.runtime.sessionClientAuthority(sessionID: id) else {
+                    return try Self.json(Optional<SessionClientAttachment>.none)
+                }
+                return try Self.json(authority)
+            }
+        }
+
+        router.post("/session/:id/client/authority/release") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(SessionClientOwnerBody.self, request)
+                return try Self.json(try await self.runtime.releaseSessionAuthority(
+                    sessionID: id,
+                    clientID: body.clientID,
+                    owner: body.owner
+                ))
+            }
+        }
+
+        router.post("/session/:id/client/authority/transfer") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(SessionClientTransferBody.self, request)
+                return try Self.json(try await self.runtime.transferSessionAuthority(
+                    sessionID: id,
+                    fromClientID: body.fromClientID,
+                    toClientID: body.toClientID,
+                    owner: body.owner
+                ))
+            }
+        }
+
+        router.post("/session/:id/client/cursor") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(SessionClientCursorBody.self, request)
+                return try Self.json(try await self.runtime.advanceSessionClientCursor(
+                    sessionID: id,
+                    clientID: body.clientID,
+                    owner: body.owner,
+                    sequence: body.sequence
+                ))
+            }
+        }
+
+        router.get("/session/:id/client/events") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let rawAfter = request.uri.queryParameters["after"].map(String.init)
+                let after: Int
+                if let rawAfter {
+                    guard let parsed = Int(rawAfter), parsed >= 0 else {
+                        throw HTTPError(.badRequest)
+                    }
+                    after = parsed
+                } else {
+                    after = 0
+                }
+                return try Self.json(try await self.runtime.sessionClientEvents(
+                    after: after,
+                    sessionID: id
+                ))
+            }
+        }
+
+        router.get("/session/:id/client/export") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let clientID = request.uri.queryParameters["clientID"].map(String.init)
+                return try Self.json(try await self.runtime.sessionClientExport(
+                    sessionID: id,
+                    clientID: clientID
+                ))
             }
         }
 
@@ -1024,6 +1168,14 @@ public struct DoMoServer: Sendable {
             case .automationDenied:
                 throw HTTPError(.forbidden)
             case .automationInvalid:
+                throw HTTPError(.badRequest)
+            case .sessionClientsUnavailable, .sessionClientNotFound:
+                throw HTTPError(.notFound)
+            case .sessionClientConflict:
+                throw HTTPError(.conflict)
+            case .sessionClientDenied, .sessionClientAuthorityRequired:
+                throw HTTPError(.forbidden)
+            case .sessionClientInvalid:
                 throw HTTPError(.badRequest)
             }
         }

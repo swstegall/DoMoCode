@@ -77,6 +77,11 @@ private final class ActivityStamp: Sendable {
 /// caller owns and shuts down.
 public struct ServerClient: Sendable {
     public let baseURL: String
+    /// Stable identity used by the session-client ledger when this client
+    /// reconnects or opens a second mirrored view.
+    public let clientID: String
+    /// Owner label paired with `clientID` for authority and cursor writes.
+    public let clientOwner: String
     private let token: String
     private let http: HTTPClient
     private let streamIdleTimeout: Duration
@@ -102,14 +107,21 @@ public struct ServerClient: Sendable {
     ///   - streamIdleTimeout: the SSE silence watchdog; injectable so a test can
     ///     assert the watchdog in a fraction of a second rather than in forty.
     ///   - requestTimeout: the REST deadline, head AND body.
+    ///   - clientID: stable session-mirroring identity; generated when omitted.
+    ///   - clientOwner: owner label for authority/cursor operations; defaults to
+    ///     the client id.
     public init(
         baseURL: String,
         token: String,
         http: HTTPClient,
         streamIdleTimeout: Duration = ServerClient.streamIdleTimeout,
-        requestTimeout: Duration = ServerClient.requestTimeout
+        requestTimeout: Duration = ServerClient.requestTimeout,
+        clientID: String = UUIDv7.generate().description,
+        clientOwner: String? = nil
     ) {
         self.baseURL = baseURL
+        self.clientID = clientID
+        self.clientOwner = clientOwner ?? clientID
         self.token = token
         self.http = http
         self.streamIdleTimeout = streamIdleTimeout
@@ -151,6 +163,25 @@ public struct ServerClient: Sendable {
     }
     private struct JobOwnerBody: Encodable { let owner: String }
     private struct AutomationOwnerBody: Encodable { let owner: String }
+    private struct SessionClientAttachmentBody: Encodable {
+        let clientID: String
+        let owner: String
+        let requestAuthority: Bool
+    }
+    private struct SessionClientOwnerBody: Encodable {
+        let clientID: String
+        let owner: String
+    }
+    private struct SessionClientTransferBody: Encodable {
+        let fromClientID: String
+        let toClientID: String
+        let owner: String
+    }
+    private struct SessionClientCursorBody: Encodable {
+        let clientID: String
+        let owner: String
+        let sequence: Int
+    }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -173,6 +204,130 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.get, "/sessions")
         try expect(status, 200, "/sessions", body: data)
         return try JSONDecoder().decode([SessionSummary].self, from: data)
+    }
+
+    /// Register this client as a session mirror. The first active client may
+    /// become the authority; later clients attach as observers until an
+    /// explicit transfer occurs.
+    public func attachClient(
+        sessionID: String,
+        clientID: String? = nil,
+        owner: String? = nil,
+        requestAuthority: Bool = true
+    ) async throws -> SessionClientAttachment {
+        let path = "/session/\(Self.percentEncode(sessionID))/client/attach"
+        let body = try JSONEncoder().encode(SessionClientAttachmentBody(
+            clientID: clientID ?? self.clientID,
+            owner: owner ?? clientOwner,
+            requestAuthority: requestAuthority
+        ))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionClientAttachment.self, from: data)
+    }
+
+    public func detachClient(
+        sessionID: String,
+        clientID: String? = nil,
+        owner: String? = nil
+    ) async throws -> SessionClientAttachment {
+        let path = "/session/\(Self.percentEncode(sessionID))/client/detach"
+        let body = try JSONEncoder().encode(SessionClientOwnerBody(
+            clientID: clientID ?? self.clientID,
+            owner: owner ?? clientOwner
+        ))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionClientAttachment.self, from: data)
+    }
+
+    public func sessionClients(
+        sessionID: String,
+        includeInactive: Bool = false
+    ) async throws -> [SessionClientAttachment] {
+        let path = "/session/\(Self.percentEncode(sessionID))/clients?includeInactive=\(includeInactive)"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionClientAttachment].self, from: data)
+    }
+
+    public func sessionClientAuthority(sessionID: String) async throws -> SessionClientAttachment? {
+        let path = "/session/\(Self.percentEncode(sessionID))/client/authority"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionClientAttachment?.self, from: data)
+    }
+
+    public func releaseSessionAuthority(
+        sessionID: String,
+        clientID: String? = nil,
+        owner: String? = nil
+    ) async throws -> SessionClientAttachment {
+        let path = "/session/\(Self.percentEncode(sessionID))/client/authority/release"
+        let body = try JSONEncoder().encode(SessionClientOwnerBody(
+            clientID: clientID ?? self.clientID,
+            owner: owner ?? clientOwner
+        ))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionClientAttachment.self, from: data)
+    }
+
+    public func transferSessionAuthority(
+        sessionID: String,
+        toClientID: String,
+        fromClientID: String? = nil,
+        owner: String? = nil
+    ) async throws -> SessionClientAttachment {
+        let path = "/session/\(Self.percentEncode(sessionID))/client/authority/transfer"
+        let body = try JSONEncoder().encode(SessionClientTransferBody(
+            fromClientID: fromClientID ?? self.clientID,
+            toClientID: toClientID,
+            owner: owner ?? clientOwner
+        ))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionClientAttachment.self, from: data)
+    }
+
+    public func advanceSessionClientCursor(
+        sessionID: String,
+        sequence: Int,
+        clientID: String? = nil,
+        owner: String? = nil
+    ) async throws -> SessionClientAttachment {
+        let path = "/session/\(Self.percentEncode(sessionID))/client/cursor"
+        let body = try JSONEncoder().encode(SessionClientCursorBody(
+            clientID: clientID ?? self.clientID,
+            owner: owner ?? clientOwner,
+            sequence: sequence
+        ))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(SessionClientAttachment.self, from: data)
+    }
+
+    public func sessionClientEvents(
+        sessionID: String,
+        after sequence: Int = 0
+    ) async throws -> [SessionClientEvent] {
+        let path = "/session/\(Self.percentEncode(sessionID))/client/events?after=\(sequence)"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionClientEvent].self, from: data)
+    }
+
+    public func sessionClientExport(
+        sessionID: String,
+        clientID: String? = nil
+    ) async throws -> [SessionClientJournalEntry] {
+        var path = "/session/\(Self.percentEncode(sessionID))/client/export"
+        if let clientID {
+            path += "?clientID=\(Self.percentEncode(clientID))"
+        }
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SessionClientJournalEntry].self, from: data)
     }
 
     /// Fetch the runtime's command descriptors. Templates are not included in
@@ -862,6 +1017,8 @@ public struct ServerClient: Sendable {
         let token = token
         let http = http
         let idle = streamIdleTimeout
+        let clientID = clientID
+        let clientOwner = clientOwner
         let path = "/session/\(sessionID)/events"
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -882,6 +1039,8 @@ public struct ServerClient: Sendable {
                         var request = HTTPClientRequest(url: baseURL + path)
                         request.method = .GET
                         request.headers.add(name: "authorization", value: "Bearer \(token)")
+                        request.headers.add(name: "x-domocode-client-id", value: clientID)
+                        request.headers.add(name: "x-domocode-client-owner", value: clientOwner)
                         // A long deadline for a long-lived stream; heartbeats keep it
                         // active, and the consumer cancels on teardown / session switch.
                         let response = try await http.execute(request, timeout: .hours(24))
@@ -995,6 +1154,8 @@ public struct ServerClient: Sendable {
         var request = HTTPClientRequest(url: baseURL + path)
         request.method = method == .get ? .GET : .POST
         request.headers.add(name: "authorization", value: "Bearer \(token)")
+        request.headers.add(name: "x-domocode-client-id", value: clientID)
+        request.headers.add(name: "x-domocode-client-owner", value: clientOwner)
         if let body {
             request.headers.add(name: "content-type", value: "application/json")
             request.body = .bytes(Array(body))

@@ -70,6 +70,18 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     case automationDenied
     /// The automation definition, invocation, or cursor was malformed.
     case automationInvalid(String)
+    /// The runtime was not configured with a session-client ledger.
+    case sessionClientsUnavailable
+    /// A session-client attachment is not known to this runtime.
+    case sessionClientNotFound
+    /// A session-client authority or cursor operation conflicts with current state.
+    case sessionClientConflict
+    /// The caller does not own the session-client attachment.
+    case sessionClientDenied
+    /// The session-client request or cursor was malformed.
+    case sessionClientInvalid(String)
+    /// The caller is not the session's current mutation/permission authority.
+    case sessionClientAuthorityRequired
 }
 
 /// A reference to a session, returned by create and fork.
@@ -407,6 +419,9 @@ public actor ServerRuntime {
         /// Trigger adapters must explicitly invoke this seam before they can
         /// hand bounded work to the durable job manager.
         public var automationRegistry: AutomationRegistry?
+        /// Optional durable client presence, authority, and mirror cursor ledger.
+        /// When absent, embedded runtimes retain the legacy single-client API.
+        public var sessionClients: SessionClientManager?
 
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
@@ -456,7 +471,8 @@ public actor ServerRuntime {
             workflowStore: WorkflowStore? = nil,
             sessionHandoffs: SessionHandoffManager? = nil,
             jobManager: JobManager? = nil,
-            automationRegistry: AutomationRegistry? = nil
+            automationRegistry: AutomationRegistry? = nil,
+            sessionClients: SessionClientManager? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -499,6 +515,7 @@ public actor ServerRuntime {
             self.sessionHandoffs = sessionHandoffs
             self.jobManager = jobManager
             self.automationRegistry = automationRegistry
+            self.sessionClients = sessionClients
         }
     }
 
@@ -699,6 +716,162 @@ public actor ServerRuntime {
     public func memory() async throws -> [ProjectMemoryRecord] {
         guard let provider = config.projectMemoryProvider else { return [] }
         return try await provider.list()
+    }
+
+    // MARK: Session clients
+
+    /// Attach a client to a live or disk-backed session. The ledger owns the
+    /// authority decision; this runtime method only exposes its serialized
+    /// state through the server boundary.
+    public func attachClient(
+        sessionID: String,
+        clientID: String,
+        owner: String,
+        requestAuthority: Bool = true
+    ) async throws -> SessionClientAttachment {
+        guard config.sessionClients != nil else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        guard sessions[sessionID] != nil else { throw ServerRuntimeError.sessionNotFound }
+        do {
+            return try await config.sessionClients!.attach(
+                sessionID: sessionID,
+                clientID: clientID,
+                owner: owner,
+                requestAuthority: requestAuthority
+            )
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func detachClient(
+        sessionID: String,
+        clientID: String,
+        owner: String
+    ) async throws -> SessionClientAttachment {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.detach(sessionID: sessionID, clientID: clientID, owner: owner)
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func sessionClients(
+        sessionID: String,
+        includeInactive: Bool = false
+    ) async throws -> [SessionClientAttachment] {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.list(sessionID: sessionID, includeInactive: includeInactive)
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func sessionClientAuthority(sessionID: String) async throws -> SessionClientAttachment? {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.authority(sessionID: sessionID)
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func releaseSessionAuthority(
+        sessionID: String,
+        clientID: String,
+        owner: String
+    ) async throws -> SessionClientAttachment {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.releaseAuthority(
+                sessionID: sessionID,
+                clientID: clientID,
+                owner: owner
+            )
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func transferSessionAuthority(
+        sessionID: String,
+        fromClientID: String,
+        toClientID: String,
+        owner: String
+    ) async throws -> SessionClientAttachment {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.transferAuthority(
+                sessionID: sessionID,
+                fromClientID: fromClientID,
+                toClientID: toClientID,
+                owner: owner
+            )
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func advanceSessionClientCursor(
+        sessionID: String,
+        clientID: String,
+        owner: String,
+        sequence: Int
+    ) async throws -> SessionClientAttachment {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.advanceCursor(
+                sessionID: sessionID,
+                clientID: clientID,
+                owner: owner,
+                sequence: sequence
+            )
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func sessionClientEvents(
+        after sequence: Int = 0,
+        sessionID: String
+    ) async throws -> [SessionClientEvent] {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.events(after: sequence, sessionID: sessionID)
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
+    }
+
+    public func sessionClientExport(
+        sessionID: String,
+        clientID: String? = nil
+    ) async throws -> [SessionClientJournalEntry] {
+        guard let manager = config.sessionClients else {
+            throw ServerRuntimeError.sessionClientsUnavailable
+        }
+        do {
+            return try await manager.export(sessionID: sessionID, clientID: clientID)
+        } catch {
+            throw Self.mapSessionClientError(error)
+        }
     }
 
     // MARK: Session handoff
@@ -1678,6 +1851,26 @@ public actor ServerRuntime {
             return .automationInvalid(message)
         case .invalidCursor(let cursor):
             return .automationInvalid("Invalid automation cursor \(cursor).")
+        }
+    }
+
+    private static func mapSessionClientError(_ error: any Error) -> ServerRuntimeError {
+        guard let error = error as? SessionClientError else {
+            return .sessionClientInvalid("Session client operation failed.")
+        }
+        switch error {
+        case .notFound:
+            return .sessionClientNotFound
+        case .ownershipDenied:
+            return .sessionClientDenied
+        case .authorityHeld:
+            return .sessionClientConflict
+        case .authorityRequired:
+            return .sessionClientAuthorityRequired
+        case .invalidCursor(let cursor):
+            return .sessionClientInvalid("Invalid session client cursor \(cursor).")
+        case .invalidRequest(let message):
+            return .sessionClientInvalid(message)
         }
     }
 
