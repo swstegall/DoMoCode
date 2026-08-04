@@ -3,6 +3,7 @@
 
 import DoMoCore
 import DoMoLLM
+import DoMoMCP
 import Foundation
 import Testing
 
