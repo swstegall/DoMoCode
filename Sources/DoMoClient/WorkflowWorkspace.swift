@@ -59,7 +59,7 @@ struct WorkflowWorkspacePhase: Sendable, Hashable {
 /// its live content on the right. Escape walks back one level, and Escape from the
 /// phase list exits the workspace.
 @MainActor
-final class WorkflowWorkspaceController: Focusable {
+final class WorkflowWorkspaceController: @MainActor Focusable {
     enum NavigationLevel: Equatable {
         case phases
         case agents

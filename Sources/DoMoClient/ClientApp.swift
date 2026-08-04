@@ -3042,9 +3042,9 @@ public final class ClientApp {
                     content: content
                 )
             }
-            var summary = "tool policy: (stage.toolPolicy.mode.rawValue)"
-            if let profile = stage.profile { summary += " · profile: (profile)" }
-            if let artifact = stage.outputArtifact { summary += " · artifact: (artifact)" }
+            var summary = "tool policy: \(stage.toolPolicy.mode.rawValue)"
+            if let profile = stage.profile { summary += " · profile: \(profile)" }
+            if let artifact = stage.outputArtifact { summary += " · artifact: \(artifact)" }
             if !stage.dependencies.isEmpty {
                 summary += " · after: " + stage.dependencies.joined(separator: ", ")
             }
