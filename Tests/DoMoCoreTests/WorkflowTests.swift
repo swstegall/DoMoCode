@@ -71,6 +71,49 @@ struct WorkflowTests {
         #expect(definition.isValid)
     }
 
+    @Test("stage evidence preserves provenance and decodes from legacy snapshots")
+    func stageEvidenceRoundTrip() throws {
+        let evidence = WorkflowEvidence(
+            id: "research:child-session",
+            stageID: "research",
+            source: "workflow-child-session",
+            sessionID: "child-1",
+            kind: .observed,
+            untrustedData: true,
+            summary: "Repository search output.",
+            locator: "Sources/DoMoCore/Workflow.swift",
+            metadata: ["taskID": "task-1"]
+        )
+        var run = WorkflowRunRecord(
+            id: "evidence-run",
+            workflowID: "workflow",
+            createdAt: "2026-01-01T00:00:00Z",
+            stageIDs: ["research"]
+        )
+        #expect(run.updateStage(
+            "research",
+            status: .succeeded,
+            timestamp: "2026-01-01T00:01:00Z",
+            evidence: [evidence]
+        ))
+        let copy = try JSONDecoder().decode(
+            WorkflowRunRecord.self,
+            from: JSONEncoder().encode(run)
+        )
+        #expect(copy == run)
+        #expect(copy.stage(withID: "research")?.evidence == [evidence])
+        #expect(evidence.jsonValue["untrustedData"]?.boolValue == true)
+
+        let legacyStage = Data(
+            "{\"stageID\":\"research\",\"status\":\"succeeded\",\"output\":null,\"agentIDs\":[],\"metadata\":{}}".utf8
+        )
+        let decodedLegacy = try JSONDecoder().decode(
+            WorkflowStageRunRecord.self,
+            from: legacyStage
+        )
+        #expect(decodedLegacy.evidence.isEmpty)
+    }
+
     @Test("validation catches duplicate, missing, and cyclic stage references")
     func invalidDAG() {
         let definition = WorkflowDefinition(

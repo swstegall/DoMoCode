@@ -896,13 +896,32 @@ public actor ServerRuntime {
         switch child.status {
         case .completed:
             let output = child.output ?? ""
+            let childSessionID = child.childSessionID ?? sessionID
+            let untrustedData = request.stage.kind == .research
+                || AgentModePolicy.isReadOnly(workflowStageMode(request.stage))
+            let evidenceKind: WorkflowEvidenceKind = switch request.stage.kind {
+            case .ask, .research:
+                .observed
+            case .debug, .review, .plan, .execute, .synthesize:
+                .inference
+            }
             var metadata: [String: JSONValue] = [
                 "stage": .string(request.stage.id),
                 "kind": .string(request.stage.kind.rawValue),
                 "toolPolicy": .string(request.stage.toolPolicy.mode.rawValue),
                 "sourceSessionID": .string(sessionID),
-                "untrustedData": .bool(request.stage.kind == .research || AgentModePolicy.isReadOnly(workflowStageMode(request.stage))),
+                "untrustedData": .bool(untrustedData),
             ]
+            var evidence = [WorkflowEvidence(
+                id: "\(taskID):child-session",
+                stageID: request.stage.id,
+                source: "workflow-child-session",
+                sessionID: childSessionID,
+                kind: evidenceKind,
+                untrustedData: untrustedData,
+                summary: "\(request.stage.displayName) output from a workflow child session.",
+                metadata: ["taskID": .string(taskID)]
+            )]
             if let model = request.stage.model {
                 metadata["model"] = .string(model)
             }
@@ -923,11 +942,23 @@ public actor ServerRuntime {
                     )
                 )
                 metadata["artifactPath"] = .string(artifactPath)
+                evidence.append(WorkflowEvidence(
+                    id: "\(taskID):artifact",
+                    stageID: request.stage.id,
+                    source: "workflow-artifact",
+                    sessionID: childSessionID,
+                    kind: evidenceKind,
+                    untrustedData: untrustedData,
+                    summary: "\(request.stage.displayName) output was persisted as a workflow artifact.",
+                    locator: artifact,
+                    metadata: ["artifactPath": .string(artifactPath)]
+                ))
             }
             return WorkflowStageResult(
                 output: .string(output),
                 metadata: metadata,
-                agentIDs: child.childSessionID.map { [$0] } ?? []
+                agentIDs: child.childSessionID.map { [$0] } ?? [],
+                evidence: evidence
             )
         case .cancelled:
             throw WorkflowStageExecutionError(message: child.error ?? "Workflow child session was cancelled.")
@@ -1001,6 +1032,12 @@ public actor ServerRuntime {
             if let output = request.dependencyOutputs[dependency] {
                 context[dependency] = output
             }
+        }
+        let dependencyEvidence = request.dependencyEvidence.values
+            .flatMap { $0 }
+            .map { $0.jsonValue }
+        if !dependencyEvidence.isEmpty {
+            context["evidence"] = .array(dependencyEvidence)
         }
         let contextText = context.description
         let policy = request.stage.toolPolicy.mode.rawValue

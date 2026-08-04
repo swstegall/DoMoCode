@@ -11,6 +11,7 @@ public struct WorkflowStageRequest: Sendable, Hashable {
     public let input: JSONValue
     public let dependencyOutputs: [String: JSONValue]
     public let dependencyArtifacts: [String: String]
+    public let dependencyEvidence: [String: [WorkflowEvidence]]
 
     public init(
         workflowID: String,
@@ -19,7 +20,8 @@ public struct WorkflowStageRequest: Sendable, Hashable {
         stage: WorkflowStageDefinition,
         input: JSONValue,
         dependencyOutputs: [String: JSONValue],
-        dependencyArtifacts: [String: String] = [:]
+        dependencyArtifacts: [String: String] = [:],
+        dependencyEvidence: [String: [WorkflowEvidence]] = [:]
     ) {
         self.workflowID = workflowID
         self.runID = runID
@@ -28,6 +30,7 @@ public struct WorkflowStageRequest: Sendable, Hashable {
         self.input = input
         self.dependencyOutputs = dependencyOutputs
         self.dependencyArtifacts = dependencyArtifacts
+        self.dependencyEvidence = dependencyEvidence
     }
 }
 
@@ -35,15 +38,18 @@ public struct WorkflowStageResult: Sendable, Hashable {
     public let output: JSONValue
     public let metadata: [String: JSONValue]
     public let agentIDs: [String]
+    public let evidence: [WorkflowEvidence]
 
     public init(
         output: JSONValue = .null,
         metadata: [String: JSONValue] = [:],
-        agentIDs: [String] = []
+        agentIDs: [String] = [],
+        evidence: [WorkflowEvidence] = []
     ) {
         self.output = output
         self.metadata = metadata
         self.agentIDs = agentIDs
+        self.evidence = evidence
     }
 }
 
@@ -312,7 +318,8 @@ public actor WorkflowRunner {
                         status: .succeeded,
                         timestamp: now(),
                         output: result.output,
-                        agentIDs: result.agentIDs
+                        agentIDs: result.agentIDs,
+                        evidence: result.evidence
                     )
                     if let index = run.stages.firstIndex(where: { $0.stageID == outcome.stageID }) {
                         run.stages[index].metadata.merge(result.metadata) { _, latest in latest }
@@ -474,6 +481,11 @@ public actor WorkflowRunner {
             dependencyArtifacts: stage.dependencies.reduce(into: [String: String]()) { result, dependency in
                 if let artifact = definition.stages.first(where: { $0.id == dependency })?.outputArtifact {
                     result[dependency] = artifact
+                }
+            },
+            dependencyEvidence: stage.dependencies.reduce(into: [String: [WorkflowEvidence]]()) { result, dependency in
+                if let evidence = run.stage(withID: dependency)?.evidence, !evidence.isEmpty {
+                    result[dependency] = evidence
                 }
             }
         )

@@ -71,6 +71,64 @@ public enum WorkflowExecutionMode: String, Sendable, Codable, Hashable, CaseIter
     case parallel
 }
 
+public enum WorkflowEvidenceKind: String, Sendable, Codable, Hashable, CaseIterable {
+    case observed
+    case inference
+}
+
+/// A provenance-bearing claim produced by a workflow stage. Evidence is data,
+/// not authority: ``untrustedData`` remains true for content that originated
+/// outside the workflow's trusted instructions, even after it is persisted.
+public struct WorkflowEvidence: Sendable, Codable, Hashable {
+    public var id: String
+    public var stageID: String
+    public var source: String
+    public var sessionID: String?
+    public var kind: WorkflowEvidenceKind
+    public var untrustedData: Bool
+    public var summary: String
+    public var locator: String?
+    public var metadata: [String: JSONValue]
+
+    public init(
+        id: String,
+        stageID: String,
+        source: String,
+        sessionID: String? = nil,
+        kind: WorkflowEvidenceKind,
+        untrustedData: Bool,
+        summary: String,
+        locator: String? = nil,
+        metadata: [String: JSONValue] = [:]
+    ) {
+        self.id = id
+        self.stageID = stageID
+        self.source = source
+        self.sessionID = sessionID
+        self.kind = kind
+        self.untrustedData = untrustedData
+        self.summary = summary
+        self.locator = locator
+        self.metadata = metadata
+    }
+
+    /// Stable JSON for prompts and other untrusted-data boundaries.
+    public var jsonValue: JSONValue {
+        var value: [String: JSONValue] = [
+            "id": .string(id),
+            "stageID": .string(stageID),
+            "source": .string(source),
+            "kind": .string(kind.rawValue),
+            "untrustedData": .bool(untrustedData),
+            "summary": .string(summary),
+        ]
+        if let sessionID { value["sessionID"] = .string(sessionID) }
+        if let locator { value["locator"] = .string(locator) }
+        if !metadata.isEmpty { value["metadata"] = .object(metadata) }
+        return .object(value)
+    }
+}
+
 /// One node in a workflow sequence or DAG. Dependencies refer to other stage
 /// ids in the same definition and are validated before a run can be scheduled.
 public struct WorkflowStageDefinition: Sendable, Codable, Hashable {
@@ -333,6 +391,7 @@ public struct WorkflowStageRunRecord: Sendable, Codable, Hashable {
     public var output: JSONValue
     public var error: String?
     public var agentIDs: [String]
+    public var evidence: [WorkflowEvidence]
     public var metadata: [String: JSONValue]
 
     public init(
@@ -343,6 +402,7 @@ public struct WorkflowStageRunRecord: Sendable, Codable, Hashable {
         output: JSONValue = .null,
         error: String? = nil,
         agentIDs: [String] = [],
+        evidence: [WorkflowEvidence] = [],
         metadata: [String: JSONValue] = [:]
     ) {
         self.stageID = stageID
@@ -352,7 +412,47 @@ public struct WorkflowStageRunRecord: Sendable, Codable, Hashable {
         self.output = output
         self.error = error
         self.agentIDs = agentIDs
+        self.evidence = evidence
         self.metadata = metadata
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stageID
+        case status
+        case startedAt
+        case finishedAt
+        case output
+        case error
+        case agentIDs
+        case evidence
+        case metadata
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        stageID = try container.decode(String.self, forKey: .stageID)
+        status = try container.decode(WorkflowStageRunStatus.self, forKey: .status)
+        startedAt = try container.decodeIfPresent(String.self, forKey: .startedAt)
+        finishedAt = try container.decodeIfPresent(String.self, forKey: .finishedAt)
+        output = try container.decodeIfPresent(JSONValue.self, forKey: .output) ?? .null
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        agentIDs = try container.decodeIfPresent([String].self, forKey: .agentIDs) ?? []
+        // Evidence was added after the first durable workflow format.
+        evidence = try container.decodeIfPresent([WorkflowEvidence].self, forKey: .evidence) ?? []
+        metadata = try container.decodeIfPresent([String: JSONValue].self, forKey: .metadata) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(stageID, forKey: .stageID)
+        try container.encode(status, forKey: .status)
+        try container.encodeIfPresent(startedAt, forKey: .startedAt)
+        try container.encodeIfPresent(finishedAt, forKey: .finishedAt)
+        try container.encode(output, forKey: .output)
+        try container.encodeIfPresent(error, forKey: .error)
+        try container.encode(agentIDs, forKey: .agentIDs)
+        try container.encode(evidence, forKey: .evidence)
+        try container.encode(metadata, forKey: .metadata)
     }
 }
 
@@ -402,7 +502,8 @@ public struct WorkflowRunRecord: Sendable, Codable, Hashable {
         timestamp: String,
         output: JSONValue? = nil,
         error: String? = nil,
-        agentIDs: [String]? = nil
+        agentIDs: [String]? = nil,
+        evidence: [WorkflowEvidence]? = nil
     ) -> Bool {
         guard let index = stages.firstIndex(where: { $0.stageID == stageID }) else { return false }
         stages[index].status = status
@@ -413,6 +514,7 @@ public struct WorkflowRunRecord: Sendable, Codable, Hashable {
         if let output { stages[index].output = output }
         stages[index].error = error
         if let agentIDs { stages[index].agentIDs = agentIDs }
+        if let evidence { stages[index].evidence = evidence }
         updatedAt = timestamp
         return true
     }

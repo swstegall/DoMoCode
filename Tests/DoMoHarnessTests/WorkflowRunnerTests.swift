@@ -77,6 +77,45 @@ struct WorkflowRunnerTests {
         #expect(await log.values == ["research", "plan"])
     }
 
+    @Test("stage evidence is propagated to dependent stages and durable records")
+    func evidencePropagation() async throws {
+        let definition = WorkflowDefinition(
+            id: "evidence",
+            stages: [
+                WorkflowStageDefinition(id: "research", kind: .research),
+                WorkflowStageDefinition(id: "plan", kind: .plan, dependencies: ["research"]),
+            ]
+        )
+        let evidence = WorkflowEvidence(
+            id: "research:observation",
+            stageID: "research",
+            source: "test-fixture",
+            sessionID: "child-session",
+            kind: .observed,
+            untrustedData: true,
+            summary: "Observed test evidence."
+        )
+        let runner = WorkflowRunner(
+            definition: definition,
+            now: { "2026-01-01T00:00:00Z" }
+        ) { request in
+            if request.stage.id == "plan" {
+                guard request.dependencyEvidence["research"] == [evidence] else {
+                    return WorkflowStageResult(output: "missing evidence")
+                }
+            }
+            return WorkflowStageResult(
+                output: request.stage.id,
+                evidence: request.stage.id == "research" ? [evidence] : []
+            )
+        }
+
+        let run = try await runner.run(runID: "evidence-run")
+        #expect(run.status == .succeeded)
+        #expect(run.stage(withID: "research")?.evidence == [evidence])
+        #expect(run.output == "plan")
+    }
+
     @Test("parallel execution completes independent stages before their join")
     func parallelJoin() async throws {
         let definition = WorkflowDefinition(

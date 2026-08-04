@@ -366,6 +366,12 @@ struct ServerRuntimeTests {
         let run = try #require(settled)
         #expect(run.stages.allSatisfy { $0.status == .succeeded })
         #expect(run.stages.allSatisfy { !$0.agentIDs.isEmpty })
+        #expect(run.stages.allSatisfy { !$0.evidence.isEmpty })
+        let researchEvidence = try #require(run.stage(withID: "research")?.evidence.first)
+        #expect(researchEvidence.source == "workflow-child-session")
+        #expect(researchEvidence.sessionID == run.stage(withID: "research")?.agentIDs.first)
+        #expect(researchEvidence.kind == .observed)
+        #expect(researchEvidence.untrustedData)
         let evidencePath = dirs.cwd.appendingPathComponent(".domocode/evidence/standard.json")
         let evidence = try JSONValue(parsing: Data(contentsOf: evidencePath))
         #expect(evidence["sourceSessionID"]?.stringValue == parent.id)
@@ -377,6 +383,13 @@ struct ServerRuntimeTests {
         #expect(executeMessages.contains { message in
             if case .user(let user) = message {
                 return user.text.contains("edited plan from the user")
+            }
+            return false
+        })
+        #expect(executeMessages.contains { message in
+            if case .user(let user) = message {
+                return user.text.contains("workflow-child-session")
+                    && user.text.contains("untrustedData")
             }
             return false
         })
