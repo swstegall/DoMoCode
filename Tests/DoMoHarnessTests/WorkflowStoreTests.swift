@@ -37,12 +37,13 @@ struct WorkflowStoreTests {
         try store.append(run: pending)
         #expect(try store.records().count == 2)
 
-        #expect(pending.updateStage(
+        let updated = pending.updateStage(
             "ask",
             status: .succeeded,
             timestamp: "2026-01-01T00:01:00Z",
             output: "answer"
-        ))
+        )
+        #expect(updated)
         pending.status = .succeeded
         pending.output = "answer"
         pending.updatedAt = "2026-01-01T00:01:00Z"

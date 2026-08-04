@@ -90,7 +90,7 @@ struct WorkflowRunnerTests {
                     return WorkflowStageResult(output: "missing inputs")
                 }
             }
-            return WorkflowStageResult(output: request.stage.id)
+            return WorkflowStageResult(output: .string(request.stage.id))
         }
 
         let run = try await runner.run(runID: "parallel-run")
