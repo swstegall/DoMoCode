@@ -129,6 +129,17 @@ public struct ServerClient: Sendable {
     private struct LabelBody: Encodable { let targetID: String; let label: String? }
     private struct LeafBody: Encodable { let targetID: String? }
     private struct DiffRevertBody: Encodable { let path: String; let base: String? }
+    private struct WorkflowStartBody: Encodable {
+        let sessionID: String
+        let input: JSONValue
+        let runID: String?
+    }
+    private struct WorkflowResumeBody: Encodable { let sessionID: String? }
+    private struct WorkflowApprovalBody: Encodable {
+        let stageID: String
+        let decision: String
+        let reason: String?
+    }
 
     private enum Method: String { case get = "GET", post = "POST" }
 
@@ -189,7 +200,7 @@ public struct ServerClient: Sendable {
 
     /// Fetch the latest level-triggered snapshot for each run of a workflow.
     public func workflowRuns(workflowID: String) async throws -> [WorkflowRunRecord] {
-        let path = "/workflow/(workflowID)/runs"
+        let path = "/workflow/\(workflowID)/runs"
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([WorkflowRunRecord].self, from: data)
@@ -197,10 +208,75 @@ public struct ServerClient: Sendable {
 
     /// Fetch one durable run snapshot by id.
     public func workflowRun(workflowID: String, runID: String) async throws -> WorkflowRunRecord {
-        let path = "/workflow/(workflowID)/run/(runID)"
+        let path = "/workflow/\(workflowID)/run/\(runID)"
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
+    }
+
+    /// Start a durable workflow rooted at a live parent session.
+    public func startWorkflow(
+        workflowID: String,
+        sessionID: String,
+        input: JSONValue = .null,
+        runID: String? = nil
+    ) async throws -> WorkflowRunRecord {
+        let path = "/workflow/\(workflowID)/run"
+        let body = try JSONEncoder().encode(
+            WorkflowStartBody(sessionID: sessionID, input: input, runID: runID)
+        )
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 202, path, body: data)
+        return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
+    }
+
+    /// Resume a durable run, preserving successful stage checkpoints.
+    public func resumeWorkflow(
+        workflowID: String,
+        runID: String,
+        sessionID: String? = nil
+    ) async throws -> WorkflowRunRecord {
+        let path = "/workflow/\(workflowID)/run/\(runID)/resume"
+        let body = try JSONEncoder().encode(WorkflowResumeBody(sessionID: sessionID))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 202, path, body: data)
+        return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
+    }
+
+    /// Request cancellation of a workflow run.
+    public func cancelWorkflow(workflowID: String, runID: String) async throws -> WorkflowRunRecord {
+        let path = "/workflow/\(workflowID)/run/\(runID)/cancel"
+        let (status, data) = try await send(.post, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(WorkflowRunRecord.self, from: data)
+    }
+
+    /// List stage approvals that are waiting for an explicit client decision.
+    public func workflowApprovals(
+        workflowID: String,
+        runID: String
+    ) async throws -> [WorkflowApprovalRequest] {
+        let path = "/workflow/\(workflowID)/run/\(runID)/approvals"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([WorkflowApprovalRequest].self, from: data)
+    }
+
+    /// Resolve one workflow stage approval without widening any normal session
+    /// permission grant.
+    public func resolveWorkflowApproval(
+        workflowID: String,
+        runID: String,
+        stageID: String,
+        decision: String,
+        reason: String? = nil
+    ) async throws {
+        let path = "/workflow/\(workflowID)/run/\(runID)/approval"
+        let body = try JSONEncoder().encode(
+            WorkflowApprovalBody(stageID: stageID, decision: decision, reason: reason)
+        )
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
     }
 
     /// Fetch the session's current callable-tool catalog. The runtime resolves

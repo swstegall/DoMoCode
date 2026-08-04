@@ -48,9 +48,13 @@ struct WorkflowRunnerTests {
         let log = WorkflowExecutionLog()
         let runner = WorkflowRunner(
             definition: definition,
+            sessionID: "parent-session",
             now: { "2026-01-01T00:00:00Z" }
         ) { request in
             await log.append(request.stage.id)
+            guard request.sessionID == "parent-session" else {
+                return WorkflowStageResult(output: "missing parent session")
+            }
             if request.stage.id == "plan" {
                 guard request.dependencyOutputs["research"] == .string("evidence") else {
                     return WorkflowStageResult(output: "missing dependency")
@@ -150,6 +154,33 @@ struct WorkflowRunnerTests {
         let run = try await runner.run(runID: "approval-run")
         #expect(run.status == .succeeded)
         #expect(await approvals.values == ["execute"])
+    }
+
+    @Test("missing approval handlers fail closed")
+    func missingApprovalHandler() async throws {
+        let definition = WorkflowDefinition(
+            id: "approval-required",
+            stages: [WorkflowStageDefinition(
+                id: "execute",
+                kind: .execute,
+                approvalBoundary: .beforeMutation
+            )]
+        )
+        let runner = WorkflowRunner(definition: definition) { _ in
+            WorkflowStageResult(output: "must not run")
+        }
+
+        do {
+            _ = try await runner.run(runID: "approval-required-run")
+            Issue.record("expected missing approval to fail")
+        } catch let error as WorkflowRunnerError {
+            guard case .stageFailed("execute", let message) = error else {
+                Issue.record("unexpected runner error: \(error)")
+                return
+            }
+            #expect(message.contains("requires approval"))
+        }
+        #expect(await runner.snapshot()?.stage(withID: "execute")?.status == .failed)
     }
 
     @Test("a timed-out stage becomes a durable failure")

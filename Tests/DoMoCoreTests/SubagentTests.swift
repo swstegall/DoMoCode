@@ -16,6 +16,7 @@ struct SubagentTests {
             parentSessionID: "parent",
             prompt: "inspect the parser",
             agent: "explore",
+            mode: .ask,
             background: true
         )
         let result = SubagentTaskResult(
@@ -30,6 +31,7 @@ struct SubagentTests {
             parentSessionID: request.parentSessionID,
             description: request.prompt,
             agent: request.agent,
+            mode: request.mode,
             status: .completed,
             output: result.output,
             depth: 1

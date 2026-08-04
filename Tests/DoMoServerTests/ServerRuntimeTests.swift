@@ -264,6 +264,63 @@ struct ServerRuntimeTests {
         #expect(header.parentSession == parent.path)
     }
 
+    @Test("workflow runs stages through child sessions and waits at approval boundaries")
+    func workflowExecution() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let workflowDirectory = dirs.root.appendingPathComponent("workflows", isDirectory: true)
+        let store = try WorkflowStore.create(directory: FilePath(workflowDirectory.path))
+        try store.append(definition: .standard)
+        let runtime = ServerRuntime(config: .init(
+            systemPrompt: "test",
+            tools: [],
+            model: "test-model",
+            streamFn: textStream("stage output"),
+            toolExecution: .sequential,
+            maxTurns: 5,
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path,
+            workflowStore: store
+        ))
+        let parent = try await runtime.createSession()
+        let admitted = try await runtime.startWorkflow(
+            workflowID: WorkflowDefinition.standard.id,
+            sessionID: parent.id,
+            input: "investigate the parser",
+            runID: "workflow-run"
+        )
+        #expect(admitted.status == .running)
+        #expect(admitted.metadata["sessionID"] == .string(parent.id))
+
+        var settled: WorkflowRunRecord?
+        for _ in 0..<500 {
+            let approvals = try await runtime.workflowApprovals(
+                workflowID: WorkflowDefinition.standard.id,
+                runID: "workflow-run"
+            )
+            for approval in approvals {
+                try await runtime.resolveWorkflowApproval(
+                    workflowID: approval.workflowID,
+                    runID: approval.runID,
+                    stageID: approval.stage.id,
+                    decision: .approved
+                )
+            }
+            if let run = try await runtime.workflowRun(
+                workflowID: WorkflowDefinition.standard.id,
+                runID: "workflow-run"
+            ), run.status == .succeeded {
+                settled = run
+                break
+            }
+            await Task.yield()
+        }
+
+        let run = try #require(settled)
+        #expect(run.stages.allSatisfy { $0.status == .succeeded })
+        #expect(run.stages.allSatisfy { !$0.agentIDs.isEmpty })
+    }
+
     @Test("background results enter the parent queue and can start an idle parent")
     func backgroundSubagentStartsParent() async throws {
         let dirs = try Dirs()

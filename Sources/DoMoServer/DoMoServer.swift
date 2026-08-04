@@ -3,6 +3,7 @@
 
 import DoMoAgent
 import DoMoCore
+import DoMoHarness
 import DoMoLLM
 import DoMoPermissions
 import Foundation
@@ -77,6 +78,17 @@ private struct RenameBody: Decodable { var name: String? }
 private struct LabelBody: Decodable { var targetID: String; var label: String? }
 private struct LeafBody: Decodable { var targetID: String? }
 private struct DiffRevertBody: Decodable { var path: String; var base: String? }
+private struct WorkflowStartBody: Decodable {
+    var sessionID: String
+    var input: JSONValue?
+    var runID: String?
+}
+private struct WorkflowResumeBody: Decodable { var sessionID: String? }
+private struct WorkflowApprovalBody: Decodable {
+    var stageID: String
+    var decision: String
+    var reason: String?
+}
 
 // MARK: - Auth middleware
 
@@ -240,6 +252,76 @@ public struct DoMoServer: Sendable {
                     throw HTTPError(.notFound)
                 }
                 return try Self.json(run)
+            }
+        }
+
+        router.post("/workflow/:id/run") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let body = try await Self.requiredBody(WorkflowStartBody.self, request)
+                let run = try await self.runtime.startWorkflow(
+                    workflowID: id,
+                    sessionID: body.sessionID,
+                    input: body.input ?? .null,
+                    runID: body.runID
+                )
+                return try Self.json(run, status: .accepted)
+            }
+        }
+
+        router.post("/workflow/:id/run/:runID/resume") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let runID = try context.parameters.require("runID")
+                let body = try await Self.optionalBody(WorkflowResumeBody.self, request)
+                let run = try await self.runtime.resumeWorkflow(
+                    workflowID: id,
+                    runID: runID,
+                    sessionID: body?.sessionID
+                )
+                return try Self.json(run, status: .accepted)
+            }
+        }
+
+        router.post("/workflow/:id/run/:runID/cancel") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let runID = try context.parameters.require("runID")
+                return try Self.json(try await self.runtime.cancelWorkflow(workflowID: id, runID: runID))
+            }
+        }
+
+        router.get("/workflow/:id/run/:runID/approvals") { _, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let runID = try context.parameters.require("runID")
+                return try Self.json(try await self.runtime.workflowApprovals(workflowID: id, runID: runID))
+            }
+        }
+
+        router.post("/workflow/:id/run/:runID/approval") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                let runID = try context.parameters.require("runID")
+                let body = try await Self.requiredBody(WorkflowApprovalBody.self, request)
+                let decision: WorkflowApprovalDecision
+                switch body.decision.lowercased() {
+                case "approve", "approved":
+                    decision = .approved
+                case "cancel", "cancelled":
+                    decision = .cancelled
+                case "deny", "denied":
+                    decision = .denied(body.reason ?? "Workflow stage approval denied.")
+                default:
+                    throw HTTPError(.badRequest)
+                }
+                try await self.runtime.resolveWorkflowApproval(
+                    workflowID: id,
+                    runID: runID,
+                    stageID: body.stageID,
+                    decision: decision
+                )
+                return Response(status: .ok)
             }
         }
 
@@ -616,6 +698,12 @@ public struct DoMoServer: Sendable {
             case .sessionNotFound: throw HTTPError(.notFound)
             case .terminalNotFound: throw HTTPError(.notFound)
             case .sessionBusy, .sessionNotRunning: throw HTTPError(.conflict)
+            case .workflowNotFound, .workflowRunNotFound, .workflowApprovalNotFound:
+                throw HTTPError(.notFound)
+            case .workflowRunBusy, .workflowRunNotResumable:
+                throw HTTPError(.conflict)
+            case .workflowSessionRequired:
+                throw HTTPError(.badRequest)
             }
         }
     }

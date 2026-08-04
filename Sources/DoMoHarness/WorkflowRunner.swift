@@ -6,6 +6,7 @@ import DoMoCore
 public struct WorkflowStageRequest: Sendable, Hashable {
     public let workflowID: String
     public let runID: String
+    public let sessionID: String?
     public let stage: WorkflowStageDefinition
     public let input: JSONValue
     public let dependencyOutputs: [String: JSONValue]
@@ -13,12 +14,14 @@ public struct WorkflowStageRequest: Sendable, Hashable {
     public init(
         workflowID: String,
         runID: String,
+        sessionID: String? = nil,
         stage: WorkflowStageDefinition,
         input: JSONValue,
         dependencyOutputs: [String: JSONValue]
     ) {
         self.workflowID = workflowID
         self.runID = runID
+        self.sessionID = sessionID
         self.stage = stage
         self.input = input
         self.dependencyOutputs = dependencyOutputs
@@ -43,7 +46,7 @@ public struct WorkflowStageResult: Sendable, Hashable {
 
 public typealias WorkflowStageExecutor = @Sendable (WorkflowStageRequest) async throws -> WorkflowStageResult
 
-public struct WorkflowApprovalRequest: Sendable, Hashable {
+public struct WorkflowApprovalRequest: Codable, Sendable, Hashable {
     public let workflowID: String
     public let runID: String
     public let stage: WorkflowStageDefinition
@@ -79,6 +82,7 @@ public enum WorkflowRunnerError: Error, Sendable, Equatable {
 public actor WorkflowRunner {
     public let definition: WorkflowDefinition
     public let executionMode: WorkflowExecutionMode
+    public let sessionID: String?
 
     private let store: WorkflowStore?
     private let executor: WorkflowStageExecutor
@@ -91,6 +95,7 @@ public actor WorkflowRunner {
     public init(
         definition: WorkflowDefinition,
         executionMode: WorkflowExecutionMode = .serial,
+        sessionID: String? = nil,
         store: WorkflowStore? = nil,
         now: @escaping @Sendable () -> String = { WorkflowStore.timestamp() },
         approvalHandler: WorkflowApprovalHandler? = nil,
@@ -98,6 +103,7 @@ public actor WorkflowRunner {
     ) {
         self.definition = definition
         self.executionMode = executionMode
+        self.sessionID = sessionID
         self.store = store
         self.now = now
         self.approvalHandler = approvalHandler
@@ -106,7 +112,8 @@ public actor WorkflowRunner {
 
     public func run(
         input: JSONValue = .null,
-        runID: String = UUIDv7.generate().description
+        runID: String = UUIDv7.generate().description,
+        metadata: [String: JSONValue] = [:]
     ) async throws -> WorkflowRunRecord {
         guard !running else { throw WorkflowRunnerError.alreadyRunning }
         guard definition.isValid else {
@@ -119,7 +126,8 @@ public actor WorkflowRunner {
             createdAt: now(),
             input: input,
             stageIDs: definition.stages.map(\.id),
-            status: .running
+            status: .running,
+            metadata: metadata
         )
         return try await execute(initialRun: run, outputs: [:])
     }
@@ -391,6 +399,7 @@ public actor WorkflowRunner {
         let request = WorkflowStageRequest(
             workflowID: definition.id,
             runID: run.id,
+            sessionID: sessionID,
             stage: stage,
             input: run.input,
             dependencyOutputs: stage.dependencies.reduce(into: [String: JSONValue]()) { result, dependency in

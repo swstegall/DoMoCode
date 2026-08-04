@@ -22,6 +22,10 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
     public let parentSessionID: String
     public let prompt: String
     public let agent: String?
+    /// The child policy mode. Nil preserves the historical read-only child
+    /// default; workflow stages set this explicitly after applying their own
+    /// tool-policy boundary.
+    public let mode: AgentMode?
     public let background: Bool
 
     public init(
@@ -29,12 +33,14 @@ public struct SubagentTaskRequest: Codable, Hashable, Sendable {
         parentSessionID: String,
         prompt: String,
         agent: String? = nil,
+        mode: AgentMode? = nil,
         background: Bool = false
     ) {
         self.taskID = taskID
         self.parentSessionID = parentSessionID
         self.prompt = prompt
         self.agent = agent
+        self.mode = mode
         self.background = background
     }
 }
@@ -88,6 +94,10 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
     /// The inert profile selected for the child, when one was requested.
     /// Optional so older session metadata and wire clients remain readable.
     public let agent: String?
+    /// Optional so session files written before explicit child modes remain
+    /// readable. Workflow child sessions use it to preserve their policy after
+    /// a restart.
+    public let mode: AgentMode?
     public let status: SubagentTaskStatus
     public let output: String?
     public let error: String?
@@ -99,6 +109,7 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         parentSessionID: String,
         description: String,
         agent: String? = nil,
+        mode: AgentMode? = nil,
         status: SubagentTaskStatus,
         output: String? = nil,
         error: String? = nil,
@@ -109,6 +120,7 @@ public struct SubagentTaskEvent: Codable, Hashable, Sendable {
         self.parentSessionID = parentSessionID
         self.description = description
         self.agent = agent
+        self.mode = mode
         self.status = status
         self.output = output
         self.error = error
