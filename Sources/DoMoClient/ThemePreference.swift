@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import DoMoCore
+import DoMoTUI
 import Foundation
 import SystemPackage
 
