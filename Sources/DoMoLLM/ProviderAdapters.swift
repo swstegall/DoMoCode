@@ -130,50 +130,54 @@ private enum ProviderAdapterConversion {
         switch event {
         case .start(let snapshot):
             return [make(.messageStart, [
-                "model": snapshot.model,
-                "responseModel": snapshot.responseModel ?? .null,
-                "responseId": snapshot.responseID ?? .null,
+                "model": .string(snapshot.model),
+                "responseModel": snapshot.responseModel.map(JSONValue.string) ?? .null,
+                "responseId": snapshot.responseID.map(JSONValue.string) ?? .null,
             ])]
         case .textDelta(let blockIndex, let delta):
-            return [make(.textDelta, ["blockIndex": blockIndex, "delta": delta])]
+            return [make(.textDelta, ["blockIndex": .int(blockIndex), "delta": .string(delta)])]
         case .reasoningDelta(let blockIndex, let delta):
-            return [make(.reasoningDelta, ["blockIndex": blockIndex, "delta": delta])]
+            return [make(.reasoningDelta, ["blockIndex": .int(blockIndex), "delta": .string(delta)])]
         case .toolCallStart(let blockIndex, _):
-            return [make(.toolCallDelta, ["phase": "start", "blockIndex": blockIndex])]
+            return [make(.toolCallDelta, ["phase": .string("start"), "blockIndex": .int(blockIndex)])]
         case .toolCallDelta(let blockIndex, let delta):
-            return [make(.toolCallDelta, ["phase": "delta", "blockIndex": blockIndex, "delta": delta])]
+            return [make(.toolCallDelta, [
+                "phase": .string("delta"),
+                "blockIndex": .int(blockIndex),
+                "delta": .string(delta),
+            ])]
         case .toolCallEnd(let blockIndex, let call, _):
             return [make(.toolCallDelta, [
-                "phase": "end",
-                "blockIndex": blockIndex,
-                "id": call.id,
-                "name": call.name,
+                "phase": .string("end"),
+                "blockIndex": .int(blockIndex),
+                "id": .string(call.id),
+                "name": .string(call.name),
                 "arguments": call.arguments,
             ])]
         case .retrying(let notice):
             return [make(.retry, [
-                "attempt": notice.attempt,
-                "maxAttempts": notice.maxAttempts,
-                "delayMilliseconds": DoMoError.wholeMilliseconds(notice.delay),
-                "reason": notice.reason.label,
-                "message": notice.message,
+                "attempt": .int(notice.attempt),
+                "maxAttempts": .int(notice.maxAttempts),
+                "delayMilliseconds": .int(DoMoError.wholeMilliseconds(notice.delay)),
+                "reason": .string(notice.reason.label),
+                "message": .string(notice.message),
             ])]
         case .recovery(let envelope):
             return [make(.error, ["recovery": Self.json(envelope)])]
         case .done(let message):
             return [make(.messageEnd, [
                 "assistant": Self.json(message),
-                "stopReason": String(describing: message.stopReason),
+                "stopReason": .string(String(describing: message.stopReason)),
             ])]
         case .failed(let message):
             return [
                 make(.error, [
-                    "message": message.errorMessage ?? "Provider request failed",
+                    "message": .string(message.errorMessage ?? "Provider request failed"),
                     "assistant": Self.json(message),
                 ]),
                 make(.messageEnd, [
                     "assistant": Self.json(message),
-                    "stopReason": String(describing: message.stopReason),
+                    "stopReason": .string(String(describing: message.stopReason)),
                 ]),
             ]
         case .textStart, .textEnd, .reasoningStart, .reasoningEnd:
@@ -408,7 +412,7 @@ public struct AnthropicMessagesProviderAdapter: DoMoProvider, DoMoAdapterHealthC
                         throw Self.classify(status: status, body: text, policy: profile.errorPolicy)
                     }
 
-                    var decoder = SSEByteDecoder()
+                    let decoder = SSEByteDecoder()
                     var sequence = 0
                     for try await chunk in response.body {
                         let frames = await decoder.consume(chunk)
@@ -459,20 +463,20 @@ public struct AnthropicMessagesProviderAdapter: DoMoProvider, DoMoAdapterHealthC
             keys: ["maxTokens", "max_tokens"]
         ) ?? defaultMaxTokens
         var object: [String: JSONValue] = [
-            "model": request.model.isEmpty ? (profile.defaultModel ?? "") : request.model,
-            "max_tokens": max(1, maxTokens),
-            "stream": true,
+            "model": .string(request.model.isEmpty ? (profile.defaultModel ?? "") : request.model),
+            "max_tokens": .int(max(1, maxTokens)),
+            "stream": .bool(true),
             "messages": .array(messages),
         ]
-        if !systemMessages.isEmpty { object["system"] = systemMessages.joined(separator: "\n\n") }
+        if !systemMessages.isEmpty { object["system"] = .string(systemMessages.joined(separator: "\n\n")) }
         if let temperature = ProviderAdapterConversion.doubleOption(request.options, keys: ["temperature"]) {
             object["temperature"] = .double(temperature)
         }
         if !request.tools.isEmpty {
             object["tools"] = .array(request.tools.map { tool in
                 [
-                    "name": tool.name,
-                    "description": tool.description,
+                    "name": .string(tool.name),
+                    "description": tool.description.map(JSONValue.string) ?? .null,
                     "input_schema": tool.inputSchema,
                 ]
             })
@@ -502,10 +506,10 @@ public struct AnthropicMessagesProviderAdapter: DoMoProvider, DoMoAdapterHealthC
                 ?? "provider-tool-result"
             let output = message.content["output"] ?? message.content
             let result: JSONValue = [
-                "type": "tool_result",
-                "tool_use_id": id,
+                "type": .string("tool_result"),
+                "tool_use_id": .string(id),
                 "content": output,
-                "is_error": message.content["isError"] ?? message.content["is_error"] ?? false,
+                "is_error": message.content["isError"] ?? message.content["is_error"] ?? .bool(false),
             ]
             return ["role": "user", "content": [result]]
         case .user:
