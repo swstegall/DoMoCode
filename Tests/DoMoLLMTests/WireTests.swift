@@ -431,6 +431,38 @@ struct RequestTests {
         #expect(json["content"] == JSONValue.null)
     }
 
+    @Test("Tool-call ids are Bedrock-safe and stay correlated across turns")
+    func bedrockSafeToolCallIDs() throws {
+        let originalID = "toolu:0/é with space"
+        let assistant = Message.assistant(
+            AssistantMessage(
+                content: [.toolCall(ToolCallBlock(id: originalID, name: "read"))],
+                model: "m",
+                stopReason: .toolUse
+            )
+        )
+        let result = Message.tool(
+            ToolResultBlock(toolCallID: originalID, toolName: "read", output: "contents")
+        )
+
+        let assistantWire = try #require(WireMessage.encoding(assistant).first)
+        let toolWire = try #require(WireMessage.encoding(result).first)
+        let wireID = try #require(assistantWire.toolCalls?.first?.id)
+
+        #expect(wireID == toolWire.toolCallID)
+        #expect(wireID != originalID)
+        #expect(ToolCallIDPolicy.isWireSafe(wireID))
+        #expect(ToolCallIDPolicy.wireID(wireID) == wireID)
+    }
+
+    @Test("Safe tool-call ids remain unchanged while the policy owns its prefix")
+    func safeToolCallIDsRemainStable() {
+        #expect(ToolCallIDPolicy.wireID("call_1") == "call_1")
+        #expect(ToolCallIDPolicy.wireID("toolu-01A") == "toolu-01A")
+        #expect(ToolCallIDPolicy.wireID("domo-call") != "domo-call")
+        #expect(ToolCallIDPolicy.wireID("") == "domo-")
+    }
+
     @Test("An assistant turn with neither text nor tool calls is dropped")
     func emptyAssistantDropped() {
         let message = Message.assistant(AssistantMessage(model: "m", stopReason: .aborted))

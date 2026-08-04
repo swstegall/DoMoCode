@@ -129,6 +129,49 @@ extension StopReason {
 
 // MARK: - Request
 
+/// The identifier grammar accepted by the Bedrock adapters behind LiteLLM.
+///
+/// Tool-call ids are opaque to DoMoCode, so the normalized transcript keeps the
+/// provider's original value. Bedrock is less permissive when LiteLLM translates
+/// an OpenAI tool call into an Anthropic `tool_use`: its id must match
+/// `^[a-zA-Z0-9_-]+$`. Applying this policy only while encoding a request keeps
+/// replay and tool-result correlation lossless while making every outbound
+/// request safe for that gateway.
+public enum ToolCallIDPolicy {
+    private static let encodedPrefix = "domo-"
+    private static let hexDigits: [Character] = Array("0123456789abcdef")
+
+    /// Whether an id can be sent to the Bedrock/LiteLLM boundary unchanged.
+    public static func isWireSafe(_ id: String) -> Bool {
+        !id.isEmpty && id.utf8.allSatisfy { byte in
+            (byte >= 0x41 && byte <= 0x5A) // A-Z
+                || (byte >= 0x61 && byte <= 0x7A) // a-z
+                || (byte >= 0x30 && byte <= 0x39) // 0-9
+                || byte == 0x5F // _
+                || byte == 0x2D // -
+        }
+    }
+
+    /// Return the stable id used on the wire for an in-memory tool-call id.
+    ///
+    /// Safe ids remain byte-for-byte unchanged. Other ids are UTF-8 hex encoded
+    /// behind a reserved prefix, which is injective and therefore cannot make
+    /// two distinct provider ids share a wire id. Safe ids using that prefix are
+    /// encoded too, reserving the namespace for this mapping.
+    public static func wireID(_ id: String) -> String {
+        guard isWireSafe(id), !id.hasPrefix(encodedPrefix) else {
+            var encoded = encodedPrefix
+            encoded.reserveCapacity(encodedPrefix.utf8.count + id.utf8.count * 2)
+            for byte in id.utf8 {
+                encoded.append(hexDigits[Int(byte >> 4)])
+                encoded.append(hexDigits[Int(byte & 0x0F)])
+            }
+            return encoded
+        }
+        return id
+    }
+}
+
 /// The `POST /chat/completions` body.
 ///
 /// Deliberately small. Every field upstream sets from a per-provider compat
@@ -1003,7 +1046,7 @@ extension WireMessage {
                         ? nil
                         : calls.map { call in
                             WireToolCall(
-                                id: call.id,
+                                id: ToolCallIDPolicy.wireID(call.id),
                                 function: WireFunctionCall(
                                     name: call.name,
                                     // A tool call whose arguments will not
@@ -1035,7 +1078,7 @@ extension WireMessage {
             let toolMsg = WireMessage(
                 role: .tool,
                 content: toolText,
-                toolCallID: result.toolCallID,
+                toolCallID: ToolCallIDPolicy.wireID(result.toolCallID),
                 name: includeToolResultName ? result.toolName : nil
             )
             if images.isEmpty { return [toolMsg] }
