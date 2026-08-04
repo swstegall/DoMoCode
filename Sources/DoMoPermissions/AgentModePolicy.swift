@@ -51,6 +51,7 @@ public enum AgentModePolicy {
             PermissionRule(permission: "todowrite", pattern: "*", action: .allow),
             PermissionRule(permission: "question", pattern: "*", action: .ask),
             PermissionRule(permission: "webfetch", pattern: "*", action: .ask),
+            PermissionRule(permission: "websearch", pattern: "*", action: .ask),
             PermissionRule(permission: "plan_exit", pattern: "*", action: .allow),
             // Delegation creates a read-only child session. The runtime still
             // enforces the depth cap and derives the child's permissions from

@@ -224,7 +224,7 @@ public struct ToolRegistry: Sendable {
     ) -> ToolRegistry {
         var tools: [any Tool] = [
             ReadTool(), BashTool(), EditTool(), ApplyPatchTool(), WriteTool(), GrepTool(), FindTool(), LsTool(),
-            TodoWriteTool(store: todoStore), GlobTool(), FinishTool(), QuestionTool(), WebFetchTool(),
+            TodoWriteTool(store: todoStore), GlobTool(), FinishTool(), QuestionTool(), WebFetchTool(), WebSearchTool(),
             BackgroundProcessTool(), InteractiveTerminalTool(),
         ]
         if includePlanExit { tools.append(PlanExitTool()) }
@@ -268,6 +268,25 @@ public struct WebFetchResponse: Sendable, Hashable {
 
 /// Fetches one URL for WebFetchTool.
 public typealias WebFetch = @Sendable (URL) async throws -> WebFetchResponse
+
+/// One provider-returned web-search hit. The provider owns ranking and URL
+/// fetching; the tool only bounds and presents the result set.
+public struct WebSearchHit: Sendable, Hashable {
+    public let title: String
+    public let url: String
+    public let snippet: String?
+
+    public init(title: String, url: String, snippet: String? = nil) {
+        self.title = title
+        self.url = url
+        self.snippet = snippet
+    }
+}
+
+/// Injectable search seam. A deployment can provide a hosted search API, an
+/// MCP-backed adapter, or no provider at all; the native tool never guesses at
+/// a search endpoint and never receives a secret value through ``ToolContext``.
+public typealias WebSearch = @Sendable (String, Int) async throws -> [WebSearchHit]
 
 /// One structured multiple-choice option.
 public struct QuestionOption: Sendable, Hashable {
@@ -352,6 +371,10 @@ public struct ToolContext: Sendable {
     /// The HTTP seam used by WebFetchTool.
     public let webFetch: WebFetch
 
+    /// Optional provider seam used by WebSearchTool. Nil is intentional for
+    /// installations that expose search through MCP instead.
+    public let webSearch: WebSearch?
+
     /// Session-scoped long-running children used by ``BackgroundProcessTool``.
     /// The manager is created with the context so one session can poll a process
     /// from a later tool call without sharing it with another session.
@@ -396,6 +419,7 @@ public struct ToolContext: Sendable {
         environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
+        webSearch: WebSearch? = nil,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         processSandbox: ProcessSandbox? = nil,
         interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
@@ -413,6 +437,7 @@ public struct ToolContext: Sendable {
         self.environment = environment
         self.questionHandler = questionHandler
         self.webFetch = webFetch
+        self.webSearch = webSearch
         self.backgroundProcesses = backgroundProcesses
         self.processSandbox = processSandbox
         self.interactiveTerminal = interactiveTerminal
@@ -435,6 +460,7 @@ public struct ToolContext: Sendable {
         environment: ShellEnvironment = ToolContext.scrubbedEnvironment(),
         questionHandler: QuestionHandler? = nil,
         webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
+        webSearch: WebSearch? = nil,
         backgroundProcesses: BackgroundProcessManager = BackgroundProcessManager(),
         processSandbox: ProcessSandbox? = nil,
         interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
@@ -453,6 +479,7 @@ public struct ToolContext: Sendable {
             environment: environment,
             questionHandler: questionHandler,
             webFetch: webFetch,
+            webSearch: webSearch,
             backgroundProcesses: backgroundProcesses,
             processSandbox: processSandbox,
             interactiveTerminal: interactiveTerminal,
@@ -472,6 +499,7 @@ public struct ToolContext: Sendable {
         withQuestionHandler(
             handler,
             backgroundProcesses: backgroundProcesses,
+            webSearch: webSearch,
             processSandbox: processSandbox,
             diagnosticsProvider: diagnosticsProvider,
             formatterProvider: formatterProvider,
@@ -489,6 +517,7 @@ public struct ToolContext: Sendable {
     public func withQuestionHandler(
         _ handler: QuestionHandler?,
         backgroundProcesses: BackgroundProcessManager,
+        webSearch: WebSearch? = nil,
         processSandbox: ProcessSandbox? = nil,
         interactiveTerminal: (any InteractiveTerminalProvider)? = nil,
         diagnosticsProvider: (any DiagnosticsProvider)? = nil,
@@ -506,6 +535,7 @@ public struct ToolContext: Sendable {
             environment: environment,
             questionHandler: handler,
             webFetch: webFetch,
+            webSearch: webSearch ?? self.webSearch,
             backgroundProcesses: backgroundProcesses,
             processSandbox: processSandbox ?? self.processSandbox,
             interactiveTerminal: interactiveTerminal ?? self.interactiveTerminal,

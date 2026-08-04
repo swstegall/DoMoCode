@@ -30,6 +30,8 @@ nonisolated func toolCallDetail(name: String, arguments: JSONValue) -> String {
         raw = pathArgument(arguments)
     case "apply_patch":
         raw = patchPaths(arguments)
+    case "websearch":
+        raw = arguments["query"]?.stringValue ?? ""
     case "ls":
         raw = arguments["path"]?.stringValue ?? "."
     case "grep":

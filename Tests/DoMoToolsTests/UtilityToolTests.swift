@@ -114,6 +114,48 @@ struct UtilityToolTests {
         #expect(result.text.contains("only http and https"))
     }
 
+    @Test("websearch uses the injected provider and preserves structured hits")
+    func webSearch() async throws {
+        let fixture = try await ToolFixture.make(
+            webSearch: { query, limit in
+                #expect(query == "swift concurrency")
+                #expect(limit == 3)
+                return [
+                    WebSearchHit(
+                        title: "Swift Concurrency",
+                        url: "https://example.test/swift",
+                        snippet: "Async code without guesswork."
+                    )
+                ]
+            }
+        )
+        defer { fixture.removeCleanup() }
+
+        let result = try await WebSearchTool().execute(
+            ["query": "swift concurrency", "limit": 3],
+            in: fixture.context
+        )
+
+        #expect(!result.isError)
+        #expect(result.text.contains("Swift Concurrency"))
+        #expect(result.text.contains("Async code without guesswork."))
+        #expect(result.details["results"]?.arrayValue?.count == 1)
+    }
+
+    @Test("websearch fails closed when no provider is configured")
+    func webSearchUnavailable() async throws {
+        let fixture = try await ToolFixture.make()
+        defer { fixture.removeCleanup() }
+
+        let result = try await WebSearchTool().execute(
+            ["query": "anything"],
+            in: fixture.context
+        )
+
+        #expect(result.isError)
+        #expect(result.text.contains("configure a search provider"))
+    }
+
     @Test("question returns structured selections through its handler")
     func question() async throws {
         let fixture = try await ToolFixture.make(

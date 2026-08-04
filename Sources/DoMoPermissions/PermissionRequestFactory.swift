@@ -83,6 +83,14 @@ public struct PermissionRequestFactory: Sendable {
                 always: [],
                 metadata: ["url": .string(url)]
             )
+        case "websearch":
+            let query = arguments["query"]?.stringValue ?? ""
+            return PermissionRequestSpec(
+                permission: "websearch",
+                patterns: [query],
+                always: [],
+                metadata: ["query": .string(query)]
+            )
         case "background_process":
             let action = arguments["action"]?.stringValue ?? ""
             let target = arguments["command"]?.stringValue
@@ -427,6 +435,7 @@ public func defaultBaselinePermissionConfig() -> PermissionConfig {
         PermissionConfigEntry(permission: "memory.read", value: .action(.allow)),
         PermissionConfigEntry(permission: "question", value: .action(.ask)),
         PermissionConfigEntry(permission: "webfetch", value: .action(.ask)),
+        PermissionConfigEntry(permission: "websearch", value: .action(.ask)),
         PermissionConfigEntry(permission: "doom_loop", value: .action(.ask)),
     ]
 }

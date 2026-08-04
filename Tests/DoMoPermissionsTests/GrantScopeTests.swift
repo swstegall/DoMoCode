@@ -190,6 +190,17 @@ struct GrantScopeTests {
         #expect(spec.always.isEmpty)
     }
 
+    @Test("websearch is query-scoped and never persists a blanket grant")
+    func webSearchPermission() {
+        let spec = factory.make(
+            toolName: "websearch",
+            arguments: ["query": "swift concurrency"]
+        )
+        #expect(spec.permission == "websearch")
+        #expect(spec.patterns == ["swift concurrency"])
+        #expect(spec.always.isEmpty)
+    }
+
     // MARK: Persistence
 
     @Test("A persisted grant never buries a deny the user wrote by hand")

@@ -14,7 +14,8 @@ struct ToolFixture {
     static func make(
         toolLocator: ExternalToolLocator = .pathSearch,
         questionHandler: QuestionHandler? = nil,
-        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch
+        webFetch: @escaping WebFetch = ToolContext.defaultWebFetch,
+        webSearch: WebSearch? = nil
     ) async throws -> ToolFixture {
         let base = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("domotools-\(UUID().uuidString)", isDirectory: true)
@@ -25,7 +26,8 @@ struct ToolFixture {
             shell: shell,
             toolLocator: toolLocator,
             questionHandler: questionHandler,
-            webFetch: webFetch
+            webFetch: webFetch,
+            webSearch: webSearch
         )
         return ToolFixture(root: context.workingDirectory, context: context, cleanupURL: base)
     }

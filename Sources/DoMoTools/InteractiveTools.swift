@@ -80,6 +80,76 @@ public struct WebFetchTool: Tool {
     }
 }
 
+// MARK: - Web search
+
+/// Searches through an injected provider. The native surface intentionally has
+/// no built-in endpoint: deployments can supply a hosted API or an MCP-backed
+/// adapter without putting provider credentials into the tool layer.
+public struct WebSearchTool: Tool {
+    private static let defaultLimit = 5
+    private static let maximumLimit = 10
+
+    public init() {}
+
+    public let name = "websearch"
+    public let description = "Search the web through the configured search provider and return ranked links with snippets."
+
+    public var parameters: JSONSchema {
+        .object(
+            .required("query", .string(description: "The web search query")),
+            .optional("limit", .number(description: "Maximum results to return (default: 5, maximum: 10)"))
+        )
+    }
+
+    @concurrent
+    public func execute(
+        _ arguments: JSONValue,
+        in context: ToolContext
+    ) async throws(DoMoError) -> ToolResult {
+        try await ToolResult.capturing(tool: name) {
+            let args = try ArgumentReader(tool: name, arguments: arguments)
+            let query = try args.requiredString("query").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !query.isEmpty else { return ToolResult.error("websearch: query must not be empty.") }
+            guard let provider = context.webSearch else {
+                return ToolResult.error(
+                    "websearch is unavailable: configure a search provider or expose search through MCP."
+                )
+            }
+            let requestedLimit = try args.optionalInt("limit") ?? Self.defaultLimit
+            let limit = min(max(1, requestedLimit), Self.maximumLimit)
+            let hits = Array(try await provider(query, limit).prefix(limit))
+            guard !hits.isEmpty else {
+                return ToolResult.text(
+                    "No web results for \(query).",
+                    details: .object([
+                        "query": .string(query),
+                        "results": .array([]),
+                    ])
+                )
+            }
+
+            let text = hits.enumerated().map { index, hit in
+                var line = "\(index + 1). \(hit.title) — \(hit.url)"
+                if let snippet = hit.snippet, !snippet.isEmpty {
+                    line += "\n   \(snippet)"
+                }
+                return line
+            }.joined(separator: "\n")
+            let details = JSONValue.object([
+                "query": .string(query),
+                "results": .array(hits.map { hit in
+                    .object([
+                        "title": .string(hit.title),
+                        "url": .string(hit.url),
+                        "snippet": hit.snippet.map(JSONValue.string) ?? .null,
+                    ])
+                }),
+            ])
+            return ToolResult.text(text, details: details)
+        }
+    }
+}
+
 // MARK: - Questions
 
 /// Presents structured multiple-choice questions to an interactive surface.
