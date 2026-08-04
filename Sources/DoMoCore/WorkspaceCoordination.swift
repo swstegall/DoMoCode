@@ -148,19 +148,41 @@ public struct WorkspacePromotionResult: Sendable, Codable, Hashable {
     public var message: String
     public var resultingRevision: String?
     public var conflictingPaths: [String]
+    public var conflictingResources: [String]
+    public var conflictingOwners: [String]
 
     public init(
         status: WorkspacePromotionStatus,
         leaseID: String,
         message: String,
         resultingRevision: String? = nil,
-        conflictingPaths: [String] = []
+        conflictingPaths: [String] = [],
+        conflictingResources: [String] = [],
+        conflictingOwners: [String] = []
     ) {
         self.status = status
         self.leaseID = leaseID
         self.message = message
         self.resultingRevision = resultingRevision
         self.conflictingPaths = conflictingPaths.sorted()
+        self.conflictingResources = conflictingResources.sorted()
+        self.conflictingOwners = conflictingOwners.sorted()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status, leaseID, message, resultingRevision, conflictingPaths
+        case conflictingResources, conflictingOwners
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(WorkspacePromotionStatus.self, forKey: .status)
+        leaseID = try container.decode(String.self, forKey: .leaseID)
+        message = try container.decode(String.self, forKey: .message)
+        resultingRevision = try container.decodeIfPresent(String.self, forKey: .resultingRevision)
+        conflictingPaths = try container.decodeIfPresent([String].self, forKey: .conflictingPaths) ?? []
+        conflictingResources = try container.decodeIfPresent([String].self, forKey: .conflictingResources) ?? []
+        conflictingOwners = try container.decodeIfPresent([String].self, forKey: .conflictingOwners) ?? []
     }
 }
 
@@ -174,6 +196,320 @@ public protocol WorkspaceProvider: Sendable {
     func diff(_ lease: WorkspaceLease) async throws -> WorkspaceDiffSummary
     func promote(_ request: WorkspacePromotionRequest) async throws -> WorkspacePromotionResult
     func cleanup(_ lease: WorkspaceLease) async throws
+}
+
+/// Errors raised by the host-owned lease coordinator. Provider errors are
+/// reduced to a redacted message at this boundary so a local Git error and a
+/// remote worker error have the same safe shape for clients and logs.
+public enum WorkspaceLeaseCoordinatorError: Error, Sendable, Equatable {
+    case emptyLeaseID
+    case duplicateLease(String)
+    case notFound(String)
+    case parentNotFound(String)
+    case invalidRootPath(String)
+    case overlappingWorkspace(String)
+    case invalidOwnership(WorkspaceOwnershipError)
+    case invalidProviderLease(String)
+    case invalidState(leaseID: String, state: WorkspaceLeaseState)
+    case ownershipConflict(
+        leaseID: String,
+        owners: [String],
+        paths: [String],
+        resources: [String]
+    )
+    case providerFailed(leaseID: String, operation: String, message: String)
+}
+
+/// Coordinates the safety boundary around a provider-owned workspace.
+///
+/// Providers allocate and mutate concrete worktrees, containers, or remote
+/// workspaces. This actor owns the cross-provider rules: lease identity,
+/// parent/child root separation, declared ownership conflicts, explicit
+/// approval before promotion, and cleanup state. A provider is never asked to
+/// promote a lease that has not passed those checks.
+public actor WorkspaceLeaseCoordinator {
+    private struct Record: Sendable {
+        var lease: WorkspaceLease
+        let claims: [WorkspaceOwnershipClaim]
+    }
+
+    private let provider: any WorkspaceProvider
+    private var records: [String: Record] = [:]
+    private var order: [String] = []
+
+    public init(provider: any WorkspaceProvider) {
+        self.provider = provider
+    }
+
+    public func leases() -> [WorkspaceLease] {
+        order.compactMap { records[$0]?.lease }
+    }
+
+    public func lease(for id: String) throws(WorkspaceLeaseCoordinatorError) -> WorkspaceLease {
+        guard let record = records[id] else { throw .notFound(id) }
+        return record.lease
+    }
+
+    public func claims(for id: String) throws(WorkspaceLeaseCoordinatorError) -> [WorkspaceOwnershipClaim] {
+        guard let record = records[id] else { throw .notFound(id) }
+        return record.claims
+    }
+
+    /// Allocates one isolated root and records its ownership claims before it
+    /// can be activated. The provider result is checked against the request so
+    /// an adapter cannot accidentally hand a child the parent's root.
+    public func allocate(
+        _ request: WorkspaceLeaseRequest,
+        claims: [WorkspaceOwnershipClaim] = []
+    ) async throws(WorkspaceLeaseCoordinatorError) -> WorkspaceLease {
+        let id = request.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { throw .emptyLeaseID }
+        guard records[id] == nil else { throw .duplicateLease(id) }
+
+        let requestedRoot = try Self.normalizedRoot(request.rootPath)
+        do {
+            _ = try WorkspaceOwnershipPlanner.conflicts(claims)
+        } catch let error as WorkspaceOwnershipError {
+            throw .invalidOwnership(error)
+        }
+
+        if let parentSessionID = request.parentSessionID {
+            guard let parent = records.values.first(where: { $0.lease.sessionID == parentSessionID }) else {
+                throw .parentNotFound(parentSessionID)
+            }
+            guard !Self.rootsOverlap(requestedRoot, parent.lease.rootPath) else {
+                throw .overlappingWorkspace(parent.lease.id)
+            }
+        }
+        for existing in records.values where existing.lease.state != .cleaned {
+            guard !Self.rootsOverlap(requestedRoot, existing.lease.rootPath) else {
+                throw .overlappingWorkspace(existing.lease.id)
+            }
+        }
+
+        let allocated: WorkspaceLease
+        do {
+            allocated = try await provider.allocate(request)
+        } catch {
+            throw Self.providerFailure(id: id, operation: "allocate", error: error)
+        }
+
+        let allocatedRoot: String
+        do {
+            allocatedRoot = try Self.normalizedRoot(allocated.rootPath)
+        } catch let error as WorkspaceLeaseCoordinatorError {
+            try? await provider.cleanup(allocated)
+            throw error
+        }
+        guard allocated.id == id,
+              allocated.sessionID == request.sessionID,
+              allocated.parentSessionID == request.parentSessionID,
+              allocated.state == .allocated
+        else {
+            try? await provider.cleanup(allocated)
+            throw .invalidProviderLease(id)
+        }
+        guard allocatedRoot == requestedRoot else {
+            try? await provider.cleanup(allocated)
+            throw .invalidProviderLease(id)
+        }
+        for existing in records.values where existing.lease.state != .cleaned {
+            guard !Self.rootsOverlap(allocatedRoot, existing.lease.rootPath) else {
+                try? await provider.cleanup(allocated)
+                throw .overlappingWorkspace(existing.lease.id)
+            }
+        }
+
+        var lease = allocated
+        lease.id = id
+        lease.rootPath = allocatedRoot
+        records[id] = Record(lease: lease, claims: claims)
+        order.append(id)
+        return lease
+    }
+
+    /// Activates an allocated lease or resumes a paused one. No provider
+    /// operation is implied: providers own their process/container lifecycle;
+    /// this state records whether the coordinator will admit workspace work.
+    public func activate(id: String) throws(WorkspaceLeaseCoordinatorError) {
+        guard var record = records[id] else { throw .notFound(id) }
+        guard [.allocated, .paused].contains(record.lease.state) else {
+            throw .invalidState(leaseID: id, state: record.lease.state)
+        }
+        record.lease.state = .active
+        records[id] = record
+    }
+
+    public func pause(id: String) throws(WorkspaceLeaseCoordinatorError) {
+        guard var record = records[id] else { throw .notFound(id) }
+        guard record.lease.state == .active else {
+            throw .invalidState(leaseID: id, state: record.lease.state)
+        }
+        record.lease.state = .paused
+        records[id] = record
+    }
+
+    public func checkpoint(id: String) async throws(WorkspaceLeaseCoordinatorError) -> WorkspaceCheckpoint {
+        guard let record = records[id] else { throw .notFound(id) }
+        guard [.active, .paused, .promotionPending].contains(record.lease.state) else {
+            throw .invalidState(leaseID: id, state: record.lease.state)
+        }
+        let checkpoint: WorkspaceCheckpoint
+        do {
+            checkpoint = try await provider.checkpoint(record.lease)
+        } catch {
+            throw Self.providerFailure(leaseID: id, operation: "checkpoint", error: error)
+        }
+        guard checkpoint.leaseID == id else {
+            throw .invalidProviderLease(id)
+        }
+        guard var current = records[id], current.lease.state != .cleaned else {
+            throw .invalidState(leaseID: id, state: .cleaned)
+        }
+        current.lease.checkpointID = checkpoint.id
+        records[id] = current
+        return checkpoint
+    }
+
+    public func diff(id: String) async throws(WorkspaceLeaseCoordinatorError) -> WorkspaceDiffSummary {
+        guard let record = records[id] else { throw .notFound(id) }
+        guard record.lease.state != .cleaned else {
+            throw .invalidState(leaseID: id, state: .cleaned)
+        }
+        do {
+            let summary = try await provider.diff(record.lease)
+            guard summary.leaseID == id else { throw WorkspaceLeaseCoordinatorError.invalidProviderLease(id) }
+            return summary
+        } catch let error as WorkspaceLeaseCoordinatorError {
+            throw error
+        } catch {
+            throw Self.providerFailure(leaseID: id, operation: "diff", error: error)
+        }
+    }
+
+    /// Attempts promotion only after ownership conflicts are absent and the
+    /// caller has explicitly approved it. An unapproved request is a visible
+    /// pending result and never reaches the provider.
+    public func promote(
+        _ request: WorkspacePromotionRequest
+    ) async throws(WorkspaceLeaseCoordinatorError) -> WorkspacePromotionResult {
+        guard var record = records[request.leaseID] else { throw .notFound(request.leaseID) }
+        guard [.active, .paused, .promotionPending].contains(record.lease.state) else {
+            throw .invalidState(leaseID: request.leaseID, state: record.lease.state)
+        }
+        guard !request.targetSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return WorkspacePromotionResult(
+                status: .rejected,
+                leaseID: request.leaseID,
+                message: "Promotion target is required"
+            )
+        }
+
+        let currentOwners = Set(record.claims.map(\.ownerID))
+        let otherClaims = records.values
+            .filter { $0.lease.id != request.leaseID && $0.lease.state != .cleaned }
+            .flatMap(\.claims)
+        let allClaims = record.claims + otherClaims
+        let conflicts: [WorkspaceConflict]
+        do {
+            conflicts = try WorkspaceOwnershipPlanner.conflicts(allClaims).filter {
+                currentOwners.contains($0.leftOwnerID) || currentOwners.contains($0.rightOwnerID)
+            }
+        } catch let error as WorkspaceOwnershipError {
+            throw .invalidOwnership(error)
+        }
+        if !conflicts.isEmpty {
+            let paths = Array(Set(conflicts.flatMap(\.paths))).sorted()
+            let resources = Array(Set(conflicts.flatMap(\.resources))).sorted()
+            let owners = Array(Set(conflicts.flatMap { [$0.leftOwnerID, $0.rightOwnerID] })).sorted()
+            record.lease.state = .conflicted
+            records[request.leaseID] = record
+            return WorkspacePromotionResult(
+                status: .conflicted,
+                leaseID: request.leaseID,
+                message: "Workspace ownership conflicts require review",
+                conflictingPaths: paths,
+                conflictingResources: resources,
+                conflictingOwners: owners
+            )
+        }
+
+        guard request.approved else {
+            record.lease.state = .promotionPending
+            records[request.leaseID] = record
+            return WorkspacePromotionResult(
+                status: .requiresApproval,
+                leaseID: request.leaseID,
+                message: "Promotion requires explicit approval"
+            )
+        }
+
+        let result: WorkspacePromotionResult
+        do {
+            result = try await provider.promote(request)
+        } catch {
+            throw Self.providerFailure(leaseID: request.leaseID, operation: "promote", error: error)
+        }
+        guard result.leaseID == request.leaseID else {
+            throw .invalidProviderLease(request.leaseID)
+        }
+        guard var current = records[request.leaseID] else { throw .notFound(request.leaseID) }
+        switch result.status {
+        case .promoted:
+            current.lease.state = .promoted
+        case .requiresApproval:
+            current.lease.state = .promotionPending
+        case .conflicted:
+            current.lease.state = .conflicted
+        case .rejected:
+            current.lease.state = .active
+        }
+        records[request.leaseID] = current
+        return result
+    }
+
+    public func cleanup(id: String) async throws(WorkspaceLeaseCoordinatorError) {
+        guard var record = records[id] else { throw .notFound(id) }
+        guard record.lease.state != .cleaned else { return }
+        do {
+            try await provider.cleanup(record.lease)
+        } catch {
+            throw Self.providerFailure(leaseID: id, operation: "cleanup", error: error)
+        }
+        record.lease.state = .cleaned
+        records[id] = record
+    }
+
+    public func waves(
+        _ plans: [WorkspaceStagePlan]
+    ) throws(WorkspaceOwnershipError) -> [[String]] {
+        try WorkspaceOwnershipPlanner.waves(plans)
+    }
+
+    private static func normalizedRoot(_ path: String) throws(WorkspaceLeaseCoordinatorError) -> String {
+        guard !path.isEmpty, path.hasPrefix("/"), path != "/",
+              !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f })
+        else { throw .invalidRootPath(path) }
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+        guard normalized != "/", normalized.hasPrefix("/") else { throw .invalidRootPath(path) }
+        return normalized
+    }
+
+    private static func rootsOverlap(_ left: String, _ right: String) -> Bool {
+        left == right || left.hasPrefix(right + "/") || right.hasPrefix(left + "/")
+    }
+
+    private static func providerFailure(
+        leaseID: String,
+        operation: String,
+        error: any Error
+    ) -> WorkspaceLeaseCoordinatorError {
+        .providerFailed(
+            leaseID: leaseID,
+            operation: operation,
+            message: Redaction.diagnostic(String(describing: error))
+        )
+    }
 }
 
 public enum WorkspaceAccess: String, Sendable, Codable, Hashable, CaseIterable {
