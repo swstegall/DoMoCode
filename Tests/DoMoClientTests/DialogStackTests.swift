@@ -51,8 +51,8 @@ struct DialogStackTests {
             items: [SelectItem(value: "read", label: "read")]
         )
         var inserted: [String] = []
-        dialog.onInsert = { inserted.append($0.value) }
-        dialog.onSelect = { inserted.append("enter:($0.value)") }
+        dialog.onInsert = { item in inserted.append(item.value) }
+        dialog.onSelect = { item in inserted.append("enter:" + item.value) }
 
         dialog.handleInput([0x09])
         dialog.handleInput([0x0d])
