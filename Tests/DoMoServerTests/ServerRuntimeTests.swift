@@ -172,6 +172,31 @@ struct ServerRuntimeTests {
         #expect(entries[2].metadata["adapterKind"] == .string("browser"))
     }
 
+    @Test("Refreshing models merges LiteLLM discoveries with configured aliases")
+    func refreshModelsMergesDiscoveredAliases() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = ServerRuntime(config: .init(
+            systemPrompt: "test",
+            tools: [],
+            model: "configured-model",
+            streamFn: { _ in AsyncThrowingStream { $0.finish() } },
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path,
+            modelOptions: [ModelOption(id: "configured-model")],
+            modelDiscovery: {
+                [ModelOption(id: "configured-model"), ModelOption(id: "gateway/discovered")]
+            }
+        ))
+
+        let initial = await runtime.models()
+        #expect(initial.map(\.id) == ["configured-model"])
+        let refreshed = try await runtime.refreshModels()
+        #expect(refreshed.map(\.id) == ["configured-model", "gateway/discovered"])
+        let merged = await runtime.models()
+        #expect(merged.contains { $0.id == "gateway/discovered" })
+    }
+
     @Test("Resuming a live session returns the same session, not a second harness")
     func resumeLiveReturnsSameSession() async throws {
         let dirs = try Dirs()

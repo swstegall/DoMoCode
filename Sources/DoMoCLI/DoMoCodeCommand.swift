@@ -1348,6 +1348,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 return makeStreamFn(client: client, runtime: selected)
             },
             modelOptions: modelOptions,
+            modelDiscovery: {
+                let catalog = try await client.listModels()
+                return catalog.models.map { entry in
+                    ModelOption(id: entry.id)
+                }
+            },
             modelStreamFactory: { alias in
                 var selected = configuration.modelRuntime(for: alias)
                 if alias == model {
@@ -1514,6 +1520,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     cwd: workingDirectory.string
                 ),
                 themePreferencePath: configuration.configDirectory.appending("theme.json"),
+                modelPreferencePath: configuration.configDirectory.appending("model.json"),
                 // The clipboard half a terminal cannot do for itself. Resolved ONCE,
                 // here, from this process's environment: DoMoClient has no
                 // subprocess dependency and must not grow one so a right-click can

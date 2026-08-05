@@ -104,6 +104,8 @@ public final class ClientApp {
     private var theme = Theme.standard
     private let themePreferenceStore: ThemePreferenceStore
     private var appearance: ThemeAppearance
+    private let modelPreferenceStore: ModelPreferenceStore
+    private var preferredModel: String?
     private var eventTask: Task<Void, Never>?
     /// User actions can outlive the input event that started them. Keep them under
     /// the app's lifetime so shutdown cancels and drains in-flight HTTP requests
@@ -291,16 +293,20 @@ public final class ClientApp {
         client: ServerClient,
         historyStore: PromptHistoryStore? = nil,
         themePreferencePath: FilePath? = nil,
+        modelPreferencePath: FilePath? = nil,
         clipboard: any ClipboardSink = NoClipboardSink(),
         clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
         multiplexer: TerminalMultiplexer = .none,
         mouseOwned: Bool = true
     ) {
         let preferences = ThemePreferenceStore(path: themePreferencePath)
+        let modelPreferences = ModelPreferenceStore(path: modelPreferencePath)
         self.client = client
         self.historyStore = historyStore
         self.themePreferenceStore = preferences
         self.appearance = preferences.load()
+        self.modelPreferenceStore = modelPreferences
+        self.preferredModel = modelPreferences.load()
         self.clipboard = clipboard
         self.clipboardPaste = clipboardPaste
         self.multiplexer = multiplexer
@@ -1648,6 +1654,18 @@ public final class ClientApp {
         }
         guard store.selectedSessionID == sessionID else { return }
 
+        if let preferredModel {
+            do {
+                try await client.changeModel(sessionID: sessionID, modelID: preferredModel)
+            } catch {
+                failures.append((
+                    "Could not apply the saved model",
+                    error,
+                    "Choose another model from the command palette."
+                ))
+            }
+        }
+
         var history: [Message] = []
         do {
             history = try await client.messages(sessionID: sessionID)
@@ -2200,24 +2218,43 @@ public final class ClientApp {
 
     private func openModelPicker() {
         guard store.selectedSessionID != nil else { post(notice: "no session is open"); return }
+        if modelPickerHandle != nil {
+            dismissModelPicker()
+            return
+        }
+        let loading = SearchableSelectDialog(title: "Switch model · loading…", items: [], keybindings: keybindings)
+        loading.onCancel = { [weak self] in self?.dismissModelPicker() }
+        loading.onSelect = { _ in }
+        modelPickerDialog = loading
+        modelPickerHandle = dialogs?.present(loading, options: overlayOptions(width: 92, height: 18))
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 let models = try await self.client.models()
-                guard !models.isEmpty else { self.post(notice: "the runtime has no model aliases"); return }
-                let items = models.map {
-                    SelectItem(value: $0.id, label: $0.id, description: $0.contextWindow.map { "window \($0) tokens" })
+                guard !models.isEmpty else {
+                    self.modelPickerDialog?.update(title: "Switch model · no models", items: [])
+                    self.surface?.requestRender()
+                    return
                 }
-                let dialog = SearchableSelectDialog(title: "Switch model", items: items, keybindings: self.keybindings)
+                let items = models.map {
+                    SelectItem(
+                        value: $0.id,
+                        label: $0.id,
+                        description: $0.contextWindow.map { "window \($0) tokens" } ?? "discovered by LiteLLM"
+                    )
+                }
+                guard let dialog = self.modelPickerDialog else { return }
+                dialog.update(title: "Switch model", items: items)
                 dialog.onCancel = { [weak self] in self?.dismissModelPicker() }
                 dialog.onSelect = { [weak self] item in
                     self?.dismissModelPicker()
                     self?.selectModel(item.value)
                 }
-                self.modelPickerDialog = dialog
-                self.modelPickerHandle = self.dialogs?.present(dialog, options: self.overlayOptions(width: 82, height: 18))
+                self.surface?.requestRender()
             } catch {
-                self.postError("Could not load models", error)
+                self.modelPickerDialog?.update(title: "Switch model · unavailable", items: [])
+                self.surface?.requestRender()
+                self.postError("Could not load models", error, hint: "Escape closes the picker; the configured model remains active.")
             }
         }
         actionTasks.append(task)
@@ -2235,7 +2272,14 @@ public final class ClientApp {
             guard let self else { return }
             do {
                 try await self.client.changeModel(sessionID: id, modelID: model)
-                self.post(notice: "model selected: \(sanitizeUntrustedText(model))")
+                self.preferredModel = model
+                var notice = "model selected: \(sanitizeUntrustedText(model))"
+                do {
+                    try self.modelPreferenceStore.save(model)
+                } catch {
+                    notice += " (not saved)"
+                }
+                self.post(notice: notice)
                 self.store.markAccountingStale()
                 await self.refreshToolCatalog(sessionID: id)
             } catch {

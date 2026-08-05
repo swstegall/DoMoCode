@@ -309,6 +309,9 @@ public actor ServerRuntime {
         /// The aliases exposed by the model picker. An empty list is replaced by
         /// the configured default model at runtime.
         public var modelOptions: [ModelOption]
+        /// Refreshes the gateway's advertised model aliases. Credentials stay in
+        /// the serving process; clients only receive the merged public IDs.
+        public var modelDiscovery: (@Sendable () async throws -> [ModelOption])?
         /// Resolves a selected alias to the concrete stream function owned by the
         /// CLI's LLM client.
         public var modelStreamFactory: (@Sendable (String) -> AgentStreamFn)?
@@ -449,6 +452,7 @@ public actor ServerRuntime {
             commandProcessor: PromptCommandProcessor? = nil,
             commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)? = nil,
             modelOptions: [ModelOption] = [],
+            modelDiscovery: (@Sendable () async throws -> [ModelOption])? = nil,
             modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
             recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
             recoveryDiagnosticTools: [any AgentTool] = [],
@@ -479,6 +483,7 @@ public actor ServerRuntime {
             self.commandProcessor = commandProcessor
             self.commandStreamFactory = commandStreamFactory
             self.modelOptions = modelOptions
+            self.modelDiscovery = modelDiscovery
             self.modelStreamFactory = modelStreamFactory
             self.recoveryDiagnostic = recoveryDiagnostic
             self.recoveryDiagnosticTools = recoveryDiagnosticTools
@@ -690,6 +695,7 @@ public actor ServerRuntime {
     private let config: Config
     private let terminalService: PTYService
     private var sessions: [String: SessionState] = [:]
+    private var discoveredModelOptions: [ModelOption] = []
     private var subagents: [String: SubagentRecord] = [:]
     private var workflowRunners: [String: WorkflowRunner] = [:]
     private var workflowTasks: [String: Task<Void, Never>] = [:]
@@ -1198,10 +1204,29 @@ public actor ServerRuntime {
     }
 
     public func models() -> [ModelOption] {
-        if config.modelOptions.isEmpty {
+        var merged: [String: ModelOption] = [:]
+        for option in config.modelOptions { merged[option.id] = option }
+        for option in discoveredModelOptions {
+            let configured = merged[option.id]
+            merged[option.id] = ModelOption(
+                id: option.id,
+                provider: option.provider,
+                contextWindow: option.contextWindow ?? configured?.contextWindow
+            )
+        }
+        if merged.isEmpty {
             return [ModelOption(id: config.model, contextWindow: config.contextWindow)]
         }
-        return config.modelOptions
+        return merged.values.sorted { $0.id < $1.id }
+    }
+
+    /// Refresh the gateway-backed catalog while preserving configured aliases
+    /// when a proxy returns an empty advisory list. A failed refresh is surfaced
+    /// to the route so the client can show a visible failure state.
+    public func refreshModels() async throws -> [ModelOption] {
+        guard let modelDiscovery = config.modelDiscovery else { return models() }
+        discoveredModelOptions = try await modelDiscovery()
+        return models()
     }
 
     /// The durable workflow definitions known to this runtime, ordered by id.

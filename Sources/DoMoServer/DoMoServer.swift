@@ -388,7 +388,7 @@ public struct DoMoServer: Sendable {
 
         router.get("/models") { _, _ in
             try await self.mapErrors {
-                try Self.json(await self.runtime.models())
+                try Self.json(try await self.runtime.refreshModels())
             }
         }
 
