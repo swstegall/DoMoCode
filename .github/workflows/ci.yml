@@ -94,10 +94,21 @@ jobs:
           # still schedules separate suites concurrently inside one process. The
           # CLI target owns real child processes, PTYs, and loopback gateways, so
           # run each suite in its own process to keep fixture teardown isolated.
+          # Discover once before starting any fixture-bearing process. Running
+          # `swift test list` after the server target has torn down its HTTP and
+          # async fixtures can leave SwiftPM waiting forever before the first
+          # client process starts (Swift 6.3.3). The cached list also keeps every
+          # subsequent loop on the same test-discovery snapshot.
+          all_tests="$(swift test list --configuration ${{ matrix.configuration }})"
+          if [[ -z "$all_tests" ]]; then
+            printf 'No tests discovered\n' >&2
+            exit 1
+          fi
+
           run_target_suites_serially() {
             local target="$1"
             local suites
-            suites="$(swift test list --configuration ${{ matrix.configuration }} \
+            suites="$(printf '%s\n' "$all_tests" \
               | sed -n "s/^${target}\\.\\([^/]*\\)\\/.*$/\\1/p" \
               | sort -u)"
             if [[ -z "$suites" ]]; then
@@ -122,7 +133,7 @@ jobs:
             local target="$1"
             local suite="$2"
             local tests
-            tests="$(swift test list --configuration ${{ matrix.configuration }} \
+            tests="$(printf '%s\n' "$all_tests" \
               | sed -n "s/^${target}\\.${suite}\\/\\(.*\\)$/\\1/p" \
               | sort -u)"
             if [[ -z "$tests" ]]; then
