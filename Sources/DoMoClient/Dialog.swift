@@ -28,9 +28,24 @@ final class DialogStack {
         // two border rows, while making palette/picker/form callers equally clear
         // against a bright or dark page background.
         let framed: Component = component is Box ? component : Box(component, paddingX: 1)
-        let handle = surface.showOverlay(framed, options: options)
+        let handle = surface.showOverlay(
+            framed,
+            options: Self.optionsForFramedComponent(component, options: options)
+        )
         handles.append(handle)
         return handle
+    }
+
+    /// A ``Box`` contributes one top and one bottom row. Callers size the
+    /// unframed dialog content, so preserve both rules when an explicit height
+    /// cap is supplied. Explicitly boxed callers already include those rows in
+    /// their own budget and are left unchanged.
+    static func optionsForFramedComponent(_ component: Component, options: OverlayOptions?) -> OverlayOptions? {
+        guard !(component is Box), let original = options else { return options }
+        var adjusted = original
+        guard case .absolute(let height) = adjusted.maxHeight else { return options }
+        adjusted.maxHeight = .absolute(height + 2)
+        return adjusted
     }
 
     func dismiss(_ handle: ScreenOverlayHandle?) {

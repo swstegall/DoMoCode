@@ -117,6 +117,23 @@ struct ClientViewTests {
         #expect(sidebar.render(width: 20)[3] == unrelated)
     }
 
+    @Test("The focused sidebar row marquee keeps the session suffix stable")
+    func sidebarFocusedMarquee() {
+        let sidebar = SessionSidebar()
+        sidebar.sessions = [summary("abcdef123456", cwd: "/home/a-very-long-project-directory")]
+        sidebar.focused = true
+        sidebar.clock = { 2.0 }
+        let initial = sidebar.render(width: 20)[2]
+
+        sidebar.clock = { 3.1 }
+        let moved = sidebar.render(width: 20)[2]
+
+        #expect(initial.contains("123456"))
+        #expect(moved.contains("123456"))
+        #expect(initial != moved)
+        #expect(visibleWidth(moved) == 20)
+    }
+
     @Test("The full-screen status bar scrolls long controls instead of dropping them")
     func statusBarMarquee() {
         let status = StatusBar()

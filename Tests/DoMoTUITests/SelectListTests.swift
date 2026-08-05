@@ -196,6 +196,24 @@ struct SelectListTests {
         #expect(oracle.screen.contains { $0.contains("Option 5") })
     }
 
+    @Test("The selected overlong label scrolls instead of truncating permanently")
+    func selectedLabelMarquee() {
+        var now = 0.0
+        let list = SelectList(
+            items: items(["a label that is much too long for this row"]),
+            maxVisible: 3,
+            clock: { now }
+        )
+
+        let initial = list.render(width: 14)[0]
+        now = 1.1
+        let moved = list.render(width: 14)[0]
+
+        #expect(visibleWidth(initial) <= 14)
+        #expect(visibleWidth(moved) <= 14)
+        #expect(initial != moved)
+    }
+
     // MARK: Empty list
 
     @Test("Cancel still fires when the list is empty")

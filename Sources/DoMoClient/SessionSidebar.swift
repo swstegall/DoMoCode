@@ -74,8 +74,8 @@ final class SessionSidebar: @MainActor Focusable {
     }
 
     func marqueeActive(width: Int) -> Bool {
-        guard let hoveredSessionID,
-              let session = sessions.first(where: { $0.id == hoveredSessionID })
+        guard let activeSessionID,
+              let session = sessions.first(where: { $0.id == activeSessionID })
         else { return false }
         let parts = sessionLabelParts(session)
         return Marquee.isNeeded(parts.body, width: bodyWidth(for: width, suffix: parts.suffix))
@@ -92,10 +92,11 @@ final class SessionSidebar: @MainActor Focusable {
             return lines
         }
         let clampedCursor = min(cursor, sessions.count - 1)
+        let activeID = activeSessionID
         // Clamp here too: `sessions` can shrink between a scroll and a render.
         let offset = min(max(0, scrollOffset), max(0, sessions.count - 1))
         for (index, session) in sessions.enumerated().dropFirst(offset) {
-            let label = sessionRow(session, width: width)
+            let label = sessionRow(session, width: width, active: session.id == activeID)
             lines.append(index == clampedCursor && focused ? inverse(label) : label)
         }
         return lines
@@ -128,14 +129,14 @@ final class SessionSidebar: @MainActor Focusable {
         }
     }
 
-    private func sessionRow(_ session: SessionSummary, width: Int) -> String {
+    private func sessionRow(_ session: SessionSummary, width: Int, active: Bool) -> String {
         let marker = session.id == openID ? "• " : "  "
         let parts = sessionLabelParts(session)
         let budget = bodyWidth(for: width, suffix: parts.suffix)
         let identity = session.id + "\u{0}" + parts.body + "\u{0}" + String(budget)
         var state = marqueeStates[session.id] ?? MarqueeState()
         let body: String
-        if session.id == hoveredSessionID {
+        if active {
             body = Marquee.render(
                 parts.body,
                 width: budget,
@@ -149,6 +150,14 @@ final class SessionSidebar: @MainActor Focusable {
         }
         marqueeStates[session.id] = state
         return truncateToWidth(marker + body + parts.suffix, width, ellipsis: "", pad: true)
+    }
+
+    /// The pointer preview takes precedence, while keyboard focus makes the
+    /// cursor row the active selector for the same marquee behavior.
+    private var activeSessionID: String? {
+        if let hoveredSessionID { return hoveredSessionID }
+        guard focused, !sessions.isEmpty else { return nil }
+        return sessions[min(cursor, sessions.count - 1)].id
     }
 
     private func bodyWidth(for width: Int, suffix: String) -> Int {

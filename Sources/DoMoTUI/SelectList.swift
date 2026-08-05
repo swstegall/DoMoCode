@@ -12,6 +12,7 @@
 // `(current/total)` position string.
 
 import DoMoTermIO
+import Foundation
 
 // MARK: - Item
 
@@ -138,6 +139,10 @@ public final class SelectList: Component {
     private let theme: SelectListTheme
     private let layout: SelectListLayoutOptions
     private let keybindings: Keybindings
+    /// Injectable clock for deterministic selector marquee rendering. Production
+    /// callers use wall time; tests and render oracles can freeze it.
+    public var clock: () -> Double
+    private var marqueeState = MarqueeState()
 
     /// Fired when the user confirms (Enter) with a valid selection.
     public var onSelect: ((SelectItem) -> Void)?
@@ -151,7 +156,8 @@ public final class SelectList: Component {
         maxVisible: Int,
         theme: SelectListTheme = .plain,
         layout: SelectListLayoutOptions = SelectListLayoutOptions(),
-        keybindings: Keybindings = Keybindings()
+        keybindings: Keybindings = Keybindings(),
+        clock: @escaping () -> Double = { Date().timeIntervalSinceReferenceDate }
     ) {
         self.items = items
         self.filteredItems = items
@@ -159,6 +165,7 @@ public final class SelectList: Component {
         self.theme = theme
         self.layout = layout
         self.keybindings = keybindings
+        self.clock = clock
     }
 
     // MARK: State access
@@ -332,6 +339,16 @@ public final class SelectList: Component {
         columnWidth: Int
     ) -> String {
         let displayValue = item.displayValue
+        if isSelected, Marquee.isNeeded(displayValue, width: maxWidth) {
+            let identity = item.value + "\u{0}" + String(maxWidth)
+            return Marquee.render(
+                displayValue,
+                width: maxWidth,
+                identity: identity,
+                now: clock(),
+                state: &marqueeState
+            )
+        }
         let truncatedValue: String
         if let custom = layout.truncatePrimary {
             truncatedValue = custom(SelectListTruncatePrimaryContext(
