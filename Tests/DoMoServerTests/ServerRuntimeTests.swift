@@ -50,6 +50,25 @@ struct ServerRuntimeTests {
         }
     }
 
+    private struct DirectReadTool: AgentTool {
+        var definition: ToolDefinition {
+            ToolDefinition(
+                name: "read",
+                description: "Read a file",
+                parameters: JSONSchema.object(.required("path", .string()))
+            )
+        }
+
+        func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
+            guard case .object(let values) = arguments,
+                  let path = values["path"]?.stringValue
+            else {
+                return AgentToolResult(output: "missing path", isError: true)
+            }
+            return AgentToolResult(output: "read " + path)
+        }
+    }
+
     private struct Dirs {
         let root: URL
         let cwd: URL
@@ -170,6 +189,33 @@ struct ServerRuntimeTests {
         #expect(entries[2].permission == .unavailable)
         #expect(entries[2].hiddenReason == "Available only in plan mode")
         #expect(entries[2].metadata["adapterKind"] == .string("browser"))
+    }
+
+    @Test("A catalog command executes through the live session tool set")
+    func directToolCommandRunsAgainstSessionTools() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let runtime = ServerRuntime(config: .init(
+            systemPrompt: "test",
+            tools: [],
+            model: "test-model",
+            streamFn: { _ in AsyncThrowingStream { $0.finish() } },
+            toolExecution: .sequential,
+            sessionDirectory: FilePath(dirs.sessions.path),
+            cwd: dirs.cwd.path,
+            toolsForSession: { _, _ in [DirectReadTool()] }
+        ))
+        let session = try await runtime.createSession()
+
+        let result = try await runtime.executeDirectTool(
+            sessionID: session.id,
+            command: "/read foo.txt"
+        )
+
+        #expect(result.toolName == "read")
+        #expect(result.output == "read foo.txt")
+        #expect(!result.isError)
+        #expect(try await runtime.status(sessionID: session.id).running == false)
     }
 
     @Test("Refreshing models merges LiteLLM discoveries with configured aliases")

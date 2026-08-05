@@ -12,6 +12,10 @@ import DoMoLLM
 import Foundation
 import SystemPackage
 
+private struct DirectToolDiscardingSink: AgentEventSink {
+    func emit(_ event: AgentEvent) async {}
+}
+
 // MARK: - Harness
 
 /// The stateful runtime that ties the session store, the tree/context builder, and
@@ -802,6 +806,54 @@ public actor AgentHarness {
     /// harness reconstructs the identical context an uninterrupted run held.
     public func contextMessages() throws -> [Message] {
         try buildContextMessages()
+    }
+
+    /// Execute a catalog command without involving the model. Tool resolution
+    /// still comes from the current session/model resolver, and the shared
+    /// dispatcher runs permission and lifecycle hooks before invoking it.
+    public func executeDirectTool(
+        command: String,
+        sink: (any AgentEventSink)? = nil
+    ) async throws(DoMoError) -> DirectToolInvocation {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "AgentHarness is already running a turn")
+        }
+        isRunning = true
+        defer { isRunning = false }
+
+        let tools: [any AgentTool]
+        if let resolver = configuration.getTools {
+            tools = await resolver(activeModel)
+        } else {
+            tools = configuration.tools
+        }
+        let parsed = try DirectToolCommandParser.parse(command, tools: tools)
+        let call = ToolCallBlock(
+            id: "direct-\(UUIDv7.generate().description)",
+            name: parsed.name,
+            arguments: parsed.arguments
+        )
+        let assistant = AssistantMessage(
+            content: [.toolCall(call)],
+            model: activeModel,
+            stopReason: .toolUse
+        )
+        let loopConfig = AgentLoopConfig(
+            model: activeModel,
+            toolExecution: configuration.toolExecution,
+            beforeToolCall: configuration.beforeToolCall,
+            toolLifecycle: configuration.toolLifecycle,
+            toolLifecycleTimeout: configuration.toolLifecycleTimeout
+        )
+        let eventSink: any AgentEventSink = sink ?? DirectToolDiscardingSink()
+        let result = await executeDirectToolCall(
+            call,
+            from: assistant,
+            tools: tools,
+            config: loopConfig,
+            sink: eventSink
+        )
+        return DirectToolInvocation(toolName: parsed.name, result: result)
     }
 
     /// Write a compaction checkpoint for the current branch immediately.

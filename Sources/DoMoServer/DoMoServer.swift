@@ -57,6 +57,10 @@ private struct PromptBody: Decodable {
     var images: [ImageBlock]?
 }
 
+private struct DirectToolBody: Decodable {
+    var command: String
+}
+
 /// `POST /session/{id}/permission` body (Phase 8b). `reply` is "once" / "always" /
 /// "reject"; `message` is the optional model-visible reason carried only on reject.
 private struct PermissionReplyBody: Decodable {
@@ -774,6 +778,17 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        router.post("/session/:id/tool") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
+                let body = try await Self.requiredBody(DirectToolBody.self, request)
+                return try Self.json(
+                    try await self.runtime.executeDirectTool(sessionID: id, command: body.command)
+                )
+            }
+        }
+
         router.get("/session/:id/messages") { _, context in
             try await self.mapErrors {
                 let id = try context.parameters.require("id")
@@ -1227,6 +1242,8 @@ public struct DoMoServer: Sendable {
             case .sessionClientDenied, .sessionClientAuthorityRequired:
                 throw HTTPError(.forbidden)
             case .sessionClientInvalid:
+                throw HTTPError(.badRequest)
+            case .toolCommandInvalid:
                 throw HTTPError(.badRequest)
             }
         }

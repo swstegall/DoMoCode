@@ -133,6 +133,7 @@ public struct ServerClient: Sendable {
 
     private struct CreateBody: Encodable { let resume: String? }
     private struct PromptBody: Encodable { let prompt: String; let images: [ImageBlock]? }
+    private struct DirectToolBody: Encodable { let command: String }
     private struct PermissionReplyBody: Encodable { let requestID: String; let reply: String; let message: String? }
     private struct QuestionReplyBody: Encodable { let requestID: String; let answers: [ServerQuestionAnswer]? }
     private struct ModelBody: Encodable { let modelID: String }
@@ -676,6 +677,18 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.get, path)
         try expect(status, 200, path, body: data)
         return try JSONDecoder().decode([ToolCatalogEntry].self, from: data)
+    }
+
+    /// Execute a tool command selected from the catalog. The server resolves the
+    /// command against the live tool schema and emits the ordinary tool lifecycle
+    /// events on the session stream.
+    public func executeToolCommand(sessionID: String, command: String) async throws -> DirectToolResult {
+        _ = try await attachIfSupported(sessionID: sessionID)
+        let path = "/session/\(sessionID)/tool"
+        let body = try JSONEncoder().encode(DirectToolBody(command: command))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode(DirectToolResult.self, from: data)
     }
 
     /// The linear root-to-leaf transcript to seed the main pane. `GET

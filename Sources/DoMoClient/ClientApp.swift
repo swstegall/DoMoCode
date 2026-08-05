@@ -3515,6 +3515,16 @@ public final class ClientApp {
             }
             return
         }
+        if let commandName = Self.commandName(in: trimmed),
+           commandRegistry.command(named: commandName) == nil {
+            guard attachments.isEmpty else {
+                promptInput.restore(text, attachments: attachments)
+                post(notice: "direct tool commands currently accept text only")
+                return
+            }
+            executeDirectToolCommand(trimmed, originalText: text, attachments: attachments)
+            return
+        }
         guard let id = store.selectedSessionID else {
             promptInput.restore(text, attachments: attachments)
             post(notice: "no session is open")
@@ -3573,6 +3583,42 @@ public final class ClientApp {
                     "Could not send the message",
                     error,
                     hint: "Your text was put back in the prompt."
+                )
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    /// Route an unknown slash command through the live tool catalog. Named local
+    /// commands and project prompt commands have already been handled by
+    /// ``submit(_:_: )``; what remains is the direct `/tool arguments` syntax.
+    private func executeDirectToolCommand(
+        _ command: String,
+        originalText: String,
+        attachments: [PromptAttachment]
+    ) {
+        guard let id = store.selectedSessionID else {
+            promptInput.restore(originalText, attachments: attachments)
+            post(notice: "no session is open")
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await self.client.executeToolCommand(sessionID: id, command: command)
+                guard self.store.selectedSessionID == id else { return }
+                self.surface?.requestRender()
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                self.promptInput.restore(originalText, attachments: attachments)
+                self.refuseAsBusy()
+                await self.reconcileWithServer(id)
+            } catch {
+                self.promptInput.restore(originalText, attachments: attachments)
+                self.post(notice: "could not run direct tool — the command was put back")
+                self.postError(
+                    "Could not run direct tool command",
+                    error,
+                    hint: "Your command was put back in the prompt."
                 )
             }
         }

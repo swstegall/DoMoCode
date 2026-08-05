@@ -82,6 +82,9 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     case sessionClientInvalid(String)
     /// The caller is not the session's current mutation/permission authority.
     case sessionClientAuthorityRequired
+    /// A direct slash-tool command could not be parsed or resolved against the
+    /// session's currently callable tool set.
+    case toolCommandInvalid(String)
 }
 
 /// A reference to a session, returned by create and fork.
@@ -117,6 +120,23 @@ public struct CompactionResult: Sendable, Codable, Hashable {
 
     public init(compacted: Bool) {
         self.compacted = compacted
+    }
+}
+
+/// The completed result of a direct catalog command. Tool lifecycle events carry
+/// the live progress; this response gives the requesting client a bounded REST
+/// completion value as well.
+public struct DirectToolResult: Sendable, Codable, Hashable {
+    public var toolName: String
+    public var output: String
+    public var isError: Bool
+    public var imageCount: Int
+
+    public init(toolName: String, output: String, isError: Bool, imageCount: Int = 0) {
+        self.toolName = toolName
+        self.output = output
+        self.isError = isError
+        self.imageCount = imageCount
     }
 }
 
@@ -612,6 +632,9 @@ public actor ServerRuntime {
         let agent: String?
         let toolAllowlist: Set<String>?
         var runTask: Task<Void, Never>?
+        /// A direct catalog command owns the same session slot as a model run,
+        /// but returns a typed value to its REST caller.
+        var directToolTask: Task<Result<DirectToolResult, DoMoError>, Never>?
         /// The typed result task for a delegated child. The ordinary `runTask`
         /// remains a `Task<Void, Never>` so abort/status keep one invariant for
         /// every session, while foreground callers can await this value.
@@ -632,6 +655,10 @@ public actor ServerRuntime {
         /// The runtime keeps the set so a client cannot address another session's
         /// process even when it guesses a UUID.
         var terminalIDs: Set<String> = []
+
+        var isBusy: Bool {
+            runTask != nil || directToolTask != nil
+        }
 
         init(
             token: Int,
@@ -3001,6 +3028,59 @@ public actor ServerRuntime {
 
     // MARK: Runs
 
+    /// Execute a slash-tool command selected from the live catalog. The harness
+    /// resolves the command against the same filtered tool set used for a model
+    /// turn, and the direct task is held in the session slot so a prompt cannot
+    /// race it while a permission dialog or tool is waiting.
+    public func executeDirectTool(sessionID: String, command: String) async throws -> DirectToolResult {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
+
+        let token = session.token
+        let harness = session.harness
+        let sink = RunSink(session.sink)
+        let task = Task { () -> Result<DirectToolResult, DoMoError> in
+            do {
+                let invocation = try await harness.executeDirectTool(command: command, sink: sink)
+                return .success(
+                    DirectToolResult(
+                        toolName: invocation.toolName,
+                        output: invocation.result.output,
+                        isError: invocation.result.isError,
+                        imageCount: invocation.result.images.count
+                    )
+                )
+            } catch let error as DoMoError {
+                return .failure(error)
+            } catch {
+                return .failure(
+                    DoMoError(wrapping: error, as: .toolExecution(tool: "command"), "Direct tool command failed")
+                )
+            }
+        }
+        session.directToolTask = task
+        session.runSink = sink
+        session.runStartedAt = Date()
+
+        let outcome = await task.value
+        guard let current = sessions[sessionID], current.token == token else {
+            switch outcome {
+            case .success(let result): return result
+            case .failure(let error):
+                throw ServerRuntimeError.toolCommandInvalid(error.description)
+            }
+        }
+        current.directToolTask = nil
+        current.runSink = nil
+        current.runStartedAt = nil
+        switch outcome {
+        case .success(let result):
+            return result
+        case .failure(let error):
+            throw ServerRuntimeError.toolCommandInvalid(error.description)
+        }
+    }
+
     /// Start a turn on a session. Returns immediately; the run advances in a
     /// retained ``Task`` whose events flow to the session's broadcast sink.
     ///
@@ -3045,7 +3125,7 @@ public actor ServerRuntime {
         drainSteeringBeforeFirstTurn: Bool = true
     ) throws {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         let harness = session.harness
         // NOT `session.sink` directly: everything this run emits goes through a gate
         // the runtime can close, so a run that ``forceClearRun(sessionID:)`` walked
@@ -3255,8 +3335,9 @@ public actor ServerRuntime {
     @discardableResult
     public func abort(sessionID: String) throws -> Bool {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        let wasRunning = session.runTask != nil
+        let wasRunning = session.isBusy
         session.runTask?.cancel()
+        session.directToolTask?.cancel()
         session.subagentResultTask?.cancel()
         // A foreground child is part of the parent's tool call and must not
         // outlive an aborted parent. Background children intentionally survive
@@ -3365,7 +3446,7 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         // Read synchronously, before the first suspension, so "was anything held"
         // cannot be answered from a stale snapshot.
-        guard session.runTask != nil || !session.pending.isEmpty else {
+        guard session.isBusy || !session.pending.isEmpty else {
             // Nothing to free. Replacing the state anyway is not harmlessly wasted
             // work: rebuilding a harness means re-opening the file, and an earlier
             // force-clear's abandoned run may since have moved the file's leaf onto
@@ -3440,6 +3521,7 @@ public actor ServerRuntime {
         // can emit into a sink the replacement state already owns.
         session.runSink?.detach()
         session.runTask?.cancel()
+        session.directToolTask?.cancel()
         session.subagentResultTask?.cancel()
         for record in subagents.values where record.parentSessionID == sessionID && !record.background {
             sessions[record.childSessionID]?.subagentResultTask?.cancel()
@@ -3505,7 +3587,7 @@ public actor ServerRuntime {
     ///    and serializes against the harness's own work.
     public func status(sessionID: String) async throws -> SessionStatus {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        let running = session.runTask != nil
+        let running = session.isBusy
         // Sorted so the projection is stable across calls; the pending map is
         // a dictionary and its iteration order is not.
         let pendingPermissionIDs = session.pending.keys.sorted()
@@ -3557,7 +3639,7 @@ public actor ServerRuntime {
     /// session selection — so a client attaching mid-turn asks rather than assumes.
     /// An unknown session is not running.
     public func isRunning(sessionID: String) -> Bool {
-        sessions[sessionID]?.runTask != nil
+        sessions[sessionID]?.isBusy ?? false
     }
 
     /// The broadcast sink for a live session, for the SSE handler to subscribe to.
@@ -3608,14 +3690,14 @@ public actor ServerRuntime {
     /// checkpoint. The harness owns the append-only action and conflict result.
     public func undo(sessionID: String) async throws -> WorkspaceHistoryResult {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         return try await session.harness.undo()
     }
 
     /// Reapply the most recent undo when no newer entry superseded it.
     public func redo(sessionID: String) async throws -> WorkspaceHistoryResult {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         return try await session.harness.redo()
     }
 
@@ -3623,7 +3705,7 @@ public actor ServerRuntime {
     /// next turn.
     public func changeModel(sessionID: String, modelID: String) async throws {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         guard let option = models().first(where: { $0.id == modelID }) else {
             throw DoMoError(.configuration, "Unknown model: \(modelID)")
         }
@@ -3640,7 +3722,7 @@ public actor ServerRuntime {
     @discardableResult
     public func changeMode(sessionID: String, mode: AgentMode) throws -> AgentMode {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         session.modeState.set(mode)
         session.sink.broadcast(
             .notice(ServerNotice(level: .info, code: "mode", text: "mode: \(mode.rawValue)", ttlMilliseconds: 2500))
@@ -3650,7 +3732,7 @@ public actor ServerRuntime {
 
     public func renameSession(sessionID: String, name: String?) async throws {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         try await session.harness.rename(name)
     }
 
@@ -3659,19 +3741,19 @@ public actor ServerRuntime {
     /// belong to its harness; the client revives disk-only sessions before calling.
     public func autoTitle(sessionID: String) async throws -> String? {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         return try await session.harness.autoTitle()
     }
 
     public func label(sessionID: String, targetID: String, label: String?) async throws {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         try await session.harness.setLabel(targetID: targetID, label: label)
     }
 
     public func moveLeaf(sessionID: String, targetID: String?) async throws {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         try await session.harness.moveLeaf(to: targetID)
     }
 
@@ -3706,7 +3788,7 @@ public actor ServerRuntime {
     /// settings do not suppress an explicit user request.
     public func compact(sessionID: String) async throws -> CompactionResult {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         return CompactionResult(compacted: try await session.harness.compactNow())
     }
 
@@ -3740,7 +3822,7 @@ public actor ServerRuntime {
     public func restoreDiffFile(sessionID: String, path: String, base: String? = nil) async throws {
         let source = try configuredDiffSource()
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         let checkpoint: String?
         if let base {
             checkpoint = base
@@ -3760,7 +3842,7 @@ public actor ServerRuntime {
     /// Generate a commit subject from the same diff currently shown in review.
     public func commitMessage(sessionID: String) async throws -> String? {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
-        guard session.runTask == nil else { throw ServerRuntimeError.sessionBusy }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
         let diff = try await diff(sessionID: sessionID)
         return try await session.harness.generateCommitMessage(diff: diff.patch)
     }

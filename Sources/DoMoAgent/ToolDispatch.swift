@@ -52,6 +52,42 @@ struct ToolDispatch: Sendable {
         var terminate: Bool
     }
 
+    /// Execute one host-supplied call without opening an agent/model turn. The
+    /// normal prepare, permission, lifecycle, and result hooks still run; only
+    /// the assistant loop and transcript message generation are omitted.
+    func runDirect(_ toolCall: ToolCallBlock, from assistantMessage: AssistantMessage) async -> AgentToolResult {
+        await sink.emit(
+            .toolExecutionStart(
+                toolCallID: toolCall.id,
+                toolName: toolCall.name,
+                arguments: JSONValueBox(toolCall.arguments)
+            )
+        )
+        let finalized: Finalized
+        if Task.isCancelled {
+            finalized = Finalized(toolCall: toolCall, result: Self.abortedResult(for: toolCall))
+        } else {
+            switch await prepare(toolCall, from: assistantMessage) {
+            case .immediate(let result):
+                finalized = Finalized(toolCall: toolCall, result: result)
+            case .prepared(let tool, let preparedCall, let arguments, let metadata):
+                finalized = await executeAndFinalize(
+                    tool: tool,
+                    toolCall: preparedCall,
+                    arguments: arguments,
+                    metadata: metadata,
+                    from: assistantMessage
+                )
+            }
+        }
+        await emitEnd(finalized)
+        // Mirror the normal tool-result wire events so clients can render image
+        // attachments as well as the text carried by `tool_end`. The direct path
+        // deliberately does not persist this synthetic assistant turn.
+        _ = await emitResultMessage(finalized)
+        return finalized.result
+    }
+
     // MARK: - Entry
 
     /// Dispatches `toolCalls`, choosing sequential or parallel execution.
@@ -615,4 +651,17 @@ struct ToolDispatch: Sendable {
     private static func abortedResult(for toolCall: ToolCallBlock) -> AgentToolResult {
         AgentToolResult(output: "Tool call \"\(toolCall.name)\" was aborted.", isError: true)
     }
+}
+
+/// Public seam for hosts such as AgentHarness that need a direct catalog action
+/// but must not duplicate the dispatcher's permission and lifecycle path.
+public func executeDirectToolCall(
+    _ toolCall: ToolCallBlock,
+    from assistantMessage: AssistantMessage,
+    tools: [any AgentTool],
+    config: AgentLoopConfig,
+    sink: any AgentEventSink
+) async -> AgentToolResult {
+    await ToolDispatch(tools: tools, config: config, sink: sink)
+        .runDirect(toolCall, from: assistantMessage)
 }
