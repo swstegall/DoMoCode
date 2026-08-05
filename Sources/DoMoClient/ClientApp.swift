@@ -74,6 +74,7 @@ public final class ClientApp {
     private var surface: ScreenSurface?
     private var dialogs: DialogStack?
     private var paletteHandle: ScreenOverlayHandle?
+    private var themePickerHandle: ScreenOverlayHandle?
     private var sessionPickerHandle: ScreenOverlayHandle?
     private var modelPickerHandle: ScreenOverlayHandle?
     private var treePickerHandle: ScreenOverlayHandle?
@@ -1976,13 +1977,7 @@ public final class ClientApp {
             SelectItem(value: "clone", label: "Clone session", description: "Open an independent copy of this branch"),
             SelectItem(value: "diff", label: "Review working-tree diff", description: "Inspect changes since the session started"),
             SelectItem(value: "review", label: "Review diff (guided)", description: "Mark files reviewed and restore individual paths"),
-        ] + ThemeAppearance.allCases.map { appearance in
-            SelectItem(
-                value: "theme-\(appearance.rawValue)",
-                label: "Theme: \(appearance.displayName)",
-                description: "Use the \(appearance.displayName) palette"
-            )
-        } + [
+            SelectItem(value: "theme", label: "Select Theme", description: "Choose the persistent terminal palette"),
             SelectItem(value: "edit-dialog", label: "Edit prompt in dialog", description: "Edit the draft inside the client"),
             SelectItem(value: "edit", label: "Edit prompt in $EDITOR", description: "Hand the draft to the external editor"),
         ]
@@ -2118,13 +2113,9 @@ public final class ClientApp {
     }
 
     private func activatePalette(_ value: String) {
-        if value.hasPrefix("theme-"),
-           let selected = ThemeAppearance(rawValue: String(value.dropFirst("theme-".count))) {
-            setAppearance(selected)
-            return
-        }
         switch value {
         case "session": openSessionPicker()
+        case "theme": openThemePicker()
         case "rename": openRenameDialog()
         case "title": autoTitleSession()
         case "model": openModelPicker()
@@ -2142,6 +2133,33 @@ public final class ClientApp {
         case "edit": editPromptInEditor()
         default: break
         }
+    }
+
+    private func openThemePicker() {
+        if themePickerHandle != nil {
+            dismissThemePicker()
+            return
+        }
+        let items = ThemeAppearance.allCases.map { value in
+            SelectItem(
+                value: value.rawValue,
+                label: value.displayName,
+                description: value == appearance ? "Currently active" : "Use the \(value.displayName) palette"
+            )
+        }
+        let dialog = SearchableSelectDialog(title: "Select Theme", items: items, keybindings: keybindings)
+        dialog.onCancel = { [weak self] in self?.dismissThemePicker() }
+        dialog.onSelect = { [weak self] item in
+            guard let self, let selected = ThemeAppearance(rawValue: item.value) else { return }
+            self.dismissThemePicker()
+            self.setAppearance(selected)
+        }
+        themePickerHandle = dialogs?.present(dialog, options: overlayOptions(width: 82, height: 12))
+    }
+
+    private func dismissThemePicker() {
+        dismissDialog(themePickerHandle)
+        themePickerHandle = nil
     }
 
     private func openSessionPicker() {
@@ -4203,7 +4221,7 @@ extension ClientApp: TerminalApp {
         // branch must precede the global Escape/abort interpretation below:
         // Escape dismisses a palette, picker, or rename form, while it still
         // aborts a turn when no dialog owns the surface.
-        if autocompleteHandle != nil || paletteHandle != nil || toolCatalogHandle != nil
+        if autocompleteHandle != nil || paletteHandle != nil || themePickerHandle != nil || toolCatalogHandle != nil
             || sessionPickerHandle != nil
             || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
             || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
