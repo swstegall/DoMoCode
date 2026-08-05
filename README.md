@@ -789,6 +789,13 @@ a native browser or notebook runtime.
   `Ctrl+Tab` handling. Update input routing, footer hints, palette/help text,
   and terminal regression tests while retaining `Tab` for content-to-sessions
   pane navigation.
+- [ ] Make the tool catalog directly usable from the prompt: pressing `Tab`
+  on a selected tool inserts its canonical slash-command form into the editor,
+  and submitting a command such as `/read foo.txt` resolves the catalog entry,
+  validates and parses its arguments, then invokes the corresponding tool on
+  the normal permission, cancellation, error-result, and session-recording
+  paths. Unknown commands and malformed arguments must remain prompt-visible
+  errors rather than becoming model turns.
 
 The phase is complete only when the same keymap and command metadata drive the
 footer, palette, and Help dialog, and every new state is covered by component,
