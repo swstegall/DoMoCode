@@ -155,7 +155,6 @@ final class SearchableSelectDialog: Component {
             keybindings: keybindings
         )
         replacement.onSelect = { [weak self] item in self?.onSelect?(item) }
-        replacement.onInsert = { [weak self] item in self?.onInsert?(item) }
         replacement.onCancel = { [weak self] in self?.onCancel?() }
         if let preferredValue,
            let index = filtered.firstIndex(where: { $0.value == preferredValue }) {
@@ -257,7 +256,7 @@ final class HelpDialog: Component {
         rows.append("")
         rows.append("COMMANDS")
         for command in commands.commands {
-            let hint = command.argumentHint.map { " ($0)" } ?? ""
+            let hint = command.argumentHint.map { value in " (" + value + ")" } ?? ""
             let description = command.description ?? (command.kind == .local ? "Local client action" : "Send a prompt")
             rows.append("  /\(command.name)\(hint)  —  \(sanitizeUntrustedText(collapseToOneLine(description)))")
         }

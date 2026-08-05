@@ -2066,8 +2066,9 @@ public final class ClientApp {
                     keybindings: self.keybindings
                 )
                 dialog.onCancel = { [weak self] in self?.dismissToolCatalog() }
-                let insert = { [weak self] (item: SelectItem) in
-                    self?.insertToolCommand(item.value)
+                let insert: (SelectItem) -> Void = { [weak self] item in
+                    guard let self else { return }
+                    self.insertToolCommand(item.value)
                 }
                 dialog.onSelect = insert
                 dialog.onInsert = insert
