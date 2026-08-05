@@ -18,15 +18,8 @@ permissions, MCP, commands and skills, context management, mutable tools, Git
 review, checkpoints, agents, subagents, LSP, memory, sandboxing, PTY support,
 export/replay, and split-footer rendering.
 
-This README rewrite adds the next roadmap rather than claiming that the new
-work is already implemented. The highest-priority unfinished items are:
-
-- full-page themed painting and the remaining two-pane TUI polish;
-- a live, searchable tool catalog opened by /;
-- research → plan → execution → synthesis workflows;
-- bounded long-duration retry and LLM-assisted provider-error recovery;
-- a provider-neutral model seam, including a conditional Claude subscription
-  adapter through a supported external protocol.
+Phases 0–31 are recorded as complete. The next planned work is the focused
+TUI interaction, model-discovery, and help polish in Phase 32.
 
 Audit snapshot: 2026-08-03. Branches and feature refs can move; the branch
 table below records what was present in the local checkouts at audit time.
@@ -769,6 +762,37 @@ Browser, notebook, and remote-search behavior remains an explicitly configured
 MCP/ACP capability. DoMoCode carries image results, approvals, cancellation,
 output bounds, and permission metadata across that boundary; it does not ship
 a native browser or notebook runtime.
+
+#### Phase 32 — TUI interaction polish, model discovery, and help — P1 — planned
+
+- [ ] Give every modal, dialog, palette, and selector a shared outlined frame
+  that always paints its bottom border, including on first render, resize, and
+  content overflow. Cover the frame and stale-cell behavior with cell-oracle
+  and PTY tests.
+- [ ] Generalize the horizontal marquee to every focused or selected label that
+  exceeds its available area, including command-palette entries, sessions,
+  theme/model selectors, and workflow lists. Preserve stable columns, pause at
+  both ends, and reset predictably after selection, resize, or content changes.
+- [ ] Make the command palette's theme action a `Select Theme` command that
+  opens its own outlined, navigable dialog. Include the existing light/dark
+  themes plus Gruvbox dark/light and Solarized dark/light, and persist the
+  selected theme as the active default for every session until changed.
+- [ ] Make `Switch model` query and refresh the configured LiteLLM `/models`
+  endpoint, merge endpoint results with configured aliases, show loading and
+  failure states, and let the user select any returned model. Persist the
+  selected model in trusted user settings so it applies across sessions without
+  leaking credentials.
+- [ ] Add a `Help` command-palette entry that opens an outlined, scrollable
+  dialog. Generate its shortcut list from the canonical keymap, describe all
+  registered commands, and explain how to trigger and navigate workflows.
+- [ ] Change mode cycling from `Ctrl+Tab` to `Shift+Tab` to avoid iTerm2's
+  `Ctrl+Tab` handling. Update input routing, footer hints, palette/help text,
+  and terminal regression tests while retaining `Tab` for content-to-sessions
+  pane navigation.
+
+The phase is complete only when the same keymap and command metadata drive the
+footer, palette, and Help dialog, and every new state is covered by component,
+cell-oracle, and PTY tests where terminal bytes or lifecycle matter.
 
 ## Retry and provider behavior today
 
