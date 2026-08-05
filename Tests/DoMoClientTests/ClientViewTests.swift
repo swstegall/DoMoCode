@@ -137,7 +137,7 @@ struct ClientViewTests {
     @Test("The full-screen status bar scrolls long controls instead of dropping them")
     func statusBarMarquee() {
         let status = StatusBar()
-        status.text = "working — diagnostics — Esc: abort — Tab: pane — Ctrl+Tab: mode — Enter: send"
+        status.text = "working — diagnostics — Esc: abort — Tab: pane — Shift+Tab: mode — Enter: send"
         status.clock = { 10.0 }
         let initial = status.render(width: 18)[0]
         status.clock = { 11.2 }

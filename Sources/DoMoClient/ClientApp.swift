@@ -75,6 +75,7 @@ public final class ClientApp {
     private var dialogs: DialogStack?
     private var paletteHandle: ScreenOverlayHandle?
     private var themePickerHandle: ScreenOverlayHandle?
+    private var helpHandle: ScreenOverlayHandle?
     private var sessionPickerHandle: ScreenOverlayHandle?
     private var modelPickerHandle: ScreenOverlayHandle?
     private var treePickerHandle: ScreenOverlayHandle?
@@ -83,6 +84,7 @@ public final class ClientApp {
     private var autocompleteHandle: ScreenOverlayHandle?
     private var autocompleteDialog: SearchableSelectDialog?
     private var paletteDialog: SearchableSelectDialog?
+    private var helpDialog: HelpDialog?
     private var toolCatalogHandle: ScreenOverlayHandle?
     private var toolCatalogDialog: SearchableSelectDialog?
     private var toolCatalogRefreshTask: Task<Void, Never>?
@@ -274,6 +276,23 @@ public final class ClientApp {
     /// Matches `DOMOCODE_RETRY_BUDGET_MS`'s default: no single backoff can exceed
     /// the whole sleep budget, so nothing legitimate is ever truncated by this.
     private static let maxNoticeDwell: Double = 300
+
+    private static let helpGlobalShortcuts: [(String, String)] = [
+        ("^P", "open the command palette"),
+        ("^S", "open and search sessions"),
+        ("^L", "open the LiteLLM model selector"),
+        ("^T", "browse the conversation tree"),
+        ("^E", "edit the prompt in the external editor"),
+        ("^G", "open connection and run diagnostics"),
+        ("^O", "expand or collapse transcript detail"),
+        ("F6", "expand or shrink transcript images"),
+        ("^V", "paste an image from the clipboard"),
+        ("Tab", "move between the prompt and sessions panes"),
+        ("Shift+Tab", "cycle the agent mode"),
+        ("F8", "release or capture mouse reporting"),
+        ("Esc", "cancel a dialog or abort a running turn"),
+        ("^C", "quit DoMoCode"),
+    ]
 
     /// The app-level controls are decoded by ``matchesKey`` rather than compared
     /// with one terminal's raw control byte. iTerm2 can report the same physical
@@ -668,7 +687,7 @@ public final class ClientApp {
             parts.append(
                 "^P: palette   ^S: sessions   ^L: model   ^T: tree   ^E: edit prompt   "
                 + "^G: diagnostics   ^O: detail   F6: images   ^V: paste image   "
-                + "Tab: pane   Ctrl+Tab: mode   Enter: send   Shift+Enter/^J: newline   "
+                + "Tab: pane   Shift+Tab: mode   Enter: send   Shift+Enter/^J: newline   "
                 + "↑/↓: history/list   PgUp/PgDn: scroll   Esc: abort   ^C: quit   "
                 + "Ctrl+B/F: cursor   Alt+←/→/B/F: word   Home/End: line   ^A: line start   "
                 + "Ctrl+]/Ctrl+Alt+]: jump   Backspace/Delete: char delete   "
@@ -1985,7 +2004,7 @@ public final class ClientApp {
             SelectItem(
                 value: "mode",
                 label: "Switch agent mode (currently \(agentMode.rawValue))",
-                description: "Ctrl+Tab cycles build, plan, ask, debug, and review policies"
+                description: "Shift+Tab cycles build, plan, ask, debug, and review policies"
             ),
             SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
             SelectItem(value: "timeline", label: "Show session timeline", description: "Inspect checkpoints and history moves"),
@@ -1996,6 +2015,7 @@ public final class ClientApp {
             SelectItem(value: "diff", label: "Review working-tree diff", description: "Inspect changes since the session started"),
             SelectItem(value: "review", label: "Review diff (guided)", description: "Mark files reviewed and restore individual paths"),
             SelectItem(value: "theme", label: "Select Theme", description: "Choose the persistent terminal palette"),
+            SelectItem(value: "help", label: "Help", description: "Shortcuts, commands, and workflow navigation"),
             SelectItem(value: "edit-dialog", label: "Edit prompt in dialog", description: "Edit the draft inside the client"),
             SelectItem(value: "edit", label: "Edit prompt in $EDITOR", description: "Hand the draft to the external editor"),
         ]
@@ -2147,6 +2167,7 @@ public final class ClientApp {
         case "clone": forkSession(clone: true)
         case "diff": openDiffReview(advisory: false)
         case "review": openDiffReview(advisory: true)
+        case "help": openHelpDialog()
         case "edit-dialog": openPromptEditorDialog()
         case "edit": editPromptInEditor()
         default: break
@@ -2178,6 +2199,29 @@ public final class ClientApp {
     private func dismissThemePicker() {
         dismissDialog(themePickerHandle)
         themePickerHandle = nil
+    }
+
+    private func openHelpDialog() {
+        if helpHandle != nil {
+            dismissHelpDialog()
+            return
+        }
+        let componentRows = max(8, min(18, (surface?.target.rows ?? 24) - 4))
+        let dialog = HelpDialog(
+            commands: commandRegistry,
+            keybindings: keybindings,
+            globalShortcuts: Self.helpGlobalShortcuts,
+            viewportRows: componentRows
+        )
+        dialog.onCancel = { [weak self] in self?.dismissHelpDialog() }
+        helpDialog = dialog
+        helpHandle = dialogs?.present(dialog, options: overlayOptions(width: 100, height: componentRows))
+    }
+
+    private func dismissHelpDialog() {
+        dismissDialog(helpHandle)
+        helpHandle = nil
+        helpDialog = nil
     }
 
     private func openSessionPicker() {
@@ -3368,8 +3412,7 @@ public final class ClientApp {
             case .fork:
                 forkSession(clone: false)
             case .help:
-                let names = commandRegistry.commands.map { "/\($0.name)" }.joined(separator: " · ")
-                post(notice: names, seconds: 8)
+                openHelpDialog()
             case .tools:
                 openToolCatalog()
             case .memory:
@@ -4265,7 +4308,7 @@ extension ClientApp: TerminalApp {
         // branch must precede the global Escape/abort interpretation below:
         // Escape dismisses a palette, picker, or rename form, while it still
         // aborts a turn when no dialog owns the surface.
-        if autocompleteHandle != nil || paletteHandle != nil || themePickerHandle != nil || toolCatalogHandle != nil
+        if autocompleteHandle != nil || paletteHandle != nil || themePickerHandle != nil || helpHandle != nil || toolCatalogHandle != nil
             || sessionPickerHandle != nil
             || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
             || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
@@ -4352,10 +4395,9 @@ extension ClientApp: TerminalApp {
             return
         }
         // Plain Tab belongs to ScreenSurface's focus ring, which moves between the
-        // prompt/content pane and the session list. Ctrl-Tab is the mode switch;
-        // unlike the old raw Tab branch it does not steal focus traversal, and its
-        // decoded forms work in iTerm2 whether Kitty or modifyOtherKeys is active.
-        if matchesKey(data, KeyId(base: .tab, ctrl: true)) {
+        // prompt/content pane and the session list. Shift-Tab is the mode switch;
+        // Ctrl-Tab is left unused because iTerm2 reserves it for tab navigation.
+        if matchesKey(data, KeyId(base: .tab, shift: true)) {
             toggleAgentMode()
             return
         }

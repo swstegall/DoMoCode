@@ -155,6 +155,159 @@ final class SearchableSelectDialog: Component {
     }
 }
 
+/// The scrollable command reference shown by the palette's Help action and the
+/// `/help` command. The rows are assembled from the injected canonical keymap and
+/// command registry so project commands and binding changes do not leave a stale
+/// hard-coded reference behind.
+@MainActor
+final class HelpDialog: Component {
+    private let keybindings: Keybindings
+    private let rows: [String]
+    private let viewportRows: Int
+    private var offset = 0
+
+    var onCancel: (() -> Void)?
+
+    init(
+        commands: CommandRegistry,
+        keybindings: Keybindings = Keybindings(),
+        globalShortcuts: [(String, String)],
+        viewportRows: Int = 18
+    ) {
+        self.keybindings = keybindings
+        self.viewportRows = max(8, viewportRows)
+        self.rows = Self.makeRows(
+            commands: commands,
+            keybindings: keybindings,
+            globalShortcuts: globalShortcuts
+        )
+    }
+
+    func render(width: Int) -> [String] {
+        guard width > 0 else { return [] }
+        let bodyRows = max(1, viewportRows - 2)
+        let start = min(offset, max(0, rows.count - 1))
+        let end = min(rows.count, start + bodyRows)
+        var output = [truncateToWidth("\u{1b}[1mHelp\u{1b}[0m", width, ellipsis: "")]
+        output.append(contentsOf: rows[start..<end].map {
+            truncateToWidth($0, width, ellipsis: "")
+        })
+        if rows.count > bodyRows {
+            let range = "\(start + 1)-\(end)/\(rows.count)"
+            output.append(truncateToWidth(
+                "↑/↓ or PgUp/PgDn scroll · \(range) · Esc close",
+                width,
+                ellipsis: ""
+            ))
+        } else {
+            output.append(truncateToWidth("Esc close", width, ellipsis: ""))
+        }
+        return output
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if isKeyRelease(data) { return }
+        if keybindings.matches(data, .selectCancel) {
+            onCancel?()
+            return
+        }
+        let bodyRows = max(1, viewportRows - 2)
+        if keybindings.matches(data, .selectUp) {
+            scroll(by: -1, bodyRows: bodyRows)
+        } else if keybindings.matches(data, .selectDown) {
+            scroll(by: 1, bodyRows: bodyRows)
+        } else if keybindings.matches(data, .selectPageUp) || matchesKey(data, Key.pageUp) {
+            scroll(by: -bodyRows, bodyRows: bodyRows)
+        } else if keybindings.matches(data, .selectPageDown) || matchesKey(data, Key.pageDown) {
+            scroll(by: bodyRows, bodyRows: bodyRows)
+        } else if matchesKey(data, Key.home) || data == Array("g".utf8) {
+            offset = 0
+        } else if matchesKey(data, Key.end) || data == Array("G".utf8) {
+            offset = max(0, rows.count - bodyRows)
+        }
+    }
+
+    private func scroll(by delta: Int, bodyRows: Int) {
+        offset = max(0, min(offset + delta, max(0, rows.count - bodyRows)))
+    }
+
+    private static func makeRows(
+        commands: CommandRegistry,
+        keybindings: Keybindings,
+        globalShortcuts: [(String, String)]
+    ) -> [String] {
+        var rows = ["GLOBAL SHORTCUTS"]
+        rows.append(contentsOf: globalShortcuts.map { "  \($0.0)  —  \($0.1)" })
+        rows.append("")
+        rows.append("EDITOR AND SELECTORS")
+        for binding in Keybinding.allCases {
+            let keys = keybindings.keys(for: binding).map(Self.displayKey).joined(separator: " / ")
+            rows.append("  \(keys)  —  \(Self.description(for: binding))")
+        }
+        rows.append("")
+        rows.append("COMMANDS")
+        for command in commands.commands {
+            let hint = command.argumentHint.map { " ($0)" } ?? ""
+            let description = command.description ?? (command.kind == .local ? "Local client action" : "Send a prompt")
+            rows.append("  /\(command.name)\(hint)  —  \(sanitizeUntrustedText(collapseToOneLine(description)))")
+        }
+        rows.append("")
+        rows.append("WORKFLOWS")
+        rows.append("  /workflow [prompt]  —  open the phase-and-agent workspace")
+        rows.append("  /research, /plan, /execute, /synthesize  —  open at a named phase")
+        rows.append("  Enter a phase to inspect its agents; Enter an agent to view its running content")
+        rows.append("  Escape walks back from agents to phases and from the workflow to sessions")
+        return rows
+    }
+
+    private static func displayKey(_ key: KeyId) -> String {
+        let description = key.description
+        if key.ctrl, case .char(let character) = key.base {
+            return "^" + String(character).uppercased()
+        }
+        if key.shift, case .tab = key.base { return "Shift+Tab" }
+        if key.shift, case .enter = key.base { return "Shift+Enter" }
+        return description
+    }
+
+    private static func description(for binding: Keybinding) -> String {
+        switch binding {
+        case .editorCursorUp: return "move the prompt cursor up"
+        case .editorCursorDown: return "move the prompt cursor down"
+        case .editorCursorLeft: return "move left"
+        case .editorCursorRight: return "move right"
+        case .editorCursorWordLeft: return "move one word left"
+        case .editorCursorWordRight: return "move one word right"
+        case .editorCursorLineStart: return "move to the line start"
+        case .editorCursorLineEnd: return "move to the line end"
+        case .editorJumpForward: return "jump forward to a matching bracket"
+        case .editorJumpBackward: return "jump backward to a matching bracket"
+        case .editorPageUp: return "page up in the prompt editor"
+        case .editorPageDown: return "page down in the prompt editor"
+        case .editorDeleteCharBackward: return "delete the previous character"
+        case .editorDeleteCharForward: return "delete the next character"
+        case .editorDeleteWordBackward: return "delete the previous word"
+        case .editorDeleteWordForward: return "delete the next word"
+        case .editorDeleteToLineStart: return "delete to the line start"
+        case .editorDeleteToLineEnd: return "delete to the line end"
+        case .editorYank: return "yank the cut text"
+        case .editorYankPop: return "cycle the yank ring"
+        case .editorUndo: return "undo prompt editing"
+        case .inputNewLine: return "insert a newline without sending"
+        case .inputSubmit: return "send the prompt"
+        case .inputTab: return "move focus to the next pane"
+        case .inputCopy: return "copy the current input or quit at the app level"
+        case .inputPasteImage: return "paste an image from the clipboard"
+        case .selectUp: return "move a selector up"
+        case .selectDown: return "move a selector down"
+        case .selectPageUp: return "page up in a selector"
+        case .selectPageDown: return "page down in a selector"
+        case .selectConfirm: return "confirm a selector choice"
+        case .selectCancel: return "cancel a selector"
+        }
+    }
+}
+
 /// A one-line input dialog used for session names and other small metadata.
 @MainActor
 final class DialogTextInput: @MainActor Focusable {
