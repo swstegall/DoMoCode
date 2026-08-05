@@ -43,4 +43,20 @@ struct DialogStackTests {
         }
         #expect(height == 7)
     }
+
+    @Test("A catalog picker inserts its selected tool on Tab and Enter")
+    func toolCatalogInsertionBindings() {
+        let dialog = SearchableSelectDialog(
+            title: "Tools",
+            items: [SelectItem(value: "read", label: "read")]
+        )
+        var inserted: [String] = []
+        dialog.onInsert = { inserted.append($0.value) }
+        dialog.onSelect = { inserted.append("enter:($0.value)") }
+
+        dialog.handleInput([0x09])
+        dialog.handleInput([0x0d])
+
+        #expect(inserted == ["read", "enter:read"])
+    }
 }

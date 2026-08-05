@@ -76,6 +76,9 @@ final class SearchableSelectDialog: Component {
     private let keybindings: Keybindings
 
     var onSelect: ((SelectItem) -> Void)?
+    /// Optional insertion action used by catalogs whose selected value becomes
+    /// prompt text. Plain Tab is intentionally inert for every other picker.
+    var onInsert: ((SelectItem) -> Void)?
     var onCancel: (() -> Void)?
 
     init(title: String, items: [SelectItem], keybindings: Keybindings = Keybindings()) {
@@ -108,6 +111,12 @@ final class SearchableSelectDialog: Component {
 
     func handleInput(_ data: [UInt8]) {
         if isKeyRelease(data) { return }
+        if keybindings.matches(data, .inputTab) {
+            if let item = list.getSelectedItem() {
+                onInsert?(item)
+            }
+            return
+        }
         if keybindings.matches(data, .selectUp)
             || keybindings.matches(data, .selectDown)
             || keybindings.matches(data, .selectConfirm) {
@@ -146,6 +155,7 @@ final class SearchableSelectDialog: Component {
             keybindings: keybindings
         )
         replacement.onSelect = { [weak self] item in self?.onSelect?(item) }
+        replacement.onInsert = { [weak self] item in self?.onInsert?(item) }
         replacement.onCancel = { [weak self] in self?.onCancel?() }
         if let preferredValue,
            let index = filtered.firstIndex(where: { $0.value == preferredValue }) {

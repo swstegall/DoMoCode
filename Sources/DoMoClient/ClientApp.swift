@@ -2066,10 +2066,11 @@ public final class ClientApp {
                     keybindings: self.keybindings
                 )
                 dialog.onCancel = { [weak self] in self?.dismissToolCatalog() }
-                dialog.onSelect = { [weak self] item in
-                    self?.dismissToolCatalog()
-                    self?.post(notice: item.description ?? item.value, seconds: 8)
+                let insert = { [weak self] (item: SelectItem) in
+                    self?.insertToolCommand(item.value)
                 }
+                dialog.onSelect = insert
+                dialog.onInsert = insert
                 self.toolCatalogDialog = dialog
                 self.toolCatalogHandle = self.dialogs?.present(
                     dialog,
@@ -2081,6 +2082,14 @@ public final class ClientApp {
             }
         }
         actionTasks.append(task)
+    }
+
+    private func insertToolCommand(_ name: String) {
+        dismissToolCatalog()
+        promptInput.insertToolCommand(name)
+        focus.setCurrent(promptInput)
+        post(notice: "inserted /\(name) — add arguments and press Enter", seconds: 8)
+        surface?.requestRender()
     }
 
     private func dismissToolCatalog() {

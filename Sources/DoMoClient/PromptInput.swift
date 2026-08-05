@@ -117,6 +117,17 @@ final class PromptInput: @MainActor Focusable {
 
     func setText(_ text: String) { editor.setText(text) }
 
+    /// Insert a catalog tool as a slash command and leave the caret ready for
+    /// arguments. The command is appended to an existing draft with one space
+    /// so selecting a tool never destroys text the user has already written.
+    func insertToolCommand(_ name: String) {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else { return }
+        let existing = editor.getExpandedText()
+        let separator = existing.isEmpty || existing.hasSuffix(" ") || existing.hasSuffix("\n") ? "" : " "
+        editor.setText(existing + separator + "/\(cleanName) ")
+    }
+
     func applyTheme(_ theme: Theme, appearance: ThemeAppearance, trueColor: Bool = true) {
         let palette = theme.palette(for: appearance)
         editor.borderColor = { value in

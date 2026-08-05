@@ -226,6 +226,16 @@ struct ClientViewTests {
         #expect(input.text.isEmpty)
     }
 
+    @Test("A selected tool can be inserted into the prompt with an argument gap")
+    func promptInputToolInsertion() {
+        let input = PromptInput()
+        input.insertToolCommand("read")
+        #expect(input.text == "/read ")
+
+        input.insertToolCommand("grep")
+        #expect(input.text == "/read /grep ")
+    }
+
     @Test("An empty prompt does not submit")
     func promptInputEmptyNoSubmit() {
         let input = PromptInput()
