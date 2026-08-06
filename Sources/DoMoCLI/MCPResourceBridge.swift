@@ -53,9 +53,11 @@ func makeMCPResourceProvider(_ manager: MCPManager) -> MCPResourceProvider {
 }
 
 /// Captures only the inert skill values from a trusted prompt workspace. The
-/// provider does not reread arbitrary paths or execute a resource.
+/// provider does not reread arbitrary paths or execute a resource. Skills
+/// marked `disable-model-invocation` are omitted: this provider is the
+/// model's only fetch path, so serving them would disengage the flag.
 func makeSkillProvider(_ workspace: PromptWorkspace) -> SkillProvider {
-    let skills = workspace.skills.map { skill in
+    let skills = workspace.skills.filter { !$0.disableModelInvocation }.map { skill in
         TrustedSkillResource(
             name: skill.name,
             description: skill.description,

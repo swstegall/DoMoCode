@@ -22,17 +22,24 @@ import Musl
 /// Whether `directory` carries project-local resources that must be gated behind
 /// project trust before a run may act on them.
 ///
-/// This is pi's `hasTrustRequiringProjectResources`, covering project settings and
-/// every prompt resource the Phase 5b loader can inject: system files, ancestor
-/// instructions, commands, and skills. These files can change what the agent is
-/// told to do or cause a trusted command template to read files and run inline
-/// shell, so a repository must not supply them without the user having said "I
-/// trust this directory".
+/// This is pi's `hasTrustRequiringProjectResources`, covering project settings
+/// and every prompt resource `SystemPromptBuilder` can inject: system files,
+/// ancestor instructions, commands, skills, and agent profiles. These files
+/// can change what the agent is told to do or cause a trusted command template
+/// to read files and run inline shell, so a repository must not supply them
+/// without the user having said "I trust this directory".
 ///
 /// A bare `.domocode` directory (or one holding only a `sessions/` cache) does
 /// *not* count, matching pi: trust guards *input* the project would inject, not
-/// the mere presence of the config folder. The check is the single gate every
+/// the mere presence of the config folder. The same rule keeps an ordinary
+/// `.github` directory (CI workflows, issue templates) from prompting: only its
+/// `commands`, `skills`, and `agents` subdirectories are consulted, and an
+/// absent or empty directory never counts. The check is the single gate every
 /// such resource passes through.
+///
+/// The candidate list must mirror `SystemPromptBuilder.projectResourceRoots`
+/// (DoMoHarness/PromptResources.swift): a root the loader reads but this gate
+/// misses would inject project-authored prompt content with no trust prompt.
 public func projectRequiresTrust(directory: FilePath) -> Bool {
     func hasResource(_ path: FilePath) -> Bool {
         guard FileManager.default.fileExists(atPath: path.string) else { return false }
@@ -60,6 +67,9 @@ public func projectRequiresTrust(directory: FilePath) -> Bool {
             current.appending(".agents").appending("commands"),
             current.appending(".agents").appending("skills"),
             current.appending(".agents").appending("agents"),
+            current.appending(".github").appending("commands"),
+            current.appending(".github").appending("skills"),
+            current.appending(".github").appending("agents"),
         ]
         if candidates.contains(where: hasResource) { return true }
         let parent = current.removingLastComponent()

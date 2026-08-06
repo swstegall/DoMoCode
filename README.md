@@ -18,8 +18,9 @@ permissions, MCP, commands and skills, context management, mutable tools, Git
 review, checkpoints, agents, subagents, LSP, memory, sandboxing, PTY support,
 export/replay, and split-footer rendering.
 
-Phases 0–32 are recorded as complete, including the focused TUI interaction,
-model-discovery, help, and direct tool-catalog command work in Phase 32.
+Phases 0–33 are recorded as complete, including the focused TUI interaction,
+model-discovery, help, and direct tool-catalog command work in Phase 32 and
+the Copilot-compatible `.github` prompt-resource discovery in Phase 33.
 
 Audit snapshot: 2026-08-03. Branches and feature refs can move; the branch
 table below records what was present in the local checkouts at audit time.
@@ -800,6 +801,45 @@ a native browser or notebook runtime.
 The phase is complete: the same keymap and command metadata drive the
 footer, palette, and Help dialog, and every new state is covered by component,
 cell-oracle, and PTY tests where terminal bytes or lifecycle matter.
+
+#### Phase 33 — Copilot-compatible .github prompt resources — P1 — complete
+
+- [x] Discover `.github/skills/*/SKILL.md`, `.github/skills/*.md`,
+  `.github/agents/*.md`, and `.github/commands/*.md` as a fourth trust-gated
+  project resource root, so a repo vendoring a GitHub Copilot-style resource
+  pack works in place with no copies or symlinks. `.github/` loads first and
+  every loader is last-write-wins, so same-named resources in `.domocode/`,
+  `.claude/`, or `.agents/` override the vendored pack per-repo without
+  editing it. User-scope resources stay below the project layer, unchanged.
+- [x] Extend the trust gate's candidate list with
+  `.github/{commands,skills,agents}` so the new root cannot inject prompt
+  content without an explicit trust decision. A `.github/` holding only CI
+  workflows or templates never prompts: only the three resource
+  subdirectories are consulted, and absent or empty ones do not count.
+- [x] Accept the `<name>.agent.md` agent filename convention: the `.agent`
+  suffix is stripped from the fallback profile name, and an explicit `name:`
+  frontmatter key still wins over any filename.
+- [x] Parse `disable-model-invocation` skill frontmatter (kebab, camel, and
+  snake spellings; boolean, numeric, and quoted truthy scalars; a present but
+  unparseable value fails closed). A disabled skill's body is never
+  auto-injected on a keyword match and is not served by the model-facing
+  `skill` tool; the skill stays in the `<available-skills>` catalogue marked
+  not model-invocable. An explicit user-invocation surface is follow-up work.
+- [x] Parse `tools:` frontmatter onto skills and agent profiles as a verbatim
+  allow-list — sequence or scalar names preserved unchanged (except a scalar
+  spelled empty, `~`, or `null` — even quoted — which reads as the empty
+  list; a tool literally named `null` needs list form), a truthy-flag mapping
+  reduced to its allowed names, and `nil` only when the key is absent so
+  "undeclared" stays distinct from every declared form, which fails closed.
+  Stored as data only; wiring it into the runtime tool-visibility filter is a
+  follow-up, the same parsed-before-enforced path permission rules took.
+
+The phase is complete: discovery, trust gating, precedence, and both new
+frontmatter keys are covered by loader and trust-store tests. A repo with no
+`.github` prompt resources gains no new resource root; the `.agent` filename
+convention and both frontmatter keys apply uniformly in every resource root,
+so a pre-existing `<name>.agent.md` profile is now addressed without the
+suffix and skills already declaring the new keys pick up their meaning.
 
 ## Retry and provider behavior today
 

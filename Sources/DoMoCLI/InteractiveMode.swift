@@ -2434,7 +2434,7 @@ public struct InteractiveMode: Sendable {
             projectTrusted: true,
             agentName: agentProfile?.name
         ).build()
-        if !initialPromptWorkspace.skills.isEmpty {
+        if initialPromptWorkspace.hasModelInvocableSkills {
             registry.register(SkillTool())
         }
         let promptWorkspace = try SystemPromptBuilder(
@@ -2450,7 +2450,7 @@ public struct InteractiveMode: Sendable {
             environment: toolEnvironment,
             questionHandler: { await questionBox.ask($0) },
             mcpResourceProvider: mcpManager.map(makeMCPResourceProvider),
-            skillProvider: promptWorkspace.skills.isEmpty ? nil : makeSkillProvider(promptWorkspace),
+            skillProvider: promptWorkspace.hasModelInvocableSkills ? makeSkillProvider(promptWorkspace) : nil,
             backgroundProcesses: backgroundProcesses,
             processSandbox: sandbox,
             interactiveTerminal: interactiveTerminal,

@@ -75,6 +75,29 @@ struct TrustStoreTests {
         #expect(projectRequiresTrust(directory: dir) == true)
     }
 
+    @Test("each .github prompt-resource directory independently requires trust")
+    func gitHubResourcesRequireTrust() throws {
+        for subdirectory in ["commands", "skills", "agents"] {
+            let dir = try makeTempDirectory()
+            defer { try? FileManager.default.removeItem(atPath: dir.string) }
+            let root = dir.appending(".github").appending(subdirectory)
+            try FileManager.default.createDirectory(atPath: root.string, withIntermediateDirectories: true)
+            try "Project-authored prompt content."
+                .write(toFile: root.appending("entry.md").string, atomically: true, encoding: .utf8)
+            #expect(projectRequiresTrust(directory: dir) == true, "\(subdirectory) must be a trust candidate")
+        }
+    }
+
+    @Test("a CI-only .github directory requires no trust")
+    func ciOnlyGitHubDirectoryNeedsNoTrust() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(atPath: dir.string) }
+        let workflows = dir.appending(".github").appending("workflows")
+        try FileManager.default.createDirectory(atPath: workflows.string, withIntermediateDirectories: true)
+        try "name: CI".write(toFile: workflows.appending("ci.yml").string, atomically: true, encoding: .utf8)
+        #expect(projectRequiresTrust(directory: dir) == false)
+    }
+
     // MARK: - Decisions
 
     @Test("an unrecorded directory has no decision")

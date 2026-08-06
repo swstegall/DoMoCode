@@ -136,28 +136,44 @@ public struct PromptSkill: Hashable, Sendable {
     public let keywords: [String]
     public let body: String
     public let source: PromptResourceSource
+    /// When `true` (frontmatter `disable-model-invocation`), the body is never
+    /// auto-injected on a keyword match and the model-facing `skill` tool does
+    /// not serve it. The skill stays in the `<available-skills>` catalogue,
+    /// marked not model-invocable, so it remains visible; an explicit
+    /// user-invocation surface is follow-up work.
+    public let disableModelInvocation: Bool
+    /// The frontmatter `tools:` list, verbatim, or `nil` when the file declares
+    /// none. `nil` means unrestricted; an empty list means "no tools". Stored
+    /// as data only — the runtime tool-visibility filter does not consult it
+    /// yet, mirroring how ``AgentProfile/permissionRules`` landed before its
+    /// enforcement.
+    public let toolAllowlist: [String]?
 
     public init(
         name: String,
         description: String? = nil,
         keywords: [String] = [],
         body: String,
-        source: PromptResourceSource = .project
+        source: PromptResourceSource = .project,
+        disableModelInvocation: Bool = false,
+        toolAllowlist: [String]? = nil
     ) {
         self.name = name
         self.description = description
         self.keywords = keywords
         self.body = body
         self.source = source
+        self.disableModelInvocation = disableModelInvocation
+        self.toolAllowlist = toolAllowlist
     }
 }
 
 /// An inert, value-based agent persona loaded from a Markdown file.
 ///
 /// The file contributes only data: prompt text, an optional model alias, a
-/// mode, and optional policy rules. It has no host API, executable section, or
-/// watcher. A runtime owns the value returned by ``SystemPromptBuilder`` for
-/// the lifetime of its session.
+/// mode, optional policy rules, and an optional tool allow-list. It has no
+/// host API, executable section, or watcher. A runtime owns the value returned
+/// by ``SystemPromptBuilder`` for the lifetime of its session.
 public struct AgentProfile: Codable, Hashable, Sendable {
     public let name: String
     public let description: String?
@@ -167,6 +183,13 @@ public struct AgentProfile: Codable, Hashable, Sendable {
     public let mode: AgentMode
     public let permissionRules: Ruleset
     public let source: PromptResourceSource
+    /// The frontmatter `tools:` list, verbatim — names are not normalized or
+    /// filtered, so entries that map onto no DoMoCode tool survive unchanged.
+    /// `nil` means the file declared no list (unrestricted); an empty list
+    /// means "no tools". Stored as data only — the runtime tool-visibility
+    /// filter does not consult it yet, the same parsed-before-enforced path
+    /// ``permissionRules`` took.
+    public let toolAllowlist: [String]?
 
     public init(
         name: String,
@@ -176,7 +199,8 @@ public struct AgentProfile: Codable, Hashable, Sendable {
         reasoningEffort: ReasoningEffort? = nil,
         mode: AgentMode = .build,
         permissionRules: Ruleset = [],
-        source: PromptResourceSource = .project
+        source: PromptResourceSource = .project,
+        toolAllowlist: [String]? = nil
     ) {
         self.name = name
         self.description = description
@@ -186,6 +210,7 @@ public struct AgentProfile: Codable, Hashable, Sendable {
         self.mode = mode
         self.permissionRules = permissionRules
         self.source = source
+        self.toolAllowlist = toolAllowlist
     }
 }
 
@@ -201,7 +226,7 @@ public struct AgentProfileRegistry: Codable, Hashable, Sendable {
         self.profiles = byName.values.sorted { $0.name < $1.name }
     }
 
-    /// The two profiles that are always available, even with no dotfiles.
+    /// The built-in profiles that are always available, even with no dotfiles.
     public static let builtIn = AgentProfileRegistry(profiles: [
         AgentProfile(
             name: "build",
@@ -282,6 +307,13 @@ public struct PromptWorkspace: Hashable, Sendable {
         self.activeAgent = activeAgent
     }
 
+    /// Whether any skill may be served to the model. Gates the model-facing
+    /// skill tool: a workspace whose skills all carry
+    /// `disable-model-invocation` must not register or advertise it.
+    public var hasModelInvocableSkills: Bool {
+        skills.contains { !$0.disableModelInvocation }
+    }
+
     /// Returns a copy with an already-resolved persona selected. The profile is
     /// still inert data; selection only changes the prompt assembled for turns.
     public func selecting(agent name: String) -> PromptWorkspace? {
@@ -307,6 +339,7 @@ public struct PromptWorkspace: Hashable, Sendable {
         }
         let lowerPrompt = userPrompt.lowercased()
         let active = skills.filter { skill in
+            guard !skill.disableModelInvocation else { return false }
             let triggers = skill.keywords.isEmpty ? [skill.name] : skill.keywords
             return triggers.contains { trigger in
                 let value = trigger.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -798,7 +831,13 @@ public struct PromptCommandProcessor: Sendable {
 
 // MARK: - Builder
 
-/// Loads project/user prompt resources in the documented order.
+/// Loads prompt resources in layered order: built-ins, then the user config
+/// directory, then — behind project trust — the project roots `.github/`,
+/// `.domocode/`, `.claude/`, `.agents/`. Commands, skills, and agents fold
+/// into name-keyed, last-write-wins tables, so later layers override earlier
+/// ones. `SYSTEM.md` and ancestor `AGENTS.md`/`CLAUDE.md` instructions are
+/// instead appended as base-prompt sections — every layer is retained, and
+/// `.github/` contributes none of them.
 public struct SystemPromptBuilder: Sendable {
     public let workingDirectory: FilePath
     public let configDirectory: FilePath
@@ -847,7 +886,8 @@ public struct SystemPromptBuilder: Sendable {
         let skillCatalogue = skills.isEmpty
             ? "<available-skills>\n(none)\n</available-skills>"
             : "<available-skills>\n" + skills.map { skill in
-                "- \(skill.name): \(skill.description ?? "keyword-triggered guidance")"
+                let marker = skill.disableModelInvocation ? " (not model-invocable)" : ""
+                return "- \(skill.name): \(skill.description ?? "keyword-triggered guidance")\(marker)"
             }.joined(separator: "\n") + "\n</available-skills>"
         sections.append(skillCatalogue)
         sections.append("<cwd>\n\(workingDirectory.string)\n</cwd>")
@@ -908,7 +948,14 @@ public struct SystemPromptBuilder: Sendable {
             let file = root.appending(name)
             guard name.lowercased().hasSuffix(".md"), !directoryExists(file) else { return nil }
             let parsed = try parseMarkdown(file)
-            let fallbackName = String(name.dropLast(3))
+            // `foo.agent.md` (the Copilot agent filename convention) names the
+            // profile `foo`, not `foo.agent`, when no `name:` key decides. A
+            // file named exactly `.agent.md` keeps its `.agent` stem rather
+            // than stripping to an empty, silently-skipped name.
+            var fallbackName = String(name.dropLast(3))
+            if fallbackName.lowercased().hasSuffix(".agent"), fallbackName.count > 6 {
+                fallbackName = String(fallbackName.dropLast(6))
+            }
             let profileName = Self.normalizeName(parsed.name ?? fallbackName)
             guard !profileName.isEmpty else { return nil }
             return AgentProfile(
@@ -919,7 +966,8 @@ public struct SystemPromptBuilder: Sendable {
                 reasoningEffort: parsed.reasoningEffort,
                 mode: parsed.mode ?? .build,
                 permissionRules: parsed.permissionRules,
-                source: source
+                source: source,
+                toolAllowlist: parsed.toolAllowlist
             )
         }
     }
@@ -971,13 +1019,28 @@ public struct SystemPromptBuilder: Sendable {
                 description: parsed.description,
                 keywords: parsed.keywords,
                 body: parsed.body,
-                source: source
+                source: source,
+                disableModelInvocation: parsed.disableModelInvocation,
+                toolAllowlist: parsed.toolAllowlist
             )
         }
     }
 
+    /// Trust-gated project roots for `commands`, `skills`, and `agents`.
+    ///
+    /// Load order is precedence order: every consumer folds these into a
+    /// last-write-wins dictionary, so the root that loads last wins a name
+    /// collision. `.github/` deliberately loads first — a vendored
+    /// Copilot-style resource pack can be overridden from any DoMoCode-native
+    /// root without editing the vendored files.
+    ///
+    /// Must stay in sync with the trust gate's candidate list in
+    /// `projectRequiresTrust(directory:)` (DoMoCLI/TrustStore.swift): a root
+    /// read here but missing there would inject project-authored prompt
+    /// content without a trust prompt.
     private func projectResourceRoots(named resource: String) -> [FilePath] {
         [
+            workingDirectory.appending(".github").appending(resource),
             workingDirectory.appending(".domocode").appending(resource),
             workingDirectory.appending(".claude").appending(resource),
             workingDirectory.appending(".agents").appending(resource),
@@ -1033,6 +1096,12 @@ public struct SystemPromptBuilder: Sendable {
             throw PromptResourceError.invalidFrontmatter(path: file.string, reason: "frontmatter must be a mapping")
         }
         let body = lines[(end + 1)...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        // `tools:` reads from a merge-only second parse so unquoted names that
+        // YAML 1.1 would type as booleans or numbers (`on`, `42`) survive as
+        // their literal text — the allow-list is contractually verbatim. The
+        // `.merge` rule stays so a list supplied through a `<<:` merge key is
+        // still seen. Every other key keeps the default-resolved map.
+        let verbatim = ((try? Yams.load(yaml: yaml, Resolver.basic.appending(.merge))) as? [AnyHashable: Any]) ?? map
         return ParsedMarkdown(
             name: Self.stringValue(map, keys: ["name"]),
             description: Self.stringValue(map, keys: ["description", "desc"]),
@@ -1043,6 +1112,8 @@ public struct SystemPromptBuilder: Sendable {
             keywords: Self.stringList(map, keys: ["keywords", "triggers", "trigger"]),
             mode: Self.stringValue(map, keys: ["mode"]).flatMap { AgentMode(rawValue: $0.lowercased()) },
             permissionRules: Self.permissionRules(map),
+            disableModelInvocation: Self.disableModelInvocation(map),
+            toolAllowlist: Self.optionalStringList(verbatim, keys: ["tools"]),
             body: body
         )
     }
@@ -1078,6 +1149,8 @@ public struct SystemPromptBuilder: Sendable {
         var keywords: [String]
         var mode: AgentMode?
         var permissionRules: Ruleset
+        var disableModelInvocation: Bool
+        var toolAllowlist: [String]?
         var body: String
 
         init(
@@ -1090,6 +1163,8 @@ public struct SystemPromptBuilder: Sendable {
             keywords: [String] = [],
             mode: AgentMode? = nil,
             permissionRules: Ruleset = [],
+            disableModelInvocation: Bool = false,
+            toolAllowlist: [String]? = nil,
             body: String
         ) {
             self.name = name
@@ -1101,6 +1176,8 @@ public struct SystemPromptBuilder: Sendable {
             self.keywords = keywords
             self.mode = mode
             self.permissionRules = permissionRules
+            self.disableModelInvocation = disableModelInvocation
+            self.toolAllowlist = toolAllowlist
             self.body = body
         }
     }
@@ -1120,6 +1197,99 @@ public struct SystemPromptBuilder: Sendable {
             if let value = map[AnyHashable(key)] as? String { return [value] }
         }
         return []
+    }
+
+    /// Like ``stringList(_:keys:)`` but keeps "key absent" (`nil`) distinct
+    /// from "key present" — a tool allow-list needs the difference between
+    /// unrestricted and declared. A key declared with no usable entries
+    /// (`tools:`, `tools: ~`, `tools: []`, or an unusable value shape) is an
+    /// empty list, never `nil`: a declared restriction must not read as
+    /// unrestricted. The mapping spelling (`tools:\n  edit: false`) keeps the
+    /// truthy-flagged names, sorted; an unrecognizable flag excludes its tool.
+    /// Accepted deviation from "verbatim": the rule-free parse erases quoting,
+    /// so a scalar spelled empty, `~`, or any-case `null` — quoted or not —
+    /// reads as the empty list; a tool literally named `null` survives in the
+    /// list and mapping forms — only the scalar spelling erases it.
+    private static func optionalStringList(_ map: [AnyHashable: Any], keys: [String]) -> [String]? {
+        for key in keys {
+            guard let raw = map[AnyHashable(key)] else { continue }
+            if raw is NSNull { return [] }
+            if let value = raw as? [String] { return value }
+            if let value = raw as? [Any] { return value.compactMap { Self.scalarText($0) } }
+            if let value = raw as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty || trimmed == "~" || trimmed.lowercased() == "null" { return [] }
+                return [value]
+            }
+            if let value = raw as? [AnyHashable: Any] {
+                return value.compactMap { entry, flag -> String? in
+                    guard let name = Self.scalarText(entry.base) else { return nil }
+                    guard let text = Self.scalarText(flag) else { return nil }
+                    switch text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                    case "true", "yes", "on", "1": return name
+                    default: return nil
+                    }
+                }.sorted()
+            }
+            // Present but an unusable shape: a declared restriction fails
+            // closed rather than reading as unrestricted.
+            return []
+        }
+        return nil
+    }
+
+    /// The literal text of a scalar that a resolver may have typed. The
+    /// rule-free primary parse delivers untagged scalars as strings, but typed
+    /// values still arrive here — via the fallback default-resolved map or
+    /// explicit YAML tags — and stringifying them beats silently dropping a
+    /// declared entry. Nested collections have no literal text and are dropped.
+    private static func scalarText(_ value: Any) -> String? {
+        if let text = value as? String { return text }
+        if let flag = value as? Bool { return flag ? "true" : "false" }
+        if let number = value as? Int { return String(number) }
+        if let number = value as? NSNumber { return number.stringValue }
+        return nil
+    }
+
+    /// `disable-model-invocation` fails closed: any spelling of the key that
+    /// is present but unparseable engages the restriction — even when another
+    /// spelling parses — rather than silently granting the model access the
+    /// author declared withheld. Among parseable spellings, the first in key
+    /// order wins, matching the keys read through ``stringValue(_:keys:)`` and
+    /// ``stringList(_:keys:)``. (``permissionRules(_:)`` differs: it takes the
+    /// first *present* spelling and yields an empty ruleset when its shape is
+    /// unusable.)
+    private static func disableModelInvocation(_ map: [AnyHashable: Any]) -> Bool {
+        let keys = ["disable-model-invocation", "disableModelInvocation", "disable_model_invocation"]
+        var parsed: Bool?
+        for key in keys {
+            guard map[AnyHashable(key)] != nil else { continue }
+            guard let value = boolValue(map, keys: [key]) else { return true }
+            if parsed == nil { parsed = value }
+        }
+        return parsed ?? false
+    }
+
+    /// Reads a boolean frontmatter scalar. Native `Bool` first because Yams
+    /// constructs YAML booleans as Swift `Bool` on every platform; the `Int`,
+    /// `NSNumber`, and quoted-string forms cover files written for harnesses
+    /// that spell truth as `1` or `"yes"`. Absent or unrecognizable is `nil`,
+    /// never a throw, matching how every other frontmatter key degrades.
+    private static func boolValue(_ map: [AnyHashable: Any], keys: [String]) -> Bool? {
+        for key in keys {
+            guard let raw = map[AnyHashable(key)] else { continue }
+            if let value = raw as? Bool { return value }
+            if let value = raw as? Int { return value != 0 }
+            if let value = raw as? NSNumber { return value.boolValue }
+            if let value = raw as? String {
+                switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                case "true", "yes", "on", "1": return true
+                case "false", "no", "off", "0": return false
+                default: continue
+                }
+            }
+        }
+        return nil
     }
 
     private static func permissionRules(_ map: [AnyHashable: Any]) -> Ruleset {

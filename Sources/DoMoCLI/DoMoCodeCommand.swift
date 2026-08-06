@@ -694,7 +694,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             projectTrusted: true,
             agentName: profile.name
         ).build()
-        if !initialPromptWorkspace.skills.isEmpty {
+        if initialPromptWorkspace.hasModelInvocableSkills {
             registry.register(SkillTool())
         }
         let promptBuilder = SystemPromptBuilder(
@@ -710,7 +710,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             shell: shell,
             environment: toolEnvironment,
             mcpResourceProvider: configuration.mcpServers.isEmpty ? nil : makeMCPResourceProvider(mcpManager),
-            skillProvider: promptWorkspace.skills.isEmpty ? nil : makeSkillProvider(promptWorkspace),
+            skillProvider: promptWorkspace.hasModelInvocableSkills ? makeSkillProvider(promptWorkspace) : nil,
             backgroundProcesses: BackgroundProcessManager(sandbox: processSandbox),
             processSandbox: processSandbox,
             diagnosticsProvider: CLIDiagnosticsProvider(
@@ -1182,7 +1182,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             projectTrusted: true,
             agentName: agentProfile.name
         ).build()
-        if !initialPromptWorkspace.skills.isEmpty {
+        if initialPromptWorkspace.hasModelInvocableSkills {
             registry.register(SkillTool())
         }
         let promptWorkspace = try SystemPromptBuilder(
@@ -1200,7 +1200,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             shell: shell,
             environment: toolEnvironment,
             mcpResourceProvider: configuration.mcpServers.isEmpty ? nil : makeMCPResourceProvider(mcpManager),
-            skillProvider: promptWorkspace.skills.isEmpty ? nil : makeSkillProvider(promptWorkspace),
+            skillProvider: promptWorkspace.hasModelInvocableSkills ? makeSkillProvider(promptWorkspace) : nil,
             backgroundProcesses: BackgroundProcessManager(sandbox: sandbox),
             processSandbox: sandbox,
             diagnosticsProvider: CLIDiagnosticsProvider(
@@ -1240,7 +1240,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 includeSessionRecall: true,
                 includeProjectMemory: true,
                 includeMCPResourceInspection: !configuration.mcpServers.isEmpty,
-                includeSkillInvocation: !promptWorkspace.skills.isEmpty
+                includeSkillInvocation: promptWorkspace.hasModelInvocableSkills
             )
             let sessionContext = toolContext.withQuestionHandler({ prompts in
                 let wirePrompts = prompts.map { prompt in
