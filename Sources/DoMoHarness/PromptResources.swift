@@ -43,6 +43,11 @@ public struct CommandDescriptor: Codable, Hashable, Sendable {
     public let source: PromptResourceSource
 
     let template: String?
+    /// Promotion marker: a promoted skill's `template` is the skill body,
+    /// injected verbatim with the arguments appended — never expanded as a
+    /// command template — and the skill excludes itself from keyword
+    /// injection on its own invocation. Not part of the wire representation.
+    let promotedFromSkill: Bool
 
     public init(
         name: String,
@@ -54,7 +59,8 @@ public struct CommandDescriptor: Codable, Hashable, Sendable {
         reasoningEffort: ReasoningEffort? = nil,
         keywords: [String] = [],
         source: PromptResourceSource = .builtin,
-        template: String? = nil
+        template: String? = nil,
+        promotedFromSkill: Bool = false
     ) {
         self.name = name
         self.description = description
@@ -66,6 +72,7 @@ public struct CommandDescriptor: Codable, Hashable, Sendable {
         self.keywords = keywords
         self.source = source
         self.template = template
+        self.promotedFromSkill = promotedFromSkill
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -92,6 +99,7 @@ public struct CommandDescriptor: Codable, Hashable, Sendable {
         keywords = try container.decodeIfPresent([String].self, forKey: .keywords) ?? []
         source = try container.decodeIfPresent(PromptResourceSource.self, forKey: .source) ?? .project
         template = nil
+        promotedFromSkill = false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -139,8 +147,8 @@ public struct PromptSkill: Hashable, Sendable {
     /// When `true` (frontmatter `disable-model-invocation`), the body is never
     /// auto-injected on a keyword match and the model-facing `skill` tool does
     /// not serve it. The skill stays in the `<available-skills>` catalogue,
-    /// marked not model-invocable, so it remains visible; an explicit
-    /// user-invocation surface is follow-up work.
+    /// marked not model-invocable, and the user invokes it through its
+    /// promoted `/name` command like any other skill.
     public let disableModelInvocation: Bool
     /// The frontmatter `tools:` list, verbatim, or `nil` when the file declares
     /// none. `nil` means unrestricted; an empty list means "no tools". Stored
@@ -148,6 +156,9 @@ public struct PromptSkill: Hashable, Sendable {
     /// yet, mirroring how ``AgentProfile/permissionRules`` landed before its
     /// enforcement.
     public let toolAllowlist: [String]?
+    /// The frontmatter `argument-hint`, surfaced on the skill's promoted
+    /// `/name` command so palettes can hint at the expected arguments.
+    public let argumentHint: String?
 
     public init(
         name: String,
@@ -156,7 +167,8 @@ public struct PromptSkill: Hashable, Sendable {
         body: String,
         source: PromptResourceSource = .project,
         disableModelInvocation: Bool = false,
-        toolAllowlist: [String]? = nil
+        toolAllowlist: [String]? = nil,
+        argumentHint: String? = nil
     ) {
         self.name = name
         self.description = description
@@ -165,6 +177,7 @@ public struct PromptSkill: Hashable, Sendable {
         self.source = source
         self.disableModelInvocation = disableModelInvocation
         self.toolAllowlist = toolAllowlist
+        self.argumentHint = argumentHint
     }
 }
 
@@ -330,7 +343,10 @@ public struct PromptWorkspace: Hashable, Sendable {
     /// Returns the base prompt plus any skills whose keywords occur in the user
     /// prompt. Skill bodies are added only for the matching turn, keeping the
     /// default context small while preserving the available-skill catalogue.
-    public func systemPrompt(for userPrompt: String) -> String {
+    /// `excludingSkill` suppresses one skill from keyword matching — the
+    /// invoked skill of a promoted `/name` command, whose body already rides
+    /// in the prompt text and must not be delivered twice.
+    public func systemPrompt(for userPrompt: String, excludingSkill excluded: String? = nil) -> String {
         var prompt = baseSystemPrompt
         if let activeAgent, !activeAgent.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             prompt += "\n\n<agent name=\"\(activeAgent.name)\">\n"
@@ -340,6 +356,7 @@ public struct PromptWorkspace: Hashable, Sendable {
         let lowerPrompt = userPrompt.lowercased()
         let active = skills.filter { skill in
             guard !skill.disableModelInvocation else { return false }
+            if let excluded, skill.name.caseInsensitiveCompare(excluded) == .orderedSame { return false }
             let triggers = skill.keywords.isEmpty ? [skill.name] : skill.keywords
             return triggers.contains { trigger in
                 let value = trigger.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -588,6 +605,19 @@ public struct PromptCommandProcessor: Sendable {
 
         let arguments = Self.arguments(in: input)
         let template = descriptor.template ?? arguments
+        if descriptor.promotedFromSkill {
+            // A skill body is not a template: it is injected verbatim — no
+            // substitution, inline shell, or file inclusion — with the user's
+            // words appended, matching the keyword door's verbatim injection.
+            // The skill excludes itself from keyword matching so the body is
+            // not also delivered through <active-skills>.
+            return .prompt(
+                text: arguments.isEmpty ? template : template + "\n\n" + arguments,
+                model: descriptor.model,
+                reasoningEffort: descriptor.reasoningEffort,
+                systemPrompt: workspace.systemPrompt(for: input, excludingSkill: descriptor.name)
+            )
+        }
         let rendered = try await render(template: template, arguments: arguments)
         return .prompt(
             text: rendered,
@@ -860,8 +890,11 @@ public struct SystemPromptBuilder: Sendable {
     }
 
     public func build() throws -> PromptWorkspace {
-        let commands = try loadCommands()
+        let loadedCommands = try loadCommands()
         let skills = try loadSkills()
+        let commands = CommandRegistry(
+            commands: Self.promotedSkillCommands(from: skills) + loadedCommands.commands
+        )
         let agents = try loadAgents()
         var sections = [Self.basePrompt(workingDirectory: workingDirectory, toolNames: toolNames)]
 
@@ -898,6 +931,33 @@ public struct SystemPromptBuilder: Sendable {
             agents: agents
         )
         return agentName.flatMap { workspace.selecting(agent: $0) } ?? workspace
+    }
+
+    /// Every skill is user-invocable as a `/name` prompt command, matching the
+    /// harnesses that expose skills as slash commands — including skills whose
+    /// `disable-model-invocation` withholds them from the model. Promotion
+    /// never shadows: promoted entries are prepended, so built-ins and real
+    /// command files win name collisions in the registry's last-write-wins
+    /// fold. The template is the skill body verbatim, marked
+    /// `promotedFromSkill` so resolution injects it without template
+    /// expansion: skill prose is written under an inert-body contract, and
+    /// `$1`, `!`-backtick sequences, or `@file` mentions inside it are
+    /// content, not directives.
+    private static func promotedSkillCommands(from skills: [PromptSkill]) -> [CommandDescriptor] {
+        // A frontmatter-only skill has nothing to inject; promoting it would
+        // produce an empty or blank-framed user turn.
+        skills.filter { !$0.body.isEmpty }.map { skill in
+            CommandDescriptor(
+                name: skill.name,
+                description: skill.description,
+                argumentHint: skill.argumentHint,
+                kind: .prompt,
+                keywords: skill.keywords,
+                source: skill.source,
+                template: skill.body,
+                promotedFromSkill: true
+            )
+        }
     }
 
     private func loadCommands() throws -> CommandRegistry {
@@ -1021,7 +1081,8 @@ public struct SystemPromptBuilder: Sendable {
                 body: parsed.body,
                 source: source,
                 disableModelInvocation: parsed.disableModelInvocation,
-                toolAllowlist: parsed.toolAllowlist
+                toolAllowlist: parsed.toolAllowlist,
+                argumentHint: parsed.argumentHint
             )
         }
     }
@@ -1105,7 +1166,7 @@ public struct SystemPromptBuilder: Sendable {
         return ParsedMarkdown(
             name: Self.stringValue(map, keys: ["name"]),
             description: Self.stringValue(map, keys: ["description", "desc"]),
-            argumentHint: Self.stringValue(map, keys: ["argument-hint", "argumentHint", "argument_hint"]),
+            argumentHint: Self.argumentHint(map),
             model: Self.stringValue(map, keys: ["model"]),
             reasoningEffort: Self.stringValue(map, keys: ["reasoning-effort", "reasoning_effort", "reasoningEffort"]).map(ReasoningEffort.init(rawValue:)),
             action: Self.stringValue(map, keys: ["action"]),
@@ -1186,6 +1247,29 @@ public struct SystemPromptBuilder: Sendable {
         for key in keys {
             if let value = map[AnyHashable(key)] as? String { return value }
             if let value = map[AnyHashable(key)] as? NSNumber { return value.stringValue }
+        }
+        return nil
+    }
+
+    /// `argument-hint: [target-repo]` is a YAML flow sequence, not a string —
+    /// the brackets authors mean as display text are sequence syntax to the
+    /// parser. Rebuild the display form from a sequence so the common
+    /// unquoted spelling survives; quoted strings pass through unchanged.
+    /// One pass per key spelling, so shape never trumps key order; an empty
+    /// or unusable value under one spelling defers to the next.
+    private static func argumentHint(_ map: [AnyHashable: Any]) -> String? {
+        for key in ["argument-hint", "argumentHint", "argument_hint"] {
+            guard let raw = map[AnyHashable(key)] else { continue }
+            if let value = raw as? String {
+                if value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                return value
+            }
+            if let value = raw as? [Any] {
+                let parts = value.compactMap { scalarText($0) }
+                if parts.isEmpty { continue }
+                return "[" + parts.joined(separator: " ") + "]"
+            }
+            if let value = raw as? NSNumber { return value.stringValue }
         }
         return nil
     }

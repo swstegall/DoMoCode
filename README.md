@@ -824,7 +824,18 @@ cell-oracle, and PTY tests where terminal bytes or lifecycle matter.
   unparseable value fails closed). A disabled skill's body is never
   auto-injected on a keyword match and is not served by the model-facing
   `skill` tool; the skill stays in the `<available-skills>` catalogue marked
-  not model-invocable. An explicit user-invocation surface is follow-up work.
+  not model-invocable and remains user-invocable as its promoted command.
+- [x] Promote every loaded skill to a user-invocable `/name` prompt command,
+  matching the harnesses that expose skills as slash commands. The skill's
+  `argument-hint` surfaces on the command, and promotion never shadows:
+  built-ins and real command files win name collisions. A promoted command
+  injects the skill body verbatim with the user's words appended — skill
+  prose is not a command template, so `$1` substitution, inline shell, and
+  `@file` inclusion do not run over it — and the invoked skill excludes
+  itself from that resolution's keyword injection, so a fresh invocation
+  never delivers the body twice. A `/name` typed into an in-flight run
+  steers as a plain user message against the run's already-fixed system
+  prompt, which may still carry the body from an earlier keyword match.
 - [x] Parse `tools:` frontmatter onto skills and agent profiles as a verbatim
   allow-list — sequence or scalar names preserved unchanged (except a scalar
   spelled empty, `~`, or `null` — even quoted — which reads as the empty

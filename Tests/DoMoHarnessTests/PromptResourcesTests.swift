@@ -68,6 +68,9 @@ struct PromptResourcesTests {
             projectTrusted: true
         ).build()
         #expect(workspace.commands.command(named: "review")?.description == "Project review command")
+        // The unquoted [focus] spelling is a YAML flow sequence; the display
+        // form is rebuilt.
+        #expect(workspace.commands.command(named: "review")?.argumentHint == "[focus]")
         #expect(workspace.baseSystemPrompt.contains("Be precise about this repository."))
         #expect(workspace.baseSystemPrompt.contains("Use the project vocabulary."))
         #expect(workspace.systemPrompt(for: "review this Swift concurrency code").contains("actor isolation"))
@@ -653,6 +656,155 @@ struct PromptResourcesTests {
             #expect(workspace.systemPrompt(for: "use \(marker)").contains("The \(root) \(marker) body wins."))
             #expect(!workspace.systemPrompt(for: "use \(marker)").contains("The vendored \(marker) body loses."))
         }
+    }
+
+    @Test("skills are promoted to user-invocable prompt commands")
+    func skillsArePromotedToCommands() async throws {
+        let project = try makeDirectory()
+        let config = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(atPath: project.string)
+            try? FileManager.default.removeItem(atPath: config.string)
+        }
+        try write(
+            """
+            ---
+            description: Vendor the shared checklists
+            argument-hint: [target-repo]
+            disable-model-invocation: true
+            ---
+            Copy each checklist into the target repository.
+            """,
+            to: project.appending(".github").appending("skills").appending("setup-notes").appending("SKILL.md")
+        )
+        try write(
+            """
+            ---
+            argument-hint: "add [item] | remove [item]"
+            ---
+            User-scope skills promote too.
+            """,
+            to: config.appending("skills").appending("user-notes").appending("SKILL.md")
+        )
+        try write(
+            """
+            ---
+            description: Frontmatter-only stub
+            ---
+            """,
+            to: project.appending(".github").appending("skills").appending("stub").appending("SKILL.md")
+        )
+
+        let workspace = try SystemPromptBuilder(
+            workingDirectory: project,
+            configDirectory: config,
+            toolNames: [],
+            projectTrusted: true
+        ).build()
+        let promoted = try #require(workspace.commands.command(named: "setup-notes"))
+        #expect(promoted.kind == .prompt)
+        #expect(promoted.description == "Vendor the shared checklists")
+        #expect(promoted.argumentHint == "[target-repo]")
+        #expect(promoted.source == .project)
+        #expect(workspace.commands.command(named: "user-notes")?.source == .user)
+        // A quoted argument-hint string passes through unchanged.
+        #expect(workspace.commands.command(named: "user-notes")?.argumentHint == "add [item] | remove [item]")
+        // A frontmatter-only skill has nothing to inject and is not promoted,
+        // but it stays a skill.
+        #expect(workspace.commands.command(named: "stub") == nil)
+        #expect(workspace.skills.contains { $0.name == "stub" })
+
+        let processor = PromptCommandProcessor(workspace: workspace, workingDirectory: project)
+        let resolution = try await processor.resolve("/setup-notes acme-app")
+        guard case .prompt(let text, _, _, _) = resolution else {
+            Issue.record("expected a prompt resolution")
+            return
+        }
+        #expect(text == "Copy each checklist into the target repository.\n\nacme-app")
+    }
+
+    @Test("a promoted skill body is inert prose, injected once")
+    func promotedSkillBodyIsInertProse() async throws {
+        let project = try makeDirectory()
+        let config = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(atPath: project.string)
+            try? FileManager.default.removeItem(atPath: config.string)
+        }
+        try write("readable project file\n", to: project.appending("README.md"))
+        try write(
+            """
+            Never run !`rm -rf /` here. See @README.md for context.
+            Use awk '{print $0}' with $1 and ${2} and $ARGUMENTS as literals.
+            """,
+            to: project.appending(".github").appending("skills").appending("field-guide").appending("SKILL.md")
+        )
+
+        let workspace = try SystemPromptBuilder(
+            workingDirectory: project,
+            configDirectory: config,
+            toolNames: [],
+            projectTrusted: true
+        ).build()
+        let processor = PromptCommandProcessor(workspace: workspace, workingDirectory: project)
+        let resolution = try await processor.resolve("/field-guide check the guide")
+        guard case .prompt(let text, _, _, let systemPrompt) = resolution else {
+            Issue.record("expected a prompt resolution")
+            return
+        }
+        // The body survives verbatim: no shell ran, no file was inlined, no
+        // argument substitution rewrote the examples.
+        #expect(text.contains("!`rm -rf /`"))
+        #expect(text.contains("See @README.md for context."))
+        #expect(!text.contains("readable project file"))
+        #expect(text.contains("awk '{print $0}' with $1 and ${2} and $ARGUMENTS as literals."))
+        #expect(text.hasSuffix("\n\ncheck the guide"))
+        // The invoked skill is excluded from keyword injection, so the body
+        // arrives exactly once — but an ordinary prose prompt still triggers.
+        #expect(!systemPrompt.contains("<active-skills>"))
+        #expect(workspace.systemPrompt(for: "consult the field-guide please").contains("Never run"))
+    }
+
+    @Test("skill promotion never shadows built-ins or real command files")
+    func skillPromotionNeverShadows() throws {
+        let project = try makeDirectory()
+        let config = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(atPath: project.string)
+            try? FileManager.default.removeItem(atPath: config.string)
+        }
+        // A skill named after a built-in local command must not displace it.
+        try write(
+            "A skill that dares to call itself review.",
+            to: project.appending(".github").appending("skills").appending("review").appending("SKILL.md")
+        )
+        // A same-named real command file must win over the promoted skill.
+        try write(
+            "Skill body that loses the collision.",
+            to: project.appending(".github").appending("skills").appending("triage").appending("SKILL.md")
+        )
+        try write(
+            """
+            ---
+            description: Real command file
+            ---
+            Command template that wins the collision.
+            """,
+            to: project.appending(".domocode").appending("commands").appending("triage.md")
+        )
+
+        let workspace = try SystemPromptBuilder(
+            workingDirectory: project,
+            configDirectory: config,
+            toolNames: [],
+            projectTrusted: true
+        ).build()
+        #expect(workspace.commands.command(named: "review")?.kind == .local)
+        #expect(workspace.commands.command(named: "review")?.action == .review)
+        #expect(workspace.commands.command(named: "triage")?.description == "Real command file")
+        // Both skills still exist as skills; only the command surface defers.
+        #expect(workspace.skills.contains { $0.name == "review" })
+        #expect(workspace.skills.contains { $0.name == "triage" })
     }
 
     @Test("a trusted project .github resource overrides a user-scope one")
