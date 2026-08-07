@@ -24,6 +24,17 @@
 // exposes no loop-hook passthrough (see the report's "harness gap"), so this file
 // reconstructs the effect at the one seam it does own: the injected `streamFn`
 // refuses to start a turn once a failing turn has been seen (``RunGuard``).
+//
+// That guard is deliberately blind to WHY the seam is being asked for another
+// turn, and one caller is not the runaway it was written to stop: the harness's
+// gateway-continuation loop, which re-drives `runAgentLoop` after a turn the
+// gateway timed out on. Because the guard blocked those attempts too, every one
+// of them finished its stream with the recorded error and made no request, so
+// `domo -p` spent the whole continuation budget without ever contacting the
+// gateway. ``RunGuard/allowGatewayContinuation()`` is the exemption, and the
+// harness's own `gateway_continue` notice — bounded by
+// ``GatewayContinuationSettings/effectiveMaxAttempts`` — is the only thing that
+// can grant it. See that method for why this cannot reopen the runaway path.
 
 import DoMoAgent
 import DoMoCore
@@ -357,14 +368,19 @@ struct PrintEventSink: AgentEventSink {
             )
 
         case .notice(let notice):
-            // Only retries are reported here, and only on stderr.
+            // Only the two "still going, here is why it is slow" notices are
+            // reported here — a retry and a gateway continuation — and only on
+            // stderr.
             //
-            // Scoped to `"retry"` on purpose. Error-level notices have been
+            // Scoped that narrowly on purpose. Error-level notices have been
             // flowing since the loop learned to emit one on a failed settle, and
             // `fail()` already reports that failure on stderr with an exit code
             // — reporting it twice from two places is how a CI log grows a
             // duplicate. The gap this closes is narrower: a run that goes quiet
-            // for minutes of backoff with nothing said.
+            // for minutes of backoff with nothing said. A continuation is the
+            // same gap: the run is being carried on past a timeout, which changes
+            // what the gateway is asked and what the answer costs, and a `-p`
+            // caller that is told nothing cannot tell it from a hung turn.
             //
             // stderr in BOTH modes, unlike the turn heartbeat, which is text-only.
             // A retry is a diagnostic, and `--help` promises diagnostics go to
@@ -374,6 +390,20 @@ struct PrintEventSink: AgentEventSink {
             // learns why nothing is happening.
             if notice.code == "recovery", let recovery = notice.recovery {
                 recoveryBox.record(recovery)
+                break
+            }
+            // The harness announces each gateway continuation BEFORE it asks for
+            // one, on the same serial path the loop runs on, so this is the exact
+            // moment — and the only one — at which the guard may stand down for a
+            // sanctioned attempt. Lifting it here rather than sniffing the
+            // continuation prompt out of the seam's `Context` keeps the decision
+            // with the component that owns the attempt budget: the seam cannot
+            // tell a harness-driven continuation from the model's own next turn,
+            // and a run that read the prompt text would grant itself an attempt
+            // whenever a user happened to type the continuation sentence.
+            if notice.code == "gateway_continue" {
+                runGuard.allowGatewayContinuation()
+                channel.writeErr("… \(notice.text)\n")
                 break
             }
             guard notice.code == "retry" else { break }
@@ -490,9 +520,31 @@ final class TurnCounter: Sendable {
 /// by finishing its stream with that error — which the loop settles as `.errored`
 /// with no further request. A reference type so the sink and the escaping
 /// `streamFn` closure share one instance; `Sendable` because the `Mutex` guards
-/// the only mutable field.
+/// all the mutable state.
+///
+/// The one attempt that is exempt is a harness-driven gateway continuation —
+/// see ``allowGatewayContinuation()``.
 final class RunGuard: Sendable {
-    private let blocked = Mutex<DoMoError?>(nil)
+    /// The recorded failure and what is left of this run's continuation
+    /// allowance, under ONE lock. Two locks (or a lock plus an atomic) could
+    /// grant the same remaining attempt twice, which is the only way the
+    /// allowance below could be walked past.
+    private struct State: Sendable {
+        var blocking: DoMoError?
+        var continuationsRemaining: Int
+    }
+
+    private let state: Mutex<State>
+
+    /// - Parameter continuationAllowance: how many harness-sanctioned gateway
+    ///   continuations this run may unblock. Pass
+    ///   ``GatewayContinuationSettings/effectiveMaxAttempts`` — the same number
+    ///   that bounds the harness's own loop — so the two cannot disagree about
+    ///   how much a failing gateway is allowed to cost, and a run with
+    ///   continuations disabled gets `0` and behaves exactly as it did before.
+    init(continuationAllowance: Int) {
+        self.state = Mutex(State(blocking: nil, continuationsRemaining: max(0, continuationAllowance)))
+    }
 
     /// Records the first failing (non-`.length`) turn. Idempotent: a later failing
     /// turn does not replace the first, which is the one the run should report.
@@ -502,12 +554,47 @@ final class RunGuard: Sendable {
         let error =
             assistant.failure
             ?? DoMoError(.provider(status: nil, isRetryable: false), "Turn failed: \(reason.rawValue)")
-        blocked.withLock { if $0 == nil { $0 = error } }
+        state.withLock { if $0.blocking == nil { $0.blocking = error } }
     }
 
     /// The recorded failure, or `nil` when no failing turn has been seen. When
     /// non-`nil`, the stream seam must not start another turn.
-    var blockingError: DoMoError? { blocked.withLock { $0 } }
+    var blockingError: DoMoError? { state.withLock { $0.blocking } }
+
+    /// Stands the guard down for ONE harness-sanctioned gateway continuation,
+    /// reporting whether the allowance covered it.
+    ///
+    /// The guard exists to stop a run from marching PAST a failing turn under
+    /// its own steam. A continuation is not that: the harness has already
+    /// decided the failure was a gateway timeout (``DoMoError/isGatewayTimeout``,
+    /// so an auth refusal or an unrecognized `finish_reason` never gets here),
+    /// it re-drives the loop itself, and it counts every attempt against a cap
+    /// it clamps before use. Without this the continuation loop ran its whole
+    /// budget against a seam that made no request at all, so `-p` silently got
+    /// zero continuations while every other surface got them.
+    ///
+    /// What keeps the runaway path shut is that this clears the block and
+    /// nothing more — it does not disable the guard. The very next failing turn
+    /// re-arms it (`blocking` is `nil` again, so ``blockIfFailing(_:)`` stores
+    /// the new failure), so a continuation whose own first turn fails still
+    /// cannot dispatch its tools and march on to a later clean turn that would
+    /// report success. And the allowance is spent per clearance, so even a
+    /// caller that announced continuations forever — a spelling of
+    /// `gateway_continue` from somewhere other than the harness's bounded loop —
+    /// cannot buy more turns than this run's configuration permits.
+    ///
+    /// An allowance is spent only when there was something to clear: an
+    /// announcement that arrives with no failing turn recorded needs no
+    /// exemption and must not consume one.
+    @discardableResult
+    func allowGatewayContinuation() -> Bool {
+        state.withLock { current in
+            guard current.blocking != nil, current.continuationsRemaining > 0 else { return false }
+            current.continuationsRemaining -= 1
+            current.blocking = nil
+            return true
+        }
+    }
 }
 
 /// Carries the final typed recovery notice to print mode's terminal event. The
@@ -712,8 +799,13 @@ public struct PrintMode: Sendable {
         // the stream seam refuse a turn after a failing one (the harness has no
         // `shouldStopAfterTurn`). Both are shared by reference into the escaping
         // `streamFn` and the sink.
+        //
+        // The guard's allowance is this run's continuation budget, so the seam
+        // can stand down for exactly the attempts the harness is permitted to
+        // make and not one more. `enabled: false` folds into `0` there, which is
+        // the pre-continuation behavior: the guard never stands down at all.
         let turnCounter = TurnCounter()
-        let runGuard = RunGuard()
+        let runGuard = RunGuard(continuationAllowance: gatewayContinuation.effectiveMaxAttempts)
 
         let fallbackSystemPrompt = Self.systemPrompt(
             workingDirectory: workingDirectory,
@@ -940,6 +1032,12 @@ public struct PrintMode: Sendable {
     /// terminal `.error` turn and settles `.errored`, so the run stops at the
     /// failing turn (exit 1) without a further provider call — the effect Phase 1
     /// got from `shouldStopAfterTurn`.
+    ///
+    /// A gateway continuation clears that block before it re-drives the loop
+    /// (``RunGuard/allowGatewayContinuation()``), so its first call lands here
+    /// unblocked and goes to the gateway like any other turn — counted, and
+    /// announced with `turn_start`, because it IS another turn and the terminal
+    /// `result` event's `turns` field would otherwise undercount the run.
     private func streamFunction(
         counter: TurnCounter,
         runGuard: RunGuard,

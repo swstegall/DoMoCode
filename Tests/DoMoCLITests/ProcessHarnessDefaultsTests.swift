@@ -103,7 +103,11 @@ struct ProcessHarnessDefaultsTests {
         #expect(decorated.text.hasPrefix("hello"))
         #expect(decorated.text.contains(String(threshold)))
 
-        await controller.record(ticket, succeeded: true, responseCharacters: threshold + 100)
+        // `.delivered` is the old `succeeded: true`: the gateway answered, so the
+        // length is real evidence. The boolean was replaced because a failure that
+        // has nothing to do with length — an auth error, a cancelled turn — used to
+        // be indistinguishable from a length refusal here and walked the ceiling down.
+        await controller.record(ticket, evidence: .delivered, responseCharacters: threshold + 100)
 
         // A non-probe success does not move the ceiling — it only confirms it.
         #expect(await controller.currentThreshold(model: "alias-under-test") == threshold)
@@ -125,7 +129,7 @@ struct ProcessHarnessDefaultsTests {
         for _ in 0..<(configuration.responseLimit.probeEvery + 1) {
             let decorated = await first.decorate("hello", model: "alias-under-test")
             guard let ticket = decorated.ticket else { continue }
-            await first.record(ticket, succeeded: true, responseCharacters: ticket.limit)
+            await first.record(ticket, evidence: .delivered, responseCharacters: ticket.limit)
             moved = await first.currentThreshold(model: "alias-under-test")
         }
         #expect(moved > threshold)

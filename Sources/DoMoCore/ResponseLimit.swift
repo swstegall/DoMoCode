@@ -52,6 +52,24 @@ public struct ResponseLimitSettings: Sendable, Hashable, Codable {
     /// The sentence appended to each prompt. `{limit}` is replaced with the
     /// decimal limit; see ``ResponseLimitPolicy/limitToken``.
     public var template: String
+    /// How many delivered turns retire a `knownBad` point the downward search
+    /// has already converged onto.
+    ///
+    /// Without an expiry a bad point is permanent, and not by accident: the
+    /// probe candidate is the midpoint between the threshold and `knownBad`, so
+    /// it is *always strictly below* `knownBad`, and the only branch that clears
+    /// the bound wants a success at or above it. No sequential walk can reach
+    /// that branch. One probe that failed because the gateway happened to be
+    /// restarting therefore ends the upward search for good — and because the
+    /// state is persisted, for the life of the machine rather than the session.
+    ///
+    /// This is the way back out. Once the search has nothing left to ask
+    /// (the midpoint has rounded down onto the threshold) and this many turns
+    /// have been *delivered*, the bound is treated as having expired and the
+    /// upward search re-opens. Twenty-five is deliberately unhurried: re-probing
+    /// costs a turn that may come back short, so it should follow real evidence
+    /// that whatever refused the probe is gone, not one lucky answer.
+    public var reprobeAfterSuccesses: Int
 
     /// The shipped sentence. Kept as a named constant because both the renderer
     /// and the idempotence scan have to agree on it exactly.
@@ -64,7 +82,8 @@ public struct ResponseLimitSettings: Sendable, Hashable, Codable {
         probeEvery: Int = 4,
         minimumThreshold: Int = 200,
         maximumThreshold: Int = 200_000,
-        template: String = ResponseLimitSettings.defaultTemplate
+        template: String = ResponseLimitSettings.defaultTemplate,
+        reprobeAfterSuccesses: Int = 25
     ) {
         self.enabled = enabled
         self.thresholdCharacters = thresholdCharacters
@@ -73,6 +92,7 @@ public struct ResponseLimitSettings: Sendable, Hashable, Codable {
         self.minimumThreshold = minimumThreshold
         self.maximumThreshold = maximumThreshold
         self.template = template
+        self.reprobeAfterSuccesses = reprobeAfterSuccesses
     }
 
     public static let `default` = ResponseLimitSettings()
@@ -85,6 +105,7 @@ public struct ResponseLimitSettings: Sendable, Hashable, Codable {
         case minimumThreshold
         case maximumThreshold
         case template
+        case reprobeAfterSuccesses
     }
 
     /// Decodes field by field, falling back to the shipped default for anything
@@ -109,6 +130,9 @@ public struct ResponseLimitSettings: Sendable, Hashable, Codable {
         maximumThreshold =
             try container.decodeIfPresent(Int.self, forKey: .maximumThreshold) ?? fallback.maximumThreshold
         template = try container.decodeIfPresent(String.self, forKey: .template) ?? fallback.template
+        reprobeAfterSuccesses =
+            try container.decodeIfPresent(Int.self, forKey: .reprobeAfterSuccesses)
+            ?? fallback.reprobeAfterSuccesses
     }
 }
 
@@ -126,6 +150,14 @@ public struct ResponseLimitState: Sendable, Hashable, Codable {
     /// The lowest limit ever observed to fail, or nil when the search has no
     /// upper bound yet. Its presence is what turns the probe from "reach 10%
     /// higher" into a binary search downward toward the real ceiling.
+    ///
+    /// Only a *probe* that was refused in a way that could plausibly be about
+    /// length ever writes this, and it is never written at or below
+    /// `minimumThreshold`; it retires on its own once the search has converged
+    /// and ``ResponseLimitSettings/reprobeAfterSuccesses`` turns have been
+    /// delivered. All three rules exist for the same reason: a bound that
+    /// outlives the condition that produced it is indistinguishable, from the
+    /// user's side, from a model that got worse.
     public var knownBad: Int?
     /// The longest assistant text delivered intact. Diagnostic only — the policy
     /// never reads it — but it is the one number that says whether the learned
@@ -135,7 +167,19 @@ public struct ResponseLimitState: Sendable, Hashable, Codable {
     public var promptsSinceProbe: Int
     /// Non-probe failures in a row. Two of them are read as the gateway having
     /// moved, not as a coincidence, and trigger the back-off.
+    ///
+    /// Only failures that could plausibly be about length count here; see
+    /// ``ResponseLimitEvidence``. Counting a 401 or a cancelled turn was how the
+    /// ceiling used to walk itself down during an outage it had nothing to do
+    /// with.
     public var consecutiveFailures: Int
+    /// Turns delivered since ``knownBad`` was last recorded.
+    ///
+    /// The clock on the bad point's expiry. Held at zero whenever `knownBad` is
+    /// nil, because "successes since a bound that does not exist" is not a
+    /// quantity — reading a stale count after the bound was cleared would let
+    /// the *next* bound expire immediately on evidence gathered before it.
+    public var successesSinceKnownBad: Int
 
     /// Seeds a state for an alias nothing is known about.
     ///
@@ -149,6 +193,7 @@ public struct ResponseLimitState: Sendable, Hashable, Codable {
         self.maxObservedSuccess = 0
         self.promptsSinceProbe = 0
         self.consecutiveFailures = 0
+        self.successesSinceKnownBad = 0
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -157,6 +202,7 @@ public struct ResponseLimitState: Sendable, Hashable, Codable {
         case maxObservedSuccess
         case promptsSinceProbe
         case consecutiveFailures
+        case successesSinceKnownBad
     }
 
     /// `threshold` is required; every other field defaults.
@@ -174,6 +220,12 @@ public struct ResponseLimitState: Sendable, Hashable, Codable {
         maxObservedSuccess = try container.decodeIfPresent(Int.self, forKey: .maxObservedSuccess) ?? 0
         promptsSinceProbe = try container.decodeIfPresent(Int.self, forKey: .promptsSinceProbe) ?? 0
         consecutiveFailures = try container.decodeIfPresent(Int.self, forKey: .consecutiveFailures) ?? 0
+        // Absent in every file written before the expiry existed. Zero is the
+        // right reading of those: the bound they carry has had no successes
+        // counted against it yet, so it gets the full ``reprobeAfterSuccesses``
+        // grace from here rather than expiring on the first healthy turn.
+        successesSinceKnownBad =
+            try container.decodeIfPresent(Int.self, forKey: .successesSinceKnownBad) ?? 0
     }
 }
 
@@ -225,6 +277,40 @@ public struct ResponseLimitDecision: Sendable, Hashable {
     }
 }
 
+/// What a settled turn is allowed to say about the gateway's response ceiling.
+///
+/// This exists because "the turn failed" and "the gateway would not return that
+/// many characters" are different claims, and conflating them is how the learned
+/// ceiling became a one-way ratchet downward. A boolean `succeeded` gave every
+/// failure the same weight: an expired token, a 429, a quota rejection, a tool
+/// that threw, a context overflow, a connection that never left the machine and
+/// a user pressing Escape all arrived as `false`, and two of them in a row backed
+/// the threshold off 10% and wrote a bad point that nothing could ever clear.
+/// Measured: two gateway outages followed by three hundred healthy turns each
+/// returning four thousand characters left the threshold at 499, where the same
+/// run without the outage reached 4046 — and the 499 was permanent.
+///
+/// The caller classifying the failure is the only party that can tell these
+/// apart, so the classification is an input to the policy rather than something
+/// the policy tries to infer from a number it was handed.
+public enum ResponseLimitEvidence: Sendable, Hashable {
+    /// The gateway answered. `responseCharacters` is real evidence about how
+    /// much it is willing to deliver.
+    case delivered
+    /// The request failed in a way that COULD be a length refusal — a gateway
+    /// timeout, a 5xx from the proxy, a malformed or truncated response. The
+    /// gateway was reached and did not deliver, which is the shape a silent
+    /// length cap takes, so it counts toward the back-off and can bound a probe.
+    case refusedPlausiblyForLength
+    /// The request failed for a reason that has nothing to do with length —
+    /// authentication, rate limiting, quota, context overflow, configuration, a
+    /// tool that failed, a cancelled turn, a connection that never reached the
+    /// gateway. Not evidence: ``ResponseLimitPolicy/record(_:state:settings:)``
+    /// leaves `threshold`, `knownBad`, `consecutiveFailures` and
+    /// `maxObservedSuccess` exactly as they were.
+    case inconclusive
+}
+
 /// What actually happened to a prompt that carried a limit.
 public struct ResponseLimitOutcome: Sendable, Hashable {
     /// The limit that was written into the prompt — not the current threshold,
@@ -233,15 +319,24 @@ public struct ResponseLimitOutcome: Sendable, Hashable {
     /// Whether ``ResponseLimitPolicy/nextLimit(state:settings:)`` called this a
     /// probe.
     public var wasProbe: Bool
-    /// Whether the turn produced an answer at all.
-    public var succeeded: Bool
+    /// What the turn is entitled to say about the ceiling.
+    ///
+    /// The single source of truth about whether this turn is evidence. There is
+    /// deliberately no `succeeded` beside it: a boolean that can disagree with
+    /// the classification is the defect this type was changed to remove.
+    public var evidence: ResponseLimitEvidence
     /// The length of the longest assistant text the turn delivered.
     public var responseCharacters: Int
 
-    public init(offeredLimit: Int, wasProbe: Bool, succeeded: Bool, responseCharacters: Int) {
+    public init(
+        offeredLimit: Int,
+        wasProbe: Bool,
+        evidence: ResponseLimitEvidence,
+        responseCharacters: Int
+    ) {
         self.offeredLimit = offeredLimit
         self.wasProbe = wasProbe
-        self.succeeded = succeeded
+        self.evidence = evidence
         self.responseCharacters = responseCharacters
     }
 }
@@ -278,6 +373,7 @@ public enum ResponseLimitPolicy {
         let maximum: Int
         let jump: Int
         let cadence: Int
+        let reprobe: Int
 
         init(_ settings: ResponseLimitSettings) {
             let minimum = max(1, settings.minimumThreshold)
@@ -285,7 +381,41 @@ public enum ResponseLimitPolicy {
             self.maximum = max(minimum, settings.maximumThreshold)
             self.jump = max(0, settings.jumpPercentage)
             self.cadence = max(1, settings.probeEvery)
+            // Zero or negative would retire the bad point on the first delivered
+            // turn after the search converged, and the search would then spend
+            // the rest of the session oscillating between the bound and the
+            // midpoint below it. One is the smallest setting that still asks for
+            // evidence before re-opening.
+            self.reprobe = max(1, settings.reprobeAfterSuccesses)
         }
+    }
+
+    /// The highest limit worth asking for, given what is known.
+    ///
+    /// Two shapes. With no `knownBad` the search has no upper bound and reaches
+    /// `jumpPercentage` above the threshold, capped at `maximumThreshold`. With
+    /// one it is a binary search downward — the midpoint between what is known
+    /// to work and what is known to fail — which converges on the real ceiling
+    /// and then stops on its own: once the midpoint rounds down onto the
+    /// threshold there is nothing strictly above it left to ask for.
+    ///
+    /// Factored out because ``nextLimit(state:settings:)`` and the `knownBad`
+    /// expiry in ``record(_:state:settings:)`` both have to answer "is the
+    /// search still live?" and must not answer it differently. If the expiry
+    /// used a rule of its own, a state could fall into the gap between them and
+    /// stay there for good: never probing, because the prober sees nothing above
+    /// the threshold; never expiring, because the expiry believes the search is
+    /// still making progress.
+    private static func probeCandidate(
+        threshold: Int,
+        knownBad: Int?,
+        bounds: Bounds
+    ) -> Int {
+        guard let knownBad else {
+            let base = saturatingAdd(threshold, scaled(threshold, by: bounds.jump, over: 100))
+            return min(base, bounds.maximum)
+        }
+        return saturatingAdd(threshold, saturatingSubtract(knownBad, threshold) / 2)
     }
 
     // MARK: Choosing a limit
@@ -298,14 +428,12 @@ public enum ResponseLimitPolicy {
     /// ordinary prompt at the known-good threshold with the cadence counter
     /// advanced, which is the case that runs almost every turn.
     ///
-    /// The candidate itself has two shapes. With no `knownBad` the search has no
-    /// upper bound and reaches `jumpPercentage` above the threshold, capped at
-    /// `maximumThreshold`. With a `knownBad` it becomes a binary search
-    /// downward — the midpoint between what is known to work and what is known
-    /// to fail — which converges on the real ceiling and then stops on its own:
-    /// once the midpoint rounds down to the threshold itself there is nothing
-    /// strictly above it left to ask for, and no probe is offered again until a
-    /// success clears the bad point.
+    /// The candidate itself is ``probeCandidate(threshold:knownBad:bounds:)``,
+    /// which converges and then stops offering anything. A converged search is
+    /// not the end of the story: ``record(_:state:settings:)`` retires the bad
+    /// point after `reprobeAfterSuccesses` delivered turns, which is what turns
+    /// this from a search that runs once per machine into one that keeps up with
+    /// a gateway whose limits change.
     public static func nextLimit(
         state: ResponseLimitState,
         settings: ResponseLimitSettings
@@ -313,13 +441,11 @@ public enum ResponseLimitPolicy {
         let bounds = Bounds(settings)
         let threshold = state.threshold
 
-        let candidate: Int
-        if let knownBad = state.knownBad {
-            candidate = saturatingAdd(threshold, saturatingSubtract(knownBad, threshold) / 2)
-        } else {
-            let base = saturatingAdd(threshold, scaled(threshold, by: bounds.jump, over: 100))
-            candidate = min(base, bounds.maximum)
-        }
+        let candidate = probeCandidate(
+            threshold: threshold,
+            knownBad: state.knownBad,
+            bounds: bounds
+        )
 
         let hasSomewhereToGo = candidate > threshold
         let cadenceDue = saturatingIncrement(state.promptsSinceProbe) >= bounds.cadence
@@ -347,21 +473,26 @@ public enum ResponseLimitPolicy {
 
     /// Folds one turn's outcome into the alias' state.
     ///
-    /// The case that makes this subtle is a *short successful answer*. A model
+    /// The case that makes this subtle is a *short delivered answer*. A model
     /// asked for 800 characters that replies in 200 has told us nothing about
     /// whether 800 would have survived the gateway — the answer never got near
     /// the ceiling. Treating that as a success that confirms the ceiling would
     /// ratchet the threshold up on evidence that does not exist; treating it as
-    /// a failure would ratchet it down on the same non-evidence. It is
-    /// inconclusive, and the only thing it settles is that the turn completed,
-    /// so the consecutive-failure counter resets and nothing else moves.
+    /// a failure would ratchet it down on the same non-evidence. It settles only
+    /// that the turn completed, so the consecutive-failure counter resets and
+    /// nothing else moves.
     ///
-    /// A failure on an ordinary (non-probe) prompt is likewise not immediately
-    /// conclusive: gateways time out for reasons that have nothing to do with
-    /// length. The second one in a row is treated as the ceiling having moved
-    /// underneath us, and the threshold backs off 10% — but never below
-    /// `minimumThreshold`, because a limit small enough to be useless is
-    /// indistinguishable to the user from a broken model.
+    /// A ``ResponseLimitEvidence/refusedPlausiblyForLength`` failure on an
+    /// ordinary (non-probe) prompt is likewise not immediately conclusive:
+    /// gateways time out for reasons that have nothing to do with length. The
+    /// second one in a row is treated as the ceiling having moved underneath us,
+    /// and the threshold backs off 10% — but never below `minimumThreshold`,
+    /// because a limit small enough to be useless is indistinguishable to the
+    /// user from a broken model.
+    ///
+    /// Every movement here is reversible, which is the property the whole type
+    /// turns on. The three guards that make it so, and the failures each one
+    /// prevents, are commented at their sites.
     public static func record(
         _ outcome: ResponseLimitOutcome,
         state: ResponseLimitState,
@@ -370,9 +501,28 @@ public enum ResponseLimitPolicy {
         let bounds = Bounds(settings)
         var next = state
 
-        if outcome.succeeded {
+        switch outcome.evidence {
+        case .inconclusive:
+            // GUARD 1 — a failure that is not about length changes nothing at
+            // all, not even the failure counter.
+            //
+            // This is the difference between an outage costing a few turns and
+            // an outage costing the learned ceiling. Every non-length failure
+            // used to arrive as `succeeded: false`: two 401s, two 429s, two
+            // cancelled turns or two tool errors in a row each backed the
+            // threshold off 10% and wrote a bad point that no later success
+            // could clear. Returning `state` untouched — not re-clamped, not
+            // counted — is the only spelling of "this turn is not evidence"
+            // that cannot be undone by some later rule reading a counter this
+            // one moved.
+            return state
+
+        case .delivered:
             next.maxObservedSuccess = max(state.maxObservedSuccess, outcome.responseCharacters)
             next.consecutiveFailures = 0
+            if state.knownBad != nil {
+                next.successesSinceKnownBad = saturatingIncrement(state.successesSinceKnownBad)
+            }
             // Only an answer that actually reached the ceiling is evidence about
             // where the ceiling is.
             if outcome.responseCharacters >= state.threshold, outcome.wasProbe {
@@ -381,25 +531,86 @@ public enum ResponseLimitPolicy {
                 // as bad, so that record is stale — a gateway setting changed,
                 // or the failure was never about length. Dropping it re-opens
                 // the upward search instead of leaving a binary search bounded
-                // by a bound that has been disproved.
+                // by a bound that has been disproved. Unreachable by a
+                // sequential walk (the midpoint is always strictly below the
+                // bound), which is precisely why GUARD 2 exists as well.
                 if let knownBad = next.knownBad, knownBad <= next.threshold {
                     next.knownBad = nil
                 }
             }
-        } else {
+            // GUARD 2 — a converged bad point expires.
+            //
+            // The branch above is the only other way out of a `knownBad`, and a
+            // sequential walk cannot reach it: the probe candidate is the
+            // midpoint between the threshold and the bound, so it is always
+            // strictly below the bound, so no probe can ever succeed *at* it.
+            // Measured: an exhaustive sweep of 10,062 successful probes cleared
+            // `knownBad` zero times. The consequence was that one probe that
+            // failed during a five-minute outage ended the upward search
+            // permanently, and — before GUARD 3 — a back-off that reached the
+            // floor left `knownBad == threshold == minimum`, which offers no
+            // candidate at all and froze the alias at 200 characters forever,
+            // persisted, with no reset short of deleting the state file.
+            //
+            // Expiry is gated on convergence rather than on time so it never
+            // interrupts a search that is still narrowing: while the midpoint is
+            // still above the threshold there is a real question outstanding and
+            // the bound is doing its job.
+            if let knownBad = next.knownBad,
+                probeCandidate(threshold: next.threshold, knownBad: knownBad, bounds: bounds)
+                    <= next.threshold,
+                next.successesSinceKnownBad >= bounds.reprobe
+            {
+                next.knownBad = nil
+            }
+
+        case .refusedPlausiblyForLength:
             next.consecutiveFailures = saturatingIncrement(state.consecutiveFailures)
             if outcome.wasProbe {
                 // We asked for more than we knew worked and did not get it.
                 // That is exactly what a probe is for; the threshold itself is
                 // untouched because it is still the last thing known to work.
-                next.knownBad = min(state.knownBad ?? Int.max, outcome.offeredLimit)
+                //
+                // GUARD 3 — the bound is never written at or below the floor.
+                // A limit clamped up to `minimumThreshold` that then fails would
+                // otherwise record the floor itself as unreachable, and since
+                // the threshold can never go below the floor either, the pair
+                // `knownBad == threshold == minimum` offers no candidate: an
+                // absorbing state the alias cannot leave. Recording nothing is
+                // right on the merits too — a refusal at the smallest limit the
+                // user permitted says the gateway is broken, not that it has a
+                // ceiling worth searching for. The same test rehabilitates a
+                // state file poisoned by a build that did write the floor.
+                let bad = min(state.knownBad ?? Int.max, outcome.offeredLimit)
+                next.knownBad = bad > bounds.minimum ? bad : nil
+                // A fresh bound gets a fresh clock. Carrying the previous
+                // bound's count over would let a bound recorded seconds ago
+                // expire on the strength of turns delivered before it existed —
+                // which is the same "evidence that is not about this question"
+                // mistake the whole fix is against, pointed the other way.
+                next.successesSinceKnownBad = 0
             } else if next.consecutiveFailures >= 2 {
-                next.knownBad = min(state.knownBad ?? Int.max, state.threshold)
+                // The back-off moves the threshold and NOTHING else. It
+                // deliberately does not write `knownBad`: a gateway that was
+                // down, or slow, or restarting says nothing about which limits
+                // are reachable, and recording the old threshold as bad on that
+                // basis capped every future probe below a value already known to
+                // work. Combined with a bound nothing could clear, that is what
+                // made two 504s followed by three hundred four-thousand
+                // character answers settle at 499 instead of 4046 — permanently.
+                // The 10% step itself is recoverable: a healthy probe climbs
+                // straight back through it.
                 next.threshold = max(bounds.minimum, scaled(state.threshold, by: 9, over: 10))
                 next.consecutiveFailures = 0
             }
         }
 
+        // Restated rather than maintained at each site: "no bound, no clock".
+        // A count left over from a retired bound would otherwise be inherited by
+        // the next one and expire it on evidence gathered before it existed.
+        if next.knownBad == nil {
+            next.successesSinceKnownBad = 0
+        }
         next.threshold = clamp(next.threshold, bounds)
         return next
     }
@@ -737,7 +948,7 @@ public actor ResponseLimitController {
     }
 
     /// The text to send *and store*, plus the ticket to hand back to
-    /// ``record(_:succeeded:responseCharacters:)``.
+    /// ``record(_:evidence:responseCharacters:)``.
     ///
     /// The limit sentence is part of the stored user message on purpose: the
     /// transcript, the session file and every export then show exactly what the
@@ -779,12 +990,30 @@ public actor ResponseLimitController {
 
     /// Folds one settled turn into the alias' learned state.
     ///
-    /// Callers must not call this for a cancelled turn: a user pressing escape
-    /// says nothing about the gateway's ceiling, and recording it as a failure
-    /// would walk the threshold down for a reason that has nothing to do with
-    /// length.
-    public func record(_ ticket: Ticket, succeeded: Bool, responseCharacters: Int) {
+    /// `evidence` is the caller's classification of what the turn proves — see
+    /// ``ResponseLimitEvidence``. It is a required argument rather than a
+    /// boolean with a default because the caller is the only party that can tell
+    /// a gateway timeout from an expired token, and the version of this method
+    /// that took `succeeded: Bool` let every caller silently report the second
+    /// as the first.
+    ///
+    /// A cancelled turn is ``ResponseLimitEvidence/inconclusive``, and callers
+    /// may equally drop it before reaching here; both spellings are safe, which
+    /// is deliberate — the old contract's "callers must not call this for a
+    /// cancelled turn" put the correctness of the learned ceiling in the hands
+    /// of every caller's guard clause.
+    public func record(
+        _ ticket: Ticket,
+        evidence: ResponseLimitEvidence,
+        responseCharacters: Int
+    ) {
         guard configuredSettings.enabled else { return }
+        // Short-circuited before the load, not just inside the policy. An
+        // inconclusive turn changes nothing, so the read-modify-write would be a
+        // pure cost — and worse than free: this store merges what it is handed,
+        // so writing back a state read moments ago would revert whatever a
+        // concurrently settling turn had just learned about the same alias.
+        guard evidence != .inconclusive else { return }
 
         let stored =
             store.load().models[ticket.model]
@@ -792,7 +1021,7 @@ public actor ResponseLimitController {
         let outcome = ResponseLimitOutcome(
             offeredLimit: ticket.limit,
             wasProbe: ticket.isProbe,
-            succeeded: succeeded,
+            evidence: evidence,
             responseCharacters: responseCharacters
         )
         let learned = ResponseLimitPolicy.record(

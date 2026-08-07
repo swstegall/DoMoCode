@@ -426,6 +426,18 @@ final class InteractiveCoordinator {
     private let harness: AgentHarness
     private let provider: any AutocompleteProvider
     private let commandProcessor: PromptCommandProcessor
+    /// The tools this session offers, by name, as they resolved when it was built.
+    ///
+    /// This is the gate that decides whether a `/name` nobody recognises is a TOOL
+    /// CALL or a typo — and only that. The authoritative resolution still happens
+    /// inside ``AgentHarness/executeDirectTool(command:sink:)``, which parses the
+    /// command against the tool set the harness resolves for the active model, so a
+    /// name that has since gone away comes back as a tool-execution error rather
+    /// than silently turning into a model turn. A stale snapshot can therefore only
+    /// ever be too NARROW — an MCP server that reconnected with a new tool is not
+    /// offered here, exactly as it is not offered in the `/` popup, which is built
+    /// from the same snapshot — and never too wide.
+    private let directToolNames: Set<String>
     private let commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?
     private let toolRendererRegistry: ToolRendererRegistry
     private let toolTheme: ToolRenderTheme
@@ -568,6 +580,7 @@ final class InteractiveCoordinator {
         questionBox: QuestionBox,
         memoryStore: (any ProjectMemoryProvider)? = nil,
         fileSystem: SandboxedFileSystem? = nil,
+        directToolNames: Set<String> = [],
         terminalRows: @escaping () -> Int,
         interactiveInputRouter: InteractiveTerminalInputRouter,
         keybindings: Keybindings = Keybindings(),
@@ -587,6 +600,7 @@ final class InteractiveCoordinator {
         self.interactiveInputRouter = interactiveInputRouter
         self.provider = provider
         self.commandProcessor = commandProcessor
+        self.directToolNames = directToolNames
         self.commandStreamFactory = commandStreamFactory
         self.toolRendererRegistry = toolRendererRegistry
         self.toolTheme = toolTheme
@@ -1023,6 +1037,50 @@ final class InteractiveCoordinator {
             break
         }
 
+        // A `/name` that no command answers to but a live TOOL does is executed as
+        // that tool, here, without the model. The `/` popup lists every tool this
+        // session offers, so a chosen row that submitted as "Unknown command /read"
+        // was a dead end the popup itself created; the full-screen client has had
+        // this route (``ClientApp.executeDirectToolCommand`` → `POST /session/:id/tool`)
+        // since the catalog existed, and this is the same route in process.
+        //
+        // Only the two refusals live here. The execution itself happens in
+        // ``runOne(_:)`` on the ordinary run path, so a direct tool gets the same
+        // spinner, the same Escape-interrupts contract, the same permission modal
+        // and the same "one turn at a time" guard a model turn gets.
+        if let tool = directToolName(in: trimmed) {
+            guard staged.isEmpty else {
+                // Mirrors the client, which refuses a direct tool command carrying
+                // attachments and puts the text back. A direct tool call has no
+                // message to hang an image on, and sending the command while
+                // dropping the bytes is exactly the silent truncation the staging
+                // queue exists to prevent — so nothing is consumed: the images stay
+                // staged and the command goes back into the editor.
+                editor.setText(trimmed)
+                appendStopNotice(
+                    "/\(tool) runs the tool directly and takes text only — "
+                        + (staged.count == 1 ? "the staged image is" : "the \(staged.count) staged images are")
+                        + " still attached, send them with a message instead"
+                )
+                render()
+                return
+            }
+            guard !running else {
+                // The harness refuses a direct tool while a turn owns the session
+                // (``AgentHarness/executeDirectTool(command:sink:)`` guards on
+                // `isRunning`), the same 409 the server answers a busy session
+                // with. Say so here rather than steering the text into the running
+                // turn: `/read foo` as a MESSAGE to the model is not what the user
+                // asked for, and it is what would otherwise happen.
+                appendUser(trimmed)
+                appendStopNotice(
+                    "/\(tool) cannot run while a turn is in flight — esc to interrupt, then send it again"
+                )
+                render()
+                return
+            }
+        }
+
         stagedImages = []
         if !trimmed.isEmpty { appendUser(trimmed) }
         render()
@@ -1066,6 +1124,40 @@ final class InteractiveCoordinator {
         } else {
             submissionsContinuation.yield(PendingSubmission(text: trimmed, images: images))
         }
+    }
+
+    /// The tool a submitted line invokes directly, or `nil` when the line is not a
+    /// direct tool command.
+    ///
+    /// A command of the same name always wins: ``PromptCommandProcessor/resolve(_:)``
+    /// would expand it into a prompt, and a workspace is free to name a command
+    /// after a tool. This method exists so the two refusals in ``handleSubmit(_:)``
+    /// can be decided synchronously, before anything is consumed; the run path
+    /// reaches the same conclusion from `resolve`'s own `.unknown` verdict.
+    ///
+    /// The tool match is EXACT, like ``DirectToolCommandParser``'s — commands are
+    /// looked up case-insensitively, tools are not, so `/Read` is a typo that keeps
+    /// printing "Unknown command /Read" rather than quietly running `read`.
+    private func directToolName(in input: String) -> String? {
+        guard let name = Self.slashName(in: input) else { return nil }
+        guard commandProcessor.workspace.commands.command(named: name) == nil else { return nil }
+        return directToolNames.contains(name) ? name : nil
+    }
+
+    /// The `name` in a leading `/name …`, or `nil` when the line is not one.
+    ///
+    /// Deliberately the same grammar ``PromptCommandProcessor`` applies (trim, a
+    /// leading `/`, up to the first whitespace) so this cannot disagree with the
+    /// resolver about what the user typed — a disagreement would mean a line
+    /// refused here as busy and then resolved as a prompt, or the reverse.
+    static func slashName(in input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "/" else { return nil }
+        let rest = trimmed.dropFirst()
+        guard let first = rest.first, !first.isWhitespace else { return nil }
+        let end = rest.firstIndex(where: { $0.isWhitespace }) ?? rest.endIndex
+        let name = String(rest[..<end])
+        return name.isEmpty ? nil : name
     }
 
     // MARK: Drag and drop
@@ -1626,7 +1718,14 @@ final class InteractiveCoordinator {
                 case .local(let action):
                     throw DoMoError(.configuration, "/\(action.rawValue) is a client-local command")
                 case .unknown(let name):
-                    throw DoMoError(.configuration, "Unknown command /\(name)")
+                    // No command owns the name. If a live TOOL does, the line is a
+                    // direct tool command and runs as one; if nothing does, it is a
+                    // typo, and a typo must never quietly become a model turn — so
+                    // the error this arm has always printed is still what it prints.
+                    guard self.directToolNames.contains(name) else {
+                        throw DoMoError(.configuration, "Unknown command /\(name)")
+                    }
+                    return try await self.runDirectTool(prompt, sink: sink)
                 case .prompt(let rendered, let commandModel, let reasoningEffort, let systemPrompt):
                     renderedPrompt = rendered
                     let stream = self.commandStreamFactory?(commandModel, reasoningEffort)
@@ -1692,6 +1791,41 @@ final class InteractiveCoordinator {
             .commandEnd(exitCode: wasAborted ? nil : (reason == .errored ? 1 : 0))
         )
         render()
+    }
+
+    /// Execute one `/tool …` line without the model, and report how the turn ended.
+    ///
+    /// ``AgentHarness/executeDirectTool(command:sink:)`` is the entry point the
+    /// server's `POST /session/:id/tool` route drives for the full-screen client, so
+    /// this surface inherits its contract instead of re-deriving it: the command is
+    /// parsed against the tool set the harness resolves for the ACTIVE model rather
+    /// than against ``directToolNames``; the shared dispatcher runs `beforeToolCall`,
+    /// so a tool that needs approval raises the same modal a model-issued call
+    /// raises; and a tool that fails comes back as an error RESULT rather than a
+    /// throw, drawn by the same ``ToolResultView`` as any other tool. Only a command
+    /// that cannot be parsed at all (an unknown flag, an unfinished quote, a tool
+    /// that has gone away) throws, and ``runOne(_:)``'s existing catch renders that
+    /// as the error row it renders every other throw as.
+    ///
+    /// Nothing is persisted. `ToolDispatch.runDirect` deliberately does not write the
+    /// synthetic assistant turn it builds to carry the call, so a direct tool leaves
+    /// the session file exactly as the server route leaves it — untouched — while the
+    /// transcript still shows it, because the execution events reach the sink.
+    ///
+    /// The stop reason mirrors the result so the shell-integration mark carries a
+    /// truthful exit code. ``stopNotice(for:)`` stays silent for `.errored`, which is
+    /// what is wanted here: the failure is already on screen inside the tool's own
+    /// block, and a second line restating it would be noise.
+    private func runDirectTool(
+        _ command: String,
+        sink: any AgentEventSink
+    ) async throws(DoMoError) -> RunStopReason {
+        let invocation = try await harness.executeDirectTool(command: command, sink: sink)
+        // A dispatch cancelled by Escape returns an ABORTED RESULT rather than
+        // throwing, so "was this interrupted" has to be asked of the task; reporting
+        // it as `.errored` would put a failure exit code on a turn the user stopped.
+        if Task.isCancelled { return .aborted }
+        return invocation.result.isError ? .errored : .completed
     }
 
     /// Advance the status-line spinner while a turn is in flight.
@@ -2344,6 +2478,11 @@ public struct InteractiveMode: Sendable {
     private let sessionDirectory: FilePath
     private let directoryLister: DirectoryLister
     private let slashCommands: [SlashCommand]
+    /// The names of the tools this session resolved, so the REPL can tell a `/name`
+    /// that is a tool call from a `/name` that is a typo. It is the same snapshot
+    /// ``slashCommands`` was built from — the popup advertises exactly what the
+    /// submit path will run, which is the whole point of carrying it.
+    private let directToolNames: Set<String>
     private let commandProcessor: PromptCommandProcessor
     private let commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?
     private let homeDirectory: String?
@@ -2390,6 +2529,7 @@ public struct InteractiveMode: Sendable {
         sessionDirectory: FilePath,
         directoryLister: @escaping DirectoryLister,
         slashCommands: [SlashCommand],
+        directToolNames: Set<String>,
         commandProcessor: PromptCommandProcessor,
         commandStreamFactory: (@Sendable (String?, ReasoningEffort?) -> AgentStreamFn)?,
         homeDirectory: String?,
@@ -2412,6 +2552,7 @@ public struct InteractiveMode: Sendable {
         self.sessionDirectory = sessionDirectory
         self.directoryLister = directoryLister
         self.slashCommands = slashCommands
+        self.directToolNames = directToolNames
         self.commandProcessor = commandProcessor
         self.commandStreamFactory = commandStreamFactory
         self.homeDirectory = homeDirectory
@@ -2769,6 +2910,13 @@ public struct InteractiveMode: Sendable {
                 tools: tools.map(\.definition),
                 agents: promptWorkspace.agents.profiles
             ),
+            // The same snapshot the palette above is built from, unfiltered: the
+            // palette drops a name it cannot splice into the prompt as one token,
+            // but a user is free to PASTE such a name, and the honest answer to
+            // `/weird:name` is to run the tool that exists rather than to call the
+            // line a typo. Nothing here widens what may run — the harness resolves
+            // the command against the live tool set before it executes anything.
+            directToolNames: Set(tools.map(\.definition.name)),
             commandProcessor: commandProcessor,
             commandStreamFactory: { commandModel, effort in
                 var selected = (modelRuntimeFor?(commandModel ?? runtime.model))
@@ -2886,6 +3034,7 @@ public struct InteractiveMode: Sendable {
             questionBox: questionBox,
             memoryStore: memoryStore,
             fileSystem: fileSystem,
+            directToolNames: directToolNames,
             terminalRows: { target.rows },
             interactiveInputRouter: interactiveInputRouter,
             imageCapabilities: resolvedCapabilities,

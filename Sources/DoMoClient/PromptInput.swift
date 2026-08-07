@@ -33,6 +33,14 @@ final class PromptInput: @MainActor Focusable {
     private var autocompleteTask: Task<Void, Never>?
     private var autocompleteProvider: AutocompleteProvider?
     private var autocompleteSuggestions: AutocompleteSuggestions?
+    /// Whether the lookup in flight (or the popup it produced) was opened by
+    /// TYPING rather than by an explicit Tab.
+    ///
+    /// Only an automatically opened popup is automatically closed. A Tab-opened
+    /// file completion is a request the user made and is still looking at; closing
+    /// it on the next keystroke would change a behaviour that predates the palette
+    /// and that nothing here is trying to fix.
+    private var autocompleteIsAutomatic = false
 
     var focused = false {
         didSet { editor.focused = focused }
@@ -117,17 +125,36 @@ final class PromptInput: @MainActor Focusable {
 
     func setText(_ text: String) { editor.setText(text) }
 
-    /// Insert a palette entry — a slash command, a tool, an agent — over the token
-    /// under the caret, leaving the caret ready for arguments.
+    /// Insert a palette entry — a slash command, a tool, an agent — leaving the
+    /// caret ready for arguments.
     ///
-    /// REPLACING the token rather than APPENDING to the draft is the whole fix.
-    /// The palette is normally opened by typing `/`, so that `/` is still sitting
-    /// in the document when the choice comes back; appending `"/" + name` to it
-    /// produced `//read `, which is not a tool and fails at the parser. Splicing
-    /// over the token makes all four spellings the same rule: a slash entry
+    /// TWO GESTURES REACH HERE, and they want opposite things.
+    ///
+    /// The `/` popup is opened by TYPING `/`, so that `/` — and whatever was typed
+    /// after it to filter the list — is still sitting in the document when the
+    /// choice comes back. Appending `"/" + name` to it produced `//read `, which
+    /// is not a tool and fails at the parser. So that token has to be REPLACED,
+    /// and replacing it makes all four spellings one rule: a slash entry
     /// overwrites the `/` (`/read `, never `//read `), a bare entry — an agent —
     /// overwrites it too and so eats it (`explore `, never `/explore `), and from
     /// an empty draft each inserts exactly itself.
+    ///
+    /// The ^P palette and the tool catalog are opened by a KEYSTROKE, with the
+    /// caret wherever the user was writing. Replacing the token there deletes a
+    /// word nobody asked to delete: mid-sentence in `please summarize report`, ^P
+    /// then `read` produced `please summarize /read ` — `report` gone, silently,
+    /// with no trace that anything was removed and no undo the user knows about.
+    /// The behaviour this replaced promised the exact opposite ("never destroys
+    /// text the user has already written").
+    ///
+    /// The token under the caret is what tells the two apart, because it is what
+    /// the gesture leaves behind: empty (the caret is on a whitespace boundary, so
+    /// there is nothing to destroy) or beginning with `/` (the thing the user
+    /// typed to open the list) means splice; anything else is the user's own word
+    /// and the entry is inserted AT the caret with a separating space instead.
+    /// A `/` typed mid-sentence is deliberately on the splice side — it is still
+    /// the gesture that opens the popup, and the popup is still what the user is
+    /// choosing out of.
     ///
     /// The write goes through ``DoMoTUI/Editor/applyAutocomplete(_:)``, not
     /// `setText`. `setText` re-anchors the caret to the END of the document, which
@@ -160,17 +187,27 @@ final class PromptInput: @MainActor Focusable {
         guard !bare.isEmpty else { return }
 
         let insertion = requiresSlash ? "/" + bare : bare
+        let lines = editor.getLines()
         let cursor = editor.getCursor()
-        editor.applyAutocomplete(
-            spliceTokenAtCursor(
-                lines: editor.getLines(),
+        let token = paletteTokenAtCursor(lines: lines, cursorLine: cursor.line, cursorCol: cursor.col)
+        let consumesToken = token.isEmpty || token.hasPrefix("/")
+        let result = consumesToken
+            ? spliceTokenAtCursor(
+                lines: lines,
                 cursorLine: cursor.line,
                 cursorCol: cursor.col,
                 insertion: insertion
             )
-        )
-        // An in-flight lookup was started against the pre-splice document; letting
-        // it land would reopen the popup over text that has moved underneath it.
+            : insertAtCursor(
+                lines: lines,
+                cursorLine: cursor.line,
+                cursorCol: cursor.col,
+                insertion: insertion
+            )
+        editor.applyAutocomplete(result)
+        // An in-flight lookup was started against the pre-insertion document;
+        // letting it land would reopen the popup over text that has moved
+        // underneath it.
         dismissAutocomplete()
     }
 
@@ -190,6 +227,7 @@ final class PromptInput: @MainActor Focusable {
         autocompleteTask = nil
         autocompleteProvider = provider
         autocompleteSuggestions = nil
+        autocompleteIsAutomatic = false
         onAutocomplete?(nil)
     }
 
@@ -205,6 +243,7 @@ final class PromptInput: @MainActor Focusable {
         else { return }
         editor.applyAutocomplete(result)
         autocompleteSuggestions = nil
+        autocompleteIsAutomatic = false
         onAutocomplete?(nil)
     }
 
@@ -212,6 +251,7 @@ final class PromptInput: @MainActor Focusable {
         autocompleteTask?.cancel()
         autocompleteTask = nil
         autocompleteSuggestions = nil
+        autocompleteIsAutomatic = false
         onAutocomplete?(nil)
     }
 
@@ -506,6 +546,51 @@ final class PromptInput: @MainActor Focusable {
             return
         }
         editor.handleInput(data)
+        refreshAutomaticAutocomplete()
+    }
+
+    /// Open — or close — the completion popup as the document changes under the
+    /// caret.
+    ///
+    /// Without this, the full-screen client asked for completions on Tab and
+    /// nowhere else, and ``DoMoTUI/SlashCommandProvider`` declines a forced
+    /// lookup outright (Tab is reserved for file completion, as in pi). The two
+    /// facts together meant typing `/` in `domo` with no flags showed NOTHING —
+    /// every command, tool and agent in the unified popup was unreachable on the
+    /// surface most people run, while the inline REPL, which does fire a
+    /// non-forced lookup as you type, showed all of them.
+    ///
+    /// The condition is the slash-command context and only that: the `@` file
+    /// completion stays a Tab request, because listing a directory is filesystem
+    /// IO and firing it on prose containing an `@` is a per-keystroke `readdir`.
+    /// Ordinary typing therefore starts no task at all.
+    private func refreshAutomaticAutocomplete() {
+        if isSlashCommandContext() {
+            requestAutocomplete(force: false)
+        } else if autocompleteIsAutomatic {
+            // The context the popup was opened for is gone — a space was typed, the
+            // line was cleared, the message was sent. Leaving it up would leave a
+            // list of commands over a draft that is no longer a command.
+            dismissAutocomplete()
+        }
+    }
+
+    /// Whether the text before the caret is a slash-command name being typed.
+    ///
+    /// Deliberately the SAME test ``DoMoTUI/SlashCommandProvider`` applies —
+    /// leading `/` on the caret's line, no space yet — rather than an
+    /// approximation of it. A looser test starts a task per keystroke that the
+    /// provider then declines; a tighter one leaves the popup closed in a context
+    /// the provider would have answered.
+    private func isSlashCommandContext() -> Bool {
+        let lines = editor.getLines()
+        let cursor = editor.getCursor()
+        guard cursor.line >= 0, cursor.line < lines.count else { return false }
+        let characters = Array(lines[cursor.line])
+        let end = max(0, min(cursor.col, characters.count))
+        let before = characters[0..<end]
+        guard before.first == "/" else { return false }
+        return !before.contains(" ")
     }
 
     func invalidate() { editor.invalidate() }
@@ -513,6 +598,7 @@ final class PromptInput: @MainActor Focusable {
     private func requestAutocomplete(force: Bool) {
         guard let provider = autocompleteProvider else { return }
         autocompleteTask?.cancel()
+        autocompleteIsAutomatic = !force
         let lines = editor.getLines()
         let cursor = editor.getCursor()
         autocompleteTask = Task { @MainActor [weak self] in

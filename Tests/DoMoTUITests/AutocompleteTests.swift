@@ -169,7 +169,15 @@ struct AutocompleteTests {
         let suggestions = try! #require(result)
         #expect(suggestions.prefix == "/co")
         // "co" is a subsequence of compact and cost, not clear.
-        #expect(suggestions.items.map(\.value) == ["compact", "cost"])
+        //
+        // `value` carries the SPELLING, not the bare name: the popup now mixes
+        // slash commands, tools and agents, and two rows can share a name (`review`
+        // exists as both a built-in command and a built-in agent profile). While
+        // both carried the same bare `value` they were one item to every consumer
+        // that looks an accepted row back up, so choosing the agent inserted the
+        // command's spelling. Ranking still matches on the bare name.
+        #expect(suggestions.items.map(\.value) == ["/compact", "/cost"])
+        #expect(suggestions.items.map(\.insertion) == ["/compact", "/cost"])
         #expect(suggestions.items.first?.description == "Compact the context")
     }
 
@@ -217,7 +225,7 @@ struct AutocompleteTests {
 
         let slash = try! #require(await combined.getSuggestions(
             lines: ["/co"], cursorLine: 0, cursorCol: 3, force: false, signal: .none))
-        #expect(slash.items.map(\.value) == ["compact", "cost"])
+        #expect(slash.items.map(\.value) == ["/compact", "/cost"])
 
         let file = try! #require(await combined.getSuggestions(
             lines: ["@src/aut"], cursorLine: 0, cursorCol: 8, force: false, signal: .none))

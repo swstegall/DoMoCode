@@ -154,16 +154,39 @@ struct PaletteCatalogTests {
         #expect(catalog.first?.kind == "command")
     }
 
-    @Test("An agent may share a name with a command, because the spelling differs")
-    func sameNameDifferentSlashRuleSurvives() throws {
+    // CHANGED when the palette's de-duplication moved from the
+    // (name, requiresSlash) PAIR to the name alone. This suite used to assert
+    // that a command and an agent sharing a name both survived "because the
+    // spelling differs". They do not, and must not: the built-in registries ship
+    // `plan` and `review` in BOTH, so every default install listed each of them
+    // twice — two rows reading `/plan` and `plan`, indistinguishable to anyone who
+    // has not read this file. The pair key was the reason.
+    @Test("An agent that shares a name with a command is folded into it")
+    func sameNameFoldsToTheCommand() throws {
         let catalog = PaletteCatalog.assemble(
             commands: commands([CommandDescriptor(name: "plan", description: "Plan the work")]),
             tools: [],
             agents: [try agent("plan", description: "The planning profile")]
         )
 
-        #expect(catalog.count == 2)
-        #expect(catalog.map(\.insertionText) == ["/plan", "plan"])
+        #expect(catalog.count == 1)
+        // Command over agent: `/plan` is what the runtime expands out of the
+        // prompt, while the profile of that name is reached by the mode switch and
+        // by the subagent tool rather than by being typed.
+        #expect(catalog.map(\.insertionText) == ["/plan"])
+        #expect(catalog.first?.kind == "command")
+    }
+
+    @Test("Names that differ only in case are one entry")
+    func caseInsensitiveDuplicatesCollapse() {
+        let catalog = PaletteCatalog.assemble(
+            commands: commands([CommandDescriptor(name: "Review", description: "Review the diff")]),
+            tools: [tool("review", description: "A tool spelled in lower case")],
+            agents: []
+        )
+
+        #expect(catalog.count == 1)
+        #expect(catalog.first?.name == "Review")
     }
 
     // MARK: Row values

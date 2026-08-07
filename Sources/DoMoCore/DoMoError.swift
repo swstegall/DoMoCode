@@ -372,6 +372,55 @@ extension DoMoError {
     }
 }
 
+// MARK: - Recovery envelopes
+
+extension DoMoError {
+    /// Rebuilds the classification a ``RecoveryEnvelope`` recorded, for the one
+    /// path on which a live failure cannot carry its own ``Kind`` to the caller.
+    ///
+    /// Everything the LLM client can *throw* reaches the agent loop as a
+    /// `DoMoError` with its kind intact. One class of failure is deliberately
+    /// not thrown: a gateway that commits a 2xx, streams part of an answer and
+    /// then dies — a stalled body, a mid-stream `error` frame, an undecodable
+    /// frame. Half a turn is real content and has to reach the transcript, so
+    /// that stream ends with a terminal *message* instead, and a message carries
+    /// only prose — `AssistantMessage.failure` (DoMoLLM) answers
+    /// `.provider(status: nil, isRetryable: false)`, coarse by construction,
+    /// because a message rebuilt from a session file has no kind to report.
+    ///
+    /// The classification is not gone, though: it was written down a moment
+    /// earlier. The client emits a ``RecoveryEnvelope`` describing the SAME
+    /// failure immediately before that terminal message, and
+    /// ``RecoveryEnvelope/originalKind`` exists for exactly this purpose —
+    /// ``Kind/label`` is "what crosses a wire, so the taxonomy survives the trip
+    /// instead of being re-derived from prose". This initializer is the read
+    /// side of that promise.
+    ///
+    /// What it prevents, concretely: a mid-answer stall raises ``Kind/transport``
+    /// with "… it timed out", which ``isGatewayTimeout`` recognises. Flattened
+    /// to the coarse provider shape that predicate answers false, and the
+    /// gateway-continuation loop — whose whole subject is the mid-answer stall,
+    /// the only timeout with partial work worth resuming — never fires for the
+    /// one case it was built for.
+    ///
+    /// Fidelity is limited to what the label carries, on purpose. ``Kind/labeled(_:)``
+    /// rebuilds payload-bearing kinds at their least committal value, and the
+    /// envelope's other fields are NOT folded in to sharpen them: on this path
+    /// ``RecoveryEnvelope/status`` is the committed 200 that opened the stream,
+    /// so putting it in `.provider(status:)` would state a status that never
+    /// described a failure. `nil` for an unrecognized label, for `labeled(_:)`'s
+    /// own reason — a kind this version does not know must read as unclassified,
+    /// never as the wrong kind.
+    ///
+    /// The message is the envelope's, which was already redacted and bounded
+    /// when the envelope was built, so rebuilding here cannot put a credential
+    /// anywhere the envelope had not already put it.
+    public init?(recovery envelope: RecoveryEnvelope) {
+        guard let kind = Kind.labeled(envelope.originalKind) else { return nil }
+        self.init(kind, envelope.error)
+    }
+}
+
 // MARK: - Cancellation
 
 extension DoMoError {

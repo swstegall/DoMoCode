@@ -94,8 +94,26 @@ public enum PaletteCatalog {
     /// because inspecting *why* a tool is unavailable is its job; inserting one is
     /// not.
     ///
-    /// De-duplicated on the pair that decides the inserted text, first wins, so a
-    /// tool that shares a name with a command does not produce two identical rows.
+    /// De-duplicated case-insensitively on the NAME alone, first source wins —
+    /// which, given the order above, is a precedence: command, then tool, then
+    /// agent.
+    ///
+    /// Keying on the `(name, requiresSlash)` pair instead is what shipped, and it
+    /// is broken out of the box: the built-in command registry has `plan` and
+    /// `review`, and the built-in agent registry has `plan` and `review` too, so a
+    /// default install listed each of them twice — once as `/plan`, once as
+    /// `plan` — with no visible difference beyond the slash. Two rows that read
+    /// the same are a list the user cannot choose from, and in the `/` popup the
+    /// two rows were literally the same item, so choosing the agent inserted the
+    /// command's spelling.
+    ///
+    /// Command over agent is the right way round for the collision that exists:
+    /// `/plan` and `/review` are commands the runtime expands into a turn, while
+    /// the agent profile of the same name is selected by the mode switch and by
+    /// the subagent tool rather than by being typed into the prompt. The inline
+    /// REPL's `InteractivePalette.entries` already resolves the same collision the
+    /// same way; two surfaces disagreeing about which `plan` a user gets would be
+    /// worse than either answer.
     public static func assemble(
         commands: CommandRegistry,
         tools: [ToolCatalogEntry],
@@ -145,8 +163,12 @@ public enum PaletteCatalog {
         var unique: [PaletteEntry] = []
         unique.reserveCapacity(entries.count)
         for entry in entries {
-            let key = encode(.insert(name: entry.name, requiresSlash: entry.requiresSlash))
-            guard seen.insert(key).inserted else { continue }
+            // `lowercased()` and not `caseInsensitiveCompare`: this is a set
+            // membership test over the whole catalog, and the registries that feed
+            // it already resolve names case-insensitively
+            // (`AgentProfileRegistry.profile(named:)`), so two spellings that
+            // differ only in case name one thing and must not produce two rows.
+            guard seen.insert(entry.name.lowercased()).inserted else { continue }
             unique.append(entry)
         }
         return unique

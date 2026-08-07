@@ -70,7 +70,7 @@ struct ResponseLimitPolicyTests {
             ResponseLimitOutcome(
                 offeredLimit: 550,
                 wasProbe: true,
-                succeeded: true,
+                evidence: .delivered,
                 responseCharacters: 512
             ),
             state: state,
@@ -92,7 +92,7 @@ struct ResponseLimitPolicyTests {
             ResponseLimitOutcome(
                 offeredLimit: 605,
                 wasProbe: true,
-                succeeded: false,
+                evidence: .refusedPlausiblyForLength,
                 responseCharacters: 0
             ),
             state: state,
@@ -113,7 +113,7 @@ struct ResponseLimitPolicyTests {
             ResponseLimitOutcome(
                 offeredLimit: 577,
                 wasProbe: true,
-                succeeded: true,
+                evidence: .delivered,
                 responseCharacters: 570
             ),
             state: state,
@@ -221,6 +221,9 @@ struct ResponseLimitPolicyTests {
 @Suite("Adaptive response limit — recording outcomes")
 struct ResponseLimitRecordTests {
 
+    /// A *delivered* short answer, not ``ResponseLimitEvidence/inconclusive``:
+    /// the gateway answered, so the turn is evidence — it just happens to be
+    /// evidence that stops short of the ceiling and therefore moves nothing.
     @Test("a short but successful answer proves nothing about the ceiling")
     func shortSuccessIsInconclusive() {
         var state = ResponseLimitState(threshold: 500)
@@ -230,7 +233,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 550,
                 wasProbe: true,
-                succeeded: true,
+                evidence: .delivered,
                 responseCharacters: 120
             ),
             state: state,
@@ -251,7 +254,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 605,
                 wasProbe: true,
-                succeeded: false,
+                evidence: .refusedPlausiblyForLength,
                 responseCharacters: 0
             ),
             state: state,
@@ -266,7 +269,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 1_200,
                 wasProbe: true,
-                succeeded: false,
+                evidence: .refusedPlausiblyForLength,
                 responseCharacters: 0
             ),
             state: lowered,
@@ -283,7 +286,7 @@ struct ResponseLimitRecordTests {
         let failure = ResponseLimitOutcome(
             offeredLimit: 500,
             wasProbe: false,
-            succeeded: false,
+            evidence: .refusedPlausiblyForLength,
             responseCharacters: 0
         )
 
@@ -293,7 +296,12 @@ struct ResponseLimitRecordTests {
         #expect(state.consecutiveFailures == 1)
 
         state = ResponseLimitPolicy.record(failure, state: state, settings: .default)
-        #expect(state.knownBad == 500)
+        // The back-off moves the threshold and nothing else. It used to also
+        // write `knownBad = 500` here, which capped every future probe below a
+        // limit that was already known to work and — because nothing could clear
+        // a bad point — did so permanently. The 10% step on its own is
+        // recoverable; the bound was not.
+        #expect(state.knownBad == nil)
         #expect(state.threshold == 450)
         #expect(state.consecutiveFailures == 0)
     }
@@ -305,7 +313,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 500,
                 wasProbe: false,
-                succeeded: false,
+                evidence: .refusedPlausiblyForLength,
                 responseCharacters: 0
             ),
             state: state,
@@ -315,7 +323,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 500,
                 wasProbe: false,
-                succeeded: true,
+                evidence: .delivered,
                 responseCharacters: 40
             ),
             state: state,
@@ -327,7 +335,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 500,
                 wasProbe: false,
-                succeeded: false,
+                evidence: .refusedPlausiblyForLength,
                 responseCharacters: 0
             ),
             state: state,
@@ -346,7 +354,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 410,
                 wasProbe: false,
-                succeeded: false,
+                evidence: .refusedPlausiblyForLength,
                 responseCharacters: 0
             ),
             state: state,
@@ -365,7 +373,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: 700,
                 wasProbe: true,
-                succeeded: true,
+                evidence: .delivered,
                 responseCharacters: 690
             ),
             state: state,
@@ -423,7 +431,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: Int.max,
                 wasProbe: false,
-                succeeded: false,
+                evidence: .refusedPlausiblyForLength,
                 responseCharacters: Int.max
             ),
             state: extreme,
@@ -435,7 +443,7 @@ struct ResponseLimitRecordTests {
             ResponseLimitOutcome(
                 offeredLimit: Int.max,
                 wasProbe: true,
-                succeeded: true,
+                evidence: .delivered,
                 responseCharacters: Int.max
             ),
             state: extreme,
@@ -656,7 +664,7 @@ struct ResponseLimitControllerTests {
         // The cadence is persisted before the turn runs, not after it settles.
         #expect(store.load().models["alias"]?.promptsSinceProbe == 0)
 
-        await controller.record(ticket, succeeded: true, responseCharacters: 540)
+        await controller.record(ticket, evidence: .delivered, responseCharacters: 540)
         #expect(await controller.currentThreshold(model: "alias") == 550)
 
         // A resubmitted prompt carries one sentence, at the new limit.
@@ -687,11 +695,15 @@ struct ResponseLimitControllerTests {
 
         let first = await controller.decorate("go", model: "fast")
         let fastTicket = try #require(first.ticket)
-        await controller.record(fastTicket, succeeded: true, responseCharacters: 600)
+        await controller.record(fastTicket, evidence: .delivered, responseCharacters: 600)
 
         let second = await controller.decorate("go", model: "slow")
         let slowTicket = try #require(second.ticket)
-        await controller.record(slowTicket, succeeded: false, responseCharacters: 0)
+        await controller.record(
+            slowTicket,
+            evidence: .refusedPlausiblyForLength,
+            responseCharacters: 0
+        )
 
         #expect(await controller.currentThreshold(model: "fast") == 550)
         #expect(await controller.currentThreshold(model: "slow") == 500)
@@ -706,7 +718,7 @@ struct ResponseLimitControllerTests {
         let first = ResponseLimitController(settings: settings, store: FileResponseLimitStore(path: path))
         let decorated = await first.decorate("Go.", model: "alias")
         let ticket = try #require(decorated.ticket)
-        await first.record(ticket, succeeded: true, responseCharacters: 600)
+        await first.record(ticket, evidence: .delivered, responseCharacters: 600)
 
         let second = ResponseLimitController(settings: settings, store: FileResponseLimitStore(path: path))
         #expect(await second.currentThreshold(model: "alias") == 550)

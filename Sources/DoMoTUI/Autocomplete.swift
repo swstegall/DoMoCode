@@ -46,6 +46,15 @@ import Foundation
 /// produced `"//read"`, so the spelling is decided once, by whoever built the item,
 /// and carried here. `nil` keeps the historical behavior for every producer that
 /// has not been taught about it.
+///
+/// `value` is also the item's IDENTITY: every consumer of a popup hands back the
+/// row's value and looks the item up with `items.first { $0.value == chosen }`, so
+/// two items sharing a value are one item as far as any of them can tell — the
+/// second row is unselectable and choosing it applies the first row's insertion.
+/// A producer that can emit two different entries under one name (a `plan`
+/// command beside a `plan` agent profile, which a default install really has) must
+/// therefore make `value` carry whatever distinguishes them; ``SlashCommandProvider``
+/// uses the spelling, exactly as ``FileCompletionProvider`` always has.
 public nonisolated struct AutocompleteItem: Sendable, Equatable {
     public var value: String
     public var label: String
@@ -262,6 +271,95 @@ private nonisolated func isPaletteTokenDelimiter(_ character: Character) -> Bool
     character == " " || character == "\t"
 }
 
+/// The half-open range of the whitespace-delimited token `cursor` sits in.
+///
+/// Factored out because three callers need the SAME boundary — the splice, the
+/// token query the palette decides its gesture on, and (through the query) the
+/// prompt's insert-at-caret path. Two copies of a two-directional scan is how one
+/// of them ends up treating a tab as a boundary and another one not.
+///
+/// `cursor` must already be clamped into `0...characters.count`.
+private nonisolated func paletteTokenRange(_ characters: [Character], _ cursor: Int) -> Range<Int> {
+    var start = cursor
+    while start > 0, !isPaletteTokenDelimiter(characters[start - 1]) { start -= 1 }
+    var end = cursor
+    while end < characters.count, !isPaletteTokenDelimiter(characters[end]) { end += 1 }
+    return start..<end
+}
+
+/// The whitespace-delimited token the caret sits in, or `""` when the caret sits
+/// on a boundary (or the coordinates are stale).
+///
+/// The palette needs this to tell two GESTURES apart, which is a distinction the
+/// splice itself cannot make. Choosing a row out of a popup the user opened by
+/// typing `/` means "replace what I typed to get here"; choosing one out of the
+/// ^P palette, opened by a keystroke while the caret sat in the middle of a
+/// sentence, means "put this here" — and replacing the token there deletes a word
+/// the user wrote. See ``spliceTokenAtCursor`` and ``insertAtCursor``.
+///
+/// Clamps rather than traps, for the same reason everything else in this file
+/// does: the coordinates can come from a superseded keystroke.
+public nonisolated func paletteTokenAtCursor(lines: [String], cursorLine: Int, cursorCol: Int) -> String {
+    guard cursorLine >= 0, cursorLine < lines.count else { return "" }
+    let characters = Array(lines[cursorLine])
+    let cursor = max(0, min(cursorCol, characters.count))
+    return String(characters[paletteTokenRange(characters, cursor)])
+}
+
+/// Insert `insertion` AT the caret, separated from what is already there by one
+/// space, leaving every surrounding word intact.
+///
+/// The counterpart to ``spliceTokenAtCursor``, and the reason both exist: the two
+/// palette gestures want opposite things. A popup opened by typing `/` has to
+/// CONSUME the token that opened it, or the `/` is doubled. A palette opened by
+/// ^P has to consume nothing: the caret is wherever the user was writing, and the
+/// pre-palette guarantee was that inserting a command "never destroys text the
+/// user has already written". Splicing there turned "please summarize report"
+/// into "please summarize /read " — the word `report` deleted with no undo the
+/// user knows about, and no trace that anything was removed.
+///
+/// A trailing space always follows the insertion (the caret lands after it, ready
+/// for arguments), matching the splice and the `@` file completion. The leading
+/// space is added only when the character before the caret is not already
+/// whitespace, so an insertion at the start of a line or right after a space does
+/// not acquire a stray one.
+///
+/// An empty document synthesizes the line the text would have lived on: the
+/// editor rejects an empty `lines`, so returning the input unchanged would make
+/// the palette look broken rather than empty.
+public nonisolated func insertAtCursor(
+    lines: [String],
+    cursorLine: Int,
+    cursorCol: Int,
+    insertion: String
+) -> AutocompleteResult {
+    guard cursorLine >= 0, cursorLine < lines.count else {
+        if lines.isEmpty {
+            let inserted = Array(insertion) + [" "]
+            return AutocompleteResult(lines: [String(inserted)], cursorLine: 0, cursorCol: inserted.count)
+        }
+        return AutocompleteResult(lines: lines, cursorLine: cursorLine, cursorCol: cursorCol)
+    }
+
+    let characters = Array(lines[cursorLine])
+    let cursor = max(0, min(cursorCol, characters.count))
+    let before = Array(characters[0..<cursor])
+    let after = Array(characters[cursor...])
+
+    let needsSeparator = before.last.map { !isPaletteTokenDelimiter($0) } ?? false
+    var inserted: [Character] = needsSeparator ? [" "] : []
+    inserted.append(contentsOf: Array(insertion))
+    inserted.append(" ")
+
+    var newLines = lines
+    newLines[cursorLine] = String(before + inserted + after)
+    return AutocompleteResult(
+        lines: newLines,
+        cursorLine: cursorLine,
+        cursorCol: before.count + inserted.count
+    )
+}
+
 /// Replace the whitespace-delimited token under the caret with `insertion` plus a
 /// trailing space, and report the caret's new grapheme column.
 ///
@@ -308,13 +406,9 @@ public nonisolated func spliceTokenAtCursor(
     let characters = Array(lines[cursorLine])
     let cursor = max(0, min(cursorCol, characters.count))
 
-    var start = cursor
-    while start > 0, !isPaletteTokenDelimiter(characters[start - 1]) { start -= 1 }
-    var end = cursor
-    while end < characters.count, !isPaletteTokenDelimiter(characters[end]) { end += 1 }
-
-    let before = Array(characters[0..<start])
-    let after = Array(characters[end...])
+    let token = paletteTokenRange(characters, cursor)
+    let before = Array(characters[0..<token.lowerBound])
+    let after = Array(characters[token.upperBound...])
 
     var newLines = lines
     newLines[cursorLine] = String(before + inserted + after)
@@ -414,10 +508,20 @@ public final class SlashCommandProvider: AutocompleteProvider {
             // spelling is the one thing the user cannot infer from the name — and
             // a row reading `explore` in a popup opened by typing `/` is precisely
             // how a user learns the `/` is about to be eaten, before pressing
-            // Enter rather than after. `value` stays bare: it is the identity the
-            // caller matches on.
+            // Enter rather than after.
+            //
+            // `value` is the spelling too, and that is a fix rather than tidiness.
+            // `value` is the identity every consumer resolves a chosen row back on
+            // (`items.first { $0.value == chosen.value }`), and a default install
+            // has a `plan` COMMAND and a `plan` AGENT PROFILE — two rows, two
+            // different insertions, one bare name. Keyed on the name they were the
+            // same item: the second row could not be selected at all, and picking
+            // it applied the first one's spelling, breaking the user's rule that a
+            // non-slash entry inserts `foo` and not `/foo`. The spelling is what
+            // actually distinguishes them, and it is what
+            // ``FileCompletionProvider`` has always put in `value`.
             return AutocompleteItem(
-                value: command.name,
+                value: insertion,
                 label: insertion,
                 description: description,
                 insertion: insertion
@@ -441,8 +545,13 @@ public final class SlashCommandProvider: AutocompleteProvider {
         guard String(beforePrefix).trimmingCharacters(in: [" ", "\t"]).isEmpty else { return nil }
         guard !prefix.dropFirst().contains("/") else { return nil }
 
-        // `item.insertion` carries the literal spelling; the `"/" + value` fallback
-        // is what a producer that predates the unified palette still gets.
+        // `item.insertion` carries the literal spelling. The `"/" + value`
+        // fallback is only ever reached by an item this provider did not build —
+        // one a caller hand-assembled before `insertion` existed, whose `value` is
+        // therefore the bare name it always was. Items from
+        // ``getSuggestions(lines:cursorLine:cursorCol:force:signal:)`` always carry
+        // `insertion`, so the change that made their `value` the spelling cannot
+        // reach this line and double a slash.
         //
         // The splice replaces the WHOLE token under the caret rather than just the
         // matched prefix. That is the difference between a `/` typed to open the

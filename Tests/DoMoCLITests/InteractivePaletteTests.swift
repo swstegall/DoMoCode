@@ -134,7 +134,10 @@ struct InteractivePaletteTests {
         // place the user can see that choosing the agent will eat the `/` they
         // typed to open the list.
         #expect(suggestions.items.map(\.label) == ["/review", "/read", "explore"])
-        #expect(suggestions.items.map(\.value) == ["review", "read", "explore"])
+        // `value` is the row's IDENTITY and carries the spelling too, so two rows
+        // that share a name — `review` the command and `review` the agent profile,
+        // both built in — are never the same item.
+        #expect(suggestions.items.map(\.value) == ["/review", "/read", "explore"])
         // The spelling is decided when the item is built, which is the whole fix:
         // the agent's insertion has no slash to double.
         #expect(suggestions.items.map(\.insertion) == ["/review", "/read", "explore"])
@@ -213,6 +216,12 @@ struct InteractivePaletteTests {
             force: false,
             signal: .none
         )
-        return suggestions?.items.first { $0.value == name }
+        // Matched on the BARE name, because `value` is the row's identity and now
+        // carries the spelling (`/read` vs `explore`) rather than the name. It has
+        // to: `plan` and `review` exist as both a built-in command and a built-in
+        // agent profile, and while both rows shared one bare `value` the popup
+        // could not tell them apart — choosing the agent row inserted the
+        // command's spelling.
+        return suggestions?.items.first { $0.value == name || $0.value == "/" + name }
     }
 }

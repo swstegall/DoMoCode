@@ -1291,13 +1291,60 @@ public actor AgentHarness {
             return user.text
         }.first ?? ""
 
-        let steeringMessages: (@Sendable () async -> [Message])?
+        // Steering is wrapped here rather than forwarded verbatim, and this is the
+        // one seam where that can be done once. A message typed while a run is in
+        // flight reaches the model through this closure and never through
+        // ``run(messages:)``, so an unwrapped steering path puts the single prompt
+        // on the wire that carries no limit sentence — on the surface where it is
+        // most likely to be a long request, since the user is correcting a run they
+        // are watching. Decorating inside the harness means the client, the inline
+        // REPL and the server all get it without each re-implementing it, and
+        // cannot drift apart afterwards.
+        //
+        // Both sources are resolved first and the wrapper is applied to whichever
+        // one won, so neither can escape it.
+        let steeringSource: (@Sendable () async -> [Message])?
         if let configured = configuration.getSteeringMessages {
-            steeringMessages = configured
+            steeringSource = configured
         } else if let box = configuration.steeringBox {
-            steeringMessages = { @Sendable in box.drain() }
+            steeringSource = { @Sendable in box.drain() }
         } else {
-            steeringMessages = nil
+            steeringSource = nil
+        }
+        let steeringMessages: (@Sendable () async -> [Message])?
+        if let steeringSource, let limitController = configuration.responseLimit {
+            let limitModel = runOverride?.model ?? activeModel
+            steeringMessages = { @Sendable in
+                let drained = await steeringSource()
+                guard !drained.isEmpty else { return drained }
+                // The ticket is deliberately DISCARDED, so a steering message is
+                // decorated and never recorded.
+                //
+                // A run holds exactly one ticket, and it describes the decorated
+                // request the run was issued for. Keeping the steering ticket
+                // instead would silently substitute a different offered limit for
+                // the one the run is measuring; keeping both would fold two
+                // outcomes out of one settled result, which the policy reads as
+                // two independent observations of a gateway that answered once —
+                // enough, on its own, to trip the two-failures-in-a-row back-off
+                // from a single failure.
+                //
+                // The cost is that a limit offered on a steering message teaches
+                // nothing, and that a probe cadence slot can be spent on a turn
+                // whose answer is never scored. That is a lost probe, which the
+                // next prompt re-offers. The alternative is wrong arithmetic on
+                // the value the whole feature exists to learn.
+                // Spelled with the type's own name rather than `Self`, so nothing
+                // about this closure can be read — by a compiler or by a reader —
+                // as capturing the harness instance it was built inside.
+                return await AgentHarness.applyingResponseLimit(
+                    to: drained,
+                    controller: limitController,
+                    model: limitModel
+                ).messages
+            }
+        } else {
+            steeringMessages = steeringSource
         }
 
         let followUpMessages: (@Sendable () async -> [Message])?
@@ -1400,6 +1447,33 @@ public actor AgentHarness {
             }
         }
 
+        // What the DECORATED request is answerable for, read here and never again:
+        // after overflow recovery, strictly before the first continuation attempt.
+        //
+        // The ticket describes one request — the one carrying the limit sentence.
+        // The continuation asks a different question, with the harness's own
+        // undecorated words and no limit on them at all, so reading the merged
+        // result would let the continuation's long answer stand as proof that the
+        // probe the gateway had just refused was delivered. That is not a rounding
+        // error in the learning: it promotes the ceiling to the exact value the
+        // gateway declined, and since a promotion is only undone by fresh failures
+        // *at the new height*, the ratchet goes up and cannot come back down.
+        //
+        // Cancellation is sampled at the same instant for the same reason. The
+        // continuation loop is the only suspension between here and the recording
+        // below, and it runs only while `result.failure` is non-nil — so a run
+        // whose evidence is `.delivered` reaches the record call with nothing
+        // awaited in between, and a late interrupt has no path by which to turn a
+        // refusal into a delivery.
+        let responseLimitObservation = ResponseLimitObservation(
+            evidence: Self.responseLimitEvidence(
+                stopReason: result.stopReason,
+                failure: result.failure,
+                cancelled: Task.isCancelled
+            ),
+            characters: Self.longestAssistantText(in: result.messages)
+        )
+
         // Gateway continuation, strictly downstream of overflow recovery: an
         // over-window request is repaired by compacting and re-asking, and only
         // a failure that survives *that* is a candidate for "the gateway hung up
@@ -1466,8 +1540,12 @@ public actor AgentHarness {
         // could not be written is a failure of this process's filesystem and
         // says nothing whatever about what the gateway was willing to return,
         // which is the only question the learned ceiling answers.
+        //
+        // `responseLimitObservation`, never `result`: by this line `result` may
+        // have been rewritten by one or more continuations, and those describe an
+        // undecorated request this ticket was never issued for.
         if let ticket = responseLimitTicket {
-            await recordResponseLimitOutcome(ticket, result: result)
+            await recordResponseLimitOutcome(ticket, observation: responseLimitObservation)
         }
 
         if let error = errorBox.first {
@@ -1492,13 +1570,39 @@ public actor AgentHarness {
     ///
     /// Returns the input unchanged, with a `nil` ticket, whenever there is no
     /// controller or no user message to decorate. A `nil` ticket is what makes
-    /// ``recordResponseLimitOutcome(_:result:)`` a no-op, so an undecorated run
-    /// can never teach the ceiling anything.
+    /// ``recordResponseLimitOutcome(_:observation:)`` a no-op, so an undecorated
+    /// run can never teach the ceiling anything.
     private func decorateWithResponseLimit(
         _ messages: [Message],
         runOverride: RunOverride?
     ) async -> (messages: [Message], ticket: ResponseLimitController.Ticket?) {
         guard let controller = configuration.responseLimit else { return (messages, nil) }
+        // The model that will actually answer, which a per-command override can
+        // change for one turn. The ceiling is learned per alias, so charging a
+        // probe to the session's default model when a different one answered
+        // would teach the wrong row.
+        return await Self.applyingResponseLimit(
+            to: messages,
+            controller: controller,
+            model: runOverride?.model ?? activeModel
+        )
+    }
+
+    /// Puts the limit sentence on the last `.user` message of `messages`, using
+    /// `controller`, and returns the ticket that request is owed back.
+    ///
+    /// `static`, and reading none of the harness's state, because it has two
+    /// callers that must decorate *identically* and one of them is not on the
+    /// actor: the steering wrapper runs inside the agent loop while
+    /// ``run(messages:)`` is suspended on that loop, and hopping back onto the
+    /// harness there would serialize a decoration behind the very run that is
+    /// waiting for it. One implementation is also the only way the prompt path and
+    /// the steering path cannot drift into decorating differently.
+    private static func applyingResponseLimit(
+        to messages: [Message],
+        controller: ResponseLimitController,
+        model: String
+    ) async -> (messages: [Message], ticket: ResponseLimitController.Ticket?) {
         let promptIndex = messages.lastIndex { message in
             if case .user = message { return true }
             return false
@@ -1508,14 +1612,7 @@ public actor AgentHarness {
         }
         let textIndex = user.content.lastIndex { $0.textBlock != nil }
         let original = textIndex.flatMap { user.content[$0].textBlock?.text } ?? ""
-        // The model that will actually answer, which a per-command override can
-        // change for one turn. The ceiling is learned per alias, so charging a
-        // probe to the session's default model when a different one answered
-        // would teach the wrong row.
-        let decorated = await controller.decorate(
-            original,
-            model: runOverride?.model ?? activeModel
-        )
+        let decorated = await controller.decorate(original, model: model)
         if let textIndex {
             user.content[textIndex] = .text(decorated.text)
         } else {
@@ -1526,32 +1623,117 @@ public actor AgentHarness {
         return (updated, decorated.ticket)
     }
 
-    /// Feeds one settled run back into the adaptive response-character limit.
+    /// What the decorated request — and only the decorated request — is
+    /// answerable for.
     ///
-    /// A cancelled or aborted run is dropped rather than recorded as a failure:
-    /// the gateway was never given the chance to refuse, so counting an
-    /// interrupt as evidence would walk the learned ceiling down every time a
-    /// user pressed Escape — and the back-off is exactly the direction that is
-    /// expensive to undo, since it takes several successful probes to climb back.
+    /// A value rather than two locals so the capture is a single statement that a
+    /// later edit cannot half-move: the evidence and the length have to be read
+    /// off the same result at the same instant, or the pair describes two
+    /// different requests and means nothing.
+    private struct ResponseLimitObservation: Sendable {
+        var evidence: ResponseLimitEvidence
+        var characters: Int
+    }
+
+    /// What one settled result says about the gateway's willingness to return a
+    /// response of the offered length.
     ///
-    /// `responseCharacters` is the LONGEST assistant text in the run, not the
-    /// sum and not the last: the question the ceiling answers is "how much did
-    /// the gateway deliver intact in one response", and a multi-turn run's total
-    /// would claim credit no single response earned.
-    private func recordResponseLimitOutcome(
-        _ ticket: ResponseLimitController.Ticket,
-        result: AgentRunResult
-    ) async {
-        guard let controller = configuration.responseLimit else { return }
-        guard !Task.isCancelled, result.stopReason != .aborted else { return }
-        let characters = result.messages.reduce(into: 0) { longest, message in
+    /// The three answers are not "success, failure, maybe". They are three
+    /// different questions the same result can answer, and folding any two of them
+    /// together is what produced a learned ceiling that could only ever fall:
+    ///
+    /// - ``ResponseLimitEvidence/delivered`` — the gateway answered. How much it
+    ///   returned is real evidence about where the ceiling is.
+    /// - ``ResponseLimitEvidence/refusedPlausiblyForLength`` — the request died in
+    ///   one of the few shapes an undocumented length cap actually takes on this
+    ///   deployment. The gateway times out rather than saying "too long" (that is
+    ///   the whole reason this feature exists); a proxy in front of it returns a
+    ///   retryable 5xx; or the answer arrives cut off into something the decoder
+    ///   cannot finish reading. None of those *prove* it was the length. They are
+    ///   the only failures that could be, which is exactly what the binary search
+    ///   needs in order to bound itself from above.
+    /// - ``ResponseLimitEvidence/inconclusive`` — everything else. A refused
+    ///   credential, a throttle, an exhausted budget, a context overflow, a bad
+    ///   setting, a tool that failed, a connection that never reached the gateway,
+    ///   and a turn the user interrupted all say precisely nothing about how many
+    ///   characters would have come back. Counted as failures, two of them in a row
+    ///   used to back the threshold down and write a bad point at the old one —
+    ///   which is how a short outage pinned a healthy gateway's ceiling at the
+    ///   floor for the life of the machine.
+    ///
+    /// Note the failure that is deliberately *not* in the middle case: a
+    /// ``DoMoError/Kind/transport`` whose prose never mentions a timeout — a
+    /// refused connection — is inconclusive, because nothing on the far side ever
+    /// got the chance to refuse anything.
+    private static func responseLimitEvidence(
+        stopReason: RunStopReason,
+        failure: DoMoError?,
+        cancelled: Bool
+    ) -> ResponseLimitEvidence {
+        // Checked before the failure, because an interrupt is the one outcome that
+        // can arrive wearing another failure's clothes: tearing down an in-flight
+        // socket surfaces as an arbitrary transport error, and a stream torn down
+        // mid-answer says "timed out" as readily as a gateway that gave up.
+        if cancelled || stopReason == .aborted { return .inconclusive }
+        guard let failure else {
+            // No failure at all: the turn ran to a stop reason of its own — it
+            // completed, hit a turn or cost budget, was stopped by a hook, or was
+            // ended by a tool. Every one of those got an answer out of the gateway,
+            // which is the only thing this measures.
+            return .delivered
+        }
+        if failure.isCancellation { return .inconclusive }
+        if failure.isGatewayTimeout { return .refusedPlausiblyForLength }
+        switch failure.kind {
+        case .malformedResponse:
+            // A response the decoder could not finish reading is the shape a
+            // silently truncated answer takes by the time it reaches here.
+            return .refusedPlausiblyForLength
+        case .provider(let status, let isRetryable):
+            // A retryable 5xx from a proxy that is not one of the named timeout
+            // statuses — 500 or 503 from a gateway that gave up on a long
+            // generation. A 4xx is the model or the request being refused on its
+            // merits and is not evidence about length; a non-retryable 5xx is the
+            // layer that saw the body saying this will fail again identically.
+            guard let status, isRetryable, (500..<600).contains(status) else { return .inconclusive }
+            return .refusedPlausiblyForLength
+        case .transport, .authentication, .rateLimit, .quotaExhausted, .contextOverflow,
+            .toolExecution, .file, .cancelled, .configuration:
+            return .inconclusive
+        }
+    }
+
+    /// The LONGEST assistant text in `messages`, not the sum and not the last.
+    ///
+    /// The question the ceiling answers is "how much did the gateway deliver
+    /// intact in one response", so a multi-turn run's total would claim credit no
+    /// single response earned, and its last turn — routinely a one-line wrap-up
+    /// after a tool loop — would throw away the evidence the run actually produced.
+    private static func longestAssistantText(in messages: [Message]) -> Int {
+        messages.reduce(into: 0) { longest, message in
             guard case .assistant(let assistant) = message else { return }
             longest = max(longest, assistant.text.count)
         }
+    }
+
+    /// Feeds one settled decorated request back into the adaptive
+    /// response-character limit.
+    ///
+    /// Cancelled and otherwise unrelated failures are recorded as
+    /// ``ResponseLimitEvidence/inconclusive`` rather than skipped. The two are
+    /// equivalent to the learned values — `.inconclusive` is defined as touching
+    /// none of them — and having one path rather than a guard plus a path is what
+    /// stops the next person from adding a fourth outcome that quietly falls
+    /// through the guard as a success.
+    private func recordResponseLimitOutcome(
+        _ ticket: ResponseLimitController.Ticket,
+        observation: ResponseLimitObservation
+    ) async {
+        guard let controller = configuration.responseLimit else { return }
         await controller.record(
             ticket,
-            succeeded: result.failure == nil && result.stopReason != .errored,
-            responseCharacters: characters
+            evidence: observation.evidence,
+            responseCharacters: observation.characters
         )
     }
 

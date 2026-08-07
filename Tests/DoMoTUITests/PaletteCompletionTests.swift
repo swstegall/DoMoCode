@@ -140,7 +140,11 @@ struct PaletteCompletionTests {
         let provider = SlashCommandProvider(commands: paletteCommands)
         let suggestions = try #require(
             await provider.getSuggestions(lines: ["/"], cursorLine: 0, cursorCol: 1, force: false, signal: .none))
-        let read = try #require(suggestions.items.first { $0.value == "read" })
+        // CHANGED: `value` is now the SPELLING, not the bare name. Two rows keyed
+        // on a bare name are one item to every consumer that resolves a chosen row
+        // with `items.first { $0.value == chosen.value }`, and a default install
+        // really does have a `plan` command beside a `plan` agent profile.
+        let read = try #require(suggestions.items.first { $0.value == "/read" })
         #expect(read.insertion == "/read")
 
         let result = try #require(provider.applyCompletion(
@@ -164,7 +168,7 @@ struct PaletteCompletionTests {
         let suggestions = try #require(
             await provider.getSuggestions(lines: ["/re"], cursorLine: 0, cursorCol: 3, force: false, signal: .none))
         #expect(suggestions.prefix == "/re")
-        let read = try #require(suggestions.items.first { $0.value == "read" })
+        let read = try #require(suggestions.items.first { $0.value == "/read" })
 
         let result = try #require(provider.applyCompletion(
             lines: ["/re"], cursorLine: 0, cursorCol: 3, item: read, prefix: "/re"))
@@ -241,12 +245,12 @@ struct PaletteCompletionTests {
         let provider = SlashCommandProvider(commands: paletteCommands)
         let suggestions = try #require(
             await provider.getSuggestions(lines: ["/"], cursorLine: 0, cursorCol: 1, force: false, signal: .none))
-        let read = try #require(suggestions.items.first { $0.value == "read" })
+        let read = try #require(suggestions.items.first { $0.value == "/read" })
         #expect(read.description == "tool — Read a file")
         let explore = try #require(suggestions.items.first { $0.value == "explore" })
         #expect(explore.description == "agent — Survey the codebase")
         // No kind: byte-identical to what this produced before the palette merge.
-        let compact = try #require(suggestions.items.first { $0.value == "compact" })
+        let compact = try #require(suggestions.items.first { $0.value == "/compact" })
         #expect(compact.description == "Compact the context")
     }
 

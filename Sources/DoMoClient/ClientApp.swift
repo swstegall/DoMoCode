@@ -2100,8 +2100,22 @@ public final class ClientApp {
         autocompleteHandle = nil
         autocompleteDialog = nil
         guard let suggestions, !suggestions.items.isEmpty else { return }
-        let items = suggestions.items.map {
-            SelectItem(value: $0.value, label: $0.label, description: $0.description)
+        // Sanitized on the way to the ROW, never into the item: `value` is the
+        // identity `onSelect` resolves back against and has to stay verbatim,
+        // while `label` and `description` become terminal bytes here. Since the
+        // popup was unified, `label` is a tool NAME and `description` is its prose,
+        // and both can come from an MCP server the user merely configured — the
+        // same untrusted text ``toolCatalogItem`` has always folded.
+        //
+        // Live rather than theoretical as of this change: nothing in the
+        // full-screen client used to ask for a non-forced lookup, so the `/` popup
+        // effectively never opened here. Typing `/` opens it now.
+        let items = suggestions.items.map { item -> SelectItem in
+            SelectItem(
+                value: item.value,
+                label: sanitizeUntrustedText(collapseToOneLine(item.label)),
+                description: item.description.map { sanitizeUntrustedText(collapseToOneLine($0)) }
+            )
         }
         let dialog = SearchableSelectDialog(title: "Complete", items: items, keybindings: keybindings)
         dialog.onCancel = { [weak self] in self?.dismissAutocomplete() }
@@ -2243,9 +2257,14 @@ public final class ClientApp {
     /// will read it back.
     ///
     /// `requiresSlash` is carried from the entry rather than assumed, which is the
-    /// whole fix for `//read`: a draft that already contains `/` is a token the
-    /// splice REPLACES, and an agent — which is named in prose, not as a command —
-    /// lands without a slash at all.
+    /// whole fix for `//read`: a `/` the user typed to open the list is a token
+    /// ``PromptInput/insertCommand(_:requiresSlash:)`` REPLACES, and an agent —
+    /// which is named in prose, not as a command — lands without a slash at all.
+    ///
+    /// Both callers of this reach it from a KEYSTROKE (^P, and the tool catalog's
+    /// Enter/insert), not from typing `/`, so the caret is usually mid-draft and
+    /// the entry is inserted at it rather than over the word it is sitting in —
+    /// see that method for why the two gestures cannot share one operation.
     ///
     /// The name is sanitized before it reaches the editor buffer. A tool name can
     /// come from an MCP server the user merely configured, and this is the one

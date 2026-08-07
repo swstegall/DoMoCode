@@ -233,13 +233,15 @@ public func runAgentLoop(
             // A failed or aborted turn ends the run immediately.
             if message.stopReason == .error {
                 await sink.emit(.turnEnd(message: message, toolResults: []))
-                // `outcome.failure` is the provider's own classification, thrown
-                // out of the stream and kept rather than stringified. The
-                // fallback covers the other producer of an `.error` turn — an
-                // assembly-produced `.failed` terminal, which knows only that
-                // the provider refused, so `AssistantMessage.failure` answers
-                // `.provider(status: nil, isRetryable: false)`. Coarse, but
-                // never nil for a `.error` stop reason, so `.errored` always
+                // `outcome.failure` is the provider's own classification, kept
+                // rather than stringified: thrown out of the stream, or — for an
+                // assembly-produced `.failed` terminal, which throws nothing —
+                // read back off the recovery envelope that described the same
+                // failure (see ``terminalFailure(for:recovery:)``). The fallback
+                // is what is left when neither is available: a message knows
+                // only that the provider refused, so `AssistantMessage.failure`
+                // answers `.provider(status: nil, isRetryable: false)`. Coarse,
+                // but never nil for a `.error` stop reason, so `.errored` always
                 // carries evidence.
                 return await settle(
                     .errored,
@@ -532,6 +534,11 @@ private func drain(_ source: (@Sendable () async -> [Message])?) async -> [Messa
 /// `errorMessage` one frame later left every consumer re-deriving the
 /// classification from English. `failure` is `nil` for a turn that did not fail
 /// and for one that was cancelled; a cancellation is not a failure.
+///
+/// A `.failed` terminal throws nothing, so its classification comes from the
+/// ``RecoveryEnvelope`` the producer emitted for the same failure rather than
+/// from the terminal's prose — see ``terminalFailure(for:recovery:)``, and the
+/// mid-stream stall it exists to keep classifiable.
 private func streamAssistantResponse(
     context: Context,
     model: String,
@@ -554,11 +561,14 @@ private func streamAssistantResponse(
                     startEmitted = true
                 }
                 await sink.emit(.messageEnd(.assistant(terminal)))
-                // Nothing was thrown, so there is no classified error to carry.
-                // A `.failed` terminal still reports itself through the
-                // message's own `stopReason`; the caller falls back to
-                // `AssistantMessage.failure` for it.
-                return (terminal, nil, recovery)
+                // Nothing was thrown here, so the kind cannot come from a catch.
+                // It comes from the envelope the producer emitted for the SAME
+                // failure a moment earlier — the only copy of the classification
+                // that survives this path. Without it the caller falls back to
+                // `AssistantMessage.failure`, which is rebuilt from prose and a
+                // stop reason and is coarse by construction. See
+                // ``terminalFailure(for:recovery:)``.
+                return (terminal, terminalFailure(for: terminal, recovery: recovery), recovery)
             }
 
             if case .start(let snapshot) = event {
@@ -649,6 +659,45 @@ private func streamAssistantResponse(
             recovery: recovery
         )
     }
+}
+
+/// The classification behind a `.failed` terminal message, recovered from the
+/// ``RecoveryEnvelope`` that described the same failure.
+///
+/// A stream that throws hands its `DoMoError` straight to the caller. A stream
+/// that commits a 2xx and then dies mid-body cannot: the partial answer is real
+/// content and has to reach the transcript, so the LLM client ends that stream
+/// with a terminal message instead. `AssistantMessage.failure` can then only
+/// answer `.provider(status: nil, isRetryable: false)` — coarse by construction,
+/// because a message rebuilt from a session file has no kind to report.
+///
+/// That coarseness had one consequence worth naming. `DoMoError.isGatewayTimeout`
+/// reads a `.transport` kind plus its prose, so a gateway that streamed half an
+/// answer and then stalled — the ONLY timeout with partial work worth resuming —
+/// reached the harness looking like a plain provider refusal, and the
+/// gateway-continuation loop never fired for the one case it exists for.
+///
+/// The kind is taken from the envelope rather than re-derived from the message's
+/// prose, which is the rule the wire label was introduced for in the first
+/// place. Two guards keep the join honest:
+///
+/// - Only an `.error` terminal is classified. An envelope followed by a `.done`
+///   would be a producer that reported a failure and then recovered from it, and
+///   calling that a failure would end a run that succeeded. (`LiteLLMClient`
+///   never does: every envelope it emits is immediately followed by the end of
+///   the stream, and the only one followed by a terminal message is the
+///   mid-stream failure this exists for.)
+/// - A `.cancelled` rebuild is dropped rather than returned. `settle` refuses to
+///   carry a cancellation as a failure, so returning one would leave `.errored`
+///   with no evidence at all — the invariant the `?? message.failure` fallback
+///   is there to maintain.
+private func terminalFailure(
+    for terminal: AssistantMessage,
+    recovery: RecoveryEnvelope?
+) -> DoMoError? {
+    guard terminal.stopReason == .error, let recovery else { return nil }
+    guard let rebuilt = DoMoError(recovery: recovery), !rebuilt.isCancellation else { return nil }
+    return rebuilt
 }
 
 /// Builds and emits a terminal assistant message for a stream that neither
