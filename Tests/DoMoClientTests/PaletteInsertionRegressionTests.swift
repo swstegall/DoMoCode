@@ -296,7 +296,7 @@ struct PaletteInsertionRegressionTests {
         // Installed AFTER the provider: `setAutocompleteProvider` clears any open
         // popup through this same hook, and that nil is not what is under test.
         var batches: [AutocompleteSuggestions?] = []
-        input.onAutocomplete = { batches.append($0) }
+        input.onAutocomplete = { suggestions, _ in batches.append(suggestions) }
 
         input.handleInput(Array("/".utf8))
         await settle(until: { batches.contains(where: { $0 != nil }) })
@@ -315,7 +315,7 @@ struct PaletteInsertionRegressionTests {
             SlashCommand(name: "read", description: "Read a file"),
         ]))
         var calls = 0
-        input.onAutocomplete = { _ in calls += 1 }
+        input.onAutocomplete = { _, _ in calls += 1 }
 
         for byte in Array("hello there".utf8) { input.handleInput([byte]) }
         await settle(until: { calls > 0 })
@@ -334,7 +334,7 @@ struct PaletteInsertionRegressionTests {
             SlashCommand(name: "read", description: "Read a file"),
         ]))
         var batches: [AutocompleteSuggestions?] = []
-        input.onAutocomplete = { batches.append($0) }
+        input.onAutocomplete = { suggestions, _ in batches.append(suggestions) }
 
         input.handleInput(Array("/".utf8))
         await settle(until: { batches.contains(where: { $0 != nil }) })
@@ -353,7 +353,7 @@ struct PaletteInsertionRegressionTests {
             SlashCommand(name: "explore", description: "Survey", requiresSlash: false, kind: "agent"),
         ]))
         var batches: [AutocompleteSuggestions?] = []
-        input.onAutocomplete = { batches.append($0) }
+        input.onAutocomplete = { suggestions, _ in batches.append(suggestions) }
 
         for byte in Array("/ex".utf8) { input.handleInput([byte]) }
         await settle(until: { batches.contains(where: { $0 != nil }) })

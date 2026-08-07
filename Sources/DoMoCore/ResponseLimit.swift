@@ -556,12 +556,25 @@ public enum ResponseLimitPolicy {
             // interrupts a search that is still narrowing: while the midpoint is
             // still above the threshold there is a real question outstanding and
             // the bound is doing its job.
+            //
+            // The bound is RELAXED, not discarded. Deleting it sent the search
+            // back to `threshold + jump%` — well above a point already measured
+            // as unreachable — so every expiry bought one more timed-out turn and
+            // then re-walked the same midpoints to the same answer, on a loop:
+            // with the defaults that is a permanent low rate of failed turns
+            // against a gateway whose cap never moves. Raising it by one step
+            // instead asks the only question actually outstanding — "has the cap
+            // moved up a little?" — and if the answer is no, the next probe fails
+            // and restores a bound just above the old one, at a cost of one turn
+            // per expiry window rather than a whole re-run of the search.
             if let knownBad = next.knownBad,
                 probeCandidate(threshold: next.threshold, knownBad: knownBad, bounds: bounds)
                     <= next.threshold,
                 next.successesSinceKnownBad >= bounds.reprobe
             {
-                next.knownBad = nil
+                let relaxed = saturatingAdd(knownBad, max(1, scaled(knownBad, by: bounds.jump, over: 100)))
+                next.knownBad = relaxed > bounds.maximum ? nil : relaxed
+                next.successesSinceKnownBad = 0
             }
 
         case .refusedPlausiblyForLength:

@@ -1465,13 +1465,30 @@ public actor AgentHarness {
         // whose evidence is `.delivered` reaches the record call with nothing
         // awaited in between, and a late interrupt has no path by which to turn a
         // refusal into a delivery.
+        // A run can BOTH deliver a long answer and end on a timeout — the default
+        // shape of this agent is a tool loop, so a turn that produced 4000
+        // characters and a turn that timed out are routinely the same run. Read
+        // literally, the failure said "the gateway refuses this length" while the
+        // transcript held proof it had just delivered seven times it, and the
+        // refusal branch wrote a bound the same run disproved.
+        //
+        // The delivery wins. A response at or beyond the offered limit is direct
+        // evidence about what the gateway will return; a later timeout is evidence
+        // about something else that happened afterwards, and nothing about length.
+        let observedCharacters = Self.longestAssistantText(in: result.messages)
+        var responseLimitEvidence = Self.responseLimitEvidence(
+            stopReason: result.stopReason,
+            failure: result.failure,
+            cancelled: Task.isCancelled
+        )
+        if responseLimitEvidence == .refusedPlausiblyForLength,
+           let ticket = responseLimitTicket,
+           observedCharacters >= ticket.limit {
+            responseLimitEvidence = .delivered
+        }
         let responseLimitObservation = ResponseLimitObservation(
-            evidence: Self.responseLimitEvidence(
-                stopReason: result.stopReason,
-                failure: result.failure,
-                cancelled: Task.isCancelled
-            ),
-            characters: Self.longestAssistantText(in: result.messages)
+            evidence: responseLimitEvidence,
+            characters: observedCharacters
         )
 
         // Gateway continuation, strictly downstream of overflow recovery: an

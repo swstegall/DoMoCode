@@ -149,7 +149,10 @@ struct ResponseLimitRecoveryTests {
         )
         #expect(healthy.probes > 0, "zero probes is the frozen-search signature")
         #expect(healthy.state.threshold > 3_000)
-        #expect(healthy.state.knownBad == nil)
+        // A bound may still be recorded — the expiry RELAXES it rather than
+        // deleting it — but it must be far above where the outage left it, which
+        // is what the climbing threshold above already proves it no longer binds.
+        #expect((healthy.state.knownBad ?? Int.max) > healthy.state.threshold)
     }
 }
 
@@ -264,12 +267,21 @@ struct ResponseLimitReprobeTests {
         }
 
         state = ResponseLimitPolicy.record(delivered, state: state, settings: settings)
-        #expect(state.knownBad == nil)
-        #expect(state.successesSinceKnownBad == 0, "no bound, no clock")
+        // The bound is RELAXED by one step, not deleted. Deleting it sent the
+        // next probe to `threshold + jump%` — far above a point already measured
+        // as unreachable — so every expiry paid for a timed-out turn and then
+        // re-walked the same midpoints back to the same answer, forever. Raising
+        // it asks the only open question ("has the cap moved up a little?") and
+        // costs one turn per window if the answer is no.
+        #expect(state.knownBad == 661)
+        #expect(state.successesSinceKnownBad == 0, "a relaxed bound gets a fresh clock")
 
+        // What the test is really for: the search RE-OPENS. A probe is offered
+        // again, above the ceiling, where before the expiry existed none ever was.
         let reopened = ResponseLimitPolicy.nextLimit(state: state, settings: settings)
         #expect(reopened.isProbe)
-        #expect(reopened.limit == 660, "the upward search resumes at jumpPercentage")
+        #expect(reopened.limit > state.threshold)
+        #expect(reopened.limit == 630, "the midpoint between the ceiling and the relaxed bound")
     }
 
     /// The expiry must not interrupt a search that is still narrowing, or the
@@ -347,7 +359,10 @@ struct ResponseLimitReprobeTests {
             settings: settings,
             answerCharacters: 4_000
         )
-        #expect(healthy.state.knownBad == nil, "the bound retired once it stopped narrowing")
+        // Retired by RELAXATION rather than deletion, so what matters is that
+        // the bound stopped binding: the threshold climbed straight past where
+        // the failed probe had pinned it.
+        #expect((healthy.state.knownBad ?? Int.max) > healthy.state.threshold)
         #expect(healthy.state.threshold > 3_000, "and the upward search resumed")
     }
 }
@@ -404,11 +419,13 @@ struct ResponseLimitFloorTests {
         for _ in 0..<3 {
             frozen = ResponseLimitPolicy.record(delivered, state: frozen, settings: settings)
         }
-        #expect(frozen.knownBad == nil)
+        // Relaxed above the floor rather than deleted — either way the alias is
+        // no longer frozen, which is the whole assertion: a probe exists again.
+        #expect((frozen.knownBad ?? Int.max) > 200)
 
         let thawed = ResponseLimitPolicy.nextLimit(state: frozen, settings: settings)
         #expect(thawed.isProbe)
-        #expect(thawed.limit == 220)
+        #expect(thawed.limit > 200)
     }
 
     /// The whole trip: floor, outage over, climb back.

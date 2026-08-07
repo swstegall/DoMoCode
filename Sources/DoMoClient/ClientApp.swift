@@ -433,8 +433,20 @@ public final class ClientApp {
         promptInput.onSubmitDeferredForDrop = { [weak self] in
             self?.post(notice: "still reading the dropped file — Enter again once the 📎 chip appears")
         }
-        promptInput.onAutocomplete = { [weak self] suggestions in
-            self?.reconcileAutocomplete(suggestions)
+        promptInput.onAutocomplete = { [weak self] suggestions, automatic in
+            self?.reconcileAutocomplete(suggestions, automatic: automatic)
+        }
+        // The non-capturing popup keeps focus on the prompt, so the arrows, Enter
+        // and Escape have to be forwarded by hand. `handleInput` is the dialog's
+        // own key handling — the same code path a captured overlay would run — so
+        // selection, accept and cancel behave identically in both modes.
+        promptInput.onAutocompleteKey = { [weak self] data in
+            guard let self, let dialog = self.autocompleteDialog, self.autocompleteHandle != nil else {
+                return false
+            }
+            dialog.handleInput(data)
+            self.surface?.requestRender()
+            return true
         }
         seedPaletteCatalog()
         promptInput.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
@@ -2095,7 +2107,17 @@ public final class ClientApp {
         )
     }
 
-    private func reconcileAutocomplete(_ suggestions: AutocompleteSuggestions?) {
+    /// Present the completion popup, capturing the keyboard only when the user
+    /// ASKED for it with Tab.
+    ///
+    /// A capturing overlay steals focus the moment it is presented. That is right
+    /// for a Tab request — the user stopped typing to browse a list — and
+    /// catastrophic for a popup that opens by itself as you type: the `/` lands,
+    /// the overlay takes the keyboard, and every character after it goes to the
+    /// overlay's filter instead of the document, so a prompt beginning with `/`
+    /// simply cannot be written. An automatic popup is therefore non-capturing,
+    /// and ``PromptInput`` hands it the four navigation keys explicitly.
+    private func reconcileAutocomplete(_ suggestions: AutocompleteSuggestions?, automatic: Bool) {
         dismissDialog(autocompleteHandle)
         autocompleteHandle = nil
         autocompleteDialog = nil
@@ -2127,7 +2149,9 @@ public final class ClientApp {
             self.dismissAutocomplete()
         }
         autocompleteDialog = dialog
-        autocompleteHandle = dialogs?.present(dialog, options: overlayOptions(width: 76, height: 16))
+        var options = overlayOptions(width: 76, height: 16)
+        options.nonCapturing = automatic
+        autocompleteHandle = dialogs?.present(dialog, options: options)
     }
 
     private func dismissAutocomplete() {

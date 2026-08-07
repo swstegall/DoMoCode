@@ -76,10 +76,28 @@ final class PromptInput: @MainActor Focusable {
     /// the client has frozen and hammers the key.
     var onSubmitDeferredForDrop: (() -> Void)?
 
-    /// Fired after an explicit Tab lookup. The client presents the returned
-    /// suggestions as an overlay; keeping the provider and editor here means the
-    /// same completion cursor arithmetic is used by every client surface.
-    var onAutocomplete: ((AutocompleteSuggestions?) -> Void)?
+    /// Fired after a lookup. The client presents the returned suggestions as an
+    /// overlay; keeping the provider and editor here means the same completion
+    /// cursor arithmetic is used by every client surface.
+    ///
+    /// `automatic` says whether the lookup was typed into rather than asked for
+    /// with Tab, and the client MUST honour it: an automatic popup has to be
+    /// presented non-capturing. A capturing one takes the keyboard the instant
+    /// the `/` lands, so the very next character goes to the overlay instead of
+    /// the document and the line can never be finished — which is what happened
+    /// to every prompt beginning with `/` when this lookup was first made
+    /// automatic.
+    var onAutocomplete: ((_ suggestions: AutocompleteSuggestions?, _ automatic: Bool) -> Void)?
+
+    /// Consulted with keys that belong to an OPEN, non-capturing popup — the
+    /// arrows, Enter and Escape — before the editor sees them. Returns whether
+    /// the popup consumed the key.
+    ///
+    /// This is the other half of presenting non-capturing: focus stays on the
+    /// prompt so typing keeps narrowing the list, so the four navigation keys
+    /// have to be handed over explicitly. Without it Up recalls history, Enter
+    /// sends the half-typed command, and the list is decoration.
+    var onAutocompleteKey: ((_ data: [UInt8]) -> Bool)?
 
     /// Fired by the image-paste keybinding. Clipboard IO belongs to the app/CLI
     /// boundary, so the prompt only exposes the synchronous gesture hook.
@@ -190,7 +208,7 @@ final class PromptInput: @MainActor Focusable {
         let lines = editor.getLines()
         let cursor = editor.getCursor()
         let token = paletteTokenAtCursor(lines: lines, cursorLine: cursor.line, cursorCol: cursor.col)
-        let consumesToken = token.isEmpty || token.hasPrefix("/")
+        let consumesToken = token.isEmpty || Self.isCommandGesture(token)
         let result = consumesToken
             ? spliceTokenAtCursor(
                 lines: lines,
@@ -228,7 +246,7 @@ final class PromptInput: @MainActor Focusable {
         autocompleteProvider = provider
         autocompleteSuggestions = nil
         autocompleteIsAutomatic = false
-        onAutocomplete?(nil)
+        onAutocomplete?(nil, false)
     }
 
     func applyAutocomplete(_ item: AutocompleteItem, prefix: String) {
@@ -244,7 +262,7 @@ final class PromptInput: @MainActor Focusable {
         editor.applyAutocomplete(result)
         autocompleteSuggestions = nil
         autocompleteIsAutomatic = false
-        onAutocomplete?(nil)
+        onAutocomplete?(nil, false)
     }
 
     func dismissAutocomplete() {
@@ -252,7 +270,7 @@ final class PromptInput: @MainActor Focusable {
         autocompleteTask = nil
         autocompleteSuggestions = nil
         autocompleteIsAutomatic = false
-        onAutocomplete?(nil)
+        onAutocomplete?(nil, false)
     }
 
     func clear() {
@@ -545,8 +563,48 @@ final class PromptInput: @MainActor Focusable {
             requestAutocomplete(force: true)
             return
         }
+        // An automatic popup is presented NON-capturing, so focus never leaves
+        // this component and these four keys would otherwise be eaten by the
+        // editor: Up would recall history, Enter would send the half-typed
+        // command. Handing them over here — and only while such a popup is open —
+        // is what makes a list you can type into also a list you can choose from.
+        if autocompleteIsAutomatic, autocompleteSuggestions != nil, navigatesOpenPopup(data) {
+            if onAutocompleteKey?(data) == true { return }
+        }
         editor.handleInput(data)
         refreshAutomaticAutocomplete()
+    }
+
+    /// Whether the token under the caret is the gesture that opens a palette —
+    /// a `/` the user typed to ask for a command — rather than a word that
+    /// merely starts with one.
+    ///
+    /// "Begins with `/`" is not that test, and the difference destroys text: a
+    /// draft mentioning `/usr/bin/env` or `/tmp/build.log` has the caret in a
+    /// token starting with `/`, and consuming it deletes the path the user was
+    /// writing about. A command NAME is a single segment — one leading slash, no
+    /// further separators, and no dot — so anything with a second `/` or a `.` is
+    /// a path and takes the insert-beside-it route instead. The cost of being
+    /// wrong in this direction is a stray token the user can delete; the cost of
+    /// being wrong in the other is silently eaten text.
+    private static func isCommandGesture(_ token: String) -> Bool {
+        guard token.hasPrefix("/") else { return false }
+        let rest = token.dropFirst()
+        return !rest.contains("/") && !rest.contains(".")
+    }
+
+    /// Whether `data` is one of the keys an open, non-capturing popup owns.
+    ///
+    /// Deliberately narrow. Every other key — including every printable
+    /// character and backspace — keeps going to the document, which is the whole
+    /// point: the user carries on typing the command name and the list narrows
+    /// underneath. Widening this set is how a non-capturing popup turns back into
+    /// the capturing one this replaced.
+    private func navigatesOpenPopup(_ data: [UInt8]) -> Bool {
+        keybindings.matches(data, .selectUp)
+            || keybindings.matches(data, .selectDown)
+            || keybindings.matches(data, .selectConfirm)
+            || keybindings.matches(data, .selectCancel)
     }
 
     /// Open — or close — the completion popup as the document changes under the
@@ -611,7 +669,7 @@ final class PromptInput: @MainActor Focusable {
             )
             guard let self, !Task.isCancelled else { return }
             self.autocompleteSuggestions = suggestions
-            self.onAutocomplete?(suggestions)
+            self.onAutocomplete?(suggestions, !force)
         }
     }
 

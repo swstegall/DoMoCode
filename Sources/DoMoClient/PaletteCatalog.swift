@@ -168,10 +168,32 @@ public enum PaletteCatalog {
             // it already resolve names case-insensitively
             // (`AgentProfileRegistry.profile(named:)`), so two spellings that
             // differ only in case name one thing and must not produce two rows.
+            guard isInsertable(entry.name) else { continue }
             guard seen.insert(entry.name.lowercased()).inserted else { continue }
             unique.append(entry)
         }
         return unique
+    }
+
+    /// Whether a catalog name may become a row at all.
+    ///
+    /// A tool name comes from whatever MCP server the user configured, and this
+    /// catalog now feeds TWO insertion paths, not one: the `^P` palette, which
+    /// sanitizes as it inserts, and — since the `/` popup started opening by
+    /// itself in the full-screen client — `SlashCommandProvider.applyCompletion`,
+    /// which splices `AutocompleteItem.insertion` straight into the document. The
+    /// second path has no sanitizer of its own, so a name carrying an escape
+    /// sequence would reach the editor buffer verbatim.
+    ///
+    /// Refusing the row outright rather than scrubbing the name is deliberate: a
+    /// scrubbed name is a command that does not resolve, which fails later and
+    /// less legibly than not being offered. A name that cannot be typed is not a
+    /// name a user can invoke.
+    private static func isInsertable(_ name: String) -> Bool {
+        guard !name.isEmpty else { return false }
+        return name.unicodeScalars.allSatisfy { scalar in
+            scalar.value >= 0x20 && scalar.value != 0x7f && !(scalar.value >= 0x80 && scalar.value <= 0x9f)
+        } && !name.contains(" ") && !name.contains("\t")
     }
 
     /// The one-line detail a row carries beside its kind.

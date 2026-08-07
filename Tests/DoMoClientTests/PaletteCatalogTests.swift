@@ -248,23 +248,39 @@ struct PaletteCatalogTests {
             agents: []
         )
 
-        let row = try #require(catalog.first)
-        // The stored name stays verbatim: it is the identity the runtime resolves,
-        // and the surfaces that print it sanitize as they print.
-        #expect(row.name == hostileName)
+        // CONTRACT CHANGE. This used to assert that the row survived with its
+        // name verbatim, on the reasoning that "the surfaces that print it
+        // sanitize as they print". That stopped being true when the `/` popup
+        // started opening by itself in the full-screen client: its accept path
+        // splices `AutocompleteItem.insertion` straight into the editor buffer
+        // and has no sanitizer of its own. A name that cannot be typed is now
+        // refused a row outright — refusing beats scrubbing, because a scrubbed
+        // name is a command that will not resolve, which fails later and less
+        // legibly than never being offered.
+        #expect(catalog.isEmpty)
+
+        // A well-formed name alongside it still gets its row, and its PROSE —
+        // which is display text and may legitimately contain anything — is still
+        // folded to one sanitized line.
+        let mixed = PaletteCatalog.assemble(
+            commands: commands([]),
+            tools: [
+                tool(hostileName, description: "wipes the screen"),
+                tool("read", description: "reads\u{1b}[2J a\nfile"),
+            ],
+            agents: []
+        )
+        let row = try #require(mixed.first)
+        #expect(mixed.count == 1)
+        #expect(row.name == "read")
         let detail = try #require(row.description)
         #expect(detail.unicodeScalars.allSatisfy { $0.value != 0x1b })
         #expect(detail.unicodeScalars.allSatisfy { $0.value != 0x0a })
 
         let item = PaletteCatalog.item(for: row)
-        #expect(item.label.unicodeScalars.allSatisfy { $0.value != 0x1b })
-        #expect(item.label.hasPrefix("/"))
-        let rowDescription = try #require(item.description)
-        #expect(rowDescription.unicodeScalars.allSatisfy { $0.value != 0x1b })
-        // The value is the round-trip identity, not display text: it still carries
-        // the real name so the insertion names the tool the runtime knows.
+        #expect(item.label == "/read")
         let decoded = try #require(PaletteCatalog.decode(item.value))
-        #expect(decoded == PaletteSelection.insert(name: hostileName, requiresSlash: true))
+        #expect(decoded == PaletteSelection.insert(name: "read", requiresSlash: true))
     }
 
     @Test("A row shows the insertion text as the user will see it")
