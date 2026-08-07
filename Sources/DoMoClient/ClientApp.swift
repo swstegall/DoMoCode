@@ -42,6 +42,20 @@ final class DynamicLines: @MainActor Component {
 @MainActor
 public final class ClientApp {
     private let client: ServerClient
+
+    /// Where this run's log lines are going, when they are going anywhere but the
+    /// terminal.
+    ///
+    /// While the full-screen client owns a real terminal the process redirects
+    /// `stderr` to a file — a log line written to the terminal lands in the middle
+    /// of an absolutely-addressed frame and stays there, because nothing in the
+    /// render model changed and nothing repaints it. Naming the file in an error's
+    /// hint is what keeps that redirect from turning a visible problem into a
+    /// silent one: the detail is still somewhere the user can read it.
+    ///
+    /// A `String` and not the CLI's own type: `DoMoClient` cannot import
+    /// `DoMoCLI`, which is where the redirect lives.
+    private let diagnosticsLogPath: String?
     private let store = EventStore()
     private let sidebar = SessionSidebar()
     private let transcriptView = TranscriptView()
@@ -259,6 +273,25 @@ public final class ClientApp {
     private var diagnosticsStatusError: String?
     /// The terminal size the panel was laid out for, so a resize can rebuild it.
     private var diagnosticsOverlaySize: (columns: Int, rows: Int)?
+    /// The failure modal, when it is on screen. The HANDLE is the authority for
+    /// "is it up", exactly as the permission modal's is: ``handleInput(_:)`` keys
+    /// off this and never off ``errorDialog``, so a component that exists without
+    /// an overlay — a present that could not happen, or one deliberately taken
+    /// down while an approval prompt owns the keyboard — cannot swallow keys with
+    /// nothing on screen to dismiss.
+    private var errorDialogHandle: ScreenOverlayHandle?
+    /// The modal's component, which OUTLIVES its overlay. It holds the queue of
+    /// failures and the user's place in it, so hiding it for an approval prompt
+    /// and putting it back afterwards is a re-present of the same object rather
+    /// than a new dialog that has forgotten what was already read.
+    private var errorDialog: ErrorDialog?
+    /// Failures reported while nothing could be presented — during another modal,
+    /// or before the surface exists. Drained into the dialog by
+    /// ``reconcileErrorOverlay()``.
+    private var pendingErrors: [EventStore.ErrorReport] = []
+    /// Set once the app is on its way out, so a late failure cannot put an overlay
+    /// back onto a surface that is being torn down.
+    private var isShuttingDown = false
     /// How often the client asks the server what it actually believes, while the
     /// client believes a run is in flight.
     private static let statusPollInterval: TimeInterval = 5
@@ -326,6 +359,7 @@ public final class ClientApp {
         modelPreferencePath: FilePath? = nil,
         clipboard: any ClipboardSink = NoClipboardSink(),
         clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
+        diagnosticsLogPath: String? = nil,
         multiplexer: TerminalMultiplexer = .none,
         mouseOwned: Bool = true
     ) {
@@ -339,6 +373,7 @@ public final class ClientApp {
         self.preferredModel = modelPreferences.load()
         self.clipboard = clipboard
         self.clipboardPaste = clipboardPaste
+        self.diagnosticsLogPath = diagnosticsLogPath
         self.multiplexer = multiplexer
         self.mouseOwned = mouseOwned
     }
@@ -395,8 +430,17 @@ public final class ClientApp {
             self?.clearNoticeIfRunSettled()
             self?.reconcilePermissionOverlay()
             self?.reconcileQuestionOverlay()
+            // LAST of the reconciles, deliberately: it decides whether a failure
+            // may take the keyboard by asking whether those two just took it.
+            self?.reconcileErrorOverlay()
             self?.surface?.requestRender()
         }
+        // A failure is not a status line. Every `.error` notice and everything
+        // routed through ``postError(_:_:hint:)`` already becomes a permanent
+        // transcript row inside the store; this is the other half — the modal that
+        // makes the user notice it, with room for the paragraph a provider error
+        // usually is.
+        store.onError = { [weak self] report in self?.report(report) }
         // An info/warning notice is transient status, not transcript. The store
         // folds error-level notices into permanent rows itself and never calls
         // this for them, so there is no double-reporting to guard against.
@@ -948,11 +992,171 @@ public final class ClientApp {
         var hints: [String] = []
         if let hint { hints.append(hint) }
         if let path = store.sessionPath { hints.append("Full transcript: \(path)") }
+        // Named because the terminal is no longer where log lines go. Without
+        // this the redirect that stops them corrupting the frame would also stop
+        // the user ever finding them.
+        if let diagnosticsLogPath { hints.append("Log: \(diagnosticsLogPath)") }
         store.postError(
             headline: headline,
             message: reason,
             hint: hints.isEmpty ? nil : hints.joined(separator: " ")
         )
+    }
+
+    // MARK: The failure modal
+
+    /// The modal's outer width. Wider than a picker because the body is prose the
+    /// provider wrote, not a list this program composed.
+    private static let errorDialogWidth = 88
+
+    /// How many failures may wait for a modal that cannot be shown yet.
+    ///
+    /// A run that fails on every turn produces them faster than anyone can read,
+    /// and this queue is a convenience: the transcript keeps every one, so nothing
+    /// is lost by capping it. The dialog's OWN bound, so a burst that arrives
+    /// while an approval prompt is up is held to exactly what the dialog would
+    /// have accepted had it been on screen the whole time.
+    private static let pendingErrorLimit = ErrorDialog.maxPending
+
+    /// The dialog's viewport in rows, sized the way ``openHelpDialog()`` sizes its
+    /// own: room for a paragraph, never taller than the terminal.
+    private func errorDialogRows() -> Int {
+        max(8, min(18, (surface?.target.rows ?? 24) - 4))
+    }
+
+    /// Whether the failure modal must stand down entirely — come off the screen if
+    /// it is up, and not go on if it is not.
+    ///
+    /// Two populations, both of which would be actively harmed by a modal over
+    /// them. An approval prompt and a structured question each park a tool call
+    /// until the user replies, so a dialog over one collects the keystroke meant
+    /// for it: an Enter aimed at "Allow once" that lands on a failure nobody has
+    /// read yet is an answer the user did not give. The workflow workspace is a
+    /// separate ROOT rather than an overlay, and ``handleInput(_:)`` hands it every
+    /// key before the dialog branch is reached — so a modal presented over it would
+    /// paint and then never receive the Enter that closes it.
+    ///
+    /// The STORE is consulted as well as the two handles, because a prompt whose
+    /// overlay has not been presented yet — the reconciles run in a fixed order,
+    /// and a nil surface presents nothing at all — is still a prompt that is about
+    /// to own the keyboard.
+    private var errorModalMustStandDown: Bool {
+        permissionHandle != nil
+            || questionHandle != nil
+            || store.pendingPermission != nil
+            || store.pendingQuestion != nil
+            || workflowWorkspace != nil
+    }
+
+    /// Whether another application dialog owns the keyboard right now.
+    ///
+    /// A failure is not urgent enough to take the keyboard from a user who is
+    /// typing into a palette, a rename form or a diff review — its row is already
+    /// on the page, and the modal loses nothing by waiting for them to finish.
+    /// Unlike ``errorModalMustStandDown`` this only DEFERS a first presentation: a
+    /// dialog already up when the user opens a palette stays where it is, with the
+    /// palette on top of it and the keys going to the palette.
+    private var anotherDialogOwnsKeyboard: Bool {
+        autocompleteHandle != nil || paletteHandle != nil || themePickerHandle != nil
+            || helpHandle != nil || toolCatalogHandle != nil || sessionPickerHandle != nil
+            || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
+            || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
+            || diffReviewHandle != nil || diffRevertHandle != nil || copyOptionsHandle != nil
+            || diagnosticsHandle != nil
+    }
+
+    /// Take a live failure from the store and get it in front of the user.
+    ///
+    /// Nothing here is focus-dependent: an error that arrives while the user is
+    /// looking at another window is queued and presented exactly as one that
+    /// arrives while they are watching, and it rings nothing and raises nothing.
+    /// The modal is simply what they find when they come back.
+    private func report(_ error: EventStore.ErrorReport) {
+        // A failure that lands while the app is unwinding must not put an overlay
+        // back on a surface that is being stopped, and must not give shutdown
+        // anything new to wait for. The row is already written, which is the half
+        // that outlives the process anyway.
+        guard !isShuttingDown else { return }
+        pendingErrors.append(error)
+        // The OLDEST go when the cap is hit: the newest failure is the one that
+        // describes the state the session is in now.
+        if pendingErrors.count > Self.pendingErrorLimit {
+            pendingErrors.removeFirst(pendingErrors.count - Self.pendingErrorLimit)
+        }
+        reconcileErrorOverlay()
+    }
+
+    /// Show, hide, or fill the failure modal to match what has been reported and
+    /// what else is on screen.
+    ///
+    /// Called from `onChange`, from ``renderSync()``, and from ``report(_:)``
+    /// itself, which is what lets a failure reported under another modal appear
+    /// the moment that modal clears — with no timer and no second code path. Two
+    /// callers rather than one because the two ways a modal goes away are
+    /// different events: the server resolving a prompt is a store mutation, while
+    /// a user dismissing a palette is a keystroke, and `onChange` never fires for
+    /// the second.
+    private func reconcileErrorOverlay() {
+        guard !isShuttingDown else { return }
+        if errorModalMustStandDown {
+            // HIDDEN, not discarded. The component is the user's place in a queue
+            // of failures; dropping it here would re-show the ones they had
+            // already stepped past, and dropping the queue would lose the rest.
+            if errorDialogHandle != nil {
+                dismissDialog(errorDialogHandle)
+                errorDialogHandle = nil
+            }
+            return
+        }
+        if let dialog = errorDialog {
+            // An open modal takes the new failure into its OWN queue rather than
+            // stacking a second modal on top of itself — which would bury the one
+            // being read under the one that followed it.
+            drainPendingErrors(into: dialog)
+            if errorDialogHandle == nil, !anotherDialogOwnsKeyboard {
+                errorDialogHandle = presentErrorDialog(dialog)
+            }
+            return
+        }
+        guard !pendingErrors.isEmpty, !anotherDialogOwnsKeyboard else { return }
+        let dialog = ErrorDialog(keybindings: keybindings, viewportRows: errorDialogRows())
+        dialog.onClose = { [weak self] in self?.dismissErrorDialog() }
+        drainPendingErrors(into: dialog)
+        errorDialog = dialog
+        errorDialogHandle = presentErrorDialog(dialog)
+    }
+
+    private func presentErrorDialog(_ dialog: ErrorDialog) -> ScreenOverlayHandle? {
+        dialogs?.present(
+            dialog,
+            options: overlayOptions(width: Self.errorDialogWidth, height: errorDialogRows())
+        )
+    }
+
+    private func drainPendingErrors(into dialog: ErrorDialog) {
+        for failure in pendingErrors {
+            dialog.enqueue(ErrorDialogEntry(
+                headline: failure.headline,
+                message: failure.message,
+                hint: failure.hint
+            ))
+        }
+        pendingErrors.removeAll()
+    }
+
+    /// Take the modal down for good — the user has closed the last failure in it.
+    ///
+    /// The rows stay: the dialog was the noticing, and the transcript is where a
+    /// failure is read again afterwards.
+    private func dismissErrorDialog() {
+        dismissDialog(errorDialogHandle)
+        errorDialogHandle = nil
+        errorDialog = nil
+        surface?.requestRender()
+        // Anything reported while the modal was hidden behind an approval prompt
+        // gets its own dialog now, rather than waiting for the next failure to
+        // drag it onto the screen.
+        reconcileErrorOverlay()
     }
 
     private func spinnerGlyph() -> String {
@@ -4549,6 +4753,12 @@ extension ClientApp: TerminalApp {
         rebuildPermissionOverlayIfResized()
         rebuildQuestionOverlayIfResized()
         rebuildDiagnosticsOverlayIfResized()
+        // Here as well as in `onChange`, because the other way a deferred failure
+        // is freed is a dialog the USER dismissed, which mutates nothing in the
+        // store and so fires no change. The driver calls this after every input
+        // batch and on every resize — i.e. exactly on the keystroke that closed
+        // the dialog that was in the way.
+        reconcileErrorOverlay()
         try surface?.renderSync()
     }
 
@@ -4623,7 +4833,14 @@ extension ClientApp: TerminalApp {
             || modelPickerHandle != nil || treePickerHandle != nil || renameHandle != nil
             || labelHandle != nil || forceClearHandle != nil || draftEditorHandle != nil
             || diffReviewHandle != nil || diffRevertHandle != nil
-            || questionHandle != nil || copyOptionsHandle != nil {
+            || questionHandle != nil || copyOptionsHandle != nil
+            // The failure modal belongs in this branch and not below the Escape
+            // interpretation: Enter closes it (or advances to the next failure)
+            // and Escape closes it, and neither may fall through to "send" or
+            // "abort the turn" while it is the thing the user is looking at. It is
+            // never up at the same time as the permission modal — see
+            // ``reconcileErrorOverlay()`` — so this cannot take that modal's keys.
+            || errorDialogHandle != nil {
             surface?.handleInput(data)
             return
         }
@@ -4717,6 +4934,11 @@ extension ClientApp: TerminalApp {
     }
 
     public func stop() {
+        // Before the surface is stopped, so a failure racing the teardown — the
+        // in-flight HTTP requests the run loop cancels on its way out all report
+        // through the same door — finds the app already closed to new modals
+        // rather than presenting one onto a surface that is going away.
+        isShuttingDown = true
         surface?.stop()
     }
 }

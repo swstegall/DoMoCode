@@ -397,6 +397,252 @@ final class DialogConfirm: Component {
     func handleInput(_ data: [UInt8]) { list.handleInput(data) }
 }
 
+/// One failure as the modal shows it: the same three parts every surface in this
+/// program renders a failure as, so a caller hands over exactly what
+/// ``DoMoCore/ErrorPresentation/rows(label:message:)`` already produced rather
+/// than re-deriving a headline here.
+///
+/// `Hashable` is load-bearing, not decoration: a failing run repeats the SAME
+/// failure several times (one per retry, one per queued turn), and the queue uses
+/// equality to coalesce those repeats instead of making the user press Enter once
+/// per copy of one fact.
+struct ErrorDialogEntry: Sendable, Hashable {
+    let headline: String
+    let message: String
+    let hint: String?
+
+    init(headline: String, message: String, hint: String? = nil) {
+        self.headline = headline
+        self.message = message
+        self.hint = hint
+    }
+}
+
+/// The modal a failure gets, instead of the status line by the prompt.
+///
+/// Three things this shape is deliberately not:
+///
+/// - It is not a one-line notice. A provider error is a paragraph, and the whole
+///   reason for moving it off the transient line is that it now has room: the
+///   detail is WRAPPED to the dialog width and scrolls, never truncated to one
+///   line with the actual cause past the right edge.
+/// - It is not a stack of modals. A failing run emits several errors within a
+///   second or two; presenting one overlay per error buries the first under the
+///   last and leaves the user dismissing a pile. This component holds a QUEUE and
+///   stays a single overlay: Enter closes the error on screen, and the next one
+///   takes its place until the queue drains.
+/// - It is not a trap. Escape closes it — the whole queue — because a modal that
+///   only answers one key is a worse failure than the one it is reporting, and
+///   the transcript keeps the durable copy of every row either way.
+///
+/// Scrolling is `HelpDialog`'s model on purpose (arrows, PgUp/PgDn, Home/End,
+/// `g`/`G`, a visible `start-end/total` range): two different scroll idioms in
+/// two dialogs of the same program is a defect the user experiences as the keys
+/// not working.
+@MainActor
+final class ErrorDialog: Component {
+    /// How many failures may wait behind the one on screen.
+    ///
+    /// A bound, because the producer is a retry loop: without one, a gateway that
+    /// is down for a minute queues thousands of entries and the modal becomes
+    /// un-dismissable — every Enter reveals another. Arrivals past the bound are
+    /// counted and shown (``suppressedCount``) rather than silently vanishing,
+    /// and the transcript still records every one of them.
+    static let maxPending = 32
+
+    private let keybindings: Keybindings
+    private let viewportRows: Int
+    /// The queue, front first: `queue[0]` is what is on screen.
+    private var queue: [ErrorDialogEntry] = []
+    /// How many of this burst the user has already closed, so `(2 of 3)` counts
+    /// the burst rather than only what is left. Reset when the queue drains, so a
+    /// later failure starts a new burst at `(1 of …)` instead of continuing the
+    /// numbering of one the user already dealt with.
+    private var closedCount = 0
+    private var suppressed = 0
+    private var offset = 0
+    /// Content height from the last render. The rows depend on the width, which
+    /// only `render` knows, so scrolling clamps against what was actually drawn;
+    /// clamping against a guess is how a dialog ends up scrolled past its own end
+    /// and showing nothing.
+    private var lastContentRows = 0
+
+    /// Fired when the last queued failure is dismissed, by Enter or by Escape.
+    /// The owner dismisses the overlay here; the component has already reset, so
+    /// the same instance can be re-presented for the next failure.
+    var onClose: (() -> Void)?
+
+    init(keybindings: Keybindings = Keybindings(), viewportRows: Int = 14) {
+        self.keybindings = keybindings
+        // Two rows of content, a footer and the frame is the smallest thing that
+        // is still a dialog rather than a truncated notice.
+        self.viewportRows = max(4, viewportRows)
+    }
+
+    convenience init(
+        entry: ErrorDialogEntry,
+        keybindings: Keybindings = Keybindings(),
+        viewportRows: Int = 14
+    ) {
+        self.init(keybindings: keybindings, viewportRows: viewportRows)
+        enqueue(entry)
+    }
+
+    /// The failure currently on screen, or `nil` once the queue has drained.
+    var current: ErrorDialogEntry? { queue.first }
+    /// Everything not yet closed, including the one on screen.
+    var pendingCount: Int { queue.count }
+    /// Arrivals refused by ``maxPending``, shown in the footer so the count is
+    /// never a silent loss.
+    var suppressedCount: Int { suppressed }
+    var isEmpty: Bool { queue.isEmpty }
+
+    /// Add a failure to the queue, or fold it into one already waiting.
+    ///
+    /// Coalescing is by value against the entries still queued (including the one
+    /// on screen) and never against ones already closed: a failure the user
+    /// dismissed and which then happens AGAIN is new information, and swallowing
+    /// it would make the second attempt look like it succeeded.
+    func enqueue(_ entry: ErrorDialogEntry) {
+        guard !queue.contains(entry) else { return }
+        guard queue.count < Self.maxPending else {
+            suppressed += 1
+            return
+        }
+        queue.append(entry)
+    }
+
+    /// Drop the whole queue and report the close, the way Escape does. Exposed so
+    /// a shutting-down owner can clear the modal through one path instead of
+    /// leaving a dialog holding rows nobody will ever see.
+    func dismissAll() {
+        reset()
+        onClose?()
+    }
+
+    func render(width: Int) -> [String] {
+        guard width > 0, let entry = queue.first else {
+            lastContentRows = 0
+            return []
+        }
+        let rows = Self.contentRows(for: entry, width: width)
+        lastContentRows = rows.count
+        let bodyRows = max(1, viewportRows - 1)
+        // Clamp here, not only on the keystroke: a resize narrows the dialog and
+        // rewraps the text to MORE rows or fewer, and an offset that was valid at
+        // the old width can point past the end at the new one.
+        let maxOffset = max(0, rows.count - bodyRows)
+        offset = min(offset, maxOffset)
+        let end = min(rows.count, offset + bodyRows)
+        var lines = Array(rows[offset..<end])
+        lines.append(footer(width: width, start: offset, end: end, total: rows.count, bodyRows: bodyRows))
+        return lines
+    }
+
+    func handleInput(_ data: [UInt8]) {
+        if isKeyRelease(data) { return }
+        if keybindings.matches(data, .selectConfirm) {
+            advance()
+            return
+        }
+        if keybindings.matches(data, .selectCancel) {
+            dismissAll()
+            return
+        }
+        let bodyRows = max(1, viewportRows - 1)
+        if keybindings.matches(data, .selectUp) {
+            scroll(by: -1, bodyRows: bodyRows)
+        } else if keybindings.matches(data, .selectDown) {
+            scroll(by: 1, bodyRows: bodyRows)
+        } else if keybindings.matches(data, .selectPageUp) || matchesKey(data, Key.pageUp) {
+            scroll(by: -bodyRows, bodyRows: bodyRows)
+        } else if keybindings.matches(data, .selectPageDown) || matchesKey(data, Key.pageDown) {
+            scroll(by: bodyRows, bodyRows: bodyRows)
+        } else if matchesKey(data, Key.home) || data == Array("g".utf8) {
+            offset = 0
+        } else if matchesKey(data, Key.end) || data == Array("G".utf8) {
+            scroll(by: lastContentRows, bodyRows: bodyRows)
+        }
+    }
+
+    /// Close the failure on screen. The next one replaces it; the last one closes
+    /// the dialog.
+    private func advance() {
+        guard !queue.isEmpty else {
+            // Nothing left to show and the owner still has us mounted: report the
+            // close rather than swallowing the key, or Enter does nothing at all.
+            dismissAll()
+            return
+        }
+        queue.removeFirst()
+        offset = 0
+        guard queue.isEmpty else {
+            closedCount += 1
+            return
+        }
+        dismissAll()
+    }
+
+    private func reset() {
+        queue.removeAll()
+        closedCount = 0
+        suppressed = 0
+        offset = 0
+        lastContentRows = 0
+    }
+
+    private func scroll(by delta: Int, bodyRows: Int) {
+        offset = max(0, min(offset + delta, max(0, lastContentRows - bodyRows)))
+    }
+
+    private func footer(width: Int, start: Int, end: Int, total: Int, bodyRows: Int) -> String {
+        // Enter is honest in both cases: it closes the error being read. That the
+        // next queued one then appears is what the count says.
+        var parts = ["Enter to close"]
+        let burst = closedCount + queue.count
+        if burst > 1 {
+            parts.append("(\(closedCount + 1) of \(burst))")
+            parts.append("Esc closes all")
+        }
+        if total > bodyRows {
+            // `HelpDialog`'s wording, compressed: this footer also carries the
+            // close keys and the queue position, and at a narrow width the tail
+            // is what gets cut — so the scroll hint spends no columns on " or "
+            // and a separator it does not need.
+            parts.append("↑/↓ PgUp/PgDn scroll \(start + 1)-\(end)/\(total)")
+            // The range alone reads as decoration; say plainly that text is off
+            // screen, since the point of the dialog is that nothing is hidden.
+            parts.append(end < total ? "more below" : "more above")
+        }
+        if suppressed > 0 {
+            parts.append("\(suppressed) more in the transcript")
+        }
+        return truncateToWidth(dim(parts.joined(separator: " · ")), width, ellipsis: "")
+    }
+
+    /// The wrapped body: headline, detail, hint. Sanitized here because every
+    /// part of it is provider, gateway or MCP prose — text this project has had
+    /// reach a frame raw before, where a bare `ESC` drives the terminal instead of
+    /// being read.
+    private static func contentRows(for entry: ErrorDialogEntry, width: Int) -> [String] {
+        var rows: [String] = []
+        let headline = sanitizeUntrustedText(entry.headline)
+        if !headline.isEmpty {
+            rows.append(contentsOf: wrapToWidth(headline, width: width).map { "\u{1b}[1m" + $0 + sgrReset })
+        }
+        let message = sanitizeUntrustedText(entry.message)
+        if !message.isEmpty {
+            if !rows.isEmpty { rows.append("") }
+            rows.append(contentsOf: wrapToWidth(message, width: width))
+        }
+        if let hint = entry.hint.map(sanitizeUntrustedText), !hint.isEmpty {
+            if !rows.isEmpty { rows.append("") }
+            rows.append(contentsOf: labeledWrap("→ ", hint, width: width).map(dim))
+        }
+        return rows
+    }
+}
+
 /// A keyboard-first diff review surface. The sidebar is deliberately compact:
 /// common directory prefixes collapse to an ellipsis, leaving room for the
 /// selected file's hunks. The dialog keeps review marks locally; refreshing a

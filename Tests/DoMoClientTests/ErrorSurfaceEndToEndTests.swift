@@ -521,10 +521,20 @@ struct ErrorSurfaceEndToEndTests {
         var portIterator = ports.makeAsyncIterator()
         let port = await portIterator.next() ?? 0
 
+        // A failure now ANNOUNCES itself in a modal before the transcript row
+        // behind it can be read, so this case dismisses it first. The row and its
+        // `^O` door are unchanged and still the durable copy — that is what is
+        // being asserted — but they are no longer the first thing on screen, and
+        // a test that asserted the row without closing the dialog would only be
+        // measuring which surface is on top.
         let capturedBefore = await runClient(
             baseURL: "http://127.0.0.1:\(port)",
             script: { continuation, target in
-                await self.type("go", into: continuation, target: target, untilScreenHas: "^O to expand")
+                await self.type("go", into: continuation, target: target, untilScreenHas: "Enter to close")
+                continuation.yield([0x0d])   // Enter dismisses the error dialog
+                _ = await waitUntil(timeout: Self.endToEndTimeout) {
+                    screenContains(target, rows: Self.rows, columns: Self.columns, "^O to expand")
+                }
             },
             until: { screenContains($0, rows: Self.rows, columns: Self.columns, "^O to expand") }
         )
@@ -537,7 +547,11 @@ struct ErrorSurfaceEndToEndTests {
         let capturedAfter = await runClient(
             baseURL: "http://127.0.0.1:\(port)",
             script: { continuation, target in
-                await self.type("go", into: continuation, target: target, untilScreenHas: "^O to expand")
+                await self.type("go", into: continuation, target: target, untilScreenHas: "Enter to close")
+                continuation.yield([0x0d])   // Enter dismisses the error dialog
+                _ = await waitUntil(timeout: Self.endToEndTimeout) {
+                    screenContains(target, rows: Self.rows, columns: Self.columns, "^O to expand")
+                }
                 continuation.yield([0x0f])   // ^O
             },
             until: { screenContains($0, rows: Self.rows, columns: Self.columns, "cause 150 in the chain") }

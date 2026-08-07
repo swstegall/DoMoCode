@@ -1541,6 +1541,24 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // an app that thinks it has it is the disagreement that would make a
         // toggle turn the mouse ON when the user asked for it off).
         let lifecycle = fullScreenClientLifecycle(enableMouse: !noMouse)
+
+        // Everything in this process logs to stderr, and the runtime server the
+        // client drives runs IN this process — so a `domo.server` warning is
+        // written to the very terminal the renderer is addressing by absolute
+        // row, and lands wherever the cursor was parked, which is the prompt.
+        // The renderer never repaints those cells afterwards, because nothing in
+        // its model changed: the frame simply stays broken. Point stderr at a
+        // file for as long as the client owns the terminal.
+        //
+        // Only here. `-p` and `--json` never reach this line, and the redirect
+        // additionally declines unless stdout and stderr are the SAME terminal,
+        // so a piped run keeps stdout byte-clean and stderr carrying diagnostics
+        // exactly as before. The `defer` runs before `execute()` returns to
+        // ``run()``, so a `DoMoError` this call throws is still rendered onto the
+        // user's shell rather than into the file.
+        FullScreenLogRedirect.begin(configDirectory: configuration.configDirectory)
+        defer { FullScreenLogRedirect.end() }
+
         do {
             try await runFullScreenClient(
                 baseURL: baseURL,
@@ -1568,6 +1586,11 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 // OSC 52 is the path that reaches the clipboard that matters there.
                 clipboard: SystemClipboard.makeClipboardSink(environment: environment),
                 clipboardPaste: SystemClipboardPasteSource.make(environment: environment),
+                // Where this run's log lines went, so an error can say so. Non-nil
+                // exactly while stderr is redirected; the redirect is what keeps a
+                // log line out of the frame, and naming the file is what keeps it
+                // from also becoming invisible.
+                diagnosticsLogPath: FullScreenLogRedirect.currentLogPath?.string,
                 // Whether an OSC 52 has to be wrapped to escape a multiplexer. Read
                 // from the same environment, for the same reason: the detection is
                 // about the process's own surroundings, which only the CLI can see.

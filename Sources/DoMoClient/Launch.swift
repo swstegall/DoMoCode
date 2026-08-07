@@ -60,6 +60,7 @@ public func runFullScreenClient(
     modelPreferencePath: FilePath? = nil,
     clipboard: any ClipboardSink = NoClipboardSink(),
     clipboardPaste: any ClipboardPasteSource = NoClipboardPasteSource(),
+    diagnosticsLogPath: String? = nil,
     multiplexer: TerminalMultiplexer = .none,
     mouseOwned: Bool = true
 ) async throws {
@@ -72,6 +73,7 @@ public func runFullScreenClient(
         modelPreferencePath: modelPreferencePath,
         clipboard: clipboard,
         clipboardPaste: clipboardPaste,
+        diagnosticsLogPath: diagnosticsLogPath,
         multiplexer: multiplexer,
         mouseOwned: mouseOwned
     )

@@ -48,6 +48,26 @@ public final class EventStore {
         }
     }
 
+    /// A failure exactly as a surface receives it: the three parts the transcript
+    /// row carries, already sanitized by ``appendError(_:)``.
+    ///
+    /// A value rather than the ``TranscriptItem`` case, because the two consumers
+    /// want different things from it — the row is drawn inside the scrollback, the
+    /// modal wraps the same words to its own width — and a surface that had to
+    /// pattern-match a transcript case to find out what went wrong would break the
+    /// moment another case is added.
+    public struct ErrorReport: Sendable, Hashable {
+        public var headline: String
+        public var message: String
+        public var hint: String?
+
+        public init(headline: String, message: String, hint: String? = nil) {
+            self.headline = headline
+            self.message = message
+            self.hint = hint
+        }
+    }
+
     /// The session list backing the sidebar. Populated by `GET /sessions`; there
     /// is no cross-session push, so it is refreshed explicitly.
     public private(set) var sessions: [SessionSummary] = []
@@ -129,6 +149,20 @@ public final class EventStore {
     /// `lastNotice` currently held would restart the four-second timer on every
     /// keystroke and the message would never go away.
     public var onNotice: ((ServerNotice) -> Void)?
+
+    /// Fired once per LIVE failure, so a surface can put it in FRONT of the user
+    /// instead of only underneath whatever they are reading.
+    ///
+    /// The row and this are not alternatives: the row is the durable record a user
+    /// scrolls back to, and this is the interruption that makes them notice there
+    /// is something to scroll back to. Both fire, in that order — the row exists
+    /// before anything can be dismissed.
+    ///
+    /// Deliberately NOT fired by ``seed(_:)``. A re-seed replays every failure the
+    /// session has ever had, and the stream re-seeds on every reconnect, so a
+    /// surface driven off the rows alone would interrupt the user with a failure
+    /// they read and dismissed an hour ago — once per outage, forever.
+    public var onError: ((ErrorReport) -> Void)?
 
     // Streaming bookkeeping — indices into `transcript` of the in-progress items.
     private var streamingAssistantIndex: Int?
@@ -313,7 +347,17 @@ public final class EventStore {
                     }
                     kindsByFailureText[body] = kind
                 }
-                appendError(ErrorPresentation.rows(label: notice.kind, message: body))
+                // One of the two LIVE doors, so the failure is announced as well as
+                // recorded — see ``onError``. The re-seeded copy of this same row
+                // goes through `seed`, which is silent.
+                // Recorded FIRST, then announced. `onError?(appendError(…))`
+                // reads naturally and is wrong: optional chaining does not
+                // evaluate the argument when the closure is nil, so the row —
+                // the durable half of this — appeared only when something
+                // happened to be listening. A consumer with no hook silently
+                // lost every error it was handed.
+                let report = appendError(ErrorPresentation.rows(label: notice.kind, message: body))
+                onError?(report)
             case .warning, .info:
                 lastNotice = notice
                 onNotice?(notice)
@@ -729,7 +773,14 @@ public final class EventStore {
     /// that rejected the credential. Persistent by design — a transient notice
     /// is the wrong surface for anything the user has to act on.
     public func postError(headline: String, message: String, hint: String? = nil) {
-        appendError((headline: headline, message: message, hint: hint))
+        // The other LIVE door. Announced after the row is appended, so a surface
+        // that reacts by putting a modal up can never be dismissed back to a
+        // transcript that does not yet hold what it was about.
+        // Recorded first, announced second — see the note in the notice arm:
+        // an argument inside an optional call is not evaluated when the closure
+        // is nil.
+        let report = appendError((headline: headline, message: message, hint: hint))
+        onError?(report)
         onChange?()
     }
 
@@ -780,12 +831,24 @@ public final class EventStore {
     /// "nothing in `transcript` carries an ESC introducer" holds for the whole
     /// type rather than for all-but-one of its cases. The renderer sanitizes too
     /// because it also draws rows that did not come from here.
-    private func appendError(_ parts: (headline: String, message: String, hint: String?)) {
-        transcript.append(.error(
+    ///
+    /// Returns what it put on the transcript, so the two LIVE doors can hand the
+    /// SAME already-sanitized words to ``onError`` rather than sanitizing a second
+    /// copy that could drift from the row it is supposed to be about. Discardable
+    /// because ``seed(_:)`` rebuilds history and announces nothing.
+    @discardableResult
+    private func appendError(_ parts: (headline: String, message: String, hint: String?)) -> ErrorReport {
+        let report = ErrorReport(
             headline: sanitizeUntrustedText(parts.headline),
             message: sanitizeUntrustedText(parts.message),
             hint: parts.hint.map(sanitizeUntrustedText)
+        )
+        transcript.append(.error(
+            headline: report.headline,
+            message: report.message,
+            hint: report.hint
         ))
+        return report
     }
 
     // MARK: Tool call state
