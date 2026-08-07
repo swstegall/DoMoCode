@@ -815,7 +815,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         workingDirectory: FilePath,
         sandbox: ProcessSandbox? = nil
     ) async -> (tools: [any AgentTool], manager: MCPManager) {
-        let manager = MCPManager()
+        // A remote MCP endpoint on a corporate network is reached the same way
+        // everything else is. The manager owns this pool and shuts it down with
+        // itself, which is why it takes the settings rather than sharing the
+        // process-wide pool: two owners of one pool is how a client gets shut
+        // down while another caller is still using it.
+        let manager = MCPManager(proxy: ProcessHarnessDefaults.current.proxy)
         guard !configuration.mcpServers.isEmpty else { return ([], manager) }
         let tools = await manager.connect(
             servers: configuration.mcpServers,

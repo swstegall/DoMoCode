@@ -2680,7 +2680,9 @@ public struct InteractiveMode: Sendable {
         var mcpManager: MCPManager?
         var mcpTools: [any AgentTool] = []
         if !mcpServers.isEmpty {
-            let manager = MCPManager()
+            // Same pool ownership as the default surface: the manager owns it and
+            // shuts it down with itself.
+            let manager = MCPManager(proxy: ProcessHarnessDefaults.current.proxy)
             mcpTools = await manager.connect(
                 servers: mcpServers,
                 workspaceDirectory: workingDirectory,

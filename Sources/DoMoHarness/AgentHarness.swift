@@ -970,9 +970,22 @@ public actor AgentHarness {
         guard try sessionName() == nil else { return nil }
         let messages = try buildContextMessages()
         guard !messages.isEmpty else { return nil }
+        // Simplified BEFORE the window is taken, not after. Taking the tail of a
+        // raw transcript is what produced `POST /session/:id/title -> 500`: a tool
+        // cycle spans several messages, so a fixed window can open in the middle
+        // of one and carry a `tool_result` whose `tool_use` it left behind, which
+        // Anthropic through LiteLLM rejects outright. Simplifying first means the
+        // window can only ever land between whole user/assistant turns.
+        // See ``DoMoLLM/Message/textOnlyTranscript(_:)``.
+        let readable = Message.textOnlyTranscript(messages)
+        guard !readable.isEmpty else { return nil }
+        // Re-simplified after windowing for the one thing the window can still
+        // break: a tail that begins on the assistant's side of a turn.
+        let window = Message.textOnlyTranscript(Array(readable.suffix(12)))
+        guard !window.isEmpty else { return nil }
         let request = Context(
             systemPrompt: "You create concise session titles. Reply with only a descriptive title of at most six words. Do not use quotes, markdown, or punctuation at the end.",
-            messages: Array(messages.suffix(12)) + [
+            messages: window + [
                 .user(UserMessage(content: [.text("Give this coding session a useful short title.")]))
             ],
             tools: []

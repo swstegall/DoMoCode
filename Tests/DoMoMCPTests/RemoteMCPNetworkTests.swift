@@ -412,6 +412,39 @@ struct RemoteMCPNetworkTests {
         )
     }
 
+    /// The gate refused `http://127.0.0.1:port/mcp` and allowed
+    /// `http://127.1:port/mcp` — the same machine, spelled the way `inet_aton`
+    /// also accepts. Proven end to end against a real socket: every spelling
+    /// below connected while the canonical one was refused.
+    @Test("An alternate spelling of a loopback address is refused too", arguments: [
+        "127.1", "2130706433", "0x7f000001", "0127.0.0.1",
+    ])
+    func alternateLoopbackSpellingsAreRefused(_ spelling: String) async throws {
+        let server = try LoopbackMCPServer()
+        server.start()
+        defer { server.stop() }
+
+        // Same port, same listening socket — only the way the host is written
+        // differs, so a refusal here is about the spelling and nothing else.
+        let port = server.endpoint.split(separator: ":").last.map(String.init) ?? ""
+        let respelled = "http://\(spelling):\(port)/mcp"
+
+        let client = MCPClient(
+            serverName: "intranet",
+            config: remoteConfig(endpoint: respelled, allowPrivateNetwork: nil),
+            workspaceDirectory: NSTemporaryDirectory()
+        )
+        do {
+            try await client.connect()
+            Issue.record("\(spelling) reached loopback without the private-network opt-in")
+        } catch MCPClient.MCPError.networkPolicy {
+            // The gate held.
+        } catch {
+            Issue.record("unexpected error for \(spelling): \(error)")
+        }
+        #expect(server.requests.isEmpty, "the refusal must happen before any connection")
+    }
+
     @Test("An opted-in private-network endpoint completes the handshake and serves tools")
     func privateNetworkEndpointIsReachableWhenAllowed() async throws {
         let server = try LoopbackMCPServer()

@@ -288,7 +288,11 @@ public enum ProxyPolicy {
         guard !target.isEmpty else { return false }
         if isLoopback(target) { return true }
 
-        if let address = ipv4Address(target) { return isPrivateIPv4(address) }
+        // Every reading the resolver might take, not just the canonical one:
+        // `127.1` and `0x7f000001` are 127.0.0.1 to `getaddrinfo`, and treating
+        // them as names is what let them past this gate.
+        let readings = lenientIPv4Addresses(target)
+        if !readings.isEmpty { return readings.contains(where: isPrivateIPv4) }
         guard let address = ipv6Address(target) else { return false }
 
         // Unspecified (`::`), unique-local (`fc00::/7`), and link-local
@@ -591,7 +595,12 @@ public enum ProxyPolicy {
     /// ``bypasses(host:port:noProxy:)`` for why this outranks every setting.
     private static func isLoopback(_ host: String) -> Bool {
         if host == "localhost" || host.hasSuffix(".localhost") { return true }
-        if let address = ipv4Address(host) { return address >> 24 == 127 }
+        // Same leniency as the privacy test, and for the same reason: these two
+        // disagreeing about what an address IS is the class of bug that put a
+        // loopback endpoint on the far side of a gate that was supposed to
+        // refuse it.
+        let readings = lenientIPv4Addresses(host)
+        if !readings.isEmpty { return readings.contains { $0 >> 24 == 127 } }
         guard let address = ipv6Address(host) else { return false }
         if address == Self.ipv6Loopback { return true }
         // `::ffff:127.0.0.1` is the same interface reached through the
@@ -611,6 +620,92 @@ public enum ProxyPolicy {
     /// from a leading zero, a 32-bit integer with no dots at all — are the
     /// reason address matching is a classic source of bypasses, and none of them
     /// is a thing a user writes in this variable on purpose.
+    /// Every IPv4 address the platform resolver would reach for `text`, when it
+    /// would treat it as a numeric literal at all.
+    ///
+    /// The strict reader below is right for a `no_proxy` ENTRY, which a user
+    /// types deliberately. It is wrong for the host of a URL, which is the
+    /// untrusted side, and the difference was a way straight past the
+    /// private-network gate: `getaddrinfo` accepts `127.1`, `2130706433`,
+    /// `0x7f000001` and `0127.0.0.1` and returns 127.0.0.1 for all of them, while
+    /// a dotted-quad-only reader calls each one a name and therefore public. The
+    /// endpoint the gate refuses when spelled `127.0.0.1` was reachable by typing
+    /// the same address a different way — verified end to end against a real
+    /// listening socket.
+    ///
+    /// So this follows `inet_aton`: one to four parts, the last absorbing the
+    /// remaining bytes, each part decimal, hex (`0x…`) or octal (leading zero).
+    ///
+    /// It returns a SET because the platforms disagree and the gate must be right
+    /// on both: glibc reads a leading zero as octal (`012.0.0.1` → 10.0.0.1)
+    /// while Darwin reads it as decimal (→ 12.0.0.1). A caller treats the host as
+    /// private if ANY reading is private, which fails closed on the ambiguity
+    /// rather than picking a platform and being wrong on the other.
+    static func lenientIPv4Addresses(_ text: String) -> [UInt32] {
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...4).contains(parts.count) else { return [] }
+
+        // Each part can read more than one way; the candidate addresses are the
+        // combinations. Bounded by 2^4 readings, so the product cannot blow up.
+        var readings: [[UInt64]] = []
+        for part in parts {
+            let values = numericReadings(part)
+            guard !values.isEmpty else { return [] }
+            readings.append(values)
+        }
+
+        var addresses: Set<UInt32> = []
+        func combine(_ index: Int, _ chosen: [UInt64]) {
+            guard index < readings.count else {
+                if let address = inetAtonAddress(chosen) { addresses.insert(address) }
+                return
+            }
+            for value in readings[index] { combine(index + 1, chosen + [value]) }
+        }
+        combine(0, [])
+        return Array(addresses)
+    }
+
+    /// The values one dotted part can denote, per `inet_aton`'s grammar.
+    private static func numericReadings(_ part: Substring) -> [UInt64] {
+        // 20 rather than a tight per-radix bound: the value is what actually
+        // constrains this (a UInt64 parse rejects overflow and `inetAtonAddress`
+        // caps the result at 32 bits), and a tight digit cap silently rejected
+        // `017700000001` — twelve characters of octal that is exactly 127.0.0.1.
+        guard !part.isEmpty, part.count <= 20 else { return [] }
+        let lower = part.lowercased()
+        if lower.hasPrefix("0x") {
+            let digits = lower.dropFirst(2)
+            guard !digits.isEmpty, digits.allSatisfy({ $0.isHexDigit }),
+                let value = UInt64(digits, radix: 16)
+            else { return [] }
+            return [value]
+        }
+        guard part.allSatisfy({ ("0"..."9").contains($0) }) else { return [] }
+        guard let decimal = UInt64(part) else { return [] }
+        // A leading zero is octal on glibc and decimal on Darwin, so both count.
+        if part.count > 1, part.first == "0", let octal = UInt64(part.dropFirst(), radix: 8) {
+            return [decimal, octal]
+        }
+        return [decimal]
+    }
+
+    /// `inet_aton`'s assembly rule: the final part absorbs whatever bytes the
+    /// leading parts did not name.
+    private static func inetAtonAddress(_ parts: [UInt64]) -> UInt32? {
+        guard let last = parts.last else { return nil }
+        let leading = parts.dropLast()
+        guard leading.allSatisfy({ $0 <= 255 }) else { return nil }
+        let remainingBytes = 4 - leading.count
+        let ceiling: UInt64 = remainingBytes >= 4 ? 0xFFFF_FFFF : (UInt64(1) << (8 * remainingBytes)) - 1
+        guard last <= ceiling else { return nil }
+        var address: UInt64 = 0
+        for value in leading { address = (address << 8) | value }
+        address = (address << (8 * remainingBytes)) | last
+        guard address <= 0xFFFF_FFFF else { return nil }
+        return UInt32(address)
+    }
+
     private static func ipv4Address(_ text: String) -> UInt32? {
         let parts = text.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4 else { return nil }

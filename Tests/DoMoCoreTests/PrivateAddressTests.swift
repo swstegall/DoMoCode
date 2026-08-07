@@ -104,11 +104,20 @@ struct PrivateAddressTests {
     // MARK: Robustness
 
     @Test("Malformed input answers no rather than trapping", arguments: [
-        "", "   ", ":::", "10.0.0", "10.0.0.1.2", "10.0.0.256", "999.999.999.999",
+        "", "   ", ":::", "10.0.0.1.2", "10.0.0.256", "999.999.999.999",
         "[", "]", "%",
     ])
     func malformedIsNotPrivate(_ host: String) {
         #expect(!ProxyPolicy.isPrivateAddress(host))
+    }
+
+    /// `10.0.0` is NOT malformed — `inet_aton` reads three parts as
+    /// `10.0.0.0`, which the resolver reaches and which is private. It sat in
+    /// the malformed list until the lenient reading landed and disagreed.
+    @Test("A short dotted form is a real address, not a typo")
+    func shortDottedFormIsAnAddress() {
+        #expect(ProxyPolicy.isPrivateAddress("10.0.0"))
+        #expect(ProxyPolicy.isPrivateAddress("127.0"))
     }
 
     /// A bracketed literal is what a URL carries, and a zone index identifies an
@@ -123,5 +132,77 @@ struct PrivateAddressTests {
         // right and the safe direction — the gate denies without an opt-in, so
         // a wrong answer here would open access rather than block it.
         #expect(ProxyPolicy.isPrivateAddress("fe80::1%"))
+    }
+}
+
+// MARK: - Alternate spellings of the same address
+
+/// The gate refused `http://127.0.0.1/` and allowed `http://127.1/`, which the
+/// resolver sends to exactly the same machine. Verified end to end against a
+/// real listening socket before this was fixed: the canonical spelling was
+/// refused and every alternate spelling connected.
+@Suite("Private address detection — resolver-equivalent spellings")
+struct PrivateAddressSpellingTests {
+
+    /// `inet_aton` accepts one to four parts, the last absorbing the remainder,
+    /// in decimal, hex or octal. Every one of these reaches loopback.
+    @Test("Every spelling the resolver sends to loopback is private", arguments: [
+        "127.0.0.1",
+        "127.1",
+        "127.0.1",
+        "2130706433",
+        "0x7f000001",
+        "0x7f.1",
+        "0177.0.0.1",
+        "017700000001",
+        "0127.0.0.1",
+    ])
+    func loopbackSpellings(_ host: String) {
+        #expect(ProxyPolicy.isPrivateAddress(host), "\(host) reaches 127.0.0.1")
+    }
+
+    @Test("Every spelling the resolver sends to an RFC 1918 range is private", arguments: [
+        "10.0.0.1",
+        "0xa000001",
+        "167772161",
+        "192.11010049",
+        "192.168.0.1",
+        "0xc0a80001",
+    ])
+    func privateRangeSpellings(_ host: String) {
+        #expect(ProxyPolicy.isPrivateAddress(host), "\(host) reaches a private range")
+    }
+
+    /// The platforms disagree on a leading zero — glibc reads it as octal,
+    /// Darwin as decimal — so the ambiguous spelling has to fail CLOSED, meaning
+    /// private if either reading is private. `012.0.0.1` is 10.0.0.1 under glibc.
+    @Test("A leading zero is treated as private if either reading is")
+    func octalAmbiguityFailsClosed() {
+        #expect(ProxyPolicy.isPrivateAddress("012.0.0.1"), "glibc reads this as 10.0.0.1")
+        #expect(ProxyPolicy.isPrivateAddress("0177.0.0.1"), "glibc reads this as 127.0.0.1")
+    }
+
+    /// Leniency must not swallow public addresses, or the gate would refuse
+    /// ordinary endpoints and the tool would look broken.
+    @Test("Public addresses in any spelling stay public", arguments: [
+        "8.8.8.8",
+        "134744072",
+        "0x8080808",
+        "93.184.216.34",
+    ])
+    func publicSpellingsStayPublic(_ host: String) {
+        #expect(!ProxyPolicy.isPrivateAddress(host), "\(host) is a public address")
+    }
+
+    /// A name is still a name. `10.0.0.1.example.com` has five parts and is not
+    /// a numeric literal at all.
+    @Test("A hostname that merely contains digits is not an address", arguments: [
+        "10.0.0.1.example.com",
+        "intranet.example.com",
+        "1.2.3.4.5",
+        "999999999999",
+    ])
+    func namesStayNames(_ host: String) {
+        #expect(!ProxyPolicy.isPrivateAddress(host))
     }
 }

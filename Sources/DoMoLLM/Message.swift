@@ -889,3 +889,99 @@ public struct Context: Sendable, Hashable, Codable {
         return false
     }
 }
+
+// MARK: - A transcript safe to send without tools
+
+extension Message {
+
+    /// The conversation reduced to its readable text, with every trace of tool
+    /// traffic removed and the role alternation the strict providers require
+    /// restored.
+    ///
+    /// This exists because a metadata request — "name this session", "summarise
+    /// this" — wants the SHAPE of the conversation, not its machinery, and
+    /// slicing a raw transcript to get it is a trap. A tool cycle spans several
+    /// messages (`assistant(tool_use…)`, one `tool` per call, then the answer),
+    /// so any fixed-size window can begin in the middle of one. What travels
+    /// then is a `tool_result` whose `tool_use` was left behind, and Anthropic
+    /// through LiteLLM refuses it outright:
+    ///
+    ///     messages.0.content.0: unexpected `tool_use_id` found in `tool_result`
+    ///     blocks … Each `tool_result` block must have a corresponding
+    ///     `tool_use` block in the previous message.
+    ///
+    /// The obvious repair — move the window's start until it lands on a clean
+    /// boundary — trades one rejection for two others: a window can just as
+    /// easily END on a `tool_use` nothing answers, and it can begin on an
+    /// `assistant` message when the first message must be `user`. Dropping the
+    /// tool traffic instead makes all three unreachable rather than merely
+    /// unlikely, and it is free: a title has no use for the arguments of a call
+    /// or the contents of a file, which are also the largest part of what would
+    /// otherwise be sent.
+    ///
+    /// What comes back is safe to send with `tools: []`:
+    ///
+    /// - `tool` messages are gone, and so are `toolCall`/`toolResult` blocks.
+    /// - Images and reasoning are gone too. Neither helps name a session, and an
+    ///   image costs vision tokens on a request that exists to be cheap.
+    /// - A message left with nothing to say is dropped rather than sent empty,
+    ///   which is its own provider error.
+    /// - Neighbouring messages that end up sharing a role are merged, because
+    ///   dropping a tool-only assistant turn can strand two user messages
+    ///   together and several providers require the roles to alternate.
+    /// - Leading assistant messages are dropped so the result opens on `user`.
+    /// - `system` messages are dropped; a caller doing this is supplying its own
+    ///   instructions and does not want the session's.
+    public static func textOnlyTranscript(_ messages: [Message]) -> [Message] {
+        var simplified: [Message] = []
+        for message in messages {
+            switch message {
+            case .system, .tool:
+                continue
+            case .user(let user):
+                let text = user.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                simplified.append(.user(UserMessage(content: [.text(text)])))
+            case .assistant(let assistant):
+                let text = assistant.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                simplified.append(.assistant(AssistantMessage(
+                    content: [.text(text)],
+                    model: assistant.model,
+                    usage: Usage(),
+                    stopReason: .stop
+                )))
+            }
+        }
+
+        var merged: [Message] = []
+        for message in simplified {
+            guard let previous = merged.last, previous.role == message.role else {
+                merged.append(message)
+                continue
+            }
+            // Joined with a blank line so two separate things the user said do
+            // not read as one sentence once they share a message.
+            switch (previous, message) {
+            case (.user(let first), .user(let second)):
+                merged[merged.count - 1] = .user(
+                    UserMessage(content: [.text(first.text + "\n\n" + second.text)])
+                )
+            case (.assistant(let first), .assistant(let second)):
+                merged[merged.count - 1] = .assistant(AssistantMessage(
+                    content: [.text(first.text + "\n\n" + second.text)],
+                    model: first.model,
+                    usage: Usage(),
+                    stopReason: .stop
+                ))
+            default:
+                merged.append(message)
+            }
+        }
+
+        while let first = merged.first, first.role != .user {
+            merged.removeFirst()
+        }
+        return merged
+    }
+}

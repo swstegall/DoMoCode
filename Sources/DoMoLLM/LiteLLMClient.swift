@@ -376,11 +376,19 @@ public struct LiteLLMClient: Sendable {
         transport: (any StreamingTransport)? = nil
     ) {
         self.configuration = configuration
-        self.transport =
-            transport
-            ?? AsyncHTTPClientTransport(
-                idleTimeout: configuration.streamIdleTimeout ?? AsyncHTTPClientTransport.defaultIdleTimeout
-            )
+        let idle = configuration.streamIdleTimeout ?? AsyncHTTPClientTransport.defaultIdleTimeout
+        if let transport {
+            self.transport = transport
+        } else if let proxies = SharedProxy.current {
+            // Consulted here rather than passed in by each caller. Making the
+            // proxy an argument is what made it invisible: five construction
+            // sites, all left at the default, so the setting resolved correctly
+            // and every request still went direct. A default that opts in is the
+            // only version that survives a sixth site being added.
+            self.transport = AsyncHTTPClientTransport(proxies: proxies, idleTimeout: idle)
+        } else {
+            self.transport = AsyncHTTPClientTransport(idleTimeout: idle)
+        }
     }
 
     /// Returns a client for one bounded diagnostic request.

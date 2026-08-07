@@ -30,6 +30,7 @@
 
 import DoMoCore
 import DoMoHarness
+import DoMoLLM
 import Synchronization
 import SystemPackage
 
@@ -46,12 +47,23 @@ public struct ProcessHarnessDefaults: Sendable {
     /// declining to continue.
     public var gatewayContinuation: GatewayContinuationSettings
 
+    /// How this process reaches the network.
+    ///
+    /// Published here for the reason in this file's header: the surfaces share no
+    /// constructor, and the MCP manager is built in two of them from argument
+    /// lists that do not carry a `ResolvedConfiguration`. Threading it would mean
+    /// a third list to remember — and the first version of proxy support was
+    /// dropped at every site that had to remember it.
+    public var proxy: ProxySettings
+
     public init(
         responseLimit: ResponseLimitController? = nil,
-        gatewayContinuation: GatewayContinuationSettings = .default
+        gatewayContinuation: GatewayContinuationSettings = .default,
+        proxy: ProxySettings = .disabled
     ) {
         self.responseLimit = responseLimit
         self.gatewayContinuation = gatewayContinuation
+        self.proxy = proxy
     }
 
     /// Nothing installed: no prompt decoration, stock continuation policy.
@@ -79,10 +91,35 @@ public struct ProcessHarnessDefaults: Sendable {
     public static func install(for configuration: ResolvedConfiguration) -> ProcessHarnessDefaults {
         let defaults = ProcessHarnessDefaults(
             responseLimit: makeResponseLimitController(for: configuration),
-            gatewayContinuation: configuration.gatewayContinuation
+            gatewayContinuation: configuration.gatewayContinuation,
+            proxy: configuration.proxy
         )
         published.withLock { $0 = defaults }
+        // The proxy is installed at the same moment and for the same reason as
+        // the rest of this type: it is a fact about the PROCESS, and a knob that
+        // has to be remembered at each construction site is a knob that gets
+        // dropped. It was, at all five of them, which is why the first version of
+        // proxy support resolved the settings correctly and then sent every
+        // request direct. Nothing is installed when nothing is configured, so a
+        // run with no proxy keeps the exact behaviour it had before.
+        installSharedProxy(for: configuration)
         return defaults
+    }
+
+    /// Publish the process's proxy pool, or leave none installed.
+    ///
+    /// Separate from ``install(for:)`` only so a caller that builds no harness —
+    /// a diagnostic subcommand, a test — can still route its traffic correctly.
+    /// Replacing an existing pool shuts the old one down rather than leaking it.
+    public static func installSharedProxy(for configuration: ResolvedConfiguration) {
+        let replacement = configuration.proxy.isConfigured
+            ? ProxiedHTTPClients(settings: configuration.proxy)
+            : nil
+        // Whatever was installed before is shut down, never dropped: its clients
+        // hold connection pools, and a pool nobody shuts down can hang exit.
+        if let previous = SharedProxy.install(replacement) {
+            Task { await previous.shutdown() }
+        }
     }
 
     /// A controller over the configured settings and state file, without
