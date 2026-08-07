@@ -95,7 +95,10 @@ public struct AgentNotice: Sendable, Hashable {
     public var level: Level
 
     /// Machine-readable family, so a UI special-cases without parsing prose.
-    /// Reserved: `"retry"`, `"provider_error"`, `"runtime_error"`.
+    /// Reserved: `"retry"`, `"provider_error"`, `"runtime_error"`, `"recovery"`,
+    /// `"gateway_continue"` (the harness re-asking a turn the gateway timed out
+    /// on — like `"retry"`, it is run-scoped and a consumer should drop it when
+    /// the run settles).
     public var code: String
 
     /// One line, already truncated with `DoMoError.truncating(_:)` by whoever

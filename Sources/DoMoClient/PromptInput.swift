@@ -117,16 +117,65 @@ final class PromptInput: @MainActor Focusable {
 
     func setText(_ text: String) { editor.setText(text) }
 
-    /// Insert a catalog tool as a slash command and leave the caret ready for
-    /// arguments. The command is appended to an existing draft with one space
-    /// so selecting a tool never destroys text the user has already written.
-    func insertToolCommand(_ name: String) {
-        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanName.isEmpty else { return }
-        let existing = editor.getExpandedText()
-        let separator = existing.isEmpty || existing.hasSuffix(" ") || existing.hasSuffix("\n") ? "" : " "
-        editor.setText(existing + separator + "/\(cleanName) ")
+    /// Insert a palette entry — a slash command, a tool, an agent — over the token
+    /// under the caret, leaving the caret ready for arguments.
+    ///
+    /// REPLACING the token rather than APPENDING to the draft is the whole fix.
+    /// The palette is normally opened by typing `/`, so that `/` is still sitting
+    /// in the document when the choice comes back; appending `"/" + name` to it
+    /// produced `//read `, which is not a tool and fails at the parser. Splicing
+    /// over the token makes all four spellings the same rule: a slash entry
+    /// overwrites the `/` (`/read `, never `//read `), a bare entry — an agent —
+    /// overwrites it too and so eats it (`explore `, never `/explore `), and from
+    /// an empty draft each inserts exactly itself.
+    ///
+    /// The write goes through ``DoMoTUI/Editor/applyAutocomplete(_:)``, not
+    /// `setText`. `setText` re-anchors the caret to the END of the document, which
+    /// is wrong for an insertion the user made mid-sentence, and — as
+    /// ``restore(_:attachments:)`` explains — it clears the paste registry, so it
+    /// can only be fed `getExpandedText()`, unfolding a 40-line paste into the
+    /// draft as a side effect of picking a command. (`applyAutocomplete` resets
+    /// the registry too, so a marker already in the draft still goes literal; that
+    /// is a DoMoTUI limitation rather than an argument for `setText`, which loses
+    /// the caret on top of it.)
+    ///
+    /// - Parameter requiresSlash: whether this entry is invoked as `/name`. Tools
+    ///   and commands are; agent names are typed bare.
+    func insertCommand(_ name: String, requiresSlash: Bool) {
+        // The name can arrive from an MCP server, which makes it foreign text like
+        // any paste: an escape sequence inside a tool name would otherwise be
+        // spliced into a live document and repainted verbatim. `sanitizedForInsertion`
+        // deliberately KEEPS newlines, and a literal newline inside a line is an
+        // invariant violation for `Editor` (which addresses its buffer as lines of
+        // `Character`, joined by `\n` on the way out), so they are folded to spaces
+        // here — visibly wrong for a name that was already malformed, rather than
+        // silently welding two fragments into one plausible-looking command.
+        let sanitized = Self.sanitizedForInsertion(name)
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A catalog whose entry is spelled `"/read"` is the doubling bug arriving
+        // from the other side: every caller hands over a bare name, but one that
+        // does not must not get a second slash welded on.
+        let bare = String(sanitized.drop { $0 == "/" })
+        guard !bare.isEmpty else { return }
+
+        let insertion = requiresSlash ? "/" + bare : bare
+        let cursor = editor.getCursor()
+        editor.applyAutocomplete(
+            spliceTokenAtCursor(
+                lines: editor.getLines(),
+                cursorLine: cursor.line,
+                cursorCol: cursor.col,
+                insertion: insertion
+            )
+        )
+        // An in-flight lookup was started against the pre-splice document; letting
+        // it land would reopen the popup over text that has moved underneath it.
+        dismissAutocomplete()
     }
+
+    /// The tool-catalog spelling: a tool is always invoked as `/name`.
+    func insertToolCommand(_ name: String) { insertCommand(name, requiresSlash: true) }
 
     func applyTheme(_ theme: Theme, appearance: ThemeAppearance, trueColor: Bool = true) {
         let palette = theme.palette(for: appearance)

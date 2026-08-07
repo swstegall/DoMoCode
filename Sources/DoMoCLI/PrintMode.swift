@@ -605,6 +605,17 @@ public struct PrintMode: Sendable {
     let promptBuilder: SystemPromptBuilder?
     let commandProcessor: PromptCommandProcessor?
     let commandRuntimeFactory: CommandRuntimeFactory?
+    /// The adaptive response-character-limit controller, or `nil` to send the
+    /// prompt exactly as the caller wrote it.
+    ///
+    /// The process's one controller, never a private one: it learns a ceiling per
+    /// model alias and persists it, so a second controller in the same process
+    /// races the first for that file and both learn from half the turns. See
+    /// ``ProcessHarnessDefaults``.
+    let responseLimit: ResponseLimitController?
+    /// What this run does when the gateway times out mid-answer rather than the
+    /// model declining to continue.
+    let gatewayContinuation: GatewayContinuationSettings
 
     /// How often text mode says it is still alive, in turns. Rare enough that a
     /// short run prints nothing extra (the two-turn end-to-end runs are untouched),
@@ -633,7 +644,9 @@ public struct PrintMode: Sendable {
         commandProcessor: PromptCommandProcessor? = nil,
         commandRuntimeFactory: CommandRuntimeFactory? = nil,
         maxCostPerRun: Decimal? = nil,
-        onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil
+        onNoProgress: (@Sendable (TurnResult) async -> Bool)? = nil,
+        responseLimit: ResponseLimitController? = nil,
+        gatewayContinuation: GatewayContinuationSettings = .default
     ) {
         self.client = client
         self.modelRuntime = modelRuntime
@@ -657,6 +670,8 @@ public struct PrintMode: Sendable {
         self.promptBuilder = promptBuilder
         self.commandProcessor = commandProcessor
         self.commandRuntimeFactory = commandRuntimeFactory
+        self.responseLimit = responseLimit
+        self.gatewayContinuation = gatewayContinuation
     }
 
     private var log: EventLog { EventLog(channel: channel, mode: mode) }
@@ -768,7 +783,13 @@ public struct PrintMode: Sendable {
                 runtime: modelRuntime,
                 toolContext: toolContext,
                 visibleToolNames: tools.map(\.definition.name)
-            )
+            ),
+            // The harness decorates the last user message with the limit sentence
+            // and records what came back, so the string that reaches the gateway is
+            // the string this run persists — a `-p` transcript resumed later shows
+            // exactly what was sent.
+            responseLimit: responseLimit,
+            gatewayContinuation: gatewayContinuation
         )
         configuration.workspaceSnapshots = DoMoShadowGit(
             shell: toolContext.shell,

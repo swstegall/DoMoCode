@@ -355,6 +355,20 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode(CommandRegistry.self, from: data)
     }
 
+    /// Fetch the runtime's agent profiles for the unified command palette.
+    ///
+    /// Mirrors ``commands()`` exactly — same bearer auth, same decode-or-throw
+    /// shape — and for the same reason: the summary deliberately omits the
+    /// profile's system prompt. A palette needs a name, a sentence and a
+    /// provenance; putting prompt text on the wire would hand a remote client a
+    /// prompt-injection surface it has no use for.
+    public func agents() async throws -> [AgentProfileSummary] {
+        let path = "/agents"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([AgentProfileSummary].self, from: data)
+    }
+
     /// Fetch durable project memory for the remote memory command.
     public func memory() async throws -> [ProjectMemoryRecord] {
         let path = "/memory"

@@ -38,15 +38,27 @@ import Foundation
 /// actor and hand it back. Distinct from ``SelectItem`` — that is the list
 /// widget's row model; a popup maps these to those at render time, keeping the
 /// completion engine free of any renderer dependency.
+///
+/// ``insertion`` exists because `value` is not always the literal text that should
+/// land in the document. The unified palette lists three kinds of entry side by
+/// side — slash commands, tools and agents — and only the first two are *spelled*
+/// with a leading `/`. Deriving the spelling at accept time (`"/" + value`) is what
+/// produced `"//read"`, so the spelling is decided once, by whoever built the item,
+/// and carried here. `nil` keeps the historical behavior for every producer that
+/// has not been taught about it.
 public nonisolated struct AutocompleteItem: Sendable, Equatable {
     public var value: String
     public var label: String
     public var description: String?
+    /// The literal text to splice when this item is accepted; `nil` means "derive
+    /// it the way this provider always has".
+    public var insertion: String?
 
-    public init(value: String, label: String, description: String? = nil) {
+    public init(value: String, label: String, description: String? = nil, insertion: String? = nil) {
         self.value = value
         self.label = label
         self.description = description
+        self.insertion = insertion
     }
 }
 
@@ -238,6 +250,81 @@ private func isTokenStart(_ characters: [Character], _ index: Int) -> Bool {
     index == 0 || (index > 0 && pathDelimiters.contains(characters[index - 1]))
 }
 
+// MARK: - Token splice
+
+/// The boundary test for ``spliceTokenAtCursor``: whitespace only.
+///
+/// Deliberately narrower than the path-delimiter set above. A command, tool or
+/// agent name is a bare word; a quote or `=` sitting next to one is text the user
+/// typed, not a seam the palette gets to cut on. `nonisolated` because the public
+/// splice is — see below.
+private nonisolated func isPaletteTokenDelimiter(_ character: Character) -> Bool {
+    character == " " || character == "\t"
+}
+
+/// Replace the whitespace-delimited token under the caret with `insertion` plus a
+/// trailing space, and report the caret's new grapheme column.
+///
+/// This exists because "append the command to the draft" is the wrong operation at
+/// a caret. The palette used to build its edit by concatenating `"/" + name` onto
+/// the existing text, so opening the popup by typing `/` and then choosing `/read`
+/// produced `"//read "` — a string no command parser accepts. Replacing the token
+/// the caret sits in collapses four palette rules into one operation instead of
+/// four special cases: a `/` the user already typed is *consumed* by the
+/// replacement rather than doubled; an entry spelled with a slash brings its own;
+/// an entry invoked by bare name (a tool, an agent) lands without one even though
+/// `/` opened the popup; and the words on either side of the token survive.
+///
+/// The caret may sit in the middle of a token with more text after it (`"/re|ad"`
+/// after arrowing back), which is exactly why the scan runs in both directions —
+/// replacing only the text *before* the cursor would leave the tail behind as
+/// `"/readad"`.
+///
+/// Coordinates clamp rather than trap, so a stale `(line, col)` from a superseded
+/// keystroke can never be the thing that crashes a session. A document with no
+/// lines at all synthesizes the single line the text would have lived on:
+/// `Editor.applyAutocomplete` rejects an empty `lines` outright, so returning the
+/// input unchanged there would make the palette look broken rather than empty.
+///
+/// `nonisolated` so a non-`MainActor` surface can compute an edit without hopping;
+/// it reads nothing but its arguments.
+public nonisolated func spliceTokenAtCursor(
+    lines: [String],
+    cursorLine: Int,
+    cursorCol: Int,
+    insertion: String
+) -> AutocompleteResult {
+    // Grapheme arrays throughout: every column in this file is a `Character`
+    // offset, and building the new line out of `[Character]` keeps it that way.
+    let inserted = Array(insertion) + [" "]
+
+    guard cursorLine >= 0, cursorLine < lines.count else {
+        if lines.isEmpty {
+            return AutocompleteResult(lines: [String(inserted)], cursorLine: 0, cursorCol: inserted.count)
+        }
+        return AutocompleteResult(lines: lines, cursorLine: cursorLine, cursorCol: cursorCol)
+    }
+
+    let characters = Array(lines[cursorLine])
+    let cursor = max(0, min(cursorCol, characters.count))
+
+    var start = cursor
+    while start > 0, !isPaletteTokenDelimiter(characters[start - 1]) { start -= 1 }
+    var end = cursor
+    while end < characters.count, !isPaletteTokenDelimiter(characters[end]) { end += 1 }
+
+    let before = Array(characters[0..<start])
+    let after = Array(characters[end...])
+
+    var newLines = lines
+    newLines[cursorLine] = String(before + inserted + after)
+    return AutocompleteResult(
+        lines: newLines,
+        cursorLine: cursorLine,
+        cursorCol: before.count + inserted.count
+    )
+}
+
 // MARK: - Slash-command provider
 
 /// A slash command in the static palette: its `name`, an optional one-line
@@ -246,15 +333,38 @@ private func isTokenStart(_ characters: [Character], _ index: Int) -> Bool {
 /// pi's `SlashCommand` also carries `getArgumentCompletions` for per-command
 /// argument suggestion; that is intentionally **left out** here (see the file
 /// report) — this provider completes the command *name* only.
+///
+/// ``requiresSlash`` and ``kind`` are what let one popup list more than commands.
+/// The `/` popup now offers tools and agents alongside slash commands, and an
+/// agent is invoked by bare name: `/` is how you *reach* the list, not part of
+/// what you insert. `requiresSlash == false` says "this name stands alone", which
+/// ``SlashCommandProvider`` turns into an insertion that eats the typed `/` rather
+/// than keeping it. ``kind`` is display only — a group label ("command", "tool",
+/// "agent", "skill") folded into the description column so a list mixing all four
+/// stays readable. Both default to today's meaning so every existing construction
+/// site keeps compiling and behaving identically.
 public nonisolated struct SlashCommand: Sendable, Equatable {
     public var name: String
     public var description: String?
     public var argumentHint: String?
+    /// Whether the inserted text carries a leading `/`. `false` for entries the
+    /// model invokes by bare name.
+    public var requiresSlash: Bool
+    /// A display group shown ahead of the description; `nil` shows nothing.
+    public var kind: String?
 
-    public init(name: String, description: String? = nil, argumentHint: String? = nil) {
+    public init(
+        name: String,
+        description: String? = nil,
+        argumentHint: String? = nil,
+        requiresSlash: Bool = true,
+        kind: String? = nil
+    ) {
         self.name = name
         self.description = description
         self.argumentHint = argumentHint
+        self.requiresSlash = requiresSlash
+        self.kind = kind
     }
 }
 
@@ -295,7 +405,23 @@ public final class SlashCommandProvider: AutocompleteProvider {
         let items = ranked.map { result -> AutocompleteItem in
             let command = result.item
             let description = Self.describe(command)
-            return AutocompleteItem(value: command.name, label: command.name, description: description)
+            // The spelling is decided HERE, once, by the side that knows whether
+            // this entry is a slash command or a bare name — not derived at accept
+            // time from `value`, which is how `"//read"` happened.
+            let insertion = command.requiresSlash ? "/" + command.name : command.name
+            // The row is LABELLED with what it will insert, not with the bare
+            // name. In a list that mixes slash commands, tools and agents, the
+            // spelling is the one thing the user cannot infer from the name — and
+            // a row reading `explore` in a popup opened by typing `/` is precisely
+            // how a user learns the `/` is about to be eaten, before pressing
+            // Enter rather than after. `value` stays bare: it is the identity the
+            // caller matches on.
+            return AutocompleteItem(
+                value: command.name,
+                label: insertion,
+                description: description,
+                insertion: insertion
+            )
         }
         return AutocompleteSuggestions(items: items, prefix: String(before))
     }
@@ -315,28 +441,36 @@ public final class SlashCommandProvider: AutocompleteProvider {
         guard String(beforePrefix).trimmingCharacters(in: [" ", "\t"]).isEmpty else { return nil }
         guard !prefix.dropFirst().contains("/") else { return nil }
 
-        // Insert "/name " and drop the caret after the trailing space.
-        let insertion = "/" + item.value
-        return spliceCompletion(
+        // `item.insertion` carries the literal spelling; the `"/" + value` fallback
+        // is what a producer that predates the unified palette still gets.
+        //
+        // The splice replaces the WHOLE token under the caret rather than just the
+        // matched prefix. That is the difference between a `/` typed to open the
+        // popup being consumed by a bare-name entry and it being left in front of
+        // one, and it is also what keeps a caret parked mid-token from leaving the
+        // token's tail stranded after the insertion.
+        let insertion = item.insertion ?? ("/" + item.value)
+        return spliceTokenAtCursor(
             lines: lines,
             cursorLine: cursorLine,
             cursorCol: cursorCol,
-            prefixLength: Array(prefix).count,
-            insertion: insertion,
-            suffix: " ",
-            cursorAfterInsertionOffset: Array(insertion).count
+            insertion: insertion
         )
     }
 
-    /// Fold `argumentHint` and `description` into the popup's second column,
-    /// matching pi's `hint — desc` composition.
+    /// Fold `kind`, `argumentHint` and `description` into the popup's second
+    /// column, matching pi's `hint — desc` composition and extending it with the
+    /// group label a mixed command/tool/agent list needs to stay readable.
+    ///
+    /// Composing by joining the non-empty parts keeps the no-`kind` output
+    /// byte-identical to what this produced before the palette was unified — there
+    /// is no separator to strand when a part is missing.
     private static func describe(_ command: SlashCommand) -> String? {
-        let hint = command.argumentHint
-        let desc = command.description ?? ""
-        if let hint, !hint.isEmpty {
-            return desc.isEmpty ? hint : "\(hint) — \(desc)"
-        }
-        return desc.isEmpty ? nil : desc
+        var parts: [String] = []
+        if let kind = command.kind, !kind.isEmpty { parts.append(kind) }
+        if let hint = command.argumentHint, !hint.isEmpty { parts.append(hint) }
+        if let desc = command.description, !desc.isEmpty { parts.append(desc) }
+        return parts.isEmpty ? nil : parts.joined(separator: " — ")
     }
 }
 

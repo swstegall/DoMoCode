@@ -304,6 +304,74 @@ extension DoMoError {
     }
 }
 
+// MARK: - Gateway timeouts
+
+extension DoMoError {
+    /// The wordings a timeout leaves behind, lowercased.
+    ///
+    /// Substrings, not patterns: this is the *narrow* list, and every entry is
+    /// here because a site in this package writes it on purpose (see
+    /// ``isGatewayTimeout``). A regex vocabulary the size of
+    /// `LiteLLMErrorPatterns.retryable` would be wrong here — that list decides
+    /// whether to retry the identical request, which is cheap to get wrong in
+    /// the false-positive direction; this one decides whether to send the model
+    /// a *new* "continue" turn, which costs tokens and appends text to the
+    /// transcript.
+    private static let gatewayTimeoutWordings = ["timed out", "timeout", "stalled", "deadline"]
+
+    /// Whether this failure is the gateway giving up on time rather than the
+    /// model, the credential, or the request being wrong.
+    ///
+    /// The distinction the caller needs: a turn that died on a timeout has
+    /// partial work on the far side and can usually be resumed by asking the
+    /// model to continue, whereas a refusal, a throttle or an overflow needs
+    /// something to change first. The gateway-continuation loop in DoMoHarness
+    /// is the consumer; it resubmits a short "continue" prompt only for this.
+    ///
+    /// Two signals, and they are not equally good:
+    ///
+    /// - A status is exact. 408 (Request Timeout), 504 (Gateway Timeout) and
+    ///   Cloudflare's 522/524 all mean a hop in front of the model ran out of
+    ///   patience. 502 and 503 are deliberately *not* here: they mean the
+    ///   upstream was unreachable or refusing, so there is no half-finished
+    ///   answer to continue from, and the retry loop already handles them.
+    /// - A ``Kind/transport`` failure has no status by definition, so prose is
+    ///   the only signal left. DoMoCore cannot import AsyncHTTPClient — the
+    ///   dependency points the other way — so `HTTPClientError.readTimeout`
+    ///   cannot be tested for by type here, only recognised by the text it
+    ///   stringifies to. That is a real limitation, not a shortcut: a transport
+    ///   library that renames its errors moves this classification silently.
+    ///
+    /// The prose is taken from ``description``, which is this error's message
+    /// *and* its cause chain, because the timeout wording is routinely in the
+    /// cause: `LiteLLMClient.classifyTransport` rewrites a bare `readTimeout`
+    /// into a sentence about the 90-second HTTP-client limit and keeps the
+    /// original as ``cause``, so the enum name only survives down-chain.
+    /// `idleGuarded` (DoMoLLM/Transport.swift) writes "stalled … it timed out"
+    /// and "exceeded its … deadline and timed out" into its two messages for
+    /// exactly this kind of consumer — those phrasings are load-bearing, and
+    /// `Tests/DoMoCoreTests/GatewayTimeoutClassificationTests.swift` pins them.
+    ///
+    /// Everything else is false, including the failures that look adjacent: a
+    /// ``Kind/rateLimit`` is the gateway saying *later*, not *too late*;
+    /// ``Kind/contextOverflow`` gets worse if you continue; ``Kind/cancelled``
+    /// is the user's decision and must never be resumed behind their back; and a
+    /// plain connection-refused ``Kind/transport`` never reached a model at all.
+    public var isGatewayTimeout: Bool {
+        switch kind {
+        case .provider(let status, _):
+            guard let status else { return false }
+            return status == 408 || status == 504 || status == 522 || status == 524
+        case .transport:
+            let prose = description.lowercased()
+            return Self.gatewayTimeoutWordings.contains { prose.contains($0) }
+        case .authentication, .rateLimit, .quotaExhausted, .contextOverflow, .malformedResponse,
+            .toolExecution, .file, .cancelled, .configuration:
+            return false
+        }
+    }
+}
+
 // MARK: - Cancellation
 
 extension DoMoError {

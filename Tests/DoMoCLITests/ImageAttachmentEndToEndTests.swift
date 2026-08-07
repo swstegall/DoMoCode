@@ -85,7 +85,18 @@ struct ImageAttachmentEndToEndTests {
         let json = try JSONValue(parsing: Data(body.utf8))
         let content = json["messages"]?[1]?["content"]
         #expect(content?[0]?["type"]?.stringValue == "text", "body: \(body)")
-        #expect(content?[0]?["text"]?.stringValue == "what is this?", "body: \(body)")
+        // The adaptive response limit is ON by default and decorates the LAST
+        // text block of the last user message, so the wire text is the prompt
+        // plus one limit sentence. Asserted as prefix-plus-suffix rather than
+        // relaxed to `contains`: this test's job is to prove the attachment
+        // traversed the whole path *unflattened*, and an assertion loose enough
+        // to pass on a mangled prompt would stop proving it.
+        let wireText = content?[0]?["text"]?.stringValue
+        #expect(wireText?.hasPrefix("what is this?") == true, "body: \(body)")
+        #expect(
+            wireText?.hasSuffix("characters or less.") == true,
+            "the response-limit sentence should be the tail of the prompt; body: \(body)"
+        )
         #expect(content?[1]?["type"]?.stringValue == "image_url", "body: \(body)")
         #expect(
             content?[1]?["image_url"]?["url"]?.stringValue

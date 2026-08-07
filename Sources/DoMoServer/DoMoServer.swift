@@ -438,6 +438,15 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        // The palette's third source, beside `/commands` and `/session/:id/tools`.
+        // A summary only: the runtime keeps each profile's system prompt to itself,
+        // the way `/commands` keeps command templates. See ``AgentProfileSummary``.
+        router.get("/agents") { _, _ in
+            try await self.mapErrors {
+                try Self.json(await self.runtime.agents())
+            }
+        }
+
         router.get("/memory") { _, _ in
             try await self.mapErrors {
                 try Self.json(try await self.runtime.memory())

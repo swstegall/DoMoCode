@@ -1241,10 +1241,15 @@ final class InteractiveCoordinator {
 
     /// Apply the highlighted completion to the editor and dismiss the popup.
     ///
-    /// The editor exposes no "set lines and place caret", so the applied result is
-    /// written with ``Editor/setText(_:)`` (caret to end). For the common case —
-    /// completing at the end of what you are typing — that is where the caret
-    /// belongs anyway; drilling further into a directory is a fresh Tab away.
+    /// The result goes in through ``Editor/applyAutocomplete(_:)`` rather than
+    /// ``Editor/setText(_:)``, which is how it was written when a completion could
+    /// only ever extend the tail of the document. It no longer can: the slash
+    /// provider now REPLACES the whole token under the caret, so completing
+    /// `"/re|ad more words"` rewrites text on both sides of the caret, and
+    /// `setText` — which parks the caret at the end of the document — would leave
+    /// the user typing after `words` instead of after the command they just
+    /// chose. `applyAutocomplete` honours the column the provider computed and
+    /// keeps the edit on the editor's undo stack.
     private func applyCompletion() {
         guard
             let selected = popupList?.getSelectedItem(),
@@ -1263,7 +1268,7 @@ final class InteractiveCoordinator {
             item: item,
             prefix: popupPrefix
         ) {
-            editor.setText(result.lines.joined(separator: "\n"))
+            editor.applyAutocomplete(result)
         }
         closePopup()
         render()
@@ -2174,6 +2179,156 @@ final class InteractiveCoordinator {
     }
 }
 
+// MARK: - Command palette
+
+/// Everything the inline REPL's `/` popup can offer, assembled into one ordered
+/// list.
+///
+/// The popup used to list slash commands and nothing else, so the tool and agent
+/// vocabularies — the two things a user most often wants to name and least often
+/// remembers the spelling of — were reachable only by typing them from memory.
+///
+/// This surface can fix that without a wire format: `--inline` runs the runtime
+/// **in process**, so the ``CommandRegistry``, the resolved tool set and the
+/// ``AgentProfileRegistry`` are all plain values it already holds when it builds
+/// the session. The full-screen client has to ask a server for the same three
+/// lists over HTTP; here they are arguments.
+///
+/// Three of the user-facing rules then fall out of ``SlashCommandProvider``
+/// splicing ``AutocompleteItem/insertion`` over the token under the caret, so
+/// nothing in this type has to special-case them: a command or tool carries its
+/// own `/` (a draft of exactly `"/"` becomes `/read`, not `//read`); an agent does
+/// not, so choosing one EATS the `/` that opened the popup; and either way the
+/// surrounding words survive.
+///
+/// Pure and public rather than a private method on ``InteractiveMode``: assembling
+/// it needs no terminal, no harness and no gateway, and a projection that can only
+/// be reached through a live REPL is a projection with no test.
+public enum InteractivePalette {
+
+    /// Assemble the palette from the four lists an in-process session owns.
+    ///
+    /// Order is the popup's order for a bare `/`: ``fuzzyFilter`` leaves an
+    /// unfiltered batch in input order, so commands — the entries `/` has always
+    /// meant — stay at the top and the larger tool and agent vocabularies sit
+    /// behind them, where a couple of typed characters reaches them.
+    ///
+    /// Names are deduplicated case-insensitively, first source wins. That is not
+    /// tidiness: ``AutocompleteItem/value`` is the name, and the coordinator
+    /// resolves a chosen row back to its item by matching that value, so a second
+    /// row sharing a name would be unselectable — picking it would silently apply
+    /// the first. `review` is a real collision today (a built-in local command and
+    /// a built-in agent profile), and a project is free to add more.
+    ///
+    /// `skills` is here only to label rows. A skill is already present in
+    /// `commands` — ``SystemPromptBuilder`` promotes every skill to a `/name`
+    /// command — and the descriptor's own promotion marker is internal to
+    /// DoMoHarness, so the label is decided by matching names. The one case that
+    /// misreads is a workspace that defines BOTH a skill and a command file called
+    /// `foo`, where the command wins the registry fold but is labelled `skill`;
+    /// the row still inserts and runs the right thing.
+    public static func entries(
+        commands: [CommandDescriptor],
+        skills: [PromptSkill],
+        tools: [ToolDefinition],
+        agents: [AgentProfile]
+    ) -> [SlashCommand] {
+        var rows: [SlashCommand] = []
+        var claimed: Set<String> = []
+        let skillNames = Set(skills.map { $0.name.lowercased() })
+
+        func append(
+            name: String,
+            description: String?,
+            argumentHint: String?,
+            requiresSlash: Bool,
+            kind: String
+        ) {
+            guard isInsertable(name), claimed.insert(name.lowercased()).inserted else { return }
+            rows.append(
+                SlashCommand(
+                    name: name,
+                    description: rowDescription(description),
+                    argumentHint: argumentHint,
+                    requiresSlash: requiresSlash,
+                    kind: kind
+                )
+            )
+        }
+
+        for command in commands {
+            append(
+                name: command.name,
+                description: command.description,
+                argumentHint: command.argumentHint,
+                requiresSlash: true,
+                kind: skillNames.contains(command.name.lowercased()) ? "skill" : "command"
+            )
+        }
+        for tool in tools {
+            append(
+                name: tool.name,
+                description: tool.description,
+                argumentHint: nil,
+                requiresSlash: true,
+                kind: "tool"
+            )
+        }
+        for agent in agents {
+            append(
+                name: agent.name,
+                description: agent.description,
+                argumentHint: nil,
+                // An agent is named, never slashed: `/` is how the list is
+                // reached, not part of what the name means.
+                requiresSlash: false,
+                kind: "agent"
+            )
+        }
+        return rows
+    }
+
+    /// Whether a name can be spliced into the prompt as one token.
+    ///
+    /// The popup writes the name into the document VERBATIM as a
+    /// whitespace-delimited token, so a name carrying a space could never be
+    /// completed back out of the draft it produced, and a name carrying a control
+    /// byte would reach the tty as a control sequence rather than as text. MCP
+    /// tool names are already normalised to `[A-Za-z0-9_-]` before they get here,
+    /// but an adapter- or extension-provided tool is under no such contract and a
+    /// project file names its own commands and agents — so this checks rather than
+    /// trusts. Dropping the row is the honest outcome: an entry that cannot be
+    /// inserted correctly is worse than an entry that is absent.
+    static func isInsertable(_ name: String) -> Bool {
+        guard !name.isEmpty else { return false }
+        for scalar in name.unicodeScalars {
+            switch scalar {
+            case "a"..."z", "A"..."Z", "0"..."9", "_", "-", ".", ":": continue
+            default: return false
+            }
+        }
+        return true
+    }
+
+    /// One row's second column: collapsed to a line, stripped of anything a
+    /// terminal would act on, and bounded.
+    ///
+    /// A tool description is written by whatever MCP server served the tool, and a
+    /// command or agent description comes from a Markdown file in the workspace —
+    /// none of it is prose this process wrote, and all of it is about to be drawn
+    /// inside an overlay. The length bound is not cosmetic either: the popup is 48
+    /// columns wide, and a multi-kilobyte description would otherwise be carried
+    /// through the ranking pass that runs on every keystroke.
+    ///
+    /// Empty becomes `nil` rather than `""` so ``SlashCommandProvider`` composes
+    /// the row from the parts that exist instead of leaving a dangling separator.
+    static func rowDescription(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let clean = truncateToWidth(sanitizeUntrustedText(collapseToOneLine(text)), 80)
+        return clean.isEmpty ? nil : clean
+    }
+}
+
 // MARK: - Interactive mode
 
 /// The interactive REPL, constructed once and run against an injected terminal.
@@ -2558,7 +2713,14 @@ public struct InteractiveMode: Sendable {
                 runtime: runtime,
                 toolContext: toolContext,
                 visibleToolNames: tools.map(\.definition.name)
-            )
+            ),
+            // `--inline` is a full surface, not a debug path: it has to learn the
+            // same gateway ceiling and carry the same continuation policy as the
+            // default client, or the two modes disagree about what the gateway
+            // will return. `ProcessHarnessDefaults.current` is the neutral
+            // `.unconfigured` value in tests that never installed one.
+            responseLimit: ProcessHarnessDefaults.current.responseLimit,
+            gatewayContinuation: ProcessHarnessDefaults.current.gatewayContinuation
         )
         configuration.workspaceSnapshots = DoMoShadowGit(
             shell: shell,
@@ -2591,9 +2753,22 @@ public struct InteractiveMode: Sendable {
             harness: harness,
             sessionDirectory: sessionDir,
             directoryLister: lister,
-            slashCommands: promptWorkspace.commands.commands.map {
-                SlashCommand(name: $0.name, description: $0.description, argumentHint: $0.argumentHint)
-            },
+            // The whole palette, not just the slash commands. `tools` is the set
+            // this session actually offers the model — built-ins plus the MCP
+            // tools the permission ruleset leaves VISIBLE — so a tool a `deny`
+            // rule hides from the model is not advertised to the user either.
+            //
+            // It is a snapshot, exactly like the command and agent lists beside
+            // it: an MCP server that reconnects with a different tool set moves
+            // `toolResolver`, not this array, so the popup would keep offering
+            // the tools this session started with. That is the same staleness the
+            // command list has always had, and it is bounded by the session.
+            slashCommands: InteractivePalette.entries(
+                commands: promptWorkspace.commands.commands,
+                skills: promptWorkspace.skills,
+                tools: tools.map(\.definition),
+                agents: promptWorkspace.agents.profiles
+            ),
             commandProcessor: commandProcessor,
             commandStreamFactory: { commandModel, effort in
                 var selected = (modelRuntimeFor?(commandModel ?? runtime.model))

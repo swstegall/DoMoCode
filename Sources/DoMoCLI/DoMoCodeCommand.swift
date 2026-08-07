@@ -482,6 +482,19 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             Self.writeStderr("warning: \(Redaction.diagnostic(warning))\n")
         }
 
+        // The process's ONE adaptive response-limit controller, plus the gateway
+        // continuation policy, published where every surface built below can read
+        // them. Installed here — after resolution, before anything is constructed —
+        // because the controller learns a ceiling per model alias and persists it to
+        // one file: a per-surface controller would mean two halves of the evidence
+        // and two writers of that file. See ``ProcessHarnessDefaults``.
+        //
+        // `--replay` returned long before this line and therefore never installs
+        // one. That is the whole of "replay must not decorate": it starts no model,
+        // builds no harness, and re-runs a recorded trajectory whose prompts already
+        // carry whatever limit sentence they were sent with.
+        let harnessDefaults = ProcessHarnessDefaults.install(for: configuration)
+
         let profileWorkspace = try Self.loadAgentWorkspace(
             workingDirectory: workingDirectory,
             configDirectory: configuration.configDirectory
@@ -776,7 +789,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 return selected
             },
             maxCostPerRun: costLimit,
-            onNoProgress: noProgressHook
+            onNoProgress: noProgressHook,
+            responseLimit: harnessDefaults.responseLimit,
+            gatewayContinuation: harnessDefaults.gatewayContinuation
         )
 
         let code: Int32
@@ -1394,7 +1409,15 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             sessionHandoffs: sessionHandoffs,
             jobManager: jobManager,
             automationRegistry: automationRegistry,
-            sessionClients: sessionClients
+            sessionClients: sessionClients,
+            // The default surface's harnesses are built inside the runtime, so
+            // this is where the process's one controller has to reach them. Read
+            // from ``ProcessHarnessDefaults`` rather than threaded through this
+            // function's signature: `buildServerRuntime` is static and shared by
+            // `--serve` and the default client, and both already run after
+            // `install(for:)`.
+            responseLimit: ProcessHarnessDefaults.current.responseLimit,
+            gatewayContinuation: ProcessHarnessDefaults.current.gatewayContinuation
         )
         runtimeConfiguration.agentProfile = agentProfile
         runtimeConfiguration.agentMode = agentMode

@@ -261,6 +261,36 @@ public struct ModelOption: Sendable, Codable, Hashable {
     }
 }
 
+/// An agent persona a client may name, projected for its palette.
+///
+/// ``DoMoHarness/AgentProfile/systemPrompt`` is deliberately absent, for the same
+/// reason ``DoMoHarness/CommandDescriptor`` keeps its `template` off the wire: the
+/// prompt is the instruction the model is steered by, the serving process is the
+/// only party that needs it, and every local process can reach this route with the
+/// bearer token. A palette needs a name, a sentence, and where it came from — so
+/// shipping the prompt would buy nothing and would put an injection surface on a
+/// loopback socket. `permissionRules` and `toolAllowlist` are omitted on the same
+/// grounds: they are policy the runtime enforces, not data a client acts on.
+///
+/// `mode` and `source` are raw strings rather than the enums so a client built
+/// against an older vocabulary decodes a payload naming a mode it has never heard
+/// of, instead of failing the whole listing.
+public struct AgentProfileSummary: Codable, Hashable, Sendable {
+    public var name: String
+    public var description: String?
+    /// ``DoMoCore/AgentMode``'s raw value.
+    public var mode: String
+    /// ``DoMoHarness/PromptResourceSource``'s raw value.
+    public var source: String
+
+    public init(name: String, description: String? = nil, mode: String, source: String) {
+        self.name = name
+        self.description = description
+        self.mode = mode
+        self.source = source
+    }
+}
+
 // MARK: - ServerRuntime
 
 /// Owns the server's live sessions and the shared ingredients each ``AgentHarness``
@@ -446,6 +476,22 @@ public actor ServerRuntime {
         /// When absent, embedded runtimes retain the legacy single-client API.
         public var sessionClients: SessionClientManager?
 
+        /// The process's adaptive response-character-limit controller, or `nil` to
+        /// send prompts exactly as they were written.
+        ///
+        /// This is the load-bearing one. `domo` with no flags is the full-screen
+        /// client over an in-process server, so **every default session's harness is
+        /// built here** — a controller installed only on the CLI's own print and
+        /// inline paths would leave the surface almost everyone uses undecorated,
+        /// and the feature would look broken while its tests passed. Subagents
+        /// inherit it for free: ``runSubagent`` builds children through the same
+        /// ``harnessConfiguration(sessionID:)``.
+        public var responseLimit: ResponseLimitController?
+
+        /// What a run does when the gateway times out mid-answer. Forwarded to
+        /// every harness this runtime builds, for the same reason as above.
+        public var gatewayContinuation: GatewayContinuationSettings
+
         /// - Parameters:
         ///   - contextWindow: See ``Config/contextWindow``.
         ///   - compaction: See ``Config/compaction``.
@@ -496,7 +542,9 @@ public actor ServerRuntime {
             sessionHandoffs: SessionHandoffManager? = nil,
             jobManager: JobManager? = nil,
             automationRegistry: AutomationRegistry? = nil,
-            sessionClients: SessionClientManager? = nil
+            sessionClients: SessionClientManager? = nil,
+            responseLimit: ResponseLimitController? = nil,
+            gatewayContinuation: GatewayContinuationSettings = .default
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -541,6 +589,8 @@ public actor ServerRuntime {
             self.jobManager = jobManager
             self.automationRegistry = automationRegistry
             self.sessionClients = sessionClients
+            self.responseLimit = responseLimit
+            self.gatewayContinuation = gatewayContinuation
         }
     }
 
@@ -743,6 +793,27 @@ public actor ServerRuntime {
     /// the authority that expands them.
     public func commands() -> CommandRegistry {
         config.promptWorkspace?.commands ?? .builtIn
+    }
+
+    /// The agent personas this runtime can select, for a client's palette.
+    ///
+    /// Falls back to the built-in registry exactly as ``commands()`` does, and for
+    /// the same reason: a runtime started without dotfiles still resolves those
+    /// personas by name when work is delegated (`subagentProfile(named:)` reaches
+    /// ``DoMoHarness/AgentProfileRegistry/builtIn`` unconditionally), so answering
+    /// with an empty list would tell a client that nothing is selectable while the
+    /// names it omitted keep working.
+    ///
+    /// The projection drops each profile's system prompt; see ``AgentProfileSummary``.
+    public func agents() -> [AgentProfileSummary] {
+        (config.promptWorkspace?.agents ?? .builtIn).profiles.map { profile in
+            AgentProfileSummary(
+                name: profile.name,
+                description: profile.description,
+                mode: profile.mode.rawValue,
+                source: profile.source.rawValue
+            )
+        }
     }
 
     /// The durable memory shared by the serving workspace.
@@ -2298,7 +2369,13 @@ public actor ServerRuntime {
             maxCostPerRun: config.maxCostPerRun,
             sessionStartHead: config.sessionStartHead,
             recoveryDiagnostic: config.recoveryDiagnostic,
-            recoveryDiagnosticTools: config.recoveryDiagnosticTools
+            recoveryDiagnosticTools: config.recoveryDiagnosticTools,
+            // Forwarded, not defaulted: this is the harness the default surface
+            // runs on, and a knob that stops at `Config` is a knob a user can set
+            // and nothing reads — the same failure mode the comment above names
+            // for `summarizer`/`maxTurns`/`contextWindow`.
+            responseLimit: config.responseLimit,
+            gatewayContinuation: config.gatewayContinuation
         )
         configuration.workspaceSnapshots = config.workspaceSnapshotsForSession?(sessionID) ?? config.workspaceSnapshots
         return configuration

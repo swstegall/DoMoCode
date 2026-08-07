@@ -174,6 +174,17 @@ public final class ClientApp {
     // how two of them end up with overlapping copies of the same fact (a prompt
     // height, a mouse-owned flag) and how the copies drift.
 
+    /// Everything the palette and the `/` popup can insert: commands, tools and
+    /// agents, in one list with the slash rule already decided per entry.
+    ///
+    /// One list rather than three lookups at each surface, because the two
+    /// surfaces used to disagree — the palette offered client actions only, the
+    /// popup offered the command registry only — and neither could say whether a
+    /// chosen name is spelled with a leading slash. Rebuilt by
+    /// ``refreshPaletteCatalog()``; never partially updated, so a failed fetch
+    /// leaves the previous complete answer standing rather than a half of it.
+    private var paletteCatalog: [PaletteEntry] = []
+
     /// The prompt's height in the frame MOST RECENTLY BUILT.
     ///
     /// `handleMouse` runs between frames and has to hit-test the geometry the user is
@@ -425,7 +436,7 @@ public final class ClientApp {
         promptInput.onAutocomplete = { [weak self] suggestions in
             self?.reconcileAutocomplete(suggestions)
         }
-        promptInput.setAutocompleteProvider(makeAutocompleteProvider(commands: commandRegistry))
+        seedPaletteCatalog()
         promptInput.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
         statusBar.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
         footerBar.applyTheme(theme, appearance: appearance, trueColor: graphicsCapabilities.trueColor)
@@ -482,13 +493,57 @@ public final class ClientApp {
         }
     }
 
+    /// Rebuild the catalog from what is already in hand — the command registry
+    /// alone — and install the completion provider built from it.
+    ///
+    /// The tool and agent halves need the network, and the prompt must not be
+    /// without a provider until they answer: `/` would silently complete nothing
+    /// for the whole of startup. ``refreshPaletteCatalog()`` replaces this with
+    /// the full answer as soon as there is one.
+    private func seedPaletteCatalog() {
+        paletteCatalog = PaletteCatalog.assemble(commands: commandRegistry, tools: [], agents: [])
+        promptInput.setAutocompleteProvider(makeAutocompleteProvider(catalog: paletteCatalog))
+    }
+
+    /// Re-assemble the palette catalog from all three sources and reinstall the
+    /// completion provider.
+    ///
+    /// Every fetch is `try?` and silent. The catalog is a convenience surface: a
+    /// runtime that predates `/agents`, or a session whose tool list is momentarily
+    /// unavailable, must leave the user with a palette that still lists everything
+    /// else — not with a transcript row apologising for a list nobody asked for.
+    ///
+    /// The session is re-checked before the assignment, so a slow catalog for a
+    /// session the user has already left cannot replace the one just built for the
+    /// session they are looking at.
+    private func refreshPaletteCatalog() async {
+        let sessionID = store.selectedSessionID
+        var tools: [ToolCatalogEntry] = []
+        if let sessionID {
+            tools = (try? await client.toolCatalog(sessionID: sessionID)) ?? []
+        }
+        let agents = (try? await client.agents()) ?? []
+        guard store.selectedSessionID == sessionID else { return }
+        paletteCatalog = PaletteCatalog.assemble(commands: commandRegistry, tools: tools, agents: agents)
+        promptInput.setAutocompleteProvider(makeAutocompleteProvider(catalog: paletteCatalog))
+        // An open palette is a live list, not a snapshot: the catalog most often
+        // lands while the user is looking at it on a slow first connect.
+        if paletteHandle != nil {
+            paletteDialog?.updateItems(paletteItems())
+            surface?.requestRender()
+        }
+    }
+
     /// Build the shared slash/`@` provider. Completion is local to the client
     /// terminal, which is the useful behavior for a remote runtime: the file the
     /// user is dragging or naming is on the machine where they are typing.
-    private func makeAutocompleteProvider(commands: CommandRegistry) -> AutocompleteProvider {
-        let slash = commands.commands.map {
-            SlashCommand(name: $0.name, description: $0.description, argumentHint: $0.argumentHint)
-        }
+    ///
+    /// The slash half is the WHOLE catalog, not just the command registry, so the
+    /// popup and the palette can never offer different things — and each entry
+    /// carries its own slash rule, so choosing an agent inserts `explore` while
+    /// choosing a tool inserts `/read`.
+    private func makeAutocompleteProvider(catalog: [PaletteEntry]) -> AutocompleteProvider {
+        let slash = PaletteCatalog.slashCommands(catalog)
         let cwd = FileManager.default.currentDirectoryPath
         return CombinedAutocompleteProvider(commands: slash) { directory in
             let home = NSHomeDirectory()
@@ -830,7 +885,10 @@ public final class ClientApp {
         let seconds = notice.ttlMilliseconds.map { Double($0) / 1000 }
         post(notice: body, seconds: min(max(seconds ?? 4, 2), Self.maxNoticeDwell))
         // After `post`, which resets the flag for the ordinary case.
-        noticeIsRunScoped = notice.code == "retry"
+        // Both codes describe something the RUN is doing, so both stop being true
+        // the moment the run settles — a "continuing (3/10)" line left on the
+        // status bar after the answer arrived claims the session is still working.
+        noticeIsRunScoped = notice.code == "retry" || notice.code == "gateway_continue"
     }
 
     /// One line describing anything the transport threw.
@@ -1562,13 +1620,16 @@ public final class ClientApp {
         }
         do {
             commandRegistry = try await client.commands()
-            promptInput.setAutocompleteProvider(makeAutocompleteProvider(commands: commandRegistry))
         } catch {
             // Older runtimes do not have the additive route yet. Keep the built-in
             // local actions usable and let the prompt request surface any unknown
             // remote command normally.
             post(notice: "command list unavailable — using built-ins")
         }
+        // Outside the `catch`, deliberately: the built-in registry is still a
+        // catalog, and the agent list is fetched by its own route that a failed
+        // `/commands` says nothing about.
+        await refreshPaletteCatalog()
         let sessions: [SessionSummary]
         do {
             sessions = try await client.listSessions()
@@ -1781,6 +1842,10 @@ public final class ClientApp {
         lastStatusPollAt = Date()
         await seedAccounting(sessionID)
         await seedWorkspaceStatus(sessionID)
+        // The tool half of the catalog is per-session — the runtime resolves it
+        // against this session's mode, model and MCP list — so it is only true
+        // once a session is actually open.
+        await refreshPaletteCatalog()
     }
 
     /// Fill the footer's totals for a session that was already under way.
@@ -2060,30 +2125,11 @@ public final class ClientApp {
 
     private func openPalette() {
         if paletteHandle != nil { dismissPalette(); return }
-        let items = [
-            SelectItem(value: "session", label: "Open session", description: "Search and switch sessions"),
-            SelectItem(value: "rename", label: "Rename session", description: "Persist a display name"),
-            SelectItem(value: "title", label: "Auto-title session", description: "Ask the active model for a short name"),
-            SelectItem(value: "model", label: "Switch model", description: "Write a model_change entry"),
-            SelectItem(
-                value: "mode",
-                label: "Switch agent mode (currently \(agentMode.rawValue))",
-                description: "Shift+Tab cycles build, plan, ask, debug, and review policies"
-            ),
-            SelectItem(value: "tree", label: "Browse conversation tree", description: "Search, fold, and branch"),
-            SelectItem(value: "timeline", label: "Show session timeline", description: "Inspect checkpoints and history moves"),
-            SelectItem(value: "undo", label: "Undo conversation and workspace", description: "Restore the previous checkpoint"),
-            SelectItem(value: "redo", label: "Redo conversation and workspace", description: "Reapply the most recent undo"),
-            SelectItem(value: "fork", label: "Fork session", description: "Open a new session from this branch"),
-            SelectItem(value: "clone", label: "Clone session", description: "Open an independent copy of this branch"),
-            SelectItem(value: "diff", label: "Review working-tree diff", description: "Inspect changes since the session started"),
-            SelectItem(value: "review", label: "Review diff (guided)", description: "Mark files reviewed and restore individual paths"),
-            SelectItem(value: "theme", label: "Select Theme", description: "Choose the persistent terminal palette"),
-            SelectItem(value: "help", label: "Help", description: "Shortcuts, commands, and workflow navigation"),
-            SelectItem(value: "edit-dialog", label: "Edit prompt in dialog", description: "Edit the draft inside the client"),
-            SelectItem(value: "edit", label: "Edit prompt in $EDITOR", description: "Hand the draft to the external editor"),
-        ]
-        let dialog = SearchableSelectDialog(title: "Command palette", items: items, keybindings: keybindings)
+        let dialog = SearchableSelectDialog(
+            title: "Command palette",
+            items: paletteItems(),
+            keybindings: keybindings
+        )
         dialog.onCancel = { [weak self] in self?.dismissPalette() }
         dialog.onSelect = { [weak self] item in
             guard let self else { return }
@@ -2092,6 +2138,46 @@ public final class ClientApp {
         }
         paletteDialog = dialog
         paletteHandle = dialogs?.present(dialog, options: overlayOptions(width: 82, height: 15))
+    }
+
+    /// Everything ^P offers: the client's own actions, then the runtime's
+    /// commands, tools and agents.
+    ///
+    /// Actions first because they are what ^P has always been for and what a user
+    /// reaches for without reading; the catalog follows behind the same search
+    /// box, which is what makes "all commands, tools, agents" one list rather
+    /// than three surfaces the user has to know about separately.
+    private func paletteItems() -> [SelectItem] {
+        var items: [SelectItem] = [
+            Self.paletteAction("session", "Open session", "Search and switch sessions"),
+            Self.paletteAction("rename", "Rename session", "Persist a display name"),
+            Self.paletteAction("title", "Auto-title session", "Ask the active model for a short name"),
+            Self.paletteAction("model", "Switch model", "Write a model_change entry"),
+            Self.paletteAction(
+                "mode",
+                "Switch agent mode (currently \(agentMode.rawValue))",
+                "Shift+Tab cycles build, plan, ask, debug, and review policies"
+            ),
+            Self.paletteAction("tools", "Browse tool catalog", "Inspect the runtime's live tool projection"),
+            Self.paletteAction("tree", "Browse conversation tree", "Search, fold, and branch"),
+            Self.paletteAction("timeline", "Show session timeline", "Inspect checkpoints and history moves"),
+            Self.paletteAction("undo", "Undo conversation and workspace", "Restore the previous checkpoint"),
+            Self.paletteAction("redo", "Redo conversation and workspace", "Reapply the most recent undo"),
+            Self.paletteAction("fork", "Fork session", "Open a new session from this branch"),
+            Self.paletteAction("clone", "Clone session", "Open an independent copy of this branch"),
+            Self.paletteAction("diff", "Review working-tree diff", "Inspect changes since the session started"),
+            Self.paletteAction("review", "Review diff (guided)", "Mark files reviewed and restore individual paths"),
+            Self.paletteAction("theme", "Select Theme", "Choose the persistent terminal palette"),
+            Self.paletteAction("help", "Help", "Shortcuts, commands, and workflow navigation"),
+            Self.paletteAction("edit-dialog", "Edit prompt in dialog", "Edit the draft inside the client"),
+            Self.paletteAction("edit", "Edit prompt in $EDITOR", "Hand the draft to the external editor"),
+        ]
+        items.append(contentsOf: paletteCatalog.map(PaletteCatalog.item(for:)))
+        return items
+    }
+
+    private static func paletteAction(_ id: String, _ label: String, _ description: String) -> SelectItem {
+        SelectItem(value: PaletteCatalog.encode(.action(id)), label: label, description: description)
     }
 
     private func dismissPalette() {
@@ -2150,10 +2236,29 @@ public final class ClientApp {
     }
 
     private func insertToolCommand(_ name: String) {
+        insertPaletteCommand(name, requiresSlash: true)
+    }
+
+    /// Put a chosen catalog entry into the draft, spelled the way the runtime
+    /// will read it back.
+    ///
+    /// `requiresSlash` is carried from the entry rather than assumed, which is the
+    /// whole fix for `//read`: a draft that already contains `/` is a token the
+    /// splice REPLACES, and an agent — which is named in prose, not as a command —
+    /// lands without a slash at all.
+    ///
+    /// The name is sanitized before it reaches the editor buffer. A tool name can
+    /// come from an MCP server the user merely configured, and this is the one
+    /// path on which such a name becomes bytes the terminal executes rather than
+    /// text a row prints; for every legitimate name the call is the identity.
+    private func insertPaletteCommand(_ name: String, requiresSlash: Bool) {
+        let clean = sanitizeUntrustedText(collapseToOneLine(name))
+        guard !clean.isEmpty else { return }
         dismissToolCatalog()
-        promptInput.insertToolCommand(name)
+        promptInput.insertCommand(clean, requiresSlash: requiresSlash)
         focus.setCurrent(promptInput)
-        post(notice: "inserted /\(name) — add arguments and press Enter", seconds: 8)
+        let spelled = requiresSlash ? "/" + clean : clean
+        post(notice: "inserted \(spelled) — add arguments and press Enter", seconds: 8)
         surface?.requestRender()
     }
 
@@ -2224,7 +2329,26 @@ public final class ClientApp {
         )
     }
 
+    /// Run whatever the chosen palette row meant.
+    ///
+    /// Two populations share one list, so the row's value says which it is. An
+    /// undecodable value is treated as a bare action id: that is what every
+    /// palette row was before the catalog existed, and refusing it would turn a
+    /// stale row into a keypress that visibly does nothing.
     private func activatePalette(_ value: String) {
+        guard let selection = PaletteCatalog.decode(value) else {
+            performPaletteAction(value)
+            return
+        }
+        switch selection {
+        case .insert(let name, let requiresSlash):
+            insertPaletteCommand(name, requiresSlash: requiresSlash)
+        case .action(let id):
+            performPaletteAction(id)
+        }
+    }
+
+    private func performPaletteAction(_ value: String) {
         switch value {
         case "session": openSessionPicker()
         case "theme": openThemePicker()
@@ -2400,6 +2524,11 @@ public final class ClientApp {
                 self.post(notice: notice)
                 self.store.markAccountingStale()
                 await self.refreshToolCatalog(sessionID: id)
+                // The palette lists the same tools, and a model change can move
+                // the runtime's projection of them. Refreshing only the open
+                // catalog dialog would leave the palette advertising a tool the
+                // next request no longer carries.
+                await self.refreshPaletteCatalog()
             } catch {
                 self.postError("Could not change model", error)
             }
@@ -2429,6 +2558,10 @@ public final class ClientApp {
                 self.post(notice: "mode: \(next.rawValue)")
                 self.surface?.requestRender()
                 await self.refreshToolCatalog(sessionID: id)
+                // A mode change is exactly the event that HIDES tools (a read-only
+                // mode drops the writers), so the palette has to be rebuilt or it
+                // keeps offering what the policy just took away.
+                await self.refreshPaletteCatalog()
             } catch ServerClientError.unexpectedStatus(409, _, _) {
                 self.refuseAsBusy()
                 await self.reconcileWithServer(id)

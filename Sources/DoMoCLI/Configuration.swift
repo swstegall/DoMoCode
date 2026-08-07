@@ -34,6 +34,24 @@ public enum EnvName {
     public static let sessionDir = "DOMOCODE_SESSION_DIR"
     public static let logLevel = "DOMOCODE_LOG_LEVEL"
 
+    /// The adaptive response-character limit. `DOMOCODE_RESPONSE_LIMIT` takes a
+    /// true/false word; the other three take integers.
+    ///
+    /// Only the four knobs an operator plausibly changes from a shell have a
+    /// variable. The floor, the ceiling and the sentence template are settings
+    /// file only: they describe the *shape* of the search rather than one run's
+    /// tuning, and a name for every field is a name that has to be documented,
+    /// spelled consistently and kept working forever.
+    public static let responseLimit = "DOMOCODE_RESPONSE_LIMIT"
+    public static let responseLimitChars = "DOMOCODE_RESPONSE_LIMIT_CHARS"
+    public static let responseLimitJumpPercent = "DOMOCODE_RESPONSE_LIMIT_JUMP_PCT"
+    public static let responseLimitProbeEvery = "DOMOCODE_RESPONSE_LIMIT_PROBE_EVERY"
+
+    /// Resuming a turn the gateway timed out of. `DOMOCODE_GATEWAY_CONTINUE`
+    /// takes a true/false word; `DOMOCODE_GATEWAY_CONTINUE_MAX` an integer.
+    public static let gatewayContinue = "DOMOCODE_GATEWAY_CONTINUE"
+    public static let gatewayContinueMax = "DOMOCODE_GATEWAY_CONTINUE_MAX"
+
     /// The secret-key fallback chain. `DOMOCODE_API_KEY` first, then the two
     /// names other tools already set, so an existing LiteLLM or OpenAI
     /// environment works with no extra configuration.
@@ -84,6 +102,127 @@ public struct AutoFormatSettings: Sendable, Hashable, Codable {
         case enabled
         case command
         case timeoutMS = "timeoutMs"
+    }
+}
+
+/// A settings file's partial statement about the adaptive response limit.
+///
+/// Every field is optional so an absent key can be told from a stated one. That
+/// distinction matters more here than for most knobs because the feature is
+/// **on with no configuration at all**: a project file that only wants to raise
+/// `thresholdCharacters` must not thereby re-enable a limit the user switched
+/// off, and there is no way to express that if "silent" and "false" decode to
+/// the same value.
+///
+/// `thresholdCharacters` is a *seed*, not a ceiling. The policy probes above it
+/// and keeps whatever the gateway actually delivered, so a number written here
+/// is a starting guess the run is free to leave behind — which is why the
+/// learned values live in their own file (``ResolvedConfiguration/responseLimitStatePath``)
+/// and never rewrite the settings the user typed.
+///
+/// There is deliberately no `merged(over:)` here, unlike ``AutoFormatSettings``
+/// and ``DoMoHarness/CompactionOverrides``. Resolution reads the project and the
+/// user layer separately, because a warning about an out-of-range value has to
+/// name the file the value is written in, and collapsing the two layers with
+/// `??` first throws away exactly that fact.
+public struct ResponseLimitOverrides: Sendable, Hashable, Codable {
+    /// `false` sends every prompt untouched. Absent means on, not off.
+    public var enabled: Bool?
+
+    /// The seed ceiling, in characters. At least 1.
+    public var thresholdCharacters: Int?
+
+    /// How far above the known-good ceiling a probe may reach, as a percentage
+    /// of it. `0` keeps the limit sentence and stops probing, which is how an
+    /// operator who already knows their gateway's ceiling pins it.
+    public var jumpPercentage: Int?
+
+    /// Probe on every Nth eligible prompt. At least 1, where 1 probes every
+    /// prompt.
+    public var probeEvery: Int?
+
+    /// The floor a learned ceiling may never fall below, so a run of unrelated
+    /// failures cannot shrink the limit to nothing.
+    public var minimumThreshold: Int?
+
+    /// The ceiling a learned ceiling may never rise above.
+    public var maximumThreshold: Int?
+
+    /// The sentence appended to each prompt, with `{limit}` standing for the
+    /// number. A template containing no `{limit}` is appended verbatim rather
+    /// than rejected — see ``DoMoCore/ResponseLimitController/decorate(_:model:)``.
+    public var template: String?
+
+    public init(
+        enabled: Bool? = nil,
+        thresholdCharacters: Int? = nil,
+        jumpPercentage: Int? = nil,
+        probeEvery: Int? = nil,
+        minimumThreshold: Int? = nil,
+        maximumThreshold: Int? = nil,
+        template: String? = nil
+    ) {
+        self.enabled = enabled
+        self.thresholdCharacters = thresholdCharacters
+        self.jumpPercentage = jumpPercentage
+        self.probeEvery = probeEvery
+        self.minimumThreshold = minimumThreshold
+        self.maximumThreshold = maximumThreshold
+        self.template = template
+    }
+
+    /// Written out rather than synthesized, like every other key enum in this
+    /// file: the JSON spelling is a compatibility surface, and a property
+    /// renamed by a refactoring tool must break the build here instead of
+    /// quietly changing what a user's settings.json is allowed to say.
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case thresholdCharacters
+        case jumpPercentage
+        case probeEvery
+        case minimumThreshold
+        case maximumThreshold
+        case template
+    }
+}
+
+/// A settings file's partial statement about gateway-timeout continuation.
+///
+/// The gateway this project targets answers a long turn with a timeout rather
+/// than with a refusal, and the work done up to that point is not lost — it is
+/// already in the transcript. Continuing is therefore a *resumption*, not a
+/// retry of a failed request, which is why ``maxAttempts`` bounds how many times
+/// one turn may be resumed and is a different number from `maxRetries`.
+///
+/// Optional fields for the same reason as ``ResponseLimitOverrides``: this is on
+/// by default, so "said nothing" and "said false" must not decode alike.
+public struct GatewayContinuationOverrides: Sendable, Hashable, Codable {
+    /// `false` lets a gateway timeout fail the turn, as it did before.
+    public var enabled: Bool?
+
+    /// How many times one turn may be resumed. `0` is the same as disabling it,
+    /// spelled as a budget rather than as a switch.
+    public var maxAttempts: Int?
+
+    /// The prompt sent to resume. It is a *continuation instruction*, not a
+    /// restatement of the request: the request is still in the context the
+    /// resumed call carries.
+    public var message: String?
+
+    public init(
+        enabled: Bool? = nil,
+        maxAttempts: Int? = nil,
+        message: String? = nil
+    ) {
+        self.enabled = enabled
+        self.maxAttempts = maxAttempts
+        self.message = message
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case maxAttempts
+        case message
     }
 }
 
@@ -155,6 +294,15 @@ public struct Settings: Sendable, Hashable, Codable {
     /// but the route itself never contains a credential value.
     public var providerRoutes: [String: ProviderRoute]?
 
+    /// The adaptive response-character limit's knobs, each one optional so an
+    /// absent key can be told from a stated one when the two files are merged.
+    /// See ``ResponseLimitOverrides``.
+    public var responseLimit: ResponseLimitOverrides?
+
+    /// Resuming a turn the gateway timed out of. See
+    /// ``GatewayContinuationOverrides``.
+    public var gatewayContinuation: GatewayContinuationOverrides?
+
     public init(
         baseURL: String? = nil,
         model: String? = nil,
@@ -179,7 +327,9 @@ public struct Settings: Sendable, Hashable, Codable {
         autoFormat: AutoFormatSettings? = nil,
         retryWallClockMS: Int? = nil,
         providerProfiles: [String: ProviderProfile]? = nil,
-        providerRoutes: [String: ProviderRoute]? = nil
+        providerRoutes: [String: ProviderRoute]? = nil,
+        responseLimit: ResponseLimitOverrides? = nil,
+        gatewayContinuation: GatewayContinuationOverrides? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -205,6 +355,8 @@ public struct Settings: Sendable, Hashable, Codable {
         self.retryWallClockMS = retryWallClockMS
         self.providerProfiles = providerProfiles
         self.providerRoutes = providerRoutes
+        self.responseLimit = responseLimit
+        self.gatewayContinuation = gatewayContinuation
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -232,6 +384,8 @@ public struct Settings: Sendable, Hashable, Codable {
         case autoFormat
         case providerProfiles
         case providerRoutes
+        case responseLimit
+        case gatewayContinuation
     }
 
     /// Loads a settings file: `nil` when it is genuinely absent, a thrown error
@@ -405,6 +559,15 @@ extension Settings {
     ///   reason to keep in a separate file — and every field added to the
     ///   allowlist is a field an untrusted project config gets to point at a
     ///   file read.
+    /// - **`responseLimit` and `gatewayContinuation` are not walked either**, and
+    ///   their two string fields are the reason to say so out loud rather than
+    ///   let it be an oversight. `responseLimit.template` and
+    ///   `gatewayContinuation.message` are text that goes **to the model**, in
+    ///   every turn, from a file a clone may have written. Resolving `{file:}`
+    ///   in them would let a repository read a file straight into the model's
+    ///   context and then ask it to act on what it found; leaving them literal
+    ///   means a project can at worst write a fixed sentence, which the user can
+    ///   read for themselves in the same settings.json.
     ///
     /// `mcpServers.*.environment` is the case the feature exists for: it is
     /// overlaid onto a child process's environment, so a server that needs a
@@ -853,6 +1016,26 @@ public struct ResolvedConfiguration: Sendable {
     /// Named, ordered provider routes resolved from trusted settings.
     public var providerRoutes: [String: ProviderRoute]
 
+    /// The adaptive response-character limit, already range-checked.
+    ///
+    /// Never optional: the feature is on unless a layer turned it off, and "off"
+    /// is ``DoMoCore/ResponseLimitSettings/enabled`` being `false` — not an
+    /// absent value. Every consumer therefore reads one field to decide, and
+    /// there is no second spelling of "disabled" for one of them to forget.
+    public let responseLimit: ResponseLimitSettings
+
+    /// Where the ceilings learned about each model alias are kept between runs.
+    ///
+    /// It sits beside `settings.json` in the config directory, **not** in the
+    /// session directory, because what a gateway will actually deliver is a fact
+    /// about the gateway rather than about one conversation. Under the session
+    /// directory every new session would restart the search from the seed and
+    /// re-pay the failed probes to learn the same number again.
+    public let responseLimitStatePath: FilePath
+
+    /// What to do when the gateway answers a long turn with a timeout.
+    public let gatewayContinuation: GatewayContinuationSettings
+
     /// The *name* of the environment variable the API key was read from, when a
     /// settings file named one. Never the key.
     ///
@@ -900,7 +1083,10 @@ public struct ResolvedConfiguration: Sendable {
         apiKeyEnvName: String? = nil,
         warnings: [String] = [],
         providerProfiles: [String: ProviderProfile] = [:],
-        providerRoutes: [String: ProviderRoute] = [:]
+        providerRoutes: [String: ProviderRoute] = [:],
+        responseLimit: ResponseLimitSettings = .default,
+        responseLimitStatePath: FilePath? = nil,
+        gatewayContinuation: GatewayContinuationSettings = .default
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -930,6 +1116,16 @@ public struct ResolvedConfiguration: Sendable {
         self.warnings = warnings
         self.providerProfiles = providerProfiles
         self.providerRoutes = providerRoutes
+        self.responseLimit = responseLimit
+        // Derived here rather than at the resolver's single call site, so that
+        // every construction of this type — a test's included — agrees on where
+        // the learned ceilings live. It cannot be a default argument: a default
+        // argument may not mention another parameter, and this one is only ever
+        // "next to the config directory you were just handed". Passing a path
+        // explicitly is still allowed, for a test that wants a temp file.
+        self.responseLimitStatePath =
+            responseLimitStatePath ?? configDirectory.appending("response-limit.json")
+        self.gatewayContinuation = gatewayContinuation
     }
 
     // MARK: Per-model truth
@@ -1258,6 +1454,184 @@ extension ResolvedConfiguration {
             .merged(over: user?.autoFormat ?? AutoFormatSettings())
         let autoFormat = autoFormatOverride.isEmpty ? nil : autoFormatOverride
 
+        // MARK: The response limit and the gateway continuation
+        //
+        // These are the first knobs in this function that must never be able to
+        // fail a run. Both features are on with no configuration at all, so a
+        // user who never wrote either key can still be handed a bad value — by a
+        // project file, or by a stale variable in their shell — and losing the
+        // session to a knob they did not set is not an acceptable answer. Every
+        // value below therefore *warns and falls through* to the next layer, the
+        // way `logLevel` above does, instead of throwing the way the retry knobs
+        // do. The built-in default is the last layer, so the worst case is the
+        // behaviour of a machine with no settings file at all.
+        //
+        // The defaults themselves are read off the two settings types rather
+        // than written out again here. A second copy of "500" in this file could
+        // only ever agree with the policy's own or drift from it, and the drift
+        // would be silent — the same argument that keeps `defaultContextWindow`
+        // out of this type.
+        let limitDefaults = ResponseLimitSettings.default
+        let continuationDefaults = GatewayContinuationSettings.default
+
+        // The first layer that states a true/false word, or `fallback`. Only the
+        // environment can be malformed: the file layers decode as `Bool?`, and
+        // JSON has no second spelling of truth to get wrong.
+        func flag(
+            _ envName: String,
+            project projectValue: Bool?,
+            user userValue: Bool?,
+            default fallback: Bool
+        ) -> Bool {
+            if let raw = environment[envName], !raw.trimmingCharacters(in: .whitespaces).isEmpty {
+                if let parsed = booleanWord(raw) { return parsed }
+                warnings.append(
+                    "\(NumericSource.environment(envName).described) is not a true/false value (got \(quotable(raw))); ignoring it"
+                )
+            }
+            return projectValue ?? userValue ?? fallback
+        }
+
+        // The first layer that states an integer within `minimum...maximum`.
+        //
+        // `maximum` is passed rather than derived so the complaint can read
+        // "must be at least N" for the knobs that have no meaningful ceiling: a
+        // message naming 9223372036854775807 as the upper bound tells a user
+        // nothing except that a programmer reached for a sentinel.
+        //
+        // `env` is optional because three of these knobs deliberately have no
+        // environment variable; `nil` skips that layer rather than inventing a
+        // name that would then be half-supported and undocumented.
+        func count(
+            env envName: String?,
+            project projectValue: Int?,
+            user userValue: Int?,
+            key: String,
+            minimum: Int,
+            maximum: Int = Int.max,
+            default fallback: Int
+        ) -> Int {
+            let bound =
+                maximum == Int.max
+                ? "must be at least \(minimum)"
+                : "must be between \(minimum) and \(maximum)"
+            func checked(_ value: Int?, _ source: NumericSource) -> Int? {
+                guard let value else { return nil }
+                guard value >= minimum, value <= maximum else {
+                    warnings.append("\(source.described) \(bound) (got \(value)); ignoring it")
+                    return nil
+                }
+                return value
+            }
+            var fromEnvironment: Int?
+            if let envName, let raw = environment[envName] {
+                let trimmed = raw.trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty {
+                    if let parsed = Int(trimmed) {
+                        fromEnvironment = checked(parsed, .environment(envName))
+                    } else {
+                        warnings.append(
+                            "\(NumericSource.environment(envName).described) is not an integer (got \(quotable(raw))); ignoring it"
+                        )
+                    }
+                }
+            }
+            return fromEnvironment
+                ?? checked(projectValue, .project(key))
+                ?? checked(userValue, .user(key))
+                ?? fallback
+        }
+
+        let minimumThreshold = count(
+            env: nil,
+            project: project?.responseLimit?.minimumThreshold,
+            user: user?.responseLimit?.minimumThreshold,
+            key: "responseLimit.minimumThreshold",
+            minimum: 1,
+            default: limitDefaults.minimumThreshold
+        )
+        // The floor is resolved first and then serves as the ceiling's own lower
+        // bound, so "maximum below minimum" is reported as the contradiction it
+        // is instead of being handed to the policy to clamp its way out of.
+        let statedMaximum = count(
+            env: nil,
+            project: project?.responseLimit?.maximumThreshold,
+            user: user?.responseLimit?.maximumThreshold,
+            key: "responseLimit.maximumThreshold",
+            minimum: minimumThreshold,
+            default: limitDefaults.maximumThreshold
+        )
+
+        // Built by mutating the policy's own default rather than by calling its
+        // initializer with seven arguments: a knob added to
+        // ``DoMoCore/ResponseLimitSettings`` later then keeps its shipped default
+        // here, instead of silently becoming whatever this call site last
+        // spelled out — or failing to compile until someone guesses at a value.
+        var responseLimit = limitDefaults
+        responseLimit.enabled = flag(
+            EnvName.responseLimit,
+            project: project?.responseLimit?.enabled,
+            user: user?.responseLimit?.enabled,
+            default: limitDefaults.enabled
+        )
+        responseLimit.thresholdCharacters = count(
+            env: EnvName.responseLimitChars,
+            project: project?.responseLimit?.thresholdCharacters,
+            user: user?.responseLimit?.thresholdCharacters,
+            key: "responseLimit.thresholdCharacters",
+            minimum: 1,
+            default: limitDefaults.thresholdCharacters
+        )
+        responseLimit.jumpPercentage = count(
+            env: EnvName.responseLimitJumpPercent,
+            project: project?.responseLimit?.jumpPercentage,
+            user: user?.responseLimit?.jumpPercentage,
+            key: "responseLimit.jumpPercentage",
+            minimum: 0,
+            maximum: 10_000,
+            default: limitDefaults.jumpPercentage
+        )
+        responseLimit.probeEvery = count(
+            env: EnvName.responseLimitProbeEvery,
+            project: project?.responseLimit?.probeEvery,
+            user: user?.responseLimit?.probeEvery,
+            key: "responseLimit.probeEvery",
+            minimum: 1,
+            default: limitDefaults.probeEvery
+        )
+        responseLimit.minimumThreshold = minimumThreshold
+        // When a user raises the floor above the *default* ceiling and states no
+        // ceiling of their own, the ceiling gives way rather than the floor. The
+        // floor is the number they wrote down; quietly lowering it back would
+        // answer a question nobody asked, and leaving the pair inverted would
+        // hand the policy a range it cannot clamp into.
+        responseLimit.maximumThreshold = max(statedMaximum, minimumThreshold)
+        responseLimit.template =
+            nonEmpty(project?.responseLimit?.template)
+            ?? nonEmpty(user?.responseLimit?.template)
+            ?? limitDefaults.template
+
+        var gatewayContinuation = continuationDefaults
+        gatewayContinuation.enabled = flag(
+            EnvName.gatewayContinue,
+            project: project?.gatewayContinuation?.enabled,
+            user: user?.gatewayContinuation?.enabled,
+            default: continuationDefaults.enabled
+        )
+        gatewayContinuation.maxAttempts = count(
+            env: EnvName.gatewayContinueMax,
+            project: project?.gatewayContinuation?.maxAttempts,
+            user: user?.gatewayContinuation?.maxAttempts,
+            key: "gatewayContinuation.maxAttempts",
+            minimum: 0,
+            maximum: 100,
+            default: continuationDefaults.maxAttempts
+        )
+        gatewayContinuation.message =
+            nonEmpty(project?.gatewayContinuation?.message)
+            ?? nonEmpty(user?.gatewayContinuation?.message)
+            ?? continuationDefaults.message
+
         return ResolvedConfiguration(
             baseURL: baseURL,
             apiKey: apiKey,
@@ -1286,7 +1660,12 @@ extension ResolvedConfiguration {
             apiKeyEnvName: apiKeyEnvName,
             warnings: warnings,
             providerProfiles: providerProfiles,
-            providerRoutes: providerRoutes
+            providerRoutes: providerRoutes,
+            responseLimit: responseLimit,
+            // No path is passed: the initializer derives it from
+            // `configDirectory`, which is the only place the answer is known
+            // once, and passing it here would be a second place to keep right.
+            gatewayContinuation: gatewayContinuation
         )
     }
 
@@ -1405,6 +1784,23 @@ extension ResolvedConfiguration {
             if let value = environment[name], !value.isEmpty { return value }
         }
         return nil
+    }
+
+    /// A true/false word as an environment variable is allowed to spell it, or
+    /// `nil` for anything else.
+    ///
+    /// The four spellings on each side are the ones this codebase already
+    /// accepts in agent frontmatter (`DoMoHarness/PromptResources`), kept
+    /// identical on purpose: a user who learns that `on` works in one place and
+    /// finds it silently ignored in another has learned nothing. `nil` rather
+    /// than `false` for an unrecognized word, so the caller can say *that it did
+    /// not understand* instead of quietly turning a typo into an "off".
+    private static func booleanWord(_ raw: String) -> Bool? {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "true", "yes", "on", "1": return true
+        case "false", "no", "off", "0": return false
+        default: return nil
+        }
     }
 
     /// How a numeric setting should be named back to the user when it is wrong.

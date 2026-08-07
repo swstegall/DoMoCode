@@ -852,6 +852,37 @@ convention and both frontmatter keys apply uniformly in every resource root,
 so a pre-existing `<name>.agent.md` profile is now addressed without the
 suffix and skills already declaring the new keys pick up their meaning.
 
+#### Phase 34 — Gateway ceiling discovery, timeout continuation, unified palette — P1 — complete
+
+- [x] Append an adaptive character-limit sentence to the last user message of
+  every run, on the wire and in the session file, and discover the gateway's
+  real ceiling from what comes back: probe above the current ceiling on a
+  cadence, promote a probe that returns a response at least as long as the old
+  ceiling, binary-search downward from a probe that fails, and walk the ceiling
+  down after two consecutive ordinary failures. Learned per model alias in
+  `<configDir>/response-limit.json` under an atomic, locked, merging write, so
+  two `domo` processes cannot erase each other's learning. A cancelled run is
+  never evidence. On by default; see [Configuration](#configuration).
+- [x] Re-ask a run the gateway timed out on with
+  `Refer to previous context and continue.`, up to ten times, rebuilding the
+  context each attempt so the model continues from the partial turn the file
+  now holds. Strictly downstream of overflow recovery, provably terminating,
+  and restricted to genuine timeouts — 408/504/522/524 or a transport failure
+  whose prose says so — so a rate limit, an overflow or a cancellation never
+  enters it. Each attempt emits a run-scoped `gateway_continue` notice.
+- [x] List commands, tools and agents together in both the `^P` palette and the
+  `/` popup, each row labelled with the text it will insert, and insert by
+  REPLACING the whitespace-delimited token under the caret rather than
+  appending to the draft. That one change is what makes `/` + `/read` insert
+  `/read` instead of `//read`, makes a bare-name entry eat the `/` that opened
+  the list, and leaves the words on either side of the caret intact. New
+  `GET /agents` route projects agent profiles without putting a system prompt
+  on the wire.
+
+The phase is complete in both the full-screen client and the inline REPL, with
+the response-limit arithmetic, the continuation loop's termination, the timeout
+classifier and all four insertion rules covered by tests.
+
 ## Retry and provider behavior today
 
 The current retry and recovery path behaves as follows:
@@ -902,24 +933,95 @@ then built-in defaults. Current environment names:
 | DOMOCODE_RETRY_WALL_CLOCK_MS | Wall-clock budget for the request, response stream, backoff, and all retries; zero disables this bound. |
 | DOMOCODE_CONFIG_DIR | Settings, trust, commands, skills, and project memory root. |
 | DOMOCODE_SESSION_DIR | Session JSONL and prompt-history root. |
+| DOMOCODE_RESPONSE_LIMIT | `0`/`false` disables the adaptive response-character limit; on by default. |
+| DOMOCODE_RESPONSE_LIMIT_CHARS | Starting character ceiling advertised to the model (default 500). |
+| DOMOCODE_RESPONSE_LIMIT_JUMP_PCT | How far above the ceiling a probe may reach, in percent (default 10). |
+| DOMOCODE_RESPONSE_LIMIT_PROBE_EVERY | Probe cadence: one probe every N prompts (default 4). |
+| DOMOCODE_GATEWAY_CONTINUE | `0`/`false` disables gateway-timeout continuation; on by default. |
+| DOMOCODE_GATEWAY_CONTINUE_MAX | Continuation attempts per run (default 10, hard cap 100). |
 
 The settings file currently supports model overrides, compaction, context
-window metadata, trusted auto-format, MCP servers, and interpolation. Project
-settings cannot introduce credentials or widen permissions. Any future
-provider/profile/workflow setting must preserve those redaction and trust
-rules.
+window metadata, trusted auto-format, MCP servers, interpolation, the adaptive
+response limit, and gateway continuation. Project settings cannot introduce
+credentials or widen permissions. Any future provider/profile/workflow setting
+must preserve those redaction and trust rules.
+
+### Adaptive response-character limit
+
+Some gateways refuse to return a response over an undocumented size, and say so
+only by failing. DoMoCode appends a limit sentence to the last user message of
+each run — on the wire and in the session file, so the transcript records what
+the model was actually asked — and then *learns* the real ceiling:
+
+- the ceiling starts at `thresholdCharacters` and is remembered **per model
+  alias** in `<configDir>/response-limit.json`;
+- every `probeEvery`-th prompt advertises a probe up to `jumpPercentage` above
+  the ceiling. A probe that comes back with a response at least as long as the
+  old ceiling promotes the probe value to the new ceiling;
+- a probe that fails records that value as known-bad and the next probe is the
+  midpoint between the ceiling and it, so the search converges rather than
+  retrying the same failing number;
+- two consecutive ordinary failures walk the ceiling down 10%, floored at
+  `minimumThreshold`. A cancelled run teaches it nothing.
+
+~~~json
+{
+  "responseLimit": {
+    "enabled": true,
+    "thresholdCharacters": 500,
+    "jumpPercentage": 10,
+    "probeEvery": 4,
+    "minimumThreshold": 200,
+    "maximumThreshold": 200000,
+    "template": "Respond in less than {limit} characters or less."
+  }
+}
+~~~
+
+`{limit}` is the only substitution. The template is deliberately **not** run
+through `{env:}`/`{file:}` interpolation: it is text sent to the model every
+turn, and a cloned repository must not be able to read a file into it.
+
+### Gateway-timeout continuation
+
+A gateway that times out mid-answer leaves real work on the far side, so the
+run re-asks with a short continuation prompt instead of surfacing a dead turn.
+Only genuine timeouts qualify — HTTP 408/504/522/524, or a transport failure
+whose prose says it timed out, stalled or missed a deadline. A rate limit, an
+overflow, an auth failure or a cancellation never does.
+
+~~~json
+{
+  "gatewayContinuation": {
+    "enabled": true,
+    "maxAttempts": 10,
+    "message": "Refer to previous context and continue."
+  }
+}
+~~~
+
+Each attempt emits a `gateway_continue` notice, so the status line reads
+`Gateway timed out — continuing (3/10)` rather than going quiet.
 
 ## Testing and contribution rules
 
-Run serially because the suite uses subprocesses, sockets, PTYs, and timing
-sensitive fixtures:
+Run **target by target**, and suite by suite for the fixture-bearing targets,
+because the suite uses subprocesses, sockets, PTYs, and timing-sensitive
+fixtures. A package-wide run is not merely slow: Swift Testing overlaps suites
+inside one process even under `--no-parallel`, and the server, client and PTY
+fixtures then wait forever on a neighbour's torn-down event loop. The Test step
+in [.github/workflows/ci.yml](.github/workflows/ci.yml) is the authoritative
+invocation — mirror it locally rather than running `swift test` bare:
 
 ~~~sh
 swift build
-swift test --no-parallel
-swift test --configuration release --no-parallel
+swift test --no-parallel --filter "^DoMoCoreTests\."          # one target at a time
+swift test --no-parallel --filter "^DoMoServerTests\.Suite/"  # one suite for server/client/CLI
 swift run domo -p "prompt"
 ~~~
+
+Release matters and is not optional: `precondition` compiles out under
+`-Onone`, and `@testable import` cannot build in release.
 
 New terminal behavior needs a pure component test, a cell-oracle test, and a
 PTY test where bytes or lifecycle matter. New tools need schema, permission,

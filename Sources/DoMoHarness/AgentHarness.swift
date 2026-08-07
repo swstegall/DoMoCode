@@ -375,6 +375,23 @@ public actor AgentHarness {
         /// Maximum duration for one lifecycle hook snapshot.
         public var toolLifecycleTimeout: Duration
 
+        /// The adaptive response-character limit, or `nil` to send prompts
+        /// exactly as the caller wrote them.
+        ///
+        /// One controller per process, shared by every harness a run spawns
+        /// including subagents: what it learns is a fact about the *gateway*, and
+        /// two controllers over one gateway would each have to rediscover the
+        /// ceiling and would disagree while they did.
+        ///
+        /// It is an actor rather than a value because the learned state is
+        /// read-modify-written across the awaits of a turn, and because a parent
+        /// and its subagents decorate concurrently.
+        public var responseLimit: ResponseLimitController?
+
+        /// What a run does when the gateway times out mid-turn rather than the
+        /// model refusing. See ``GatewayContinuationSettings``.
+        public var gatewayContinuation: GatewayContinuationSettings
+
         public init(
             systemPrompt: String? = nil,
             systemPromptForPrompt: (@Sendable (String) -> String)? = nil,
@@ -407,7 +424,9 @@ public actor AgentHarness {
             recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
             recoveryDiagnosticTimeout: Duration = .seconds(8),
             recoveryDiagnosticMaxOutputTokens: Int = 512,
-            recoveryDiagnosticTools: [any AgentTool] = []
+            recoveryDiagnosticTools: [any AgentTool] = [],
+            responseLimit: ResponseLimitController? = nil,
+            gatewayContinuation: GatewayContinuationSettings = .default
         ) {
             self.systemPrompt = systemPrompt
             self.systemPromptForPrompt = systemPromptForPrompt
@@ -447,6 +466,8 @@ public actor AgentHarness {
             self.toolLifecycle = toolLifecycle
             self.toolLifecycleTimeout = toolLifecycleTimeout
             self.onNoProgress = onNoProgress
+            self.responseLimit = responseLimit
+            self.gatewayContinuation = gatewayContinuation
             self.workspaceSnapshots = nil
         }
 
@@ -1242,6 +1263,18 @@ public actor AgentHarness {
         isRunning = true
         defer { isRunning = false }
 
+        // Decorated first, before anything else in this method can look at the
+        // prompt. The decorated string is the one that goes on the wire AND the
+        // one that is persisted — `executeLoop` hands these exact messages to
+        // the loop, whose ``SessionPersistenceSink`` writes them to the session
+        // file — so the transcript, the exports and a resumed context all show
+        // what the model was actually asked. Decorating any later would put a
+        // sentence on the wire that no reader of the session ever sees, and the
+        // two records of one turn would disagree.
+        let prepared = await decorateWithResponseLimit(messages, runOverride: runOverride)
+        let promptMessages = prepared.messages
+        let responseLimitTicket = prepared.ticket
+
         // Capture the pre-prompt workspace before compaction or any transcript
         // entry can move the active tip. Failure disables workspace history for
         // this runtime but does not turn an otherwise usable coding run into a
@@ -1249,7 +1282,11 @@ public actor AgentHarness {
         await ensureWorkspaceBaseline()
         _ = try await compactIfNeeded()
 
-        let systemPromptInput = messages.compactMap { message -> String? in
+        // Read off the DECORATED messages deliberately: this string feeds
+        // keyword-triggered skill selection, and matching against a prompt that
+        // differs from the one the model receives is how a skill silently stops
+        // firing for the turn that needed it.
+        let systemPromptInput = promptMessages.compactMap { message -> String? in
             guard case .user(let user) = message else { return nil }
             return user.text
         }.first ?? ""
@@ -1334,7 +1371,7 @@ public actor AgentHarness {
         }
 
         var result = await executeLoop(
-            prompts: messages,
+            prompts: promptMessages,
             contextMessages: try buildContextMessages()
         )
 
@@ -1363,10 +1400,159 @@ public actor AgentHarness {
             }
         }
 
+        // Gateway continuation, strictly downstream of overflow recovery: an
+        // over-window request is repaired by compacting and re-asking, and only
+        // a failure that survives *that* is a candidate for "the gateway hung up
+        // while the model was still talking". Running it first would send a
+        // "continue" prompt into a context that cannot fit, which cannot succeed
+        // and would burn the whole attempt budget proving it.
+        //
+        // Termination is by construction, not by argument. `continuationAttempts`
+        // rises once per iteration and is bounded by a cap that
+        // ``GatewayContinuationSettings/effectiveMaxAttempts`` has already
+        // clamped; a cancelled task stops it before another request; a
+        // persistence error stops it, because a run that cannot record its
+        // transcript must not grow one; a context that will not rebuild breaks
+        // out rather than retrying the same unbuildable context; a failure that
+        // is not a gateway timeout never enters it; and a retry that succeeds
+        // clears `result.failure`, which is the condition that admitted it.
+        let continuationCap = configuration.gatewayContinuation.effectiveMaxAttempts
+        var continuationAttempts = 0
+        while continuationAttempts < continuationCap,
+              errorBox.first == nil,
+              !Task.isCancelled,
+              let failure = result.failure,
+              failure.isGatewayTimeout {
+            continuationAttempts += 1
+            // Announced before the request, not after it: the point of the
+            // notice is that a user watching a run that has been quiet for two
+            // minutes learns it is still being driven. `warning`, matching the
+            // retry notice — the turn has not failed, it is being carried on.
+            await sink?.emit(.notice(AgentNotice(
+                level: .warning,
+                code: "gateway_continue",
+                text: "Gateway timed out — continuing (\(continuationAttempts)/\(continuationCap))",
+                detail: DoMoError.truncating(Redaction.diagnostic(failure.message), to: 200),
+                kind: failure.kind.label
+            )))
+            // Rebuilt every iteration rather than reused: the timed-out turn
+            // persisted its own partial transcript, and the continuation must be
+            // asked against what the file now holds — otherwise the model is
+            // asked to continue from a conversation missing the turn it is being
+            // asked to continue.
+            let contextMessages: [Message]
+            do {
+                contextMessages = try buildContextMessages()
+            } catch {
+                break
+            }
+            // NOT decorated with the response limit. The continuation prompt is
+            // the harness's own words, not the user's turn, and a limit sentence
+            // on it would both re-cap a response the user already asked to be
+            // capped and make the ticket's accounting nonsense — the outcome is
+            // recorded against the ONE limit this run offered.
+            let retry = await executeLoop(
+                prompts: [.user(UserMessage(content: [.text(configuration.gatewayContinuation.message)]))],
+                contextMessages: contextMessages
+            )
+            result = AgentRunResult(
+                messages: result.messages + retry.messages,
+                stopReason: retry.stopReason,
+                failure: retry.failure
+            )
+        }
+
+        // Recorded before the persistence error is surfaced. A transcript that
+        // could not be written is a failure of this process's filesystem and
+        // says nothing whatever about what the gateway was willing to return,
+        // which is the only question the learned ceiling answers.
+        if let ticket = responseLimitTicket {
+            await recordResponseLimitOutcome(ticket, result: result)
+        }
+
         if let error = errorBox.first {
             throw DoMoError(.file(path: store.path, errno: nil), "Failed to persist session transcript", cause: error)
         }
         return result
+    }
+
+    // MARK: - Adaptive response limit
+
+    /// Appends the adaptive response-character limit to the prompt this run is
+    /// about to send, returning the messages to run and the ticket the settled
+    /// run is recorded against.
+    ///
+    /// The **last** `.user` message is the one decorated, because that is this
+    /// turn's prompt; anything before it is history a caller replayed and
+    /// re-capping it would put a second instruction into the model's context
+    /// with no turn to apply it to. Within that message the **last** text block
+    /// is rewritten, so an image-plus-caption prompt keeps its images and their
+    /// ordering; a prompt with no text at all — an image-only turn — gains one
+    /// rather than being the single case that silently escapes the limit.
+    ///
+    /// Returns the input unchanged, with a `nil` ticket, whenever there is no
+    /// controller or no user message to decorate. A `nil` ticket is what makes
+    /// ``recordResponseLimitOutcome(_:result:)`` a no-op, so an undecorated run
+    /// can never teach the ceiling anything.
+    private func decorateWithResponseLimit(
+        _ messages: [Message],
+        runOverride: RunOverride?
+    ) async -> (messages: [Message], ticket: ResponseLimitController.Ticket?) {
+        guard let controller = configuration.responseLimit else { return (messages, nil) }
+        let promptIndex = messages.lastIndex { message in
+            if case .user = message { return true }
+            return false
+        }
+        guard let promptIndex, case .user(var user) = messages[promptIndex] else {
+            return (messages, nil)
+        }
+        let textIndex = user.content.lastIndex { $0.textBlock != nil }
+        let original = textIndex.flatMap { user.content[$0].textBlock?.text } ?? ""
+        // The model that will actually answer, which a per-command override can
+        // change for one turn. The ceiling is learned per alias, so charging a
+        // probe to the session's default model when a different one answered
+        // would teach the wrong row.
+        let decorated = await controller.decorate(
+            original,
+            model: runOverride?.model ?? activeModel
+        )
+        if let textIndex {
+            user.content[textIndex] = .text(decorated.text)
+        } else {
+            user.content.append(.text(decorated.text))
+        }
+        var updated = messages
+        updated[promptIndex] = .user(user)
+        return (updated, decorated.ticket)
+    }
+
+    /// Feeds one settled run back into the adaptive response-character limit.
+    ///
+    /// A cancelled or aborted run is dropped rather than recorded as a failure:
+    /// the gateway was never given the chance to refuse, so counting an
+    /// interrupt as evidence would walk the learned ceiling down every time a
+    /// user pressed Escape — and the back-off is exactly the direction that is
+    /// expensive to undo, since it takes several successful probes to climb back.
+    ///
+    /// `responseCharacters` is the LONGEST assistant text in the run, not the
+    /// sum and not the last: the question the ceiling answers is "how much did
+    /// the gateway deliver intact in one response", and a multi-turn run's total
+    /// would claim credit no single response earned.
+    private func recordResponseLimitOutcome(
+        _ ticket: ResponseLimitController.Ticket,
+        result: AgentRunResult
+    ) async {
+        guard let controller = configuration.responseLimit else { return }
+        guard !Task.isCancelled, result.stopReason != .aborted else { return }
+        let characters = result.messages.reduce(into: 0) { longest, message in
+            guard case .assistant(let assistant) = message else { return }
+            longest = max(longest, assistant.text.count)
+        }
+        await controller.record(
+            ticket,
+            succeeded: result.failure == nil && result.stopReason != .errored,
+            responseCharacters: characters
+        )
     }
 
     /// Whether a settled loop result is recoverable by compacting the branch
