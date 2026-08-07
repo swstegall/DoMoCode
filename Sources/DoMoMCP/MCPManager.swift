@@ -10,6 +10,7 @@
 import DoMoAgent
 import DoMoCore
 import DoMoExec
+import DoMoLLM
 import Foundation
 
 /// Connects and owns the run's stdio MCP servers.
@@ -103,7 +104,19 @@ public actor MCPManager {
     private var nameOverrides: [ServerKey: String] = [:]
     private var log: (@Sendable (String) -> Void)?
 
-    public init() {}
+    /// The one HTTP-client factory every remote server this manager connects shares, so
+    /// the whole run builds at most one proxied client instead of one per server. It is
+    /// created here rather than per `connect` call because ``shutdown()`` is the single
+    /// place that may tear it down, and a client still referenced by a connected server
+    /// must outlive that server.
+    private let httpClients: ProxiedHTTPClients
+
+    /// - Parameter proxy: the resolved proxy settings for the run. The default owns
+    ///   nothing and hands every request `HTTPClient.shared`, which is the behaviour of
+    ///   every call site that does not pass one.
+    public init(proxy: ProxySettings = .disabled) {
+        httpClients = ProxiedHTTPClients(settings: proxy)
+    }
 
     /// Connect every enabled server (in a stable order) and return the bridged tools.
     /// A server that fails to spawn or handshake is logged and skipped — never fatal.
@@ -147,7 +160,8 @@ public actor MCPManager {
                 onToolsChanged: { [weak self] in
                     await self?.rebuildTools()
                 },
-                bearerToken: bearerToken
+                bearerToken: bearerToken,
+                httpClientProvider: { [httpClients] url in httpClients.client(for: url) }
             )
             var connectionError: (any Error)?
             let attempts = config.isRemote ? 3 : 1
@@ -382,11 +396,17 @@ public actor MCPManager {
         mcpTools = rebuilt
     }
 
-    /// Tear down every connected server.
+    /// Tear down every connected server, then the HTTP clients they shared. Ends this
+    /// manager's life: a client built for a proxied endpoint holds an event-loop group,
+    /// and leaving one running keeps the process from exiting.
     public func shutdown() async {
         for server in servers { await server.client.shutdown() }
         servers.removeAll()
         mcpTools.removeAll()
+        // After the servers, never before: a shut-down client cannot serve the requests
+        // a still-connected server would make. Idempotent, because the CLI's error and
+        // success paths can both reach here.
+        await httpClients.shutdown()
     }
 
     private static func safeEndpoint(_ rawURL: String?) -> String? {

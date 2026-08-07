@@ -75,6 +75,13 @@ public actor MCPClient {
 
     private let process = PersistentProcess()
     private let http: HTTPClient
+    /// Picks the `HTTPClient` for one request URL. AsyncHTTPClient carries proxy
+    /// configuration on the CLIENT, not on the request, so an endpoint reached through
+    /// a corporate HTTP proxy and an endpoint the standard `no_proxy` convention exempts
+    /// (an intranet host, or the loopback address this program talks to itself on)
+    /// cannot share one client. When this is nil every request uses `http`, which is the
+    /// unproxied behaviour every existing call site already had.
+    private let httpClientProvider: (@Sendable (URL) -> HTTPClient)?
     private var readerTask: Task<Void, Never>?
     private var nextID = 0
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
@@ -102,7 +109,8 @@ public actor MCPClient {
         log: (@Sendable (String) -> Void)? = nil,
         onToolsChanged: (@Sendable () async -> Void)? = nil,
         bearerToken: String? = nil,
-        http: HTTPClient = .shared
+        http: HTTPClient = .shared,
+        httpClientProvider: (@Sendable (URL) -> HTTPClient)? = nil
     ) {
         self.serverName = serverName
         self.config = config
@@ -114,6 +122,7 @@ public actor MCPClient {
         self.onToolsChanged = onToolsChanged
         self.bearerToken = bearerToken
         self.http = http
+        self.httpClientProvider = httpClientProvider
     }
 
     // MARK: Connect / discover
@@ -391,8 +400,13 @@ public actor MCPClient {
         }
         request.body = .bytes(Array(body))
 
+        // Resolved per request rather than once at init: the provider decides from the
+        // URL whether this endpoint is proxied, and a client's proxy cannot be changed
+        // after it is built.
+        let client = httpClientProvider?(url) ?? http
+
         do {
-            let response = try await http.execute(
+            let response = try await client.execute(
                 request,
                 timeout: .nanoseconds(Self.nanoseconds(config.requestTimeout))
             )
@@ -430,18 +444,19 @@ public actor MCPClient {
         return url
     }
 
+    /// Delegated to ``DoMoCore/ProxyPolicy/isPrivateAddress(_:)`` rather than
+    /// matched here.
+    ///
+    /// What used to live at this line matched on prefixes of the host TEXT, and
+    /// so recognised `::1` and `fe80:` but not `fc00::/7` — the range a private
+    /// IPv6 network actually uses — nor `::ffff:10.0.0.1`, the IPv4-mapped form a
+    /// dual-stack resolver hands back. Both reached the network without the
+    /// opt-in this gate exists to require, which made the gate a formality for
+    /// anyone who wrote the address the other way. The shared version parses the
+    /// address instead of the string, and having one copy is the point: two
+    /// answers to "is this private" is how the gap appeared.
     private static func isPrivateHost(_ host: String) -> Bool {
-        let lowercased = host.lowercased()
-        if lowercased == "localhost" || lowercased == "::1" || lowercased == "0.0.0.0" {
-            return true
-        }
-        let octets = lowercased.split(separator: ".").compactMap { Int($0) }
-        guard octets.count == 4 else { return lowercased.hasPrefix("fe80:") }
-        if octets[0] == 10 || octets[0] == 127 || octets[0] == 169 && octets[1] == 254 {
-            return true
-        }
-        if octets[0] == 192 && octets[1] == 168 { return true }
-        return octets[0] == 172 && (16...31).contains(octets[1])
+        ProxyPolicy.isPrivateAddress(host)
     }
 
     private func collectRemote(_ body: HTTPClientResponse.Body) async throws -> Data {

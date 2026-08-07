@@ -52,6 +52,24 @@ public enum EnvName {
     public static let gatewayContinue = "DOMOCODE_GATEWAY_CONTINUE"
     public static let gatewayContinueMax = "DOMOCODE_GATEWAY_CONTINUE_MAX"
 
+    /// The corporate HTTP proxy, and the hosts that must be reached without it.
+    ///
+    /// These exist alongside the conventional `http_proxy`, `https_proxy`,
+    /// `all_proxy` and `no_proxy` variables — the spellings curl established —
+    /// and beat them, so a machine that routes everything through a proxy
+    /// system-wide can be told to treat this one tool differently without
+    /// editing a login shell. `DOMOCODE_PROXY_ENABLED` takes a true/false word;
+    /// the other three take the same values the conventional variables do.
+    ///
+    /// An empty value means "not set", matching the convention. Switching the
+    /// proxy off for this tool alone is `DOMOCODE_PROXY_ENABLED=0`, not an empty
+    /// `DOMOCODE_HTTP_PROXY`, which would otherwise be two spellings of one
+    /// thing with only one of them documented.
+    public static let httpProxy = "DOMOCODE_HTTP_PROXY"
+    public static let httpsProxy = "DOMOCODE_HTTPS_PROXY"
+    public static let noProxy = "DOMOCODE_NO_PROXY"
+    public static let proxyEnabled = "DOMOCODE_PROXY_ENABLED"
+
     /// The secret-key fallback chain. `DOMOCODE_API_KEY` first, then the two
     /// names other tools already set, so an existing LiteLLM or OpenAI
     /// environment works with no extra configuration.
@@ -226,6 +244,57 @@ public struct GatewayContinuationOverrides: Sendable, Hashable, Codable {
     }
 }
 
+/// A settings file's partial statement about the HTTP proxy.
+///
+/// Optional fields for the same reason as ``ResponseLimitOverrides``: with no
+/// configuration at all this tool already follows the conventional
+/// `http_proxy`/`https_proxy`/`no_proxy` variables, so "said nothing" and "said
+/// false" must not decode alike. A user adding one intranet host to ``noProxy``
+/// must not thereby switch off a proxy their shell sets for everything else.
+///
+/// Only the **user** settings file may state ``httpProxy``, ``httpsProxy`` or
+/// ``noProxy``. See ``ResolvedConfiguration/resolveProxy(environment:project:user:)``
+/// for why a project file that states one is ignored and reported.
+public struct ProxyOverrides: Sendable, Hashable, Codable {
+    /// `false` sends every request direct, whatever any variable says. This is
+    /// the only field a project settings file may state, and only as `false`.
+    public var enabled: Bool?
+
+    /// `http://[user:password@]host[:port]`, used for `http:` request URLs. A
+    /// bare `host:port` is accepted too, which is how these are often written.
+    public var httpProxy: String?
+
+    /// The same, used for `https:` request URLs.
+    public var httpsProxy: String?
+
+    /// Hosts to reach directly, comma- or whitespace-separated, in the standard
+    /// `no_proxy` form: `.example.com`, `example.com`, `host:port`, an IP
+    /// literal, a CIDR range, or `*` for everything.
+    ///
+    /// Loopback is always direct whether or not it is named here — see
+    /// ``DoMoCore/ProxyPolicy/bypasses(host:port:noProxy:)``.
+    public var noProxy: String?
+
+    public init(
+        enabled: Bool? = nil,
+        httpProxy: String? = nil,
+        httpsProxy: String? = nil,
+        noProxy: String? = nil
+    ) {
+        self.enabled = enabled
+        self.httpProxy = httpProxy
+        self.httpsProxy = httpsProxy
+        self.noProxy = noProxy
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case httpProxy
+        case httpsProxy
+        case noProxy
+    }
+}
+
 /// A `settings.json` file, every field optional.
 ///
 /// This is the persisted, *non-secret* layer of configuration. It deliberately
@@ -303,6 +372,17 @@ public struct Settings: Sendable, Hashable, Codable {
     /// ``GatewayContinuationOverrides``.
     public var gatewayContinuation: GatewayContinuationOverrides?
 
+    /// The HTTP proxy every outbound request is routed through, and the hosts
+    /// that must be reached without it. See ``ProxyOverrides``.
+    ///
+    /// Honored in the **user** settings file only. A project file that states a
+    /// proxy URL is ignored with a warning, for the same reason ``mcpServers``
+    /// may only be tightened by one: a repository that could nominate the host
+    /// every request goes through would see that traffic and the `Authorization`
+    /// header on it, and the trust gate that admitted the file cannot tell a
+    /// helpful proxy from a hostile one.
+    public var proxy: ProxyOverrides?
+
     public init(
         baseURL: String? = nil,
         model: String? = nil,
@@ -329,7 +409,8 @@ public struct Settings: Sendable, Hashable, Codable {
         providerProfiles: [String: ProviderProfile]? = nil,
         providerRoutes: [String: ProviderRoute]? = nil,
         responseLimit: ResponseLimitOverrides? = nil,
-        gatewayContinuation: GatewayContinuationOverrides? = nil
+        gatewayContinuation: GatewayContinuationOverrides? = nil,
+        proxy: ProxyOverrides? = nil
     ) {
         self.baseURL = baseURL
         self.model = model
@@ -357,6 +438,7 @@ public struct Settings: Sendable, Hashable, Codable {
         self.providerRoutes = providerRoutes
         self.responseLimit = responseLimit
         self.gatewayContinuation = gatewayContinuation
+        self.proxy = proxy
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -386,6 +468,7 @@ public struct Settings: Sendable, Hashable, Codable {
         case providerRoutes
         case responseLimit
         case gatewayContinuation
+        case proxy
     }
 
     /// Loads a settings file: `nil` when it is genuinely absent, a thrown error
@@ -568,6 +651,18 @@ extension Settings {
     ///   context and then ask it to act on what it found; leaving them literal
     ///   means a project can at worst write a fixed sentence, which the user can
     ///   read for themselves in the same settings.json.
+    /// - **`proxy` is not walked**, and that is a decision rather than an
+    ///   oversight. Its three string fields would be the natural place to keep a
+    ///   proxy password out of a config file, but only the *substituted span* is
+    ///   registered as a secret, and the span of
+    ///   `"httpProxy": "http://{env:PROXY_HOST}:8080"` is a hostname — the exact
+    ///   over-registration ``keyCarriesCredential(_:)`` documents as blanking the
+    ///   one fact a connection failure needs. A password written literally here
+    ///   is still masked wherever it is rendered, because
+    ///   ``DoMoCore/Redaction``'s URL-userinfo rule recognizes `://user:pass@` by
+    ///   shape and needs no registration. So the field stays literal, and a
+    ///   `{env:}` token left in it is reported as an unusable proxy URL rather
+    ///   than silently resolved.
     ///
     /// `mcpServers.*.environment` is the case the feature exists for: it is
     /// overlaid onto a child process's environment, so a server that needs a
@@ -1036,6 +1131,21 @@ public struct ResolvedConfiguration: Sendable {
     /// What to do when the gateway answers a long turn with a timeout.
     public let gatewayContinuation: GatewayContinuationSettings
 
+    /// The HTTP proxy every outbound request is routed through, already
+    /// validated. Read by whoever builds an HTTP client — see
+    /// ``DoMoLLM/ProxiedHTTPClients``.
+    ///
+    /// Never optional, for the same reason ``responseLimit`` is not: "no proxy"
+    /// is a ``DoMoCore/ProxySettings`` with nothing configured, so every consumer
+    /// asks one value and there is no second spelling of "go direct" for one of
+    /// them to forget.
+    ///
+    /// Resolved from the `DOMOCODE_*` variables, then the conventional
+    /// `http_proxy`/`https_proxy`/`all_proxy`/`no_proxy` spellings, then the
+    /// **user** settings file. The project layer is deliberately absent from
+    /// that ladder; see ``resolveProxy(environment:project:user:)``.
+    public let proxy: ProxySettings
+
     /// The *name* of the environment variable the API key was read from, when a
     /// settings file named one. Never the key.
     ///
@@ -1086,7 +1196,8 @@ public struct ResolvedConfiguration: Sendable {
         providerRoutes: [String: ProviderRoute] = [:],
         responseLimit: ResponseLimitSettings = .default,
         responseLimitStatePath: FilePath? = nil,
-        gatewayContinuation: GatewayContinuationSettings = .default
+        gatewayContinuation: GatewayContinuationSettings = .default,
+        proxy: ProxySettings = ProxySettings()
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -1126,6 +1237,7 @@ public struct ResolvedConfiguration: Sendable {
         self.responseLimitStatePath =
             responseLimitStatePath ?? configDirectory.appending("response-limit.json")
         self.gatewayContinuation = gatewayContinuation
+        self.proxy = proxy
     }
 
     // MARK: Per-model truth
@@ -1248,6 +1360,11 @@ extension ResolvedConfiguration {
     /// Resolves configuration from the four layers, honoring the README's
     /// precedence: CLI flag → environment → project settings → user settings →
     /// default.
+    ///
+    /// ``ResolvedConfiguration/proxy`` is the one setting that does not take a
+    /// project layer at all, and ``mcpServers`` the one that takes it only in
+    /// the tightening direction. Both are security rules rather than style, and
+    /// both are argued where they are applied.
     ///
     /// `project` and `user` are already-loaded settings so this function stays
     /// pure and unit-testable; ``load(cli:environment:workingDirectory:)`` is the
@@ -1389,6 +1506,13 @@ extension ResolvedConfiguration {
             mergedMCP[name] = userServer
         }
         let mcpServers = mergedMCP.filter { $0.value.enabled != false }
+
+        // The proxy is the same policy in the same direction, and lives beside
+        // the servers for that reason. See `resolveProxy` for the ladder it
+        // follows and for why the project layer is missing from it.
+        let (proxy, proxyWarnings) = resolveProxy(
+            environment: environment, project: project, user: user)
+        warnings.append(contentsOf: proxyWarnings)
 
         // Whole entry replaced per key — see `override(for:)` for why this and
         // `compaction` below merge differently on purpose.
@@ -1665,7 +1789,8 @@ extension ResolvedConfiguration {
             // No path is passed: the initializer derives it from
             // `configDirectory`, which is the only place the answer is known
             // once, and passing it here would be a second place to keep right.
-            gatewayContinuation: gatewayContinuation
+            gatewayContinuation: gatewayContinuation,
+            proxy: proxy
         )
     }
 
@@ -1784,6 +1909,207 @@ extension ResolvedConfiguration {
             if let value = environment[name], !value.isEmpty { return value }
         }
         return nil
+    }
+
+    /// The conventional variables a `https:` request URL is proxied by, most
+    /// significant spelling first, and the same for `http:`.
+    ///
+    /// These are here only so a complaint can name the variable that has to be
+    /// edited. Which of them *wins* is decided once, in
+    /// ``DoMoCore/ProxyPolicy/fromEnvironment(_:)``, and is not re-derived here.
+    private static let conventionalHTTPSProxyNames = [
+        "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+    ]
+    private static let conventionalHTTPProxyNames = [
+        "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY",
+    ]
+
+    /// The proxy this run routes through, and every complaint about how it was
+    /// spelled.
+    ///
+    /// ## The ladder, and the layer that is missing from it
+    ///
+    /// `DOMOCODE_*` variable → conventional `*_proxy` variable → **user**
+    /// settings.json → no proxy. A project `.domocode/settings.json` is not a
+    /// layer: it may state `"proxy": {"enabled": false}` and nothing else, and
+    /// every other key it writes is dropped and named in a warning.
+    ///
+    /// That asymmetry is a security rule, and the same one ``mcpServers`` above
+    /// is subject to. A settings file arrives with whatever was cloned, and the
+    /// trust gate that admits it answers "does this user vouch for this
+    /// repository", not "is this proxy honest". A repository that could name the
+    /// host every request is routed through would be reading the whole session —
+    /// prompts, file contents, and the `Authorization` header on each request —
+    /// from a machine of its choosing, and nothing downstream would look wrong.
+    /// Turning proxying *off* cannot do that: the worst it achieves is a request
+    /// that goes direct and fails, so it is allowed.
+    ///
+    /// A project's `"enabled": false` sits below `DOMOCODE_PROXY_ENABLED` rather
+    /// than beneath everything. A variable exported in the user's own shell is
+    /// the most deliberate statement available and outranks a file they did not
+    /// write; below that, the tightening stands.
+    ///
+    /// ## Why nothing here throws
+    ///
+    /// An unusable proxy URL is reported and skipped, the way an unparseable
+    /// `logLevel` is. Losing a session to a typo in a variable that most users
+    /// never set is not an acceptable answer, and falling through in silence is
+    /// worse: it leaves a user staring at a proxy variable the tool plainly is
+    /// not using. The values are checked even when proxying is switched off, so
+    /// the typo is reported the first time it is written rather than the first
+    /// time it matters.
+    ///
+    /// ## Why no warning quotes the value
+    ///
+    /// A proxy URL is one of the few settings that routinely carries a
+    /// credential — `http://user:password@host:8080` is how these are written
+    /// when the proxy authenticates. ``DoMoCore/Redaction``'s URL-userinfo rule
+    /// would mask a well-formed one, but the value being complained about is by
+    /// definition the one that did not parse, and a rule that recognizes a shape
+    /// cannot be relied on for text that has no shape. Naming the variable or
+    /// the settings key is enough: unlike an interpolated `logLevel`, the value
+    /// is one the user can read back from their own shell or their own file.
+    static func resolveProxy(
+        environment: [String: String],
+        project: Settings?,
+        user: Settings?
+    ) -> (settings: ProxySettings, warnings: [String]) {
+        var warnings: [String] = []
+
+        if let stated = project?.proxy {
+            // `enabled: true` is listed with the URLs, not with the tightening:
+            // re-enabling a proxy the user switched off restores a route they
+            // deliberately removed, which is the widening direction by another
+            // spelling.
+            var ignored: [String] = []
+            if stated.enabled == true { ignored.append("enabled") }
+            if stated.httpProxy != nil { ignored.append("httpProxy") }
+            if stated.httpsProxy != nil { ignored.append("httpsProxy") }
+            if stated.noProxy != nil { ignored.append("noProxy") }
+            for key in ignored {
+                warnings.append(
+                    """
+                    \(NumericSource.project("proxy.\(key)").described) cannot introduce or \
+                    change a proxy; ignoring it. A project settings file may state only \
+                    "proxy": {"enabled": false}.
+                    """
+                )
+            }
+        }
+
+        // A layer's value, if it is one this can actually dial, complaining about
+        // it if it is not.
+        //
+        // Trimmed the way `ProxySettings.isConfigured` trims, so a whitespace-only
+        // value reads as "not set" to both. A value this layer called configured
+        // and that one called absent would be a proxy nothing routes through and
+        // nothing explains.
+        func usable(_ raw: String?, _ source: NumericSource) -> String? {
+            guard let trimmed = nonEmpty(raw?.trimmingCharacters(in: .whitespacesAndNewlines))
+            else {
+                return nil
+            }
+            guard ProxyPolicy.endpoint(from: trimmed) != nil else {
+                warnings.append("\(source.described) is not a usable proxy URL; ignoring it")
+                return nil
+            }
+            return trimmed
+        }
+
+        // Which conventional variable a value was read from, matched by value
+        // rather than by re-deriving the lowercase-wins-over-uppercase order — a
+        // second copy of that order could only agree with the first or drift from
+        // it. The first name is the fallback for a value that matches no
+        // spelling, which cannot happen unless `fromEnvironment` starts rewriting
+        // what it returns.
+        func conventionalName(of value: String, among names: [String]) -> NumericSource {
+            let wanted = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name =
+                names.first {
+                    environment[$0]?.trimmingCharacters(in: .whitespacesAndNewlines) == wanted
+                } ?? names[0]
+            return .environment(name)
+        }
+
+        let conventional = ProxyPolicy.fromEnvironment(environment)
+
+        func chosen(
+            domocode domocodeName: String,
+            conventionalValue: String?,
+            conventionalNames: [String],
+            user userValue: String?,
+            key userKey: String
+        ) -> String? {
+            if let value = usable(environment[domocodeName], .environment(domocodeName)) {
+                return value
+            }
+            if let raw = conventionalValue,
+                let value = usable(raw, conventionalName(of: raw, among: conventionalNames))
+            {
+                return value
+            }
+            return usable(userValue, .user(userKey))
+        }
+
+        let httpsProxy = chosen(
+            domocode: EnvName.httpsProxy,
+            conventionalValue: conventional.httpsProxy,
+            conventionalNames: conventionalHTTPSProxyNames,
+            user: user?.proxy?.httpsProxy,
+            key: "proxy.httpsProxy"
+        )
+        let httpProxy = chosen(
+            domocode: EnvName.httpProxy,
+            conventionalValue: conventional.httpProxy,
+            conventionalNames: conventionalHTTPProxyNames,
+            user: user?.proxy?.httpProxy,
+            key: "proxy.httpProxy"
+        )
+        // No parse step: every string is a well-formed bypass list, and an entry
+        // that matches nothing costs a request its direct route rather than the
+        // session. `ProxyPolicy` decides what the entries mean.
+        let noProxy =
+            nonEmpty(environment[EnvName.noProxy]?.trimmingCharacters(in: .whitespacesAndNewlines))
+            ?? conventional.noProxy
+            ?? nonEmpty(user?.proxy?.noProxy?.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        var enabled = user?.proxy?.enabled ?? true
+        if let raw = environment[EnvName.proxyEnabled],
+            !raw.trimmingCharacters(in: .whitespaces).isEmpty
+        {
+            if let parsed = booleanWord(raw) {
+                enabled = parsed
+            } else {
+                warnings.append(
+                    "\(NumericSource.environment(EnvName.proxyEnabled).described) is not a true/false value (got \(quotable(raw))); ignoring it"
+                )
+                if project?.proxy?.enabled == false { enabled = false }
+            }
+        } else if project?.proxy?.enabled == false {
+            enabled = false
+        }
+
+        // `all_proxy` stands in for both schemes, so one malformed value there
+        // would otherwise be reported twice under a single name. Identical
+        // complaints are one complaint.
+        var seen: Set<String> = []
+        let reported = warnings.filter { seen.insert($0).inserted }
+
+        guard enabled else {
+            // The URLs are dropped rather than carried alongside `enabled:
+            // false`, so no later reader can route through a proxy by reaching
+            // for `httpProxy` without also asking whether proxying is on.
+            return (.disabled, reported)
+        }
+        return (
+            ProxySettings(
+                enabled: true,
+                httpProxy: httpProxy,
+                httpsProxy: httpsProxy,
+                noProxy: noProxy
+            ),
+            reported
+        )
     }
 
     /// A true/false word as an environment variable is allowed to spell it, or

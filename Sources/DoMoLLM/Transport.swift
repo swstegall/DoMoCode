@@ -104,12 +104,19 @@ private final class StreamActivity: Sendable {
 /// CORRECTION (this comment used to say "**nothing else bounds a streamed
 /// response body**" because `Timeout.read` defaults to `nil`): that is true of
 /// `HTTPClient.Configuration()` and FALSE of `HTTPClient.shared`, which the
-/// production transport uses. Its `singletonConfiguration` sets
-/// `read: .seconds(90)`, an idle-read timeout that runs through body streaming.
-/// So there is a hard 90-second ceiling underneath this guard: an `idle` at or
-/// above it can never fire, and the failure arrives as `HTTPClientError.readTimeout`
-/// instead of the prose below. Lifting it means owning an `HTTPClient` rather than
-/// sharing the singleton — the same change proxy support needs.
+/// production transport uses for every request that goes direct. Its
+/// `singletonConfiguration` sets `read: .seconds(90)`, an idle-read timeout that
+/// runs through body streaming. So on that path there is a hard 90-second ceiling
+/// underneath this guard: an `idle` at or above it can never fire, and the failure
+/// arrives as `HTTPClientError.readTimeout` instead of the prose below.
+///
+/// The ceiling is NOT universal any more. A request that goes through a
+/// configured HTTP proxy runs on an owned `HTTPClient` (see
+/// ``AsyncHTTPClientTransport``), and an owned client built from
+/// `HTTPClient.Configuration()` leaves `read` at `nil` unless whoever built it
+/// said otherwise — so on that path this guard is the only silence bound, and an
+/// `idle` above 90 seconds does fire. Neither path may be relied on to inherit
+/// the other's ceiling.
 ///
 /// The failure message deliberately contains "timed out" so
 /// `LiteLLMClient.classifyTransport` marks it retryable and the user sees a
@@ -189,15 +196,30 @@ public func idleGuarded(
 
 /// The production transport.
 ///
-/// Uses `HTTPClient.shared` by default: it is process-wide and needs no shutdown.
+/// Uses `HTTPClient.shared` unless a proxy applies to the request: it is
+/// process-wide, needs no shutdown, and must never be shut down here.
 ///
-/// CORRECTION (this comment used to claim it "honors `HTTP(S)_PROXY`/`NO_PROXY`
-/// from the environment, which is the behavior the README promises"): it does
-/// not, and the README no longer promises it. `HTTPClient.shared` is built with
-/// a fixed configuration that cannot carry a proxy, and nothing in this package
-/// reads those variables. Proxy support means constructing an owned `HTTPClient`
-/// with `HTTPClient.Configuration(proxy:)` and taking on its shutdown — which is
-/// why the initializer accepts an injected client.
+/// CORRECTION (this comment used to say the package does not honour
+/// `HTTP(S)_PROXY`/`NO_PROXY`, and that supporting them "means constructing an
+/// owned `HTTPClient` with `HTTPClient.Configuration(proxy:)` and taking on its
+/// shutdown"): the second half is what was built, so the first half is now
+/// false. Resolved ``DoMoCore/ProxySettings`` — from the conventional
+/// `http_proxy`/`https_proxy`/`all_proxy`/`no_proxy` variables, their
+/// `DOMOCODE_` overrides, or the user's settings file — reach this transport as
+/// a ``ProxiedHTTPClients``, which owns any client it builds. Ownership stays
+/// with whoever constructed that object, because this struct is copied freely
+/// and has no point at which it could shut anything down.
+///
+/// The client is therefore chosen **per request URL, inside `execute`**, not
+/// stored once: AsyncHTTPClient carries the proxy on the `HTTPClient` rather
+/// than on the request, so a single client cannot serve both a proxied host and
+/// a host `no_proxy` excludes. A bypassed host is served by handing back
+/// `HTTPClient.shared`; there is no per-request "go direct" flag to set.
+///
+/// The gateway is deliberately not special-cased — it is matched against
+/// `no_proxy` like any other host, since a gateway reachable only inside a
+/// network is precisely what those entries exist to describe, and loopback
+/// always goes direct.
 ///
 /// Note that injecting a *client* here is unrelated to
 /// ``LiteLLMClient/Configuration/streamIdleTimeout``: this initializer takes
@@ -205,7 +227,18 @@ public func idleGuarded(
 /// `LiteLLMClient` that opts out of that setting, because at that point the
 /// caller has already chosen these bounds.
 public struct AsyncHTTPClientTransport: StreamingTransport {
-    private let client: HTTPClient
+    /// Where a request's `HTTPClient` comes from.
+    ///
+    /// Two cases rather than always going through ``ProxiedHTTPClients``
+    /// because an injected client is a deliberate override — a test's fake or a
+    /// caller that already built the client it wants — and routing it by URL
+    /// would silently send some of its requests somewhere else.
+    private enum ClientSource: Sendable {
+        case fixed(HTTPClient)
+        case routed(ProxiedHTTPClients)
+    }
+
+    private let source: ClientSource
     private let connectTimeout: Duration
     private let idleTimeout: Duration
 
@@ -263,9 +296,45 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         connectTimeout: Duration = AsyncHTTPClientTransport.defaultConnectTimeout,
         idleTimeout: Duration = AsyncHTTPClientTransport.defaultIdleTimeout
     ) {
-        self.client = client
+        source = .fixed(client)
         self.connectTimeout = connectTimeout
         self.idleTimeout = idleTimeout
+    }
+
+    /// Routes each request through `proxies`, which decides per URL whether it
+    /// goes through a proxy or straight out.
+    ///
+    /// - Parameter proxies: the caller keeps ownership and MUST shut it down;
+    ///   a proxied client that is dropped without `shutdown()` leaks its
+    ///   event-loop group and can hang process exit. A `ProxiedHTTPClients`
+    ///   built from settings with no proxy in them owns nothing and hands back
+    ///   `HTTPClient.shared`, so constructing the transport this way on a
+    ///   network with direct egress behaves exactly as ``init(client:connectTimeout:idleTimeout:)``
+    ///   does with its default.
+    public init(
+        proxies: ProxiedHTTPClients,
+        connectTimeout: Duration = AsyncHTTPClientTransport.defaultConnectTimeout,
+        idleTimeout: Duration = AsyncHTTPClientTransport.defaultIdleTimeout
+    ) {
+        source = .routed(proxies)
+        self.connectTimeout = connectTimeout
+        self.idleTimeout = idleTimeout
+    }
+
+    /// The client this transport would send a request for `url` on.
+    ///
+    /// Exposed because the routing decision is the whole of proxy support and
+    /// it is otherwise only observable by watching traffic: a test can assert
+    /// that a bypassed or loopback host gets `HTTPClient.shared` and a proxied
+    /// host does not, without a proxy to connect to. Public so those tests
+    /// build in release mode without `@testable`.
+    public func httpClient(for url: URL) -> HTTPClient {
+        switch source {
+        case .fixed(let client):
+            return client
+        case .routed(let proxies):
+            return proxies.client(for: url)
+        }
     }
 
     /// The silence budget this transport will enforce for a request whose overall
@@ -307,7 +376,15 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         }
 
         let deadline = timeout ?? Self.defaultTimeout
-        let response = try await headWithinConnectDeadline(clientRequest, deadline: deadline, host: url.host)
+        // Resolved here rather than at init because the proxy lives on the
+        // client: the same transport instance serves the gateway, and whatever
+        // else a caller sends through it, over different clients.
+        let response = try await headWithinConnectDeadline(
+            clientRequest,
+            on: httpClient(for: url),
+            deadline: deadline,
+            host: url.host
+        )
 
         var head = HTTPResponse(status: .init(code: Int(response.status.code)))
         for header in response.headers {
@@ -322,9 +399,11 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
         // An idle timeout of ZERO disables this package's silence check; the
         // wrap still happens so the OVERALL deadline keeps applying. Zero must
         // never mean "fail instantly" — that would trip a few milliseconds after
-        // the head on every request ever made. Note that disabling it does not
-        // make the stream unbounded by silence: `HTTPClient.shared`'s own 90s
-        // read timeout still applies and cannot be turned off from here.
+        // the head on every request ever made. Disabling it leaves the stream
+        // bounded only by whatever read timeout the client carries: 90s on
+        // `HTTPClient.shared`, which cannot be turned off from here, but
+        // typically none at all on an owned proxied client — so on that route
+        // zero really does mean no silence bound.
         let stream = idleGuarded(
             Self.bridge(response.body),
             idle: idleWindow(for: deadline),
@@ -348,6 +427,7 @@ public struct AsyncHTTPClientTransport: StreamingTransport {
     /// silently drops it, and then never answers.
     private func headWithinConnectDeadline(
         _ request: HTTPClientRequest,
+        on client: HTTPClient,
         deadline: Duration,
         host: String?
     ) async throws -> HTTPClientResponse {

@@ -939,12 +939,22 @@ then built-in defaults. Current environment names:
 | DOMOCODE_RESPONSE_LIMIT_PROBE_EVERY | Probe cadence: one probe every N prompts (default 4). |
 | DOMOCODE_GATEWAY_CONTINUE | `0`/`false` disables gateway-timeout continuation; on by default. |
 | DOMOCODE_GATEWAY_CONTINUE_MAX | Continuation attempts per run (default 10, hard cap 100). |
+| DOMOCODE_HTTP_PROXY | Proxy for `http:` requests; overrides `http_proxy`/`all_proxy` for this tool only. |
+| DOMOCODE_HTTPS_PROXY | Proxy for `https:` requests; overrides `https_proxy`/`all_proxy` for this tool only. |
+| DOMOCODE_NO_PROXY | Hosts that must bypass the proxy; overrides `no_proxy`. |
+| DOMOCODE_PROXY_ENABLED | `0`/`false` turns proxying off entirely, whatever else is set. |
+
+DoMoCode also reads the conventional proxy variables — `http_proxy`,
+`https_proxy`, `all_proxy`, `no_proxy`, and their uppercase spellings — with the
+usual rule that the lowercase name wins when both are set and `all_proxy` is the
+fallback for either scheme. See [HTTP proxies](#http-proxies).
 
 The settings file currently supports model overrides, compaction, context
 window metadata, trusted auto-format, MCP servers, interpolation, the adaptive
-response limit, and gateway continuation. Project settings cannot introduce
-credentials or widen permissions. Any future provider/profile/workflow setting
-must preserve those redaction and trust rules.
+response limit, gateway continuation, and proxy settings. Project settings
+cannot introduce credentials, widen permissions, or introduce a proxy. Any
+future provider/profile/workflow setting must preserve those redaction and
+trust rules.
 
 ### Adaptive response-character limit
 
@@ -1002,6 +1012,62 @@ overflow, an auth failure or a cancellation never does.
 
 Each attempt emits a `gateway_continue` notice, so the status line reads
 `Gateway timed out — continuing (3/10)` rather than going quiet.
+
+### HTTP proxies
+
+On a network whose only egress is an HTTP proxy, DoMoCode sends its model
+requests and its remote MCP requests through it. Configuration follows the
+conventional `*_proxy` variables that `curl` and most command-line tools use, so
+a shell that already works needs nothing new:
+
+- `https_proxy` / `HTTPS_PROXY` for `https:` requests, `http_proxy` /
+  `HTTP_PROXY` for `http:`, and `all_proxy` / `ALL_PROXY` as the fallback for
+  both. Lowercase wins over uppercase; an empty value means "not set".
+- `no_proxy` / `NO_PROXY` lists the hosts that must go direct: comma- or
+  whitespace-separated, matched case-insensitively. `example.com` and
+  `.example.com` both match that host and every subdomain of it on a label
+  boundary — `notexample.com` does not match. `host:port` restricts an entry to
+  that port. An IP literal matches exactly, a CIDR range such as `10.0.0.0/8`
+  matches anything inside it, and a single `*` bypasses everything.
+- A proxy URL may carry credentials (`http://user:pass@proxy.example.com:8080`).
+  They are redacted wherever DoMoCode renders a value, so a password cannot
+  reach an error message or a warning.
+
+The same settings can live in the user settings file, which is useful when the
+proxy should apply to this tool but not to the whole shell:
+
+~~~json
+{
+  "proxy": {
+    "enabled": true,
+    "httpProxy": "http://proxy.example.com:8080",
+    "httpsProxy": "http://proxy.example.com:8080",
+    "noProxy": "gateway.internal.example,.internal.example,10.0.0.0/8"
+  }
+}
+~~~
+
+Two rules are not configurable:
+
+- **Loopback is always direct.** `localhost`, any `*.localhost` name,
+  `127.0.0.0/8`, and `::1` bypass the proxy whatever `no_proxy` says. DoMoCode's
+  ordinary mode is a terminal client talking to a server it started on loopback;
+  no proxy can reach that address, so routing it through one would break the
+  program rather than reach anything.
+- **A project settings file cannot introduce or change a proxy.** Proxy keys in
+  a repository's `.domocode/settings.json` are ignored and reported in
+  `warnings`, because a cloned repository that could redirect every request
+  through a host of its choosing would capture the traffic and the
+  `Authorization` headers with it. A project file may set `enabled: false`,
+  since turning proxying off only tightens what the user already allowed. This
+  is the rule `mcpServers` already follows.
+
+Precedence for proxy settings is therefore `DOMOCODE_*` environment, then the
+conventional `*_proxy` environment, then the **user** settings file, then no
+proxy. A proxy URL that cannot be parsed is reported in `warnings` and ignored
+rather than failing the session, and an intranet host named in `no_proxy` — the
+gateway included — is chosen by that list alone, with no special case for any
+particular endpoint.
 
 ## Testing and contribution rules
 
