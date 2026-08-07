@@ -83,6 +83,8 @@ final class ExplainingServer: @unchecked Sendable {
     private var thread: Thread?
     /// How many times each route has answered, so a `times`-limited route retires.
     private var used: [Int]
+    /// See ``requests()``.
+    private var requestLog: [(method: String, path: String, body: String)] = []
 
     /// Answer everything the same way.
     convenience init(status: Int, reason: String, body: String) throws {
@@ -176,8 +178,32 @@ final class ExplainingServer: @unchecked Sendable {
     private func handleConnection(_ fd: Int32) {
         var timeout = timeval(tv_sec: 10, tv_usec: 0)
         _ = unsafe setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        guard let requestLine = drainRequestHeaders(fd) else { return }
-        writeAll(fd, Self.encode(claimRoute(for: requestLine)))
+        guard let request = drainRequest(fd) else { return }
+        record(request)
+        writeAll(fd, Self.encode(claimRoute(for: request.line)))
+    }
+
+    /// Every request this server has answered, in arrival order.
+    ///
+    /// The request LINE alone cannot prove which session a client targeted when
+    /// the target travels in the body — `POST /session {"resume": …}` looks
+    /// identical for every session — and an assertion that only reads the
+    /// stub's own canned response id back is a test of the stub.
+    func requests() -> [(method: String, path: String, body: String)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestLog
+    }
+
+    private func record(_ request: (line: String, body: String)) {
+        let parts = request.line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        lock.lock()
+        defer { lock.unlock() }
+        requestLog.append((
+            method: parts.count > 0 ? String(parts[0]) : "",
+            path: parts.count > 1 ? String(parts[1]) : "",
+            body: request.body
+        ))
     }
 
     /// The route that answers this request line, consuming one of its `times`
@@ -222,11 +248,24 @@ final class ExplainingServer: @unchecked Sendable {
         return Array(head.utf8) + bodyBytes
     }
 
-    /// Read up to the end of the headers and return the request line.
-    private func drainRequestHeaders(_ fd: Int32) -> String? {
+    /// Read one whole request — headers and, when `Content-Length` says so, the
+    /// body — returning the request line and the body text.
+    private func drainRequest(_ fd: Int32) -> (line: String, body: String)? {
         var buffer: [UInt8] = []
         var scratch = [UInt8](repeating: 0, count: 4096)
+        var headerEnd: Int?
+        var contentLength = 0
         while true {
+            if headerEnd == nil, let end = Self.doubleCRLFEnd(buffer) {
+                headerEnd = end
+                contentLength = Self.contentLength(inHead: String(decoding: buffer[..<end], as: UTF8.self))
+            }
+            if let end = headerEnd, buffer.count >= end + contentLength {
+                let head = String(decoding: buffer[..<end], as: UTF8.self)
+                let line = head.split(separator: "\r\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
+                let body = String(decoding: buffer[end..<(end + contentLength)], as: UTF8.self)
+                return (line, body)
+            }
             let count = unsafe scratch.withUnsafeMutableBytes { raw in
                 unsafe recv(fd, raw.baseAddress, raw.count, 0)
             }
@@ -235,12 +274,15 @@ final class ExplainingServer: @unchecked Sendable {
                 return nil
             }
             buffer.append(contentsOf: scratch[..<count])
-            if Self.containsDoubleCRLF(buffer) {
-                let text = String(decoding: buffer, as: UTF8.self)
-                return text.split(separator: "\r\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? ""
-            }
             if buffer.count > 1 << 20 { return nil }
         }
+    }
+
+    private static func contentLength(inHead head: String) -> Int {
+        for line in head.split(separator: "\r\n") where line.lowercased().hasPrefix("content-length:") {
+            return Int(line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)) ?? 0
+        }
+        return 0
     }
 
     private func writeAll(_ fd: Int32, _ bytes: [UInt8]) {
@@ -258,12 +300,13 @@ final class ExplainingServer: @unchecked Sendable {
         }
     }
 
-    private static func containsDoubleCRLF(_ bytes: [UInt8]) -> Bool {
-        guard bytes.count >= 4 else { return false }
+    /// The index just past the header terminator, or `nil` while incomplete.
+    private static func doubleCRLFEnd(_ bytes: [UInt8]) -> Int? {
+        guard bytes.count >= 4 else { return nil }
         for i in 0...(bytes.count - 4)
         where bytes[i] == 0x0D && bytes[i + 1] == 0x0A && bytes[i + 2] == 0x0D && bytes[i + 3] == 0x0A {
-            return true
+            return i + 4
         }
-        return false
+        return nil
     }
 }

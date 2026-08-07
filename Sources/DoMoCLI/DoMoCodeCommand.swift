@@ -1310,9 +1310,20 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let automationRegistry = AutomationRegistry(store: try AutomationStore.create(
             directory: durableRoot.appending("automations")
         ))
-        let sessionClients = SessionClientManager(store: try SessionClientStore.create(
-            directory: durableRoot.appending("clients")
-        ))
+        // The quarantine callback is the only visibility a self-repairing
+        // durable file gets; without it a journal that was set aside — and the
+        // fault that condemned it — would vanish without a line anywhere.
+        let ledgerLogger = Logger(label: "domo.session-clients")
+        let sessionClients = SessionClientManager(
+            store: try SessionClientStore.create(
+                directory: durableRoot.appending("clients")
+            ),
+            onQuarantine: { path, fault in
+                ledgerLogger.warning(
+                    "session-client journal could not be replayed and was set aside at \(path.string): \(fault)"
+                )
+            }
+        )
         let snapshotRoot = configuration.sessionDirectory
             .appending(JSONLSessionStore.sanitizedDirectoryName(forCwd: workingDirectory.string))
             .appending("snapshots")

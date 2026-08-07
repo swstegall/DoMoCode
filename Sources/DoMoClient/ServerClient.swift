@@ -48,6 +48,18 @@ public enum ServerClientError: Error, Sendable, Equatable {
     /// stream idle timeout. A half-open socket throws nothing on its own: the
     /// read simply never returns, which is exactly the wedged-session symptom.
     case streamIdle(path: String)
+
+    /// The session was created or resumed — `session` is real and live — but
+    /// the client-ledger registration that ``ServerClient/createSession(resume:)``
+    /// chains after the 201 was refused.
+    ///
+    /// A distinct case because the two failures demand opposite reports: before
+    /// it existed, an attach 400 surfaced as "This session is not live on the
+    /// server", which is the one thing the 201 in hand proves FALSE — and the
+    /// misdirection sent the diagnosis into the resume path for weeks while the
+    /// actual fault (a poisoned client journal) sat in the workspace. Callers
+    /// that only care about liveness can recover `session` and proceed.
+    case attachRejected(session: SessionRef, status: UInt, path: String, body: String?)
 }
 
 // MARK: - Idle watchdog state
@@ -198,7 +210,7 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.post, "/session", body: body)
         try expect(status, 201, "/session", body: data)
         let session = try JSONDecoder().decode(SessionRef.self, from: data)
-        _ = try await attachIfSupported(sessionID: session.id)
+        try await attachOrReport(session)
         return session
     }
 
@@ -872,16 +884,22 @@ public struct ServerClient: Sendable {
         images: [ImageBlock] = [],
         preferSteer: Bool
     ) async throws {
+        // The flip is keyed on the PATH as well as the status: a 409 means
+        // "wrong route for the current run state" only when it came from
+        // /steer or /prompt themselves. The attach preflight inside both can
+        // now answer 409 too (a busy client ledger), and flipping on that
+        // would re-run the same preflight and mis-narrate a ledger stall as an
+        // agent-busy condition.
         if preferSteer {
             do {
                 try await sendSteer(sessionID: sessionID, prompt: prompt, images: images)
-            } catch ServerClientError.unexpectedStatus(409, _, _) {
+            } catch ServerClientError.unexpectedStatus(409, let path, _) where path.hasSuffix("/steer") {
                 try await sendPrompt(sessionID: sessionID, prompt: prompt, images: images)
             }
         } else {
             do {
                 try await sendPrompt(sessionID: sessionID, prompt: prompt, images: images)
-            } catch ServerClientError.unexpectedStatus(409, _, _) {
+            } catch ServerClientError.unexpectedStatus(409, let path, _) where path.hasSuffix("/prompt") {
                 try await sendSteer(sessionID: sessionID, prompt: prompt, images: images)
             }
         }
@@ -909,7 +927,7 @@ public struct ServerClient: Sendable {
         let (status, data) = try await send(.post, path)
         try expect(status, 201, path, body: data)
         let session = try JSONDecoder().decode(SessionRef.self, from: data)
-        _ = try await attachIfSupported(sessionID: session.id)
+        try await attachOrReport(session)
         return session
     }
 
@@ -1221,6 +1239,26 @@ public struct ServerClient: Sendable {
         } catch ServerClientError.unexpectedStatus(404, _, _) {
             // Backward compatibility with servers predating the client ledger.
             return nil
+        }
+    }
+
+    /// The attach leg of the create/resume/fork/clone composites, with its
+    /// refusal typed as ``ServerClientError/attachRejected`` so it can never
+    /// masquerade as the session operation that has already succeeded.
+    ///
+    /// Only a status refusal is re-labelled. A transport failure (timeout, a
+    /// vanished socket) is left as itself: it says nothing specific about the
+    /// attach, and the very next request would hit it too.
+    private func attachOrReport(_ session: SessionRef) async throws {
+        do {
+            _ = try await attachIfSupported(sessionID: session.id)
+        } catch ServerClientError.unexpectedStatus(let status, let path, let body) {
+            throw ServerClientError.attachRejected(
+                session: session,
+                status: status,
+                path: path,
+                body: body
+            )
         }
     }
 

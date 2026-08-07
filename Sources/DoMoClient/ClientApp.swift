@@ -845,6 +845,12 @@ public final class ClientApp {
         if case ServerClientError.unexpectedStatus(let status, let path, let body) = error {
             return "HTTP \(status) from \(path)" + (body.map { ": \($0)" } ?? "")
         }
+        if case ServerClientError.attachRejected(_, let status, let path, let body) = error {
+            // Wherever this lands, it must not read as a session that failed to
+            // open — the session in hand is the proof it opened.
+            return "the session is open, but registering this client with it failed: "
+                + "HTTP \(status) from \(path)" + (body.map { ": \($0)" } ?? "")
+        }
         if case ServerClientError.timedOut(let path) = error { return "timed out: \(path)" }
         if case ServerClientError.streamIdle(let path) = error { return "stream went silent: \(path)" }
         if let domo = error as? DoMoError { return domo.description }
@@ -1578,8 +1584,17 @@ public final class ClientApp {
             return
         }
         store.setSessions(sessions)
-        if let first = sessions.first {
-            await open(first.id)
+        // The listing is ascending by header timestamp ("newest last" —
+        // `JSONLSessionStore.list`), so the most recent conversation is `.last`.
+        // `.first` here reopened the OLDEST session in the directory on every
+        // launch, while the comments downstream believed "most recent".
+        //
+        // Roots only: the listing also contains subagent and workflow CHILD
+        // sessions, which are created DURING a parent's latest run and so are
+        // routinely the newest files in the directory. A launch must resume
+        // the user's conversation, never a delegated task's transcript.
+        if let newest = sessions.last(where: { $0.parentSession == nil }) {
+            await open(newest.id)
         } else {
             await createAndOpen()
         }
@@ -1588,7 +1603,21 @@ public final class ClientApp {
     private func createAndOpen() async {
         let ref: SessionRef
         do {
-            ref = try await retrying("create a session") { try await self.client.createSession() }
+            ref = try await retrying("create a session") {
+                do {
+                    return try await self.client.createSession()
+                } catch ServerClientError.attachRejected(let session, _, _, _) {
+                    // The session WAS created — the refusal is the attach
+                    // chained after the 201. Absorbed INSIDE the retry loop,
+                    // because a retry here calls a non-idempotent create: each
+                    // attempt used to make (and then discard) a fresh session
+                    // file, orphaning three per launch, and then reported
+                    // "Could not create a session" over a directory holding all
+                    // three. `open` re-runs the attach via the idempotent
+                    // resume and posts the accurate row if it still fails.
+                    return session
+                }
+            }
         } catch {
             // A `guard … else { return }` here left the app with no session at
             // all: no transcript, no target for a prompt, and no explanation —
@@ -1653,11 +1682,37 @@ public final class ClientApp {
             // attached to a session the server does not have live, every endpoint
             // 404'd, and no code path ever tried the resume again. A runtime that
             // is a second slow to come up is not a dead session.
+            // The attach refusal is absorbed INSIDE the retry loop: the resume
+            // it rides on has already succeeded, so letting it escape made the
+            // wrapper post "could not reopen this session — retrying" — the
+            // exact 'session did not open' misdirection this row exists to
+            // kill — for a session that was open the whole time.
+            var rejection: (status: UInt, path: String, body: String?)?
             let ref = try await retrying("reopen this session") {
-                try await self.client.createSession(resume: sessionID)
+                do {
+                    return try await self.client.createSession(resume: sessionID)
+                } catch ServerClientError.attachRejected(let session, let status, let path, let body) {
+                    rejection = (status, path, body)
+                    return session
+                }
             }
             guard store.selectedSessionID == sessionID else { return }
             store.setSessionPath(ref.path)
+            if let rejection {
+                // The resume itself SUCCEEDED — the session is live, its
+                // history and stream below will work — so this must not wear
+                // the "not live" headline. It did for two weeks: the attach 400
+                // was folded into the resume's failure row, and every diagnosis
+                // chased the resume path while the actual fault (the client
+                // ledger) sat in the workspace. No "retrying in the background"
+                // hint either: the revive loop is gated on a stream 404, and a
+                // live session's stream connects fine.
+                failures.append((
+                    "Could not register this client with the session",
+                    ServerClientError.unexpectedStatus(rejection.status, path: rejection.path, body: rejection.body),
+                    "The transcript is live, but prompts and approvals may be refused until registration succeeds."
+                ))
+            }
         } catch {
             guard store.selectedSessionID == sessionID else { return }
             // The highest-value row in this file. Without it the session opens
@@ -1893,9 +1948,18 @@ public final class ClientApp {
     /// the reconnect loop is already saying, once, that the connection is down, and
     /// this runs on every backoff tick.
     private func reviveSession(_ sessionID: String) async {
-        guard let ref = try? await client.createSession(resume: sessionID),
-              store.selectedSessionID == sessionID
-        else { return }
+        let ref: SessionRef?
+        do {
+            ref = try await client.createSession(resume: sessionID)
+        } catch ServerClientError.attachRejected(let session, _, _, _) {
+            // Liveness is the only thing this loop is repairing, and the
+            // session in hand proves it. Treating this as a failed revive kept
+            // the loop retrying a resume that had already worked.
+            ref = session
+        } catch {
+            ref = nil
+        }
+        guard let ref, store.selectedSessionID == sessionID else { return }
         store.setSessionPath(ref.path)
         post(notice: "the session is live again")
     }
@@ -2529,15 +2593,29 @@ public final class ClientApp {
             guard let self else { return }
             do {
                 let ref: SessionRef
-                if clone {
-                    ref = try await self.client.clone(sessionID: id)
-                } else {
-                    ref = try await self.client.fork(sessionID: id)
+                do {
+                    if clone {
+                        ref = try await self.client.clone(sessionID: id)
+                    } else {
+                        ref = try await self.client.fork(sessionID: id)
+                    }
+                } catch ServerClientError.attachRejected(let session, _, _, _) {
+                    // The fork itself succeeded — the refusal is the attach
+                    // chained after its 201. Dropping `session` here posted
+                    // "Could not fork the session" over a fork that exists and
+                    // orphaned its file; `open` re-runs the attach via the
+                    // idempotent resume and posts the accurate row if it still
+                    // fails.
+                    ref = session
                 }
                 self.store.setSessions(try await self.client.listSessions())
                 await self.open(ref.id)
                 self.post(notice: (clone ? "cloned" : "forked") + " session")
-            } catch ServerClientError.unexpectedStatus(409, _, _) {
+            } catch ServerClientError.unexpectedStatus(409, let path, _)
+                where path.hasSuffix("/fork") || path.hasSuffix("/clone") {
+                // Only the fork/clone route's own 409 means "a turn is
+                // running". The attach leg can now answer 409 too (a busy
+                // ledger), and that must not be narrated as an agent busy.
                 self.refuseAsBusy()
             } catch {
                 self.postError(clone ? "Could not clone the session" : "Could not fork the session", error)

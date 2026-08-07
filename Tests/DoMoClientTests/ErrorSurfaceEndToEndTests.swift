@@ -379,6 +379,104 @@ struct ErrorSurfaceEndToEndTests {
         #expect(joined.contains("no such session on this runtime"), "screen:\n\(joined)")
     }
 
+    // MARK: The attach leg, refused
+
+    @Test("An attach refusal names itself instead of masquerading as a dead session, on the newest session")
+    func attachRefusalIsAttributedTruthfully() async throws {
+        // Three sessions listed ascending by timestamp, exactly as the runtime
+        // sorts them ("newest last") — the NEWEST being a subagent CHILD, which
+        // bootstrap must skip: children are created during the parent's latest
+        // run, so "newest file" and "the user's conversation" routinely differ.
+        // A ledger-shaped 400 answers every attach. The attach route is written
+        // before "/session": `pathContains` is a substring match and the attach
+        // path contains "/session" too.
+        let stub = try ExplainingServer(
+            routes: [
+                StubRoute("GET", "/sessions", 200, "OK",
+                          #"[{"id":"old123","path":"/tmp/old123.jsonl","cwd":"/work","timestamp":"2026-01-01"},"# +
+                          #"{"id":"new456","path":"/tmp/new456.jsonl","cwd":"/work","timestamp":"2026-02-01"},"# +
+                          #"{"id":"child99","path":"/tmp/child99.jsonl","cwd":"/work","timestamp":"2026-03-01","parentSession":"/tmp/new456.jsonl"}]"#),
+                StubRoute("POST", "/client/attach", 400, "Bad Request", "ledger row 2 repeats sequence 1"),
+                StubRoute("POST", "/session", 201, "Created",
+                          #"{"id":"new456","path":"/tmp/new456.jsonl"}"#),
+                StubRoute("GET", "/messages", 200, "OK", "[]"),
+            ],
+            fallback: StubRoute("", "", 404, "Not Found", "")
+        )
+        stub.start()
+        defer { stub.stop() }
+
+        let target = await runClient(
+            baseURL: stub.baseURL,
+            until: { screenContains($0, rows: Self.rows, columns: Self.columns, "Could not register this client") }
+        )
+        let joined = screenRows(target, rows: Self.rows, columns: Self.columns).joined(separator: "\n")
+        // The headline says what actually failed…
+        #expect(joined.contains("Could not register this client with the session"), "screen:\n\(joined)")
+        // …not the one thing the 201 in hand disproves. This exact screen wore
+        // "This session is not live on the server" while the resume had
+        // succeeded, and the misdirection buried the real fault for weeks.
+        #expect(!joined.contains("not live on the server"), "screen:\n\(joined)")
+        // The consequence is scoped honestly: the transcript works.
+        #expect(joined.contains("may be refused"), "screen:\n\(joined)")
+        // The server's diagnosis, carried by the no-longer-empty 400 body.
+        #expect(joined.contains("ledger row 2 repeats sequence 1"), "screen:\n\(joined)")
+        // And the failing path names the NEWEST session: bootstrap opens the
+        // most recent conversation, not (as `.first` silently did) the oldest.
+        #expect(joined.contains("new456/client/attach"), "screen:\n\(joined)")
+        #expect(!joined.contains("old123/client/attach"), "screen:\n\(joined)")
+        // The screen lines above could not distinguish WHICH session the client
+        // resumed — the stub answers every POST /session with new456 — so the
+        // selection proof is the requests themselves: every resume the client
+        // sent named the newest ROOT session in its body — not the oldest root,
+        // and not the even-newer subagent child.
+        let resumes = stub.requests().filter { $0.method == "POST" && $0.path == "/session" }
+        #expect(!resumes.isEmpty)
+        #expect(
+            resumes.allSatisfy { $0.body.contains(#""resume":"new456""#) },
+            "resumes: \(resumes.map(\.body))"
+        )
+    }
+
+    @Test("A refused attach on a fresh session is not a failed create, and creates exactly one session")
+    func attachRefusalOnFreshSessionCreatesOnce() async throws {
+        // An empty listing drives createAndOpen: the create 201s, its chained
+        // attach 400s. Before the absorption fix each of the THREE create
+        // attempts made (and discarded) a fresh session file, and the row said
+        // "Could not create a session" over a directory holding all three.
+        let stub = try ExplainingServer(
+            routes: [
+                StubRoute("GET", "/sessions", 200, "OK", "[]"),
+                StubRoute("POST", "/client/attach", 400, "Bad Request", "ledger refused this client"),
+                StubRoute("POST", "/session", 201, "Created",
+                          #"{"id":"fresh01","path":"/tmp/fresh01.jsonl"}"#),
+                StubRoute("GET", "/messages", 200, "OK", "[]"),
+            ],
+            fallback: StubRoute("", "", 404, "Not Found", "")
+        )
+        stub.start()
+        defer { stub.stop() }
+
+        let target = await runClient(
+            baseURL: stub.baseURL,
+            until: { screenContains($0, rows: Self.rows, columns: Self.columns, "Could not register this client") }
+        )
+        let joined = screenRows(target, rows: Self.rows, columns: Self.columns).joined(separator: "\n")
+        #expect(joined.contains("Could not register this client with the session"), "screen:\n\(joined)")
+        #expect(!joined.contains("Could not create a session"), "screen:\n\(joined)")
+        #expect(!joined.contains("not live on the server"), "screen:\n\(joined)")
+        // Exactly ONE bodyless create: the attach refusal is absorbed inside
+        // the retry loop, so retrying can no longer mint a session per attempt.
+        // The later POST /session calls are open()'s idempotent resume and
+        // carry the created id in their body.
+        let creates = stub.requests().filter { $0.method == "POST" && $0.path == "/session" }
+        #expect(creates.filter(\.body.isEmpty).count == 1, "creates: \(creates.map(\.body))")
+        #expect(
+            creates.filter { !$0.body.isEmpty }.allSatisfy { $0.body.contains(#""resume":"fresh01""#) },
+            "creates: \(creates.map(\.body))"
+        )
+    }
+
     @Test("History that will not load is reported, not shown as an empty conversation")
     func unloadableHistoryIsReported() async throws {
         let stub = try ExplainingServer(

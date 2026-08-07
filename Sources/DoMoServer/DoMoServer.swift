@@ -137,6 +137,59 @@ private struct SessionClientCursorBody: Decodable {
     var sequence: Int
 }
 
+// MARK: - Failure logging middleware
+
+/// Logs every request that fails.
+///
+/// Until this existed a 4xx left no trace anywhere: `mapErrors` threw a
+/// message-less `HTTPError`, Hummingbird rendered it outside the handler, and
+/// the server's log stayed clean while the client showed a bare status code —
+/// which is how an attach that failed on every launch for weeks produced not
+/// one diagnosable line. Registered first, so it also sees failures thrown by
+/// later middleware (a 401 from the token check) and the not-found responder.
+struct FailureLoggingMiddleware: RouterMiddleware {
+    let logger: Logger
+
+    func handle(
+        _ request: Request,
+        context: BasicRequestContext,
+        next: @concurrent (Request, BasicRequestContext) async throws -> Response
+    ) async throws -> Response {
+        do {
+            let response = try await next(request, context)
+            if response.status.code >= 400 {
+                logger.log(
+                    level: Self.level(for: response.status.code),
+                    "\(request.method) \(request.uri.path) → \(response.status.code)"
+                )
+            }
+            return response
+        } catch let error as HTTPError {
+            // The status Hummingbird will answer with, plus the message the
+            // body will carry — the log line and the wire agree.
+            let message = error.body.map { ": \($0)" } ?? ""
+            logger.log(
+                level: Self.level(for: error.status.code),
+                "\(request.method) \(request.uri.path) → \(error.status.code)\(message)"
+            )
+            throw error
+        } catch {
+            // Anything else becomes a bodyless 500 upstream; this line is the
+            // only place the actual fault is recorded.
+            logger.warning("\(request.method) \(request.uri.path) → 500: \(error)")
+            throw error
+        }
+    }
+
+    /// 404s are quiet because one of them is PROTOCOL: a client probes
+    /// `client/attach` on every create/resume/prompt and treats 404 as "this
+    /// runtime predates the ledger" — logged at notice, ordinary operation
+    /// against such a runtime narrates itself as a stream of failures.
+    private static func level(for status: Int) -> Logger.Level {
+        status == 404 ? .debug : .notice
+    }
+}
+
 // MARK: - Auth middleware
 
 /// Rejects any request that does not present the server's bearer token.
@@ -241,6 +294,7 @@ public struct DoMoServer: Sendable {
 
     func buildRouter() -> Router<BasicRequestContext> {
         let router = Router(context: BasicRequestContext.self)
+        router.add(middleware: FailureLoggingMiddleware(logger: logger))
         router.add(middleware: TokenAuthMiddleware(token: options.token))
 
         router.post("/session") { request, context in
@@ -1201,6 +1255,11 @@ public struct DoMoServer: Sendable {
         do {
             return try await body()
         } catch let error as ServerRuntimeError {
+            // Every case that carries a message forwards it. A message-less
+            // `HTTPError` renders as an EMPTY body, and an empty 400 is exactly
+            // how a broken client ledger stayed undiagnosable for weeks: the
+            // client faithfully showed "HTTP 400 from <path>" and nothing else,
+            // because the server had said nothing else.
             switch error {
             case .sessionNotFound: throw HTTPError(.notFound)
             case .terminalNotFound: throw HTTPError(.notFound)
@@ -1210,41 +1269,41 @@ public struct DoMoServer: Sendable {
             case .workflowRunBusy, .workflowRunNotResumable:
                 throw HTTPError(.conflict)
             case .workflowSessionRequired:
-                throw HTTPError(.badRequest)
+                throw HTTPError(.badRequest, message: "A session id is required to run this workflow.")
             case .handoffUnavailable, .handoffNotFound:
                 throw HTTPError(.notFound)
             case .handoffConflict:
                 throw HTTPError(.conflict)
             case .handoffDenied:
                 throw HTTPError(.forbidden)
-            case .handoffInvalid:
-                throw HTTPError(.badRequest)
+            case .handoffInvalid(let message):
+                throw HTTPError(.badRequest, message: message)
             case .jobUnavailable, .jobNotFound:
                 throw HTTPError(.notFound)
             case .jobConflict:
                 throw HTTPError(.conflict)
             case .jobDenied:
                 throw HTTPError(.forbidden)
-            case .jobInvalid:
-                throw HTTPError(.badRequest)
+            case .jobInvalid(let message):
+                throw HTTPError(.badRequest, message: message)
             case .automationUnavailable, .automationNotFound:
                 throw HTTPError(.notFound)
             case .automationConflict:
                 throw HTTPError(.conflict)
             case .automationDenied:
                 throw HTTPError(.forbidden)
-            case .automationInvalid:
-                throw HTTPError(.badRequest)
+            case .automationInvalid(let message):
+                throw HTTPError(.badRequest, message: message)
             case .sessionClientsUnavailable, .sessionClientNotFound:
                 throw HTTPError(.notFound)
             case .sessionClientConflict:
                 throw HTTPError(.conflict)
             case .sessionClientDenied, .sessionClientAuthorityRequired:
                 throw HTTPError(.forbidden)
-            case .sessionClientInvalid:
-                throw HTTPError(.badRequest)
-            case .toolCommandInvalid:
-                throw HTTPError(.badRequest)
+            case .sessionClientInvalid(let message):
+                throw HTTPError(.badRequest, message: message)
+            case .toolCommandInvalid(let message):
+                throw HTTPError(.badRequest, message: message)
             }
         }
     }

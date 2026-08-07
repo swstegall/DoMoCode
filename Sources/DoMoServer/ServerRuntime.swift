@@ -1937,14 +1937,17 @@ public actor ServerRuntime {
 
     private static func mapSessionClientError(_ error: any Error) -> ServerRuntimeError {
         guard let error = error as? SessionClientError else {
-            return .sessionClientInvalid("Session client operation failed.")
+            // Keep the underlying fault in the message. This used to flatten a
+            // ledger I/O or decode failure into eight words, and the client
+            // rendered a 400 nobody could act on.
+            return .sessionClientInvalid("Session client operation failed: \(error)")
         }
         switch error {
         case .notFound:
             return .sessionClientNotFound
         case .ownershipDenied:
             return .sessionClientDenied
-        case .authorityHeld:
+        case .authorityHeld, .storeBusy:
             return .sessionClientConflict
         case .authorityRequired:
             return .sessionClientAuthorityRequired
