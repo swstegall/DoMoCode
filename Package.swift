@@ -82,6 +82,17 @@ let package = Package(
         // swift-nio (2.101.x) with async-http-client, so it adds only itself plus
         // the already-present swift-service-lifecycle / NIO tail. Apache-2.0.
         .package(url: "https://github.com/hummingbird-project/hummingbird", from: "2.25.1"),
+        // MCP OAuth (browser login for remote servers). All three were already in
+        // the resolved graph transitively — swift-nio-ssl via async-http-client,
+        // swift-certificates (and its swift-crypto / swift-asn1 tail) via
+        // swift-nio-extras — so declaring them adds products, not packages.
+        // Crypto: PKCE S256 (CryptoKit is Darwin-only). X509: the self-signed
+        // loopback certificate, generated in-process rather than by shelling out
+        // to a host openssl. NIOSSL: the TLS listener the OAuth redirect lands on.
+        .package(url: "https://github.com/apple/swift-crypto", from: "4.5.1"),
+        .package(url: "https://github.com/apple/swift-certificates", from: "1.19.3"),
+        .package(url: "https://github.com/apple/swift-nio-ssl", from: "2.37.2"),
+        .package(url: "https://github.com/apple/swift-nio", from: "2.101.3"),
         // Arriving later, already validated against this graph:
         //   groue/GRDB.swift         from: "7.11.1"   — SQLite session storage (Later)
     ],
@@ -257,6 +268,17 @@ let package = Package(
                 .product(name: "Subprocess", package: "swift-subprocess"),
                 .product(name: "SystemPackage", package: "swift-system"),
                 .product(name: "Logging", package: "swift-log"),
+                // OAuth for remote servers: PKCE hashing, the self-signed
+                // loopback certificate, and the redirect listener. Hummingbird
+                // (already serving DoMoServer) provides the listener so the one
+                // HTTP server framework in the package stays the only one.
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "X509", package: "swift-certificates"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdCore", package: "hummingbird"),
+                .product(name: "HummingbirdTLS", package: "hummingbird"),
             ],
             swiftSettings: safeSettings
         ),
@@ -387,7 +409,19 @@ let package = Package(
 
         .testTarget(
             name: "DoMoMCPTests",
-            dependencies: ["DoMoMCP", "DoMoCore", "DoMoAgent", "DoMoLLM"],
+            dependencies: [
+                "DoMoMCP", "DoMoCore", "DoMoAgent", "DoMoLLM",
+                // The OAuth suites stand up stub IdP/MCP endpoints (Hummingbird,
+                // as the production listener does) and drive the TLS listener
+                // with a verification-disabled AsyncHTTPClient.
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "X509", package: "swift-certificates"),
+            ],
             swiftSettings: safeSettings
         ),
 

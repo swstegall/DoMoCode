@@ -1507,6 +1507,68 @@ extension ResolvedConfiguration {
         }
         let mcpServers = mergedMCP.filter { $0.value.enabled != false }
 
+        // OAuth blocks are validated here, where every other settings complaint
+        // is raised, rather than at connect time where a warning would race the
+        // TUI for stderr. Bad entries warn and fall through — connect will skip
+        // or fail them with the same story — except shape errors that would
+        // otherwise fail in a way the user cannot decode.
+        // A cache key with two different URLs is a footgun: the store binds an
+        // entry to one URL, so the two servers would evict each other's
+        // credentials on every login. Collect (effective key → URLs) and warn.
+        var cacheKeyURLs: [String: Set<String>] = [:]
+        for (name, server) in mcpServers where server.oauth != nil {
+            let key = server.oauth?.cacheKey ?? name
+            if let url = server.url { cacheKeyURLs[key, default: []].insert(url) }
+        }
+        for (key, urls) in cacheKeyURLs.sorted(by: { $0.key < $1.key }) where urls.count > 1 {
+            warnings.append(
+                "mcpServers: two OAuth servers share cacheKey '\(key)' with different urls; "
+                    + "they will evict each other's stored credentials — give each a distinct cacheKey"
+            )
+        }
+
+        for (name, server) in mcpServers.sorted(by: { $0.key < $1.key }) {
+            guard let oauth = server.oauth else { continue }
+            if !server.isRemote {
+                warnings.append(
+                    "mcpServers.\(name).oauth is set on a stdio server; it only applies to remote servers"
+                )
+            }
+            let hasAuthorize = !(oauth.authorizationEndpoint ?? "").isEmpty
+            let hasToken = !(oauth.tokenEndpoint ?? "").isEmpty
+            if hasAuthorize != hasToken {
+                warnings.append(
+                    "mcpServers.\(name).oauth sets only one of authorizationEndpoint/tokenEndpoint; "
+                        + "set both, or neither to use discovery"
+                )
+            }
+            for (field, value) in [
+                ("authorizationEndpoint", oauth.authorizationEndpoint),
+                ("tokenEndpoint", oauth.tokenEndpoint),
+            ] {
+                guard let value, !value.isEmpty else { continue }
+                let scheme = URL(string: value)?.scheme?.lowercased()
+                if scheme != "https" && scheme != "http" {
+                    warnings.append(
+                        "mcpServers.\(name).oauth.\(field) is not an http(s) URL"
+                    )
+                }
+            }
+            if let redirect = oauth.redirectUri, !redirect.isEmpty {
+                let url = URL(string: redirect)
+                let host = url?.host?.lowercased()
+                let scheme = url?.scheme?.lowercased()
+                if scheme != "https" && scheme != "http" {
+                    warnings.append("mcpServers.\(name).oauth.redirectUri is not an http(s) URL")
+                } else if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+                    warnings.append(
+                        "mcpServers.\(name).oauth.redirectUri must be loopback "
+                            + "(localhost, 127.0.0.1, or [::1]); the login listener refuses other hosts"
+                    )
+                }
+            }
+        }
+
         // The proxy is the same policy in the same direction, and lives beside
         // the servers for that reason. See `resolveProxy` for the ladder it
         // follows and for why the project layer is missing from it.

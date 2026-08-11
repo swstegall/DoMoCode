@@ -950,11 +950,77 @@ usual rule that the lowercase name wins when both are set and `all_proxy` is the
 fallback for either scheme. See [HTTP proxies](#http-proxies).
 
 The settings file currently supports model overrides, compaction, context
-window metadata, trusted auto-format, MCP servers, interpolation, the adaptive
-response limit, gateway continuation, and proxy settings. Project settings
-cannot introduce credentials, widen permissions, or introduce a proxy. Any
-future provider/profile/workflow setting must preserve those redaction and
-trust rules.
+window metadata, trusted auto-format, MCP servers (including browser OAuth for
+remote servers), interpolation, the adaptive response limit, gateway
+continuation, and proxy settings. Project settings cannot introduce
+credentials, widen permissions, or introduce a proxy. Any future
+provider/profile/workflow setting must preserve those redaction and trust
+rules.
+
+### Remote MCP servers and OAuth
+
+A server entry with a `url` speaks MCP streamable HTTP. Static credentials
+come from `bearerTokenEnvironment` (an environment-variable *name*; the value
+never touches disk). Servers whose IdP requires an interactive login instead
+declare an `oauth` block, and DoMoCode runs the standard authorization-code +
+PKCE flow: open the system browser, catch the redirect on a loopback listener,
+exchange the code, refresh silently for the life of the session.
+
+~~~json
+{
+  "mcpServers": {
+    "example": {
+      "command": [],
+      "url": "https://mcp.example.com/mcp",
+      "allowedHosts": ["mcp.example.com"],
+      "oauth": {}
+    },
+    "enterprise": {
+      "command": [],
+      "url": "https://mcp.example.corp/mcp",
+      "allowedHosts": ["mcp.example.corp"],
+      "oauth": {
+        "authorizationEndpoint": "https://login.example.corp/adfs/oauth2/authorize",
+        "tokenEndpoint": "https://login.example.corp/adfs/oauth2/token",
+        "clientId": "REGISTERED-PUBLIC-CLIENT-ID",
+        "resource": "https://mcp.example.corp/mcp",
+        "scope": "openid profile",
+        "redirectUri": "https://localhost:8080/redirect"
+      }
+    }
+  }
+}
+~~~
+
+An empty `{}` block means full discovery, the MCP authorization spec end to
+end: the server's protected-resource metadata names the authorization server,
+its RFC 8414 (or OpenID Connect) metadata names the endpoints, and a client id
+is registered dynamically (RFC 7591). Enterprise IdPs that support none of
+that — ADFS is the archetype — spell out the endpoints and a pre-registered
+`clientId`, exactly as in the second entry. `resource` defaults to the
+server's canonical URL and matters doubly on ADFS, which mints a token for the
+wrong audience when it is omitted. Every field is non-secret: PKCE means a
+public client, and no client secret exists to store.
+
+The redirect defaults to `http://127.0.0.1:27182/oauth/callback`, the plain
+loopback shape (RFC 8252) most authorization servers register. A registration
+that pins an `https://localhost` redirect gets a TLS listener with a
+self-signed certificate generated on first use — the browser warns once per
+year; choose "proceed". The listener binds only the loopback interface the
+redirect names (`127.0.0.1` or `::1`), answers a single state-checked callback,
+and refuses non-loopback redirect URIs outright.
+
+Login runs in the startup window, before the full-screen client takes over
+the terminal, and only when stderr is a terminal — the authorize URL is
+always printed, so a broken browser launcher costs a copy-paste, not the
+login. Afterward the session refreshes tokens silently. The token material —
+the access token, the refresh token, and any dynamically registered client
+secret — is persisted under `<configDir>/mcp-oauth/`, in an owner-only (0600)
+file in an owner-only (0700) directory, bound to the server URL it was minted
+for; settings.json holds none of it. A mid-session credential death answers
+tool calls with "restart domo to log in again" rather than popping a browser
+over the TUI. On a 401 the request is replayed exactly once with a fresh
+token; a second refusal fails the call.
 
 ### Adaptive response-character limit
 

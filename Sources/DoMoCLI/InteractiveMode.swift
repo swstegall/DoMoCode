@@ -2693,7 +2693,16 @@ public struct InteractiveMode: Sendable {
                 sandbox: sandbox,
                 // Reserve the built-in tool names so an MCP tool can't shadow one.
                 reservedNames: Set(registry.names),
-                log: mcpLog ?? { _ in }
+                log: mcpLog ?? { _ in },
+                // Same contract as the default surface: browser login only at
+                // startup with a human on the terminal; refresh-only afterward.
+                // Interactivity also requires a log sink — the provider narrates
+                // the authorize URL (the manual-paste fallback) through it, so a
+                // flow with nowhere to print that URL must not start.
+                oauth: MCPManager.OAuthSetup(
+                    configDirectory: configDirectory,
+                    allowInteractive: mcpLog != nil && isatty(STDERR_FILENO) == 1
+                )
             )
             mcpManager = manager
         }

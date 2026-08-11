@@ -840,7 +840,15 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     includeProjectMemory: true
                 ).names
             ),
-            log: { Self.writeStderr($0 + "\n") }
+            log: { Self.writeStderr($0 + "\n") },
+            // OAuth-configured servers: tokens live under the config directory,
+            // and the browser flow may run only when a human can see stderr —
+            // this all happens in the pre-TUI window, where these lines land on
+            // the real terminal. Mid-session needs are refresh-only by design.
+            oauth: MCPManager.OAuthSetup(
+                configDirectory: configuration.configDirectory.string,
+                allowInteractive: isatty(STDERR_FILENO) == 1
+            )
         )
         return (tools, manager)
     }

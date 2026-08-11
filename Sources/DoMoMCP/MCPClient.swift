@@ -61,7 +61,23 @@ public actor MCPClient {
         case connectionClosed
         case badResponse
         case networkPolicy(String)
+        /// The server rejected the credential and one refresh-and-replay did
+        /// not cure it (or the response was 403, which a refresh cannot cure).
+        case unauthorized(String)
     }
+
+    /// Answers "a bearer token, please" per request. `forceRefresh` is the
+    /// 401 path — the previous answer was just rejected; `rejectedToken` is
+    /// the exact token the failing request carried, so the provider refreshes
+    /// past it rather than past a store snapshot a sibling may already have
+    /// advanced; `wwwAuthenticate` carries the server's challenge when one
+    /// arrived, feeding OAuth discovery. Async and throwing because the answer
+    /// may involve a token endpoint; the provider decides how much work.
+    public typealias BearerTokenProvider = @Sendable (
+        _ forceRefresh: Bool,
+        _ rejectedToken: String?,
+        _ wwwAuthenticate: String?
+    ) async throws -> String?
 
     public let serverName: String
     private let config: MCPServerConfig
@@ -72,6 +88,9 @@ public actor MCPClient {
     private let log: (@Sendable (String) -> Void)?
     private let onToolsChanged: (@Sendable () async -> Void)?
     private let bearerToken: String?
+    /// When set, consulted per request and preferred over `bearerToken`; the
+    /// OAuth path. The static token stays for env/reference credentials.
+    private let tokenProvider: BearerTokenProvider?
 
     private let process = PersistentProcess()
     private let http: HTTPClient
@@ -109,6 +128,7 @@ public actor MCPClient {
         log: (@Sendable (String) -> Void)? = nil,
         onToolsChanged: (@Sendable () async -> Void)? = nil,
         bearerToken: String? = nil,
+        tokenProvider: BearerTokenProvider? = nil,
         http: HTTPClient = .shared,
         httpClientProvider: (@Sendable (URL) -> HTTPClient)? = nil
     ) {
@@ -121,6 +141,7 @@ public actor MCPClient {
         self.log = log
         self.onToolsChanged = onToolsChanged
         self.bearerToken = bearerToken
+        self.tokenProvider = tokenProvider
         self.http = http
         self.httpClientProvider = httpClientProvider
     }
@@ -387,32 +408,44 @@ public actor MCPClient {
         if let params { object["params"] = params }
         let body = try JSONValue.object(object).encoded()
 
-        var request = HTTPClientRequest(url: url.absoluteString)
-        request.method = .POST
-        request.headers.add(name: "accept", value: "application/json, text/event-stream")
-        request.headers.add(name: "content-type", value: "application/json")
-        request.headers.add(name: "mcp-protocol-version", value: mcpProtocolVersion)
-        if let remoteSessionID {
-            request.headers.add(name: "mcp-session-id", value: remoteSessionID)
-        }
-        if let bearerToken, !bearerToken.isEmpty {
-            request.headers.add(name: "authorization", value: "Bearer \(bearerToken)")
-        }
-        request.body = .bytes(Array(body))
-
         // Resolved per request rather than once at init: the provider decides from the
         // URL whether this endpoint is proxied, and a client's proxy cannot be changed
         // after it is built.
         let client = httpClientProvider?(url) ?? http
 
         do {
-            let response = try await client.execute(
-                request,
-                timeout: .nanoseconds(Self.nanoseconds(config.requestTimeout))
+            let token = try await currentBearerToken(
+                forceRefresh: false, rejectedToken: nil, wwwAuthenticate: nil
             )
+            var response = try await executeRemote(url: url, body: body, token: token, client: client)
+
+            // One refresh, one replay, only when a provider exists to refresh
+            // through. The body is a plain byte array, so the replay is the
+            // identical request under a new credential — and a second 401
+            // falls through to the typed failure rather than a loop. 403 is
+            // deliberately not retried: insufficient scope is not cured by a
+            // fresher token. The token that just 401'd is handed back so the
+            // provider refreshes past exactly it, not past a store snapshot.
+            if response.status.code == 401, tokenProvider != nil {
+                let challenge = response.headers.first(name: "www-authenticate")
+                // Drain the 401's body so AsyncHTTPClient can return the
+                // connection to the pool instead of holding it (and the socket)
+                // across the whole refresh, which may itself take seconds.
+                _ = try? await response.body.collect(upTo: 64 * 1024)
+                let fresh = try await currentBearerToken(
+                    forceRefresh: true, rejectedToken: token, wwwAuthenticate: challenge
+                )
+                response = try await executeRemote(url: url, body: body, token: fresh, client: client)
+            }
+
             guard (200..<300).contains(response.status.code) else {
                 // Do not include the endpoint, request body, response body, or
                 // authorization material in the surfaced error.
+                if response.status.code == 401 || response.status.code == 403 {
+                    throw MCPError.unauthorized(
+                        "MCP server '\(serverName)' rejected the credential (HTTP \(response.status.code))"
+                    )
+                }
                 throw MCPError.protocolError("remote MCP returned HTTP \(response.status.code)")
             }
             for header in response.headers where header.name.lowercased() == "mcp-session-id" {
@@ -422,9 +455,53 @@ public actor MCPClient {
             return (body: body, status: response.status.code)
         } catch let error as MCPError {
             throw error
+        } catch let error as MCPOAuthError {
+            // OAuth failures carry their own safe, actionable messages
+            // (interaction required, refresh rejected); collapsing them into
+            // "request failed" would hide the one thing the user must do.
+            throw error
         } catch {
             throw MCPError.protocolError("remote MCP request failed")
         }
+    }
+
+    /// The token for one request: the async provider when configured (the
+    /// OAuth path), else the static credential resolved at connect.
+    private func currentBearerToken(
+        forceRefresh: Bool,
+        rejectedToken: String?,
+        wwwAuthenticate: String?
+    ) async throws -> String? {
+        if let tokenProvider {
+            return try await tokenProvider(forceRefresh, rejectedToken, wwwAuthenticate)
+        }
+        return bearerToken
+    }
+
+    /// One POST of an already-encoded JSON-RPC body. Split from `sendRemote`
+    /// so the 401 replay is the same code path as the first attempt.
+    private func executeRemote(
+        url: URL,
+        body: Data,
+        token: String?,
+        client: HTTPClient
+    ) async throws -> HTTPClientResponse {
+        var request = HTTPClientRequest(url: url.absoluteString)
+        request.method = .POST
+        request.headers.add(name: "accept", value: "application/json, text/event-stream")
+        request.headers.add(name: "content-type", value: "application/json")
+        request.headers.add(name: "mcp-protocol-version", value: mcpProtocolVersion)
+        if let remoteSessionID {
+            request.headers.add(name: "mcp-session-id", value: remoteSessionID)
+        }
+        if let token, !token.isEmpty {
+            request.headers.add(name: "authorization", value: "Bearer \(token)")
+        }
+        request.body = .bytes(Array(body))
+        return try await client.execute(
+            request,
+            timeout: .nanoseconds(Self.nanoseconds(config.requestTimeout))
+        )
     }
 
     private func remoteURL() throws -> URL {

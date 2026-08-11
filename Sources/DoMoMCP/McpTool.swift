@@ -79,6 +79,23 @@ struct McpTool: AgentTool {
             result = try await client.callTool(name: rawName, arguments: arguments)
         } catch is CancellationError {
             throw DoMoError(.cancelled, "The MCP tool call was aborted.")
+        } catch let error as MCPOAuthError {
+            // OAuth failures carry token-endpoint text the identity provider
+            // controls — which can echo the submitted refresh token — and this
+            // result is replayed verbatim to the model and written to the
+            // session JSONL, the one surface Redaction never touches. So the
+            // model sees a fixed, safe sentence; the specifics stay on the
+            // (redacted) terminal log. `interactionRequired` is the common
+            // case and gets its own actionable line.
+            let message: String
+            if case .interactionRequired = error {
+                message =
+                    "MCP server authentication has expired for \(namespacedName); "
+                    + "restart domo to log in again."
+            } else {
+                message = "MCP server authentication failed for \(namespacedName)."
+            }
+            return AgentToolResult(output: message, isError: true)
         } catch {
             // Transport/protocol failure (server crashed, unknown tool, timeout) — a
             // model-visible error, so it can adapt, not a throw.

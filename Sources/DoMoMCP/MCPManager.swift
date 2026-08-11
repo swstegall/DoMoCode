@@ -118,6 +118,34 @@ public actor MCPManager {
         httpClients = ProxiedHTTPClients(settings: proxy)
     }
 
+    /// What the embedding surface provides for `oauth`-configured servers.
+    /// Absent, those servers are skipped with a log line — OAuth is opt-in for
+    /// the surface exactly as it is for the config.
+    public struct OAuthSetup: Sendable {
+        /// The per-user config directory; tokens and the loopback certificate
+        /// live in `<configDirectory>/mcp-oauth`, 0600.
+        public var configDirectory: String
+        /// Whether a browser flow may run *now*. True only at startup on an
+        /// interactive surface; mid-session token needs are refresh-only.
+        public var allowInteractive: Bool
+        /// Test seam; the system browser by default.
+        public var browser: (any BrowserLaunching)?
+        /// How long the browser flow may take end to end.
+        public var authorizationTimeout: Duration
+
+        public init(
+            configDirectory: String,
+            allowInteractive: Bool = true,
+            browser: (any BrowserLaunching)? = nil,
+            authorizationTimeout: Duration = .seconds(300)
+        ) {
+            self.configDirectory = configDirectory
+            self.allowInteractive = allowInteractive
+            self.browser = browser
+            self.authorizationTimeout = authorizationTimeout
+        }
+    }
+
     /// Connect every enabled server (in a stable order) and return the bridged tools.
     /// A server that fails to spawn or handshake is logged and skipped — never fatal.
     ///
@@ -136,10 +164,14 @@ public actor MCPManager {
         sandbox: ProcessSandbox? = nil,
         reservedNames: Set<String> = [],
         log: (@Sendable (String) -> Void)? = nil,
-        credentialProvider: (@Sendable (String) -> String?)? = nil
+        credentialProvider: (@Sendable (String) -> String?)? = nil,
+        oauth: OAuthSetup? = nil
     ) async -> [any AgentTool] {
         self.reservedNames = reservedNames
         self.log = log
+        // One store for every oauth server this call connects; entries are
+        // namespaced by cache key so servers never read each other's tokens.
+        let oauthStore = oauth.map { OAuthTokenStore(directory: $0.configDirectory + "/mcp-oauth") }
         // Seed with the built-in names (forward-looking; see the doc-comment) so a
         // namespaced MCP name that ever collided with one would be renamed, not shadow it.
         for (name, config) in servers.sorted(by: { $0.key < $1.key }) {
@@ -153,6 +185,60 @@ public actor MCPManager {
             }
             let bearerToken = config.credentialReference.flatMap { credentialProvider?($0) }
                 ?? config.bearerTokenEnvironment.flatMap { ProcessInfo.processInfo.environment[$0] }
+
+            // OAuth outranks the static paths when both are configured: the
+            // block is the more explicit statement of intent, and a stale env
+            // token silently shadowing a working login is the worse surprise.
+            var tokenProvider: MCPClient.BearerTokenProvider?
+            if let oauthConfig = config.oauth, config.isRemote {
+                guard let setup = oauth, let oauthStore else {
+                    log?(
+                        "MCP server '\(name)' has oauth configured, but this surface "
+                            + "provides no OAuth support; skipping."
+                    )
+                    continue
+                }
+                guard let serverURL = config.url else {
+                    // isRemote can be true via an explicit transport with no
+                    // url; that is a config error, not a surface limitation.
+                    log?("MCP server '\(name)' has oauth configured but no url; skipping.")
+                    continue
+                }
+                let provider = MCPOAuthProvider(
+                    serverName: name,
+                    serverURL: serverURL,
+                    config: oauthConfig,
+                    dependencies: MCPOAuthDependencies(
+                        store: oauthStore,
+                        browser: setup.browser ?? SystemBrowserLauncher(),
+                        clientProvider: { [httpClients] url in httpClients.client(for: url) },
+                        log: log,
+                        certificateDirectory: setup.configDirectory + "/mcp-oauth",
+                        authorizationTimeout: setup.authorizationTimeout
+                    )
+                )
+                // Acquire once, interactively if the surface allows, BEFORE
+                // the connect-retry loop below — that loop must never be the
+                // thing that opens a browser three times.
+                do {
+                    _ = try await provider.accessToken(allowInteractive: setup.allowInteractive)
+                } catch {
+                    log?(Redaction.diagnostic("MCP server '\(name)' OAuth login failed: \(error)"))
+                    continue
+                }
+                // Mid-session consults refresh silently and never interact;
+                // an expired session surfaces as a typed error telling the
+                // user to restart, not as a surprise browser window.
+                tokenProvider = { forceRefresh, rejectedToken, wwwAuthenticate in
+                    try await provider.accessToken(
+                        forceRefresh: forceRefresh,
+                        allowInteractive: false,
+                        wwwAuthenticate: wwwAuthenticate,
+                        rejectedToken: rejectedToken
+                    )
+                }
+            }
+
             let client = MCPClient(
                 serverName: name, config: config,
                 workspaceDirectory: workspaceDirectory, clientVersion: clientVersion,
@@ -160,7 +246,8 @@ public actor MCPManager {
                 onToolsChanged: { [weak self] in
                     await self?.rebuildTools()
                 },
-                bearerToken: bearerToken,
+                bearerToken: tokenProvider == nil ? bearerToken : nil,
+                tokenProvider: tokenProvider,
                 httpClientProvider: { [httpClients] url in httpClients.client(for: url) }
             )
             var connectionError: (any Error)?
@@ -172,6 +259,16 @@ public actor MCPManager {
                     break
                 } catch {
                     connectionError = error
+                    // A credential rejection is deterministic across an
+                    // immediate retry — the same token would 401 again — and
+                    // each attempt costs a real refresh grant (a rotation on a
+                    // rotating IdP). An OAuth failure surfaced through the token
+                    // provider (interaction required, a dead-grant re-login that
+                    // cannot run, a 4xx from the token endpoint) is equally
+                    // deterministic. Only the transient failures the loop exists
+                    // for are worth retrying.
+                    if error is MCPOAuthError { break }
+                    if case MCPClient.MCPError.unauthorized = error { break }
                     guard attempt + 1 < attempts else { break }
                     let delay = Duration.milliseconds(Int64(100 * (1 << attempt)))
                     try? await Task.sleep(for: delay)
