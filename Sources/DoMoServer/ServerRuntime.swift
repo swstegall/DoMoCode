@@ -298,6 +298,39 @@ public struct AgentProfileSummary: Codable, Hashable, Sendable {
     }
 }
 
+/// A skill's safe client-facing metadata. The body is omitted unless a caller
+/// explicitly requests `include=body` on `GET /skills`.
+public struct SkillDescriptor: Codable, Hashable, Sendable {
+    public var name: String
+    public var description: String?
+    public var keywords: [String]
+    public var argumentHint: String?
+    public var disableModelInvocation: Bool
+    public var toolAllowlist: [String]?
+    public var source: String
+    public var body: String?
+
+    public init(
+        name: String,
+        description: String? = nil,
+        keywords: [String] = [],
+        argumentHint: String? = nil,
+        disableModelInvocation: Bool = false,
+        toolAllowlist: [String]? = nil,
+        source: String,
+        body: String? = nil
+    ) {
+        self.name = name
+        self.description = description
+        self.keywords = keywords
+        self.argumentHint = argumentHint
+        self.disableModelInvocation = disableModelInvocation
+        self.toolAllowlist = toolAllowlist
+        self.source = source
+        self.body = body
+    }
+}
+
 // MARK: - ServerRuntime
 
 /// Owns the server's live sessions and the shared ingredients each ``AgentHarness``
@@ -845,6 +878,24 @@ public actor ServerRuntime {
                 description: profile.description,
                 mode: profile.mode.rawValue,
                 source: profile.source.rawValue
+            )
+        }
+    }
+
+    /// The workspace's skill metadata. Skill bodies remain server-owned unless
+    /// the caller explicitly opts into the body projection.
+    public func skills(includeBody: Bool = false) -> [SkillDescriptor] {
+        guard let workspace = config.promptWorkspace else { return [] }
+        return workspace.skills.map { skill in
+            SkillDescriptor(
+                name: skill.name,
+                description: skill.description,
+                keywords: skill.keywords,
+                argumentHint: skill.argumentHint,
+                disableModelInvocation: skill.disableModelInvocation,
+                toolAllowlist: skill.toolAllowlist,
+                source: skill.source.rawValue,
+                body: includeBody ? skill.body : nil
             )
         }
     }

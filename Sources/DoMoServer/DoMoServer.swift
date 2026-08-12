@@ -330,7 +330,8 @@ public struct DoMoServer: Sendable {
                         "client-ledger",
                         "mcp-admin",
                         "mcp-changed",
-                        "mcp-prompts"
+                        "mcp-prompts",
+                        "skills-route"
                     ]
                 ))
             }
@@ -483,6 +484,13 @@ public struct DoMoServer: Sendable {
         router.get("/agents") { _, _ in
             try await self.mapErrors {
                 try Self.json(await self.runtime.agents())
+            }
+        }
+
+        router.get("/skills") { request, _ in
+            try await self.mapErrors {
+                let includeBody = request.uri.queryParameters["include"].map(String.init) == "body"
+                return try Self.json(await self.runtime.skills(includeBody: includeBody))
             }
         }
 

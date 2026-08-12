@@ -369,6 +369,15 @@ public struct ServerClient: Sendable {
         return try JSONDecoder().decode([AgentProfileSummary].self, from: data)
     }
 
+    /// Fetch skill metadata. Bodies are excluded by default and may be opted
+    /// into explicitly for callers that need the server-owned Markdown.
+    public func skills(includeBody: Bool = false) async throws -> [SkillDescriptor] {
+        let path = includeBody ? "/skills?include=body" : "/skills"
+        let (status, data) = try await send(.get, path)
+        try expect(status, 200, path, body: data)
+        return try JSONDecoder().decode([SkillDescriptor].self, from: data)
+    }
+
     /// Fetch durable project memory for the remote memory command.
     public func memory() async throws -> [ProjectMemoryRecord] {
         let path = "/memory"

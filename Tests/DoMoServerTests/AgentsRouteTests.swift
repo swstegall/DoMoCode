@@ -29,11 +29,23 @@ struct AgentsRouteTests {
     /// A string no other field of the payload could contain, so a `contains`
     /// check is evidence rather than coincidence.
     private static let secretPrompt = "SECRET-PERSONA-PROMPT-must-not-be-served"
+    private static let secretSkillBody = "SECRET-SKILL-BODY-requires-explicit-opt-in"
 
     private static let workspace = PromptWorkspace(
         baseSystemPrompt: "base",
         commands: .builtIn,
-        skills: [],
+        skills: [
+            PromptSkill(
+                name: "review",
+                description: "Review the current changes.",
+                keywords: ["diff", "review"],
+                body: Self.secretSkillBody,
+                source: .project,
+                disableModelInvocation: true,
+                toolAllowlist: ["read"],
+                argumentHint: "focus"
+            ),
+        ],
         agents: AgentProfileRegistry(profiles: [
             AgentProfile(
                 name: "auditor",
@@ -125,6 +137,51 @@ struct AgentsRouteTests {
                     "a refused request was still told the persona names"
                 )
             }
+        }
+    }
+
+    @Test("GET /skills omits bodies unless explicitly requested")
+    func skillsRouteProjectsMetadataAndOptInBodies() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let server = makeServer(dirs, workspace: Self.workspace)
+
+        try await withServer(server) { http, port in
+            let metadataReply = try await send(http, port, "/skills")
+            #expect(metadataReply.status == 200)
+            let metadata = try JSONDecoder().decode([SkillDescriptor].self, from: metadataReply.body)
+            #expect(metadata == [
+                SkillDescriptor(
+                    name: "review",
+                    description: "Review the current changes.",
+                    keywords: ["diff", "review"],
+                    argumentHint: "focus",
+                    disableModelInvocation: true,
+                    toolAllowlist: ["read"],
+                    source: "project"
+                ),
+            ])
+            let metadataText = String(decoding: metadataReply.body, as: UTF8.self)
+            #expect(!metadataText.contains(Self.secretSkillBody))
+            #expect(!metadataText.contains("\"body\""))
+
+            let bodyReply = try await send(http, port, "/skills?include=body")
+            #expect(bodyReply.status == 200)
+            let withBody = try JSONDecoder().decode([SkillDescriptor].self, from: bodyReply.body)
+            #expect(withBody.first?.body == Self.secretSkillBody)
+        }
+    }
+
+    @Test("GET /skills is behind the bearer gate")
+    func skillsRouteIsGuarded() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let server = makeServer(dirs, workspace: Self.workspace)
+
+        try await withServer(server) { http, port in
+            let reply = try await send(http, port, "/skills", token: "wrong")
+            #expect(reply.status == 401)
+            #expect(!String(decoding: reply.body, as: UTF8.self).contains("review"))
         }
     }
 
