@@ -1,0 +1,38 @@
+name: TypeScript SDK conformance
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: Swift server against SDK conformance suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: swstegall/DoMoCode-Agent-SDK-Typescript
+          path: sdk
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.4.0
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+      - uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.3.3"
+      - run: swift build --product domo
+      - run: npm ci
+        working-directory: sdk
+      - run: npm run build
+        working-directory: sdk
+      - run: npm run conformance
+        working-directory: sdk
+        env:
+          DOMO_BIN: ${{ github.workspace }}/.build/debug/domo
