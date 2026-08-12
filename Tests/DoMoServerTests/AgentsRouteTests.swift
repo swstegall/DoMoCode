@@ -231,6 +231,47 @@ struct AgentsRouteTests {
         }
     }
 
+    @Test("Opt-in CORS answers browser preflight and only reflects allow-listed origins")
+    func corsPreflightIsOptInAndExact() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let server = makeServer(
+            dirs,
+            workspace: nil,
+            corsOrigins: ["http://localhost:3000", "https://dashboard.example"]
+        )
+
+        try await withServer(server) { http, port in
+            let preflight = try await send(
+                http,
+                port,
+                "/session",
+                method: "OPTIONS",
+                token: nil,
+                origin: "http://localhost:3000"
+            )
+            #expect(preflight.status == 204)
+            #expect(preflight.headers["access-control-allow-origin"] == "http://localhost:3000")
+            #expect(preflight.headers["access-control-allow-credentials"] == "true")
+            #expect(preflight.headers["access-control-allow-headers"]?.contains("Authorization") == true)
+
+            let actual = try await send(http, port, "/capabilities", origin: "https://dashboard.example")
+            #expect(actual.status == 200)
+            #expect(actual.headers["access-control-allow-origin"] == "https://dashboard.example")
+
+            let rejected = try await send(
+                http,
+                port,
+                "/session",
+                method: "OPTIONS",
+                token: nil,
+                origin: "https://evil.example"
+            )
+            #expect(rejected.status == 403)
+            #expect(rejected.headers["access-control-allow-origin"] == nil)
+        }
+    }
+
     // MARK: - Helpers
 
     private struct Dirs {
@@ -254,12 +295,14 @@ struct AgentsRouteTests {
     private struct Reply {
         let status: UInt
         let body: Data
+        let headers: [String: String]
     }
 
     private func makeServer(
         _ dirs: Dirs,
         workspace: PromptWorkspace?,
-        mcpManager: MCPManager? = nil
+        mcpManager: MCPManager? = nil,
+        corsOrigins: [String] = []
     ) -> DoMoServer {
         let runtime = ServerRuntime(config: .init(
             systemPrompt: "test",
@@ -275,7 +318,13 @@ struct AgentsRouteTests {
         ))
         return DoMoServer(
             runtime: runtime,
-            options: .init(host: "127.0.0.1", port: 0, token: Self.token, heartbeatSeconds: 3600)
+            options: .init(
+                host: "127.0.0.1",
+                port: 0,
+                token: Self.token,
+                heartbeatSeconds: 3600,
+                corsOrigins: corsOrigins
+            )
         )
     }
 
@@ -306,14 +355,27 @@ struct AgentsRouteTests {
         _ http: HTTPClient,
         _ port: Int,
         _ path: String,
-        token: String? = AgentsRouteTests.token
+        method: String = "GET",
+        token: String? = AgentsRouteTests.token,
+        origin: String? = nil
     ) async throws -> Reply {
         var request = HTTPClientRequest(url: "http://127.0.0.1:\(port)\(path)")
-        request.method = .GET
+        switch method.uppercased() {
+        case "OPTIONS": request.method = .OPTIONS
+        case "POST": request.method = .POST
+        case "PUT": request.method = .PUT
+        case "PATCH": request.method = .PATCH
+        case "DELETE": request.method = .DELETE
+        default: request.method = .GET
+        }
         if let token { request.headers.add(name: "authorization", value: "Bearer \(token)") }
+        if let origin { request.headers.add(name: "origin", value: origin) }
         let response = try await http.execute(request, timeout: .seconds(30))
         var buffer = try await response.body.collect(upTo: 1 << 20)
         let bytes = buffer.readBytes(length: buffer.readableBytes) ?? []
-        return Reply(status: response.status.code, body: Data(bytes))
+        let headers = Dictionary(
+            uniqueKeysWithValues: response.headers.map { ($0.name.lowercased(), $0.value) }
+        )
+        return Reply(status: response.status.code, body: Data(bytes), headers: headers)
     }
 }

@@ -121,6 +121,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     )
     public var port: Int = 4100
 
+    @Option(
+        name: .customLong("cors"),
+        help: "Allow this exact browser origin for --serve. Repeat for multiple origins."
+    )
+    public var corsOrigins: [String] = []
+
     @Option(name: .customLong("model"), help: "Public model alias as configured on the proxy.")
     public var model: String?
 
@@ -540,7 +546,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 steeringMode: deliveryMode,
                 agentProfile: profile,
                 agentMode: selectedMode,
-                sandbox: processSandbox
+                sandbox: processSandbox,
+                corsOrigins: corsOrigins
             )
             return
         }
@@ -1071,7 +1078,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         steeringMode: QueueDeliveryMode,
         agentProfile: AgentProfile,
         agentMode: AgentMode,
-        sandbox: ProcessSandbox?
+        sandbox: ProcessSandbox?,
+        corsOrigins: [String]
     ) async throws {
         let (runtime, mcpManager, backgroundSessions) = try await Self.buildServerRuntime(
             configuration: configuration,
@@ -1087,7 +1095,12 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         let token = Self.generateToken()
         let server = DoMoServer(
             runtime: runtime,
-            options: DoMoServer.Options(host: "127.0.0.1", port: port, token: token)
+            options: DoMoServer.Options(
+                host: "127.0.0.1",
+                port: port,
+                token: token,
+                corsOrigins: corsOrigins
+            )
         )
 
         // The handshake line first, the redaction registration second, and in that

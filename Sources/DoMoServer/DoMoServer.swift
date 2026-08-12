@@ -258,6 +258,78 @@ struct TokenAuthMiddleware: RouterMiddleware {
     }
 }
 
+/// Opt-in CORS for browser SDK clients. Preflight requests are answered before
+/// bearer authentication because browsers do not send the Authorization header
+/// on OPTIONS; actual requests still pass through the normal token gate.
+private struct DoMoEditedHTTPError: HTTPResponseError {
+    let originalError: any Error
+    let additionalHeaders: HTTPFields
+
+    var status: HTTPResponse.Status {
+        (self.originalError as? (any HTTPResponseError))?.status ?? .internalServerError
+    }
+
+    func response(from request: Request, context: some RequestContext) throws -> Response {
+        if let originalError = self.originalError as? (any HTTPResponseError) {
+            var response = try originalError.response(from: request, context: context)
+            response.headers.append(contentsOf: self.additionalHeaders)
+            return response
+        }
+        return Response(status: .internalServerError, headers: self.additionalHeaders)
+    }
+}
+
+struct DoMoCORSMiddleware: RouterMiddleware {
+    private let origins: Set<String>
+
+    init(origins: [String]) {
+        self.origins = Set(origins)
+    }
+
+    func handle(
+        _ request: Request,
+        context: BasicRequestContext,
+        next: @concurrent (Request, BasicRequestContext) async throws -> Response
+    ) async throws -> Response {
+        guard let origin = request.headers[.origin] else {
+            return try await next(request, context)
+        }
+        guard origins.contains(origin) else {
+            if request.method == .options { throw HTTPError(.forbidden) }
+            return try await next(request, context)
+        }
+
+        if request.method == .options {
+            let headers: HTTPFields = [
+                .accessControlAllowOrigin: origin,
+                .accessControlAllowMethods: "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                .accessControlAllowHeaders: "Accept, Authorization, Content-Type, X-Domocode-Client-Id, X-Domocode-Client-Owner",
+                .accessControlAllowCredentials: "true",
+                .accessControlMaxAge: "600",
+                .vary: "Origin",
+            ]
+            return Response(status: .noContent, headers: headers, body: .init())
+        }
+
+        do {
+            var response = try await next(request, context)
+            response.headers[.accessControlAllowOrigin] = origin
+            response.headers[.accessControlAllowCredentials] = "true"
+            response.headers[values: .vary].append("Origin")
+            return response
+        } catch {
+            throw DoMoEditedHTTPError(
+                originalError: error,
+                additionalHeaders: [
+                    .accessControlAllowOrigin: origin,
+                    .accessControlAllowCredentials: "true",
+                    .vary: "Origin",
+                ]
+            )
+        }
+    }
+}
+
 // MARK: - DoMoServer
 
 /// The headless HTTP/SSE server: a thin Hummingbird router over a ``ServerRuntime``.
@@ -276,12 +348,20 @@ public struct DoMoServer: Sendable {
         public var port: Int
         public var token: String
         public var heartbeatSeconds: Int
+        public var corsOrigins: [String]
 
-        public init(host: String = "127.0.0.1", port: Int = 4100, token: String, heartbeatSeconds: Int = 15) {
+        public init(
+            host: String = "127.0.0.1",
+            port: Int = 4100,
+            token: String,
+            heartbeatSeconds: Int = 15,
+            corsOrigins: [String] = []
+        ) {
             self.host = host
             self.port = port
             self.token = token
             self.heartbeatSeconds = heartbeatSeconds
+            self.corsOrigins = corsOrigins
         }
     }
 
@@ -322,23 +402,28 @@ public struct DoMoServer: Sendable {
     func buildRouter() -> Router<BasicRequestContext> {
         let router = Router(context: BasicRequestContext.self)
         router.add(middleware: FailureLoggingMiddleware(logger: logger))
+        if !options.corsOrigins.isEmpty {
+            router.add(middleware: DoMoCORSMiddleware(origins: options.corsOrigins))
+        }
         router.add(middleware: TokenAuthMiddleware(token: options.token))
 
         router.get("/capabilities") { _, _ in
             try await self.mapErrors {
-                try Self.json(ServerCapabilities(
+                var capabilities = [
+                    "session-events",
+                    "client-ledger",
+                    "mcp-admin",
+                    "mcp-changed",
+                    "mcp-prompts",
+                    "skills-route",
+                    "oauth-delegation",
+                ]
+                if !self.options.corsOrigins.isEmpty { capabilities.append("cors") }
+                return try Self.json(ServerCapabilities(
                     name: "domocode",
                     version: Self.version,
                     protocolVersion: serverProtocolVersion,
-                    capabilities: [
-                        "session-events",
-                        "client-ledger",
-                        "mcp-admin",
-                        "mcp-changed",
-                        "mcp-prompts",
-                        "skills-route",
-                        "oauth-delegation"
-                    ]
+                    capabilities: capabilities
                 ))
             }
         }
