@@ -1423,7 +1423,6 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             jobManager: jobManager,
             automationRegistry: automationRegistry,
             sessionClients: sessionClients,
-            mcpManager: mcpManager,
             // The default surface's harnesses are built inside the runtime, so
             // this is where the process's one controller has to reach them. Read
             // from ``ProcessHarnessDefaults`` rather than threaded through this
@@ -1431,7 +1430,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             // `--serve` and the default client, and both already run after
             // `install(for:)`.
             responseLimit: ProcessHarnessDefaults.current.responseLimit,
-            gatewayContinuation: ProcessHarnessDefaults.current.gatewayContinuation
+            gatewayContinuation: ProcessHarnessDefaults.current.gatewayContinuation,
+            mcpManager: mcpManager
         )
         runtimeConfiguration.agentProfile = agentProfile
         runtimeConfiguration.agentMode = agentMode

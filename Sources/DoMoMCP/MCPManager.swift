@@ -45,6 +45,97 @@ public struct MCPServerStatusInfo: Sendable, Hashable, Codable {
     }
 }
 
+/// A server-scoped OAuth request that can be delivered over any live session
+/// stream. It intentionally contains no token or client-registration material.
+public struct MCPOAuthPending: Sendable, Hashable, Codable {
+    public let id: String
+    public let server: String
+    public let authorizationURL: String
+    public let expiresAt: String
+
+    public init(id: String, server: String, authorizationURL: String, expiresAt: String) {
+        self.id = id
+        self.server = server
+        self.authorizationURL = authorizationURL
+        self.expiresAt = expiresAt
+    }
+}
+
+/// A server-scoped OAuth resolution. The status is deliberately open at the
+/// HTTP boundary; clients must tolerate a future resolution state.
+public struct MCPOAuthResolved: Sendable, Hashable, Codable {
+    public let id: String
+    public let server: String
+    public let status: String
+    public let error: String?
+
+    public init(id: String, server: String, status: String, error: String? = nil) {
+        self.id = id
+        self.server = server
+        self.status = status
+        self.error = error
+    }
+}
+
+public enum MCPOAuthEvent: Sendable {
+    case request(MCPOAuthPending)
+    case resolved(MCPOAuthResolved)
+}
+
+/// The result of a lazy MCP connection. A URL is present only while the
+/// server-owned OAuth flow is waiting for the user's browser.
+public struct MCPConnectResult: Sendable, Hashable, Codable {
+    public let status: MCPServerStatus
+    public let authorizationURL: String?
+    public let flowID: String?
+    /// The opaque client identity that started a pending flow. This is useful
+    /// to a delegating client for diagnostics and is never a credential.
+    public let initiator: String?
+
+    public init(
+        status: MCPServerStatus,
+        authorizationURL: String? = nil,
+        flowID: String? = nil,
+        initiator: String? = nil
+    ) {
+        self.status = status
+        self.authorizationURL = authorizationURL
+        self.flowID = flowID
+        self.initiator = initiator
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case authorizationURL = "authorizationUrl"
+        case flowID = "flowId"
+        case initiator
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(MCPServerStatus.self, forKey: .status)
+        authorizationURL = try container.decodeIfPresent(String.self, forKey: .authorizationURL)
+        flowID = try container.decodeIfPresent(String.self, forKey: .flowID)
+        initiator = try container.decodeIfPresent(String.self, forKey: .initiator)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(status, forKey: .status)
+        try container.encodeIfPresent(authorizationURL, forKey: .authorizationURL)
+        try container.encodeIfPresent(flowID, forKey: .flowID)
+        try container.encodeIfPresent(initiator, forKey: .initiator)
+    }
+}
+
+public struct MCPLogoutResult: Sendable, Hashable, Codable {
+    public let status: MCPServerStatus
+
+    public init(status: MCPServerStatus) {
+        self.status = status
+    }
+}
+
 /// A prompt advertised by a connected MCP server and projected into the
 /// server's ordinary slash-command catalog.
 public struct MCPPromptDescriptor: Sendable, Hashable {
@@ -138,6 +229,7 @@ public actor MCPManager {
 
     public enum MCPManagerError: Error, Sendable, Equatable {
         case serverNotConnected(String)
+        case serverNotConfigured(String)
     }
 
     private struct ServerKey: Hashable {
@@ -153,13 +245,87 @@ public actor MCPManager {
         let endpoint: String?
     }
 
+    private actor OAuthURLCapture: BrowserLaunching {
+        enum Signal: Sendable {
+            case authorizationURL(String)
+            case completed(MCPConnectResult)
+            case failed(MCPConnectResult)
+        }
+
+        private var signal: Signal?
+        private var waiter: CheckedContinuation<Signal, Never>?
+        private let onURL: @Sendable (String) async -> Void
+
+        init(onURL: @escaping @Sendable (String) async -> Void) {
+            self.onURL = onURL
+        }
+
+        func open(_ url: String) async -> Bool {
+            await onURL(url)
+            publish(.authorizationURL(url))
+            // The URL is returned to the delegating client. The client, rather
+            // than this server process, owns the decision to launch a browser.
+            return false
+        }
+
+        func complete(_ result: MCPConnectResult) {
+            publish(.completed(result))
+        }
+
+        func fail(_ result: MCPConnectResult) {
+            publish(.failed(result))
+        }
+
+        func wait() async -> Signal {
+            if let signal {
+                self.signal = nil
+                return signal
+            }
+            return await withCheckedContinuation { continuation in
+                waiter = continuation
+            }
+        }
+
+        private func publish(_ value: Signal) {
+            if let waiter {
+                self.waiter = nil
+                waiter.resume(returning: value)
+            } else if signal == nil {
+                signal = value
+            }
+        }
+    }
+
+    private struct OAuthFlow: Sendable {
+        let id: String
+        let server: String
+        let initiator: String?
+        let provider: MCPOAuthProvider
+        let capture: OAuthURLCapture
+        let expiresAt: Date
+        var pending: MCPOAuthPending?
+        var task: Task<Void, Never>?
+    }
+
     private var servers: [ConnectedServer] = []
     private var mcpTools: [any AgentTool] = []
     private var reservedNames: Set<String> = []
     private var nameOverrides: [ServerKey: String] = [:]
     private var serverStatuses: [String: MCPServerStatusInfo] = [:]
     private var changeHandler: (@Sendable (String) async -> Void)?
+    private var oauthEventHandler: (@Sendable (MCPOAuthEvent) async -> Void)?
     private var log: (@Sendable (String) -> Void)?
+
+    private var configuredServers: [String: MCPServerConfig] = [:]
+    private var workspaceDirectory = ""
+    private var clientVersion = "0.1.0"
+    private var sensitiveEnvKeys: Set<String> = []
+    private var sandbox: ProcessSandbox?
+    private var credentialProvider: (@Sendable (String) -> String?)?
+    private var oauthSetup: OAuthSetup?
+    private var oauthStore: OAuthTokenStore?
+    private var oauthProviders: [String: MCPOAuthProvider] = [:]
+    private var oauthFlows: [String: OAuthFlow] = [:]
 
     /// The one HTTP-client factory every remote server this manager connects shares, so
     /// the whole run builds at most one proxied client instead of one per server. It is
@@ -179,6 +345,13 @@ public actor MCPManager {
     /// broadcast `mcp_changed` on every live session stream.
     public func setChangeHandler(_ handler: (@Sendable (String) async -> Void)?) {
         changeHandler = handler
+    }
+
+    /// Install the server-wide OAuth sink. OAuth requests are not tied to one
+    /// session: the runtime broadcasts them to every live session stream and
+    /// also exposes the pending list for clients that attach later.
+    public func setOAuthEventHandler(_ handler: (@Sendable (MCPOAuthEvent) async -> Void)?) {
+        oauthEventHandler = handler
     }
 
     /// What the embedding surface provides for `oauth`-configured servers.
@@ -232,6 +405,16 @@ public actor MCPManager {
     ) async -> [any AgentTool] {
         self.reservedNames = reservedNames
         self.log = log
+        configuredServers = servers
+        self.workspaceDirectory = workspaceDirectory
+        self.clientVersion = clientVersion
+        self.sensitiveEnvKeys = sensitiveEnvKeys
+        self.sandbox = sandbox
+        self.credentialProvider = credentialProvider
+        self.oauthSetup = oauth
+        for flow in oauthFlows.values { flow.task?.cancel() }
+        oauthFlows.removeAll()
+        oauthProviders.removeAll()
         serverStatuses.removeAll(keepingCapacity: true)
         for (name, config) in servers.sorted(by: { $0.key < $1.key }) {
             serverStatuses[name] = MCPServerStatusInfo(
@@ -243,6 +426,7 @@ public actor MCPManager {
         // One store for every oauth server this call connects; entries are
         // namespaced by cache key so servers never read each other's tokens.
         let oauthStore = oauth.map { OAuthTokenStore(directory: $0.configDirectory + "/mcp-oauth") }
+        self.oauthStore = oauthStore
         // Seed with the built-in names (forward-looking; see the doc-comment) so a
         // namespaced MCP name that ever collided with one would be renamed, not shadow it.
         for (name, config) in servers.sorted(by: { $0.key < $1.key }) {
@@ -303,6 +487,7 @@ public actor MCPManager {
                         authorizationTimeout: setup.authorizationTimeout
                     )
                 )
+                oauthProviders[name] = provider
                 // Acquire once, interactively if the surface allows, BEFORE
                 // the connect-retry loop below — that loop must never be the
                 // thing that opens a browser three times.
@@ -387,6 +572,366 @@ public actor MCPManager {
             }
         }
         return mcpTools
+    }
+
+    /// Return the pending server-scoped browser flows. The projection is safe
+    /// to expose over HTTP and is also the recovery path when no session SSE
+    /// stream was live when the request was created.
+    public func oauthPending() -> [MCPOAuthPending] {
+        let now = Date()
+        return oauthFlows.values
+            .compactMap { flow in
+                guard flow.expiresAt > now else { return nil }
+                return flow.pending
+            }
+            .sorted { $0.id < $1.id }
+    }
+
+    /// Start or re-trigger one configured server. Cached/refreshable OAuth is
+    /// consumed silently; only an interactive miss creates a parked flow and
+    /// returns an authorization URL after its callback listener is bound.
+    public func connectServer(named name: String, initiator: String? = nil) async throws -> MCPConnectResult {
+        guard let config = configuredServers[name] else {
+            throw MCPManagerError.serverNotConfigured(name)
+        }
+        if config.enabled == false {
+            return MCPConnectResult(status: .disabled)
+        }
+        if isConnected(server: name) {
+            return MCPConnectResult(status: .connected)
+        }
+        guard config.isRemote || !config.command.isEmpty else {
+            updateStatus(name, status: .failed, error: "MCP server configuration has an empty command.")
+            return MCPConnectResult(status: .failed)
+        }
+
+        if let oauthConfig = config.oauth, config.isRemote {
+            guard let setup = oauthSetup,
+                  let store = oauthStore,
+                  let serverURL = config.url
+            else {
+                updateStatus(
+                    name,
+                    status: .needsAuth,
+                    error: "Interactive OAuth support is unavailable on this surface."
+                )
+                return MCPConnectResult(status: .needsAuth)
+            }
+            let provider = oauthProviders[name] ?? MCPOAuthProvider(
+                serverName: name,
+                serverURL: serverURL,
+                config: oauthConfig,
+                dependencies: MCPOAuthDependencies(
+                    store: store,
+                    browser: setup.browser ?? SystemBrowserLauncher(),
+                    clientProvider: { [httpClients] url in httpClients.client(for: url) },
+                    log: log,
+                    certificateDirectory: setup.configDirectory + "/mcp-oauth",
+                    authorizationTimeout: setup.authorizationTimeout
+                )
+            )
+            oauthProviders[name] = provider
+
+            do {
+                _ = try await provider.accessToken(allowInteractive: false)
+                return await connectConfiguredServer(named: name, provider: provider)
+            } catch {
+                guard let oauthError = error as? MCPOAuthError else {
+                    let outcome = Self.connectionStatus(for: error)
+                    updateStatus(name, status: outcome.status, error: outcome.error)
+                    return MCPConnectResult(status: outcome.status)
+                }
+                switch oauthError {
+                case .interactionRequired, .clientRegistrationRequired:
+                    return await beginOAuth(
+                        named: name,
+                        provider: provider,
+                        initiator: initiator,
+                        timeout: setup.authorizationTimeout
+                    )
+                default:
+                    let outcome = Self.oauthStatus(for: oauthError)
+                    updateStatus(name, status: outcome.status, error: outcome.error)
+                    return MCPConnectResult(status: outcome.status)
+                }
+            }
+        }
+
+        return await connectConfiguredServer(named: name, provider: nil)
+    }
+
+    /// Disconnect one server and discard its OAuth grant and dynamic client.
+    /// The configured entry remains in the status map so a subsequent
+    /// connect can re-trigger it without restarting DoMoCode.
+    public func logoutServer(named name: String) async throws -> MCPLogoutResult {
+        guard let config = configuredServers[name] else {
+            throw MCPManagerError.serverNotConfigured(name)
+        }
+        if let flow = oauthFlows.removeValue(forKey: name) {
+            flow.task?.cancel()
+            if let pending = flow.pending {
+                await emitOAuth(.resolved(MCPOAuthResolved(
+                    id: pending.id,
+                    server: name,
+                    status: "cancelled"
+                )))
+            }
+        }
+        if let index = servers.firstIndex(where: { $0.name == name }) {
+            let connected = servers.remove(at: index)
+            await connected.client.shutdown()
+            await rebuildTools(changedServer: name)
+        }
+        if let oauth = config.oauth, let serverURL = config.url, let store = oauthStore {
+            try? await store.removeCredential(
+                forKey: oauth.cacheKey ?? name,
+                serverURL: serverURL
+            )
+        }
+        oauthProviders.removeValue(forKey: name)
+        updateStatus(
+            name,
+            status: config.oauth == nil ? .failed : .needsAuth,
+            toolCount: 0,
+            error: config.oauth == nil ? "MCP server is disconnected." : "MCP authorization is required.",
+            clearError: true
+        )
+        return MCPLogoutResult(status: config.oauth == nil ? .failed : .needsAuth)
+    }
+
+    private func beginOAuth(
+        named name: String,
+        provider _: MCPOAuthProvider,
+        initiator: String?,
+        timeout: Duration
+    ) async -> MCPConnectResult {
+        if let existing = oauthFlows[name] {
+            guard existing.initiator == initiator else {
+                return MCPConnectResult(status: .needsAuth)
+            }
+            guard let pending = existing.pending else {
+                return MCPConnectResult(status: .needsAuth, flowID: existing.id, initiator: initiator)
+            }
+            return MCPConnectResult(
+                status: .needsAuth,
+                authorizationURL: pending.authorizationURL,
+                flowID: existing.id,
+                initiator: initiator
+            )
+        }
+
+        let flowID = UUIDv7.generate().description
+        let expiresAt = Date().addingTimeInterval(Self.durationSeconds(timeout))
+        let capture = OAuthURLCapture { [weak self] url in
+            await self?.oauthURLReady(server: name, flowID: flowID, url: url)
+        }
+        guard let config = configuredServers[name],
+              let oauthConfig = config.oauth,
+              let serverURL = config.url,
+              let setup = oauthSetup,
+              let store = oauthStore
+        else {
+            return MCPConnectResult(status: .failed, flowID: flowID, initiator: initiator)
+        }
+        let delegatedProvider = MCPOAuthProvider(
+            serverName: name,
+            serverURL: serverURL,
+            config: oauthConfig,
+            dependencies: MCPOAuthDependencies(
+                store: store,
+                browser: capture,
+                clientProvider: { [httpClients] url in httpClients.client(for: url) },
+                log: log,
+                certificateDirectory: setup.configDirectory + "/mcp-oauth",
+                authorizationTimeout: timeout
+            )
+        )
+        var flow = OAuthFlow(
+            id: flowID,
+            server: name,
+            initiator: initiator,
+            provider: delegatedProvider,
+            capture: capture,
+            expiresAt: expiresAt,
+            pending: nil,
+            task: nil
+        )
+        oauthFlows[name] = flow
+        let task = Task { [weak self] in
+            do {
+                _ = try await delegatedProvider.accessToken(allowInteractive: true)
+                let result = await self?.finishOAuth(
+                    server: name,
+                    flowID: flowID,
+                    provider: delegatedProvider
+                )
+                    ?? MCPConnectResult(status: .failed)
+                await capture.complete(result)
+            } catch {
+                let result = await self?.failOAuth(server: name, flowID: flowID, error: error)
+                    ?? MCPConnectResult(status: .failed)
+                await capture.fail(result)
+            }
+        }
+        flow.task = task
+        oauthFlows[name] = flow
+
+        switch await capture.wait() {
+        case .authorizationURL(let url):
+            return MCPConnectResult(
+                status: .needsAuth,
+                authorizationURL: url,
+                flowID: flowID,
+                initiator: initiator
+            )
+        case .completed(let result), .failed(let result):
+            return result
+        }
+    }
+
+    private func oauthURLReady(server: String, flowID: String, url: String) async {
+        guard var flow = oauthFlows[server], flow.id == flowID, flow.pending == nil else { return }
+        let pending = MCPOAuthPending(
+            id: flowID,
+            server: server,
+            authorizationURL: url,
+            expiresAt: Self.iso8601(flow.expiresAt)
+        )
+        flow.pending = pending
+        oauthFlows[server] = flow
+        await emitOAuth(.request(pending))
+    }
+
+    private func finishOAuth(
+        server: String,
+        flowID: String,
+        provider: MCPOAuthProvider
+    ) async -> MCPConnectResult {
+        guard let flow = oauthFlows[server], flow.id == flowID else {
+            return MCPConnectResult(status: .failed)
+        }
+        let result = await connectConfiguredServer(named: server, provider: provider)
+        oauthFlows.removeValue(forKey: server)
+        if let pending = flow.pending {
+            await emitOAuth(.resolved(MCPOAuthResolved(
+                id: pending.id,
+                server: server,
+                status: result.status == .connected ? "connected" : "failed"
+            )))
+        }
+        return result
+    }
+
+    private func failOAuth(server: String, flowID: String, error: any Error) async -> MCPConnectResult {
+        guard let flow = oauthFlows[server], flow.id == flowID else {
+            return MCPConnectResult(status: .failed)
+        }
+        let outcome = Self.oauthStatus(for: error)
+        updateStatus(server, status: outcome.status, error: outcome.error)
+        log?(Redaction.diagnostic("MCP server '\(server)' OAuth login failed: \(error)"))
+        oauthFlows.removeValue(forKey: server)
+        if let pending = flow.pending {
+            await emitOAuth(.resolved(MCPOAuthResolved(
+                id: pending.id,
+                server: server,
+                status: "failed",
+                error: outcome.error
+            )))
+        }
+        return MCPConnectResult(status: outcome.status)
+    }
+
+    private func emitOAuth(_ event: MCPOAuthEvent) async {
+        guard let oauthEventHandler else { return }
+        await oauthEventHandler(event)
+    }
+
+    private func connectConfiguredServer(
+        named name: String,
+        provider: MCPOAuthProvider?
+    ) async -> MCPConnectResult {
+        guard let config = configuredServers[name] else {
+            return MCPConnectResult(status: .failed)
+        }
+        let bearerToken = config.credentialReference.flatMap { credentialProvider?($0) }
+            ?? config.bearerTokenEnvironment.flatMap { ProcessInfo.processInfo.environment[$0] }
+        let tokenProvider: MCPClient.BearerTokenProvider?
+        if let provider {
+            tokenProvider = { forceRefresh, rejectedToken, wwwAuthenticate in
+                try await provider.accessToken(
+                    forceRefresh: forceRefresh,
+                    allowInteractive: false,
+                    wwwAuthenticate: wwwAuthenticate,
+                    rejectedToken: rejectedToken
+                )
+            }
+        } else {
+            tokenProvider = nil
+        }
+        let client = MCPClient(
+            serverName: name,
+            config: config,
+            workspaceDirectory: workspaceDirectory,
+            clientVersion: clientVersion,
+            sensitiveEnvKeys: sensitiveEnvKeys,
+            sandbox: sandbox,
+            log: log,
+            onToolsChanged: { [weak self] in
+                await self?.rebuildTools(changedServer: name)
+            },
+            bearerToken: tokenProvider == nil ? bearerToken : nil,
+            tokenProvider: tokenProvider,
+            httpClientProvider: { [httpClients] url in httpClients.client(for: url) }
+        )
+        var connectionError: (any Error)?
+        let attempts = config.isRemote ? 3 : 1
+        for attempt in 0..<attempts {
+            do {
+                try await client.connect()
+                connectionError = nil
+                break
+            } catch {
+                connectionError = error
+                if error is MCPOAuthError { break }
+                if case MCPClient.MCPError.unauthorized = error { break }
+                guard attempt + 1 < attempts else { break }
+                let delay = Duration.milliseconds(Int64(100 * (1 << attempt)))
+                try? await Task.sleep(for: delay)
+            }
+        }
+        if connectionError == nil {
+            servers.removeAll { $0.name == name }
+            servers.append(
+                ConnectedServer(
+                    name: name,
+                    client: client,
+                    adapterKind: config.adapterKind,
+                    transport: config.effectiveTransport,
+                    endpoint: Self.safeEndpoint(config.url)
+                )
+            )
+            await rebuildTools()
+            let count = mcpTools.filter { $0.definition.name.hasPrefix(McpTool.sanitize(name) + "_") }.count
+            updateStatus(name, status: .connected, toolCount: count, clearError: true)
+            log?("MCP server '\(name)' connected with \(count) tool(s).")
+            return MCPConnectResult(status: .connected)
+        }
+        if let connectionError {
+            log?(Redaction.diagnostic("MCP server '\(name)' failed to connect: \(connectionError)"))
+            let outcome = Self.connectionStatus(for: connectionError)
+            updateStatus(name, status: outcome.status, error: outcome.error)
+            await client.shutdown()
+            return MCPConnectResult(status: outcome.status)
+        }
+        return MCPConnectResult(status: .failed)
+    }
+
+    private static func durationSeconds(_ duration: Duration) -> TimeInterval {
+        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+    }
+
+    private static func iso8601(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
     }
 
     /// The namespaced tool name, made unique against names already emitted this run. Two
@@ -636,10 +1181,17 @@ public actor MCPManager {
     /// manager's life: a client built for a proxied endpoint holds an event-loop group,
     /// and leaving one running keeps the process from exiting.
     public func shutdown() async {
+        for flow in oauthFlows.values {
+            flow.task?.cancel()
+        }
+        oauthFlows.removeAll()
+        oauthProviders.removeAll()
         for server in servers { await server.client.shutdown() }
         servers.removeAll()
         mcpTools.removeAll()
         serverStatuses.removeAll()
+        configuredServers.removeAll()
+        oauthStore = nil
         // After the servers, never before: a shut-down client cannot serve the requests
         // a still-connected server would make. Idempotent, because the CLI's error and
         // success paths can both reach here.

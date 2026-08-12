@@ -331,9 +331,16 @@ public struct DoMoServer: Sendable {
                         "mcp-admin",
                         "mcp-changed",
                         "mcp-prompts",
-                        "skills-route"
+                        "skills-route",
+                        "oauth-delegation"
                     ]
                 ))
+            }
+        }
+
+        router.get("/oauth/pending") { _, _ in
+            try await self.mapErrors {
+                try Self.json(await self.runtime.oauthPending())
             }
         }
 
@@ -512,6 +519,24 @@ public struct DoMoServer: Sendable {
         router.get("/mcp") { _, _ in
             try await self.mapErrors {
                 try Self.json(await self.runtime.mcpServers())
+            }
+        }
+
+        router.post("/mcp/:server/connect") { request, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                let initiator = Self.clientIdentity(request)?.clientID
+                return try Self.json(await self.runtime.mcpConnect(
+                    server: server,
+                    initiator: initiator
+                ))
+            }
+        }
+
+        router.post("/mcp/:server/logout") { _, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                return try Self.json(try await self.runtime.mcpLogout(server: server))
             }
         }
 

@@ -837,6 +837,9 @@ public actor ServerRuntime {
                 await mcpManager.setChangeHandler { [weak self] server in
                     await self?.broadcastMCPChanged(server: server)
                 }
+                await mcpManager.setOAuthEventHandler { [weak self] event in
+                    await self?.broadcastOAuth(event)
+                }
             }
         }
     }
@@ -943,9 +946,56 @@ public actor ServerRuntime {
         return await manager.health(server: server)
     }
 
+    /// Pending server-scoped OAuth requests are independent of session
+    /// lifetime, so a newly attached client can reconcile them before it opens
+    /// any session stream.
+    public func oauthPending() async -> [MCPOAuthPending] {
+        guard let manager = config.mcpManager else { return [] }
+        return await manager.oauthPending()
+    }
+
+    public func mcpConnect(server: String, initiator: String?) async throws -> MCPConnectResult {
+        guard let manager = config.mcpManager else { throw ServerRuntimeError.mcpUnavailable }
+        do {
+            return try await manager.connectServer(named: server, initiator: initiator)
+        } catch MCPManager.MCPManagerError.serverNotConfigured {
+            throw ServerRuntimeError.mcpServerNotFound
+        }
+    }
+
+    public func mcpLogout(server: String) async throws -> MCPLogoutResult {
+        guard let manager = config.mcpManager else { throw ServerRuntimeError.mcpUnavailable }
+        do {
+            return try await manager.logoutServer(named: server)
+        } catch MCPManager.MCPManagerError.serverNotConfigured {
+            throw ServerRuntimeError.mcpServerNotFound
+        }
+    }
+
     private func broadcastMCPChanged(server: String) {
         for session in sessions.values {
             session.sink.broadcast(.mcpChanged(server: server))
+        }
+    }
+
+    private func broadcastOAuth(_ event: MCPOAuthEvent) {
+        for session in sessions.values {
+            switch event {
+            case .request(let pending):
+                session.sink.broadcast(.oauthRequest(
+                    id: pending.id,
+                    server: pending.server,
+                    authorizationURL: pending.authorizationURL,
+                    expiresAt: pending.expiresAt
+                ))
+            case .resolved(let resolved):
+                session.sink.broadcast(.oauthResolved(
+                    id: resolved.id,
+                    server: resolved.server,
+                    status: resolved.status,
+                    error: resolved.error
+                ))
+            }
         }
     }
 

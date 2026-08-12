@@ -16,6 +16,7 @@ import AsyncHTTPClient
 import DoMoAgent
 import DoMoCore
 import DoMoHarness
+import DoMoMCP
 import DoMoServer
 import Foundation
 import SystemPackage
@@ -119,6 +120,25 @@ struct AgentsRouteTests {
             // path must strip it exactly as the workspace path does.
             let text = String(decoding: reply.body, as: UTF8.self)
             #expect(!text.contains("Inspect the workspace carefully"), "a built-in prompt reached the wire: \(text)")
+        }
+    }
+
+    @Test("OAuth delegation advertises its capability and reconciles an empty pending list")
+    func oauthDelegationSurface() async throws {
+        let dirs = try Dirs()
+        defer { dirs.cleanUp() }
+        let server = makeServer(dirs, workspace: nil)
+
+        try await withServer(server) { http, port in
+            let capabilities = try await send(http, port, "/capabilities")
+            #expect(capabilities.status == 200)
+            let capabilityValue = try JSONSerialization.jsonObject(with: capabilities.body) as? [String: Any]
+            let names = capabilityValue?["capabilities"] as? [String] ?? []
+            #expect(names.contains("oauth-delegation"))
+
+            let pending = try await send(http, port, "/oauth/pending")
+            #expect(pending.status == 200)
+            #expect(try JSONDecoder().decode([MCPOAuthPending].self, from: pending.body).isEmpty)
         }
     }
 

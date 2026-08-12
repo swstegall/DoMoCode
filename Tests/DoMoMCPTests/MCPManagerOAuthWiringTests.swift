@@ -198,4 +198,59 @@ struct MCPManagerOAuthWiringTests {
             "the skip must be explained in the log"
         )
     }
+
+    @Test("A connected OAuth server can be re-addressed and logged out without a restart")
+    func lazyConnectAndLogout() async throws {
+        let scratch = try ScratchDirectory()
+        let authorizations = Recorder<String?>()
+        let server = try await TestHTTPServer.start(
+            router: combinedRouter(mcpAuthorizations: authorizations, issue: "unused-after-preseed")
+        )
+        defer { server.stop() }
+
+        let serverURL = "\(server.baseURL)/mcp"
+        let store = OAuthTokenStore(directory: scratch.path + "/mcp-oauth")
+        _ = try await store.mutate(forKey: "jira", serverURL: serverURL) { _ in
+            OAuthStoredCredential(
+                serverURL: serverURL,
+                tokens: OAuthTokens(
+                    accessToken: "access-token-logout-000003",
+                    expiresAt: Date().timeIntervalSince1970 + 3600
+                )
+            )
+        }
+
+        let manager = MCPManager()
+        let config = MCPServerConfig(
+            command: [],
+            url: serverURL,
+            transport: .streamableHTTP,
+            allowPrivateNetwork: true,
+            oauth: MCPOAuthConfig(
+                authorizationEndpoint: "\(server.baseURL)/authorize",
+                tokenEndpoint: "\(server.baseURL)/token",
+                clientId: "client-abc"
+            )
+        )
+        _ = await manager.connect(
+            servers: ["jira": config],
+            workspaceDirectory: scratch.path,
+            oauth: MCPManager.OAuthSetup(
+                configDirectory: scratch.path,
+                allowInteractive: false,
+                browser: SilentBrowser()
+            )
+        )
+
+        let alreadyConnected = try await manager.connectServer(named: "jira", initiator: "sdk-test")
+        #expect(alreadyConnected.status == .connected)
+
+        let loggedOut = try await manager.logoutServer(named: "jira")
+        #expect(loggedOut.status == .needsAuth)
+        #expect(!(await manager.isConnected(server: "jira")))
+        #expect(await manager.statuses()["jira"]?.status == .needsAuth)
+        #expect(await store.credential(forKey: "jira", serverURL: serverURL) == nil)
+
+        await manager.shutdown()
+    }
 }

@@ -160,6 +160,13 @@ public actor OAuthTokenStore {
         }
     }
 
+    /// Remove the complete credential, including a dynamically registered
+    /// client. This is the logout operation: the next login must not reuse a
+    /// client identity or a grant that the user explicitly discarded.
+    public func removeCredential(forKey key: String, serverURL: String) async throws {
+        _ = try await mutate(forKey: key, serverURL: serverURL) { _ in nil }
+    }
+
     /// Serializes an async critical section on a per-`key` lock file, for
     /// flows that must not run twice across processes (an interactive login,
     /// a refresh). Scoped to the key so one server's browser login does not
