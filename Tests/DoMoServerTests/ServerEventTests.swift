@@ -126,6 +126,13 @@ struct ServerEventTests {
                 depth: 1
             )),
             .mcpChanged(server: "github"),
+            .oauthRequest(
+                id: "oauth-1",
+                server: "github",
+                authorizationURL: "https://auth.example.test/authorize",
+                expiresAt: "2026-08-11T00:00:00Z"
+            ),
+            .oauthResolved(id: "oauth-1", server: "github", status: "connected", error: nil),
         ]
         for event in cases {
             #expect(try roundTrip(event) == event, "did not round-trip: \(event)")
@@ -185,5 +192,15 @@ struct ServerEventTests {
         #expect(queue["type"]?.stringValue == "queue_update")
         #expect(queue["count"]?.intValue == 2)
         #expect(queue["mode"]?.stringValue == "one-at-a-time")
+
+        let oauth = try JSONValue(parsing: try JSONEncoder().encode(
+            ServerEvent.oauthRequest(
+                id: "oauth-1",
+                server: "github",
+                authorizationURL: "https://auth.example.test/authorize",
+                expiresAt: "2026-08-11T00:00:00Z"
+            )))
+        #expect(oauth["type"]?.stringValue == "oauth_request")
+        #expect(oauth["authorizationUrl"]?.stringValue == "https://auth.example.test/authorize")
     }
 }

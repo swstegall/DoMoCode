@@ -178,6 +178,13 @@ public enum ServerEvent: Sendable, Hashable {
     /// their admin/catalog snapshots and refetch the affected server.
     case mcpChanged(server: String)
 
+    /// A server-scoped MCP OAuth flow waiting for a client to open its URL.
+    /// This frame is broadcast on every live session stream.
+    case oauthRequest(id: String, server: String, authorizationURL: String, expiresAt: String)
+
+    /// Completion of a server-scoped MCP OAuth flow.
+    case oauthResolved(id: String, server: String, status: String, error: String?)
+
     /// Projects one runtime event onto the wire, or `nil` when the event carries
     /// nothing a client needs (an assembly frame that is neither a text nor a
     /// reasoning delta — a snapshot boundary the client reconstructs from the
@@ -376,6 +383,8 @@ extension ServerEvent: Codable {
         case notice
         case subagent
         case mcpChanged = "mcp_changed"
+        case oauthRequest = "oauth_request"
+        case oauthResolved = "oauth_resolved"
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -404,6 +413,10 @@ extension ServerEvent: Codable {
         case notice
         case subagent
         case server
+        case authorizationURL = "authorizationUrl"
+        case expiresAt
+        case status
+        case error
     }
 
     public init(from decoder: any Decoder) throws {
@@ -483,6 +496,20 @@ extension ServerEvent: Codable {
             self = .subagent(try container.decode(SubagentTaskEvent.self, forKey: .subagent))
         case .mcpChanged:
             self = .mcpChanged(server: try container.decode(String.self, forKey: .server))
+        case .oauthRequest:
+            self = .oauthRequest(
+                id: try container.decode(String.self, forKey: .id),
+                server: try container.decode(String.self, forKey: .server),
+                authorizationURL: try container.decode(String.self, forKey: .authorizationURL),
+                expiresAt: try container.decode(String.self, forKey: .expiresAt)
+            )
+        case .oauthResolved:
+            self = .oauthResolved(
+                id: try container.decode(String.self, forKey: .id),
+                server: try container.decode(String.self, forKey: .server),
+                status: try container.decode(String.self, forKey: .status),
+                error: try container.decodeIfPresent(String.self, forKey: .error)
+            )
         }
     }
 
@@ -560,6 +587,18 @@ extension ServerEvent: Codable {
         case .mcpChanged(let server):
             try container.encode(Kind.mcpChanged, forKey: .type)
             try container.encode(server, forKey: .server)
+        case .oauthRequest(let id, let server, let authorizationURL, let expiresAt):
+            try container.encode(Kind.oauthRequest, forKey: .type)
+            try container.encode(id, forKey: .id)
+            try container.encode(server, forKey: .server)
+            try container.encode(authorizationURL, forKey: .authorizationURL)
+            try container.encode(expiresAt, forKey: .expiresAt)
+        case .oauthResolved(let id, let server, let status, let error):
+            try container.encode(Kind.oauthResolved, forKey: .type)
+            try container.encode(id, forKey: .id)
+            try container.encode(server, forKey: .server)
+            try container.encode(status, forKey: .status)
+            try container.encodeIfPresent(error, forKey: .error)
         }
     }
 }
