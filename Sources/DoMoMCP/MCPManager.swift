@@ -45,6 +45,29 @@ public struct MCPServerStatusInfo: Sendable, Hashable, Codable {
     }
 }
 
+/// A prompt advertised by a connected MCP server and projected into the
+/// server's ordinary slash-command catalog.
+public struct MCPPromptDescriptor: Sendable, Hashable {
+    public let server: String
+    public let name: String
+    public let description: String?
+    public let arguments: [MCPClient.PromptArgumentInfo]
+    public let commandName: String
+
+    public init(
+        server: String,
+        name: String,
+        description: String?,
+        arguments: [MCPClient.PromptArgumentInfo]
+    ) {
+        self.server = server
+        self.name = name
+        self.description = description
+        self.arguments = arguments
+        self.commandName = "mcp_" + McpTool.sanitize(server) + "_" + McpTool.sanitize(name)
+    }
+}
+
 /// Connects and owns the run's stdio MCP servers.
 public actor MCPManager {
     public struct MCPResourceInfo: Sendable, Hashable, Codable {
@@ -399,6 +422,42 @@ public actor MCPManager {
     /// The configured MCP servers, including disabled and failed entries. The
     /// values deliberately omit credentials and full endpoint paths.
     public func statuses() -> [String: MCPServerStatusInfo] { serverStatuses }
+
+    /// Return the connected MCP prompts as slash-command metadata.
+    public func promptCommands() async -> [MCPPromptDescriptor] {
+        var result: [MCPPromptDescriptor] = []
+        for server in servers {
+            result.append(contentsOf: await server.client.prompts().map { prompt in
+                MCPPromptDescriptor(
+                    server: server.name,
+                    name: prompt.name,
+                    description: prompt.description,
+                    arguments: prompt.arguments
+                )
+            })
+        }
+        return result.sorted { $0.commandName < $1.commandName }
+    }
+
+    public func promptDescriptor(named commandName: String) async -> MCPPromptDescriptor? {
+        await promptCommands().first {
+            $0.commandName.caseInsensitiveCompare(commandName) == .orderedSame
+        }
+    }
+
+    /// Fetch and render a prompt through its owning connected MCP client.
+    public func getPrompt(
+        server requestedServer: String,
+        name: String,
+        arguments: [String: String]
+    ) async throws -> String {
+        guard let server = servers.first(where: { $0.name == requestedServer }) else {
+            throw MCPManagerError.serverNotConnected(requestedServer)
+        }
+        let result = try await server.client.getPrompt(name: name, arguments: arguments)
+        let rendered = MCPClient.renderPrompt(result)
+        return rendered.isEmpty ? (result.description ?? "") : rendered
+    }
 
     /// The bridged tools belonging to one exact server. The server name is
     /// required so an adapter cannot accidentally route a call to a different

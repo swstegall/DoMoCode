@@ -15,8 +15,8 @@ import Testing
 
 @Suite("MCP client (fixture server)", .serialized)
 struct MCPClientTests {
-    /// A minimal MCP stdio server: initialize, tools/list (echo/boom/slow), tools/call,
-    /// ping. `slow` never responds (to exercise the per-request timeout).
+    /// A minimal MCP stdio server: initialize, tools/list/prompts/list, tools/call,
+    /// prompts/get, and ping. `slow` never responds (to exercise the per-request timeout).
     static let fixture = #"""
         import sys, json, os, subprocess
         # Optionally spawn a grandchild in this server's own process group, to prove the
@@ -33,7 +33,7 @@ struct MCPClientTests {
             if not line: continue
             m = json.loads(line); method = m.get("method"); mid = m.get("id")
             if method == "initialize":
-                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":pv,"capabilities":{"tools":{"listChanged":False},"resources":{"listChanged":False}},"serverInfo":{"name":"fixture","version":"1.0"}}})
+                send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":pv,"capabilities":{"tools":{"listChanged":False},"resources":{"listChanged":False},"prompts":{"listChanged":False}},"serverInfo":{"name":"fixture","version":"1.0"}}})
             elif method == "tools/list":
                 send({"jsonrpc":"2.0","id":mid,"result":{"tools":[
                     {"name":"echo","description":"Echo text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
@@ -51,6 +51,13 @@ struct MCPClientTests {
                 p = m.get("params",{})
                 send({"jsonrpc":"2.0","id":mid,"result":{"contents":[
                     {"uri":p.get("uri",""),"mimeType":"text/plain","text":"reference only"}]}})
+            elif method == "prompts/list":
+                send({"jsonrpc":"2.0","id":mid,"result":{"prompts":[
+                    {"name":"summarize","description":"Summarize a topic","arguments":[{"name":"topic","description":"Topic to summarize","required":True}]}]}})
+            elif method == "prompts/get":
+                p = m.get("params",{}); topic = p.get("arguments",{}).get("topic", "everything")
+                send({"jsonrpc":"2.0","id":mid,"result":{"description":"A summary prompt","messages":[
+                    {"role":"user","content":{"type":"text","text":"Summarize "+topic}}]}})
             elif method == "tools/call":
                 p = m.get("params",{}); name = p.get("name"); args = p.get("arguments",{})
                 if name == "echo":
@@ -174,6 +181,25 @@ struct MCPClientTests {
 
         let health = await manager.health(server: "srv")
         #expect(health == [MCPManager.MCPServerHealth(server: "srv", healthy: true)])
+    }
+
+    @Test("MCP prompts become commands and render through the normal prompt path")
+    func promptCommands() async throws {
+        guard let (dir, config) = try fixtureConfig() else { return }
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let manager = MCPManager()
+        _ = await manager.connect(servers: ["srv": config], workspaceDirectory: dir.path)
+        defer { Task { await manager.shutdown() } }
+
+        let prompts = await manager.promptCommands()
+        #expect(prompts.map(\.commandName) == ["mcp_srv_summarize"])
+        #expect(prompts.first?.arguments.first?.name == "topic")
+        let rendered = try await manager.getPrompt(
+            server: "srv",
+            name: "summarize",
+            arguments: ["topic": "Swift"]
+        )
+        #expect(rendered == "user: Summarize Swift")
     }
 
     @Test("A tool's isError result is surfaced as an error tool result, not a throw")

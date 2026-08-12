@@ -811,8 +811,21 @@ public actor ServerRuntime {
     /// The one command registry shared by every client surface. Templates are
     /// intentionally absent from the descriptor wire value; the server remains
     /// the authority that expands them.
-    public func commands() -> CommandRegistry {
-        config.promptWorkspace?.commands ?? .builtIn
+    public func commands() async -> CommandRegistry {
+        let base = config.promptWorkspace?.commands ?? .builtIn
+        guard let manager = config.mcpManager else { return base }
+        let mcpCommands = await manager.promptCommands().map { prompt in
+            CommandDescriptor(
+                name: prompt.commandName,
+                description: prompt.description,
+                argumentHint: prompt.arguments.isEmpty
+                    ? nil
+                    : prompt.arguments.map(\.name).joined(separator: ", "),
+                kind: .prompt,
+                source: .mcp
+            )
+        }
+        return CommandRegistry(commands: base.commands + mcpCommands)
     }
 
     /// The agent personas this runtime can select, for a client's palette.
@@ -3279,6 +3292,7 @@ public actor ServerRuntime {
         let commandProcessor = config.commandProcessor
         let commandStreamFactory = config.commandStreamFactory
         let promptWorkspace = config.promptWorkspace
+        let mcpManager = config.mcpManager
         let baseSystemPrompt = config.promptWorkspace?.baseSystemPrompt ?? config.systemPrompt
         let modeState = session.modeState
         let planPath = AgentModePolicy.planPath(
@@ -3303,7 +3317,23 @@ public actor ServerRuntime {
                 // the loop never saw are, and those all arrive as a throw.
                 if let commandPrompt {
                     let resolution: PromptCommandResolution
-                    if let processor = commandProcessor {
+                    if let commandName = Self.commandName(in: commandPrompt),
+                       let mcpManager,
+                       let mcpPrompt = await mcpManager.promptDescriptor(named: commandName)
+                    {
+                        let arguments = try Self.mcpPromptArguments(in: commandPrompt)
+                        let rendered = try await mcpManager.getPrompt(
+                            server: mcpPrompt.server,
+                            name: mcpPrompt.name,
+                            arguments: arguments
+                        )
+                        resolution = .prompt(
+                            text: rendered,
+                            model: nil,
+                            reasoningEffort: nil,
+                            systemPrompt: promptWorkspace?.systemPrompt(for: rendered) ?? baseSystemPrompt
+                        )
+                    } else if let processor = commandProcessor {
                         resolution = try await processor.resolve(commandPrompt)
                     } else {
                         resolution = .prompt(
@@ -3381,6 +3411,37 @@ public actor ServerRuntime {
             }
             await self?.finishRun(sessionID, token: token)
         }
+    }
+
+    private static func commandName(in input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "/" else { return nil }
+        let rest = trimmed.dropFirst()
+        guard let first = rest.first, !first.isWhitespace else { return nil }
+        let end = rest.firstIndex(where: { $0.isWhitespace }) ?? rest.endIndex
+        let name = String(rest[..<end])
+        return name.isEmpty ? nil : name
+    }
+
+    private static func commandArguments(in input: String) -> String {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let slash = trimmed.firstIndex(of: "/") else { return "" }
+        let afterSlash = trimmed.index(after: slash)
+        guard let boundary = trimmed[afterSlash...].firstIndex(where: { $0.isWhitespace }) else { return "" }
+        return String(trimmed[trimmed.index(after: boundary)...])
+    }
+
+    private static func mcpPromptArguments(in input: String) throws -> [String: String] {
+        let raw = commandArguments(in: input).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return [:] }
+        guard let data = raw.data(using: .utf8),
+              let value = try? JSONDecoder().decode([String: String].self, from: data)
+        else {
+            throw ServerRuntimeError.toolCommandInvalid(
+                "MCP prompt arguments must be a JSON object of string values."
+            )
+        }
+        return value
     }
 
     /// One wire notice from a classified failure the run threw.

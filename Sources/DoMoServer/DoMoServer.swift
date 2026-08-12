@@ -329,7 +329,8 @@ public struct DoMoServer: Sendable {
                         "session-events",
                         "client-ledger",
                         "mcp-admin",
-                        "mcp-changed"
+                        "mcp-changed",
+                        "mcp-prompts"
                     ]
                 ))
             }

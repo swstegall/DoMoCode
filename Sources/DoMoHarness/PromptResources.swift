@@ -18,6 +18,7 @@ public enum PromptResourceSource: String, Codable, Hashable, Sendable {
     case builtin
     case user
     case project
+    case mcp
 }
 
 /// Whether a command is handled by the client or expanded into an agent prompt.

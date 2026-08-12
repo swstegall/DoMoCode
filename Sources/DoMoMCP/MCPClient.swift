@@ -48,6 +48,43 @@ public actor MCPClient {
         public let mimeType: String?
     }
 
+    /// One argument accepted by an MCP prompt.
+    public struct PromptArgumentInfo: Sendable, Hashable {
+        public let name: String
+        public let description: String?
+        public let required: Bool
+
+        public init(name: String, description: String?, required: Bool) {
+            self.name = name
+            self.description = description
+            self.required = required
+        }
+    }
+
+    /// Prompt metadata returned by `prompts/list`.
+    public struct PromptInfo: Sendable, Hashable {
+        public let name: String
+        public let description: String?
+        public let arguments: [PromptArgumentInfo]
+
+        public init(name: String, description: String?, arguments: [PromptArgumentInfo]) {
+            self.name = name
+            self.description = description
+            self.arguments = arguments
+        }
+    }
+
+    /// The protocol-level result returned by `prompts/get`.
+    public struct PromptResult: Sendable {
+        public let description: String?
+        public let messages: [JSONValue]
+
+        public init(description: String?, messages: [JSONValue]) {
+            self.description = description
+            self.messages = messages
+        }
+    }
+
     /// A `tools/call` result, still in protocol terms (mapped to a tool result by ``McpTool``).
     public struct CallResult: Sendable {
         public let content: [JSONValue]
@@ -110,6 +147,7 @@ public actor MCPClient {
     /// that many sleeping tasks.
     private var timeoutTasks: [Int: Task<Void, Never>] = [:]
     private var toolsCache: [ToolInfo] = []
+    private var promptsCache: [PromptInfo] = []
     private var closed = false
     /// Set once the initialize handshake + initial tools/list have completed, so a
     /// `tools/list_changed` arriving mid-handshake doesn't race a second discovery into
@@ -195,6 +233,9 @@ public actor MCPClient {
         if initResult["capabilities"]?["tools"] != nil {
             toolsCache = try await listTools()
         }
+        if initResult["capabilities"]?["prompts"] != nil {
+            promptsCache = try await listPrompts()
+        }
         handshakeComplete = true
     }
 
@@ -204,6 +245,33 @@ public actor MCPClient {
     /// The server's negotiated capability object, retained for inspection and
     /// resource/template gating by an embedding surface.
     public func serverCapabilities() -> JSONValue { capabilities }
+
+    /// The prompts discovered at connect (or after a `prompts/list_changed`).
+    public func prompts() -> [PromptInfo] { promptsCache }
+
+    /// Fetch one prompt with its named string arguments.
+    public func getPrompt(name: String, arguments: [String: String] = [:]) async throws -> PromptResult {
+        var params: [String: JSONValue] = ["name": .string(name)]
+        if !arguments.isEmpty {
+            params["arguments"] = .object(arguments.mapValues(JSONValue.string))
+        }
+        let result = try await request("prompts/get", params: .object(params))
+        return PromptResult(
+            description: result["description"]?.stringValue,
+            messages: result["messages"]?.arrayValue ?? []
+        )
+    }
+
+    /// Render the text-bearing portions of an MCP prompt into the ordinary
+    /// user prompt channel. Non-text blocks remain visible as bounded markers.
+    public static func renderPrompt(_ result: PromptResult) -> String {
+        result.messages.compactMap { message in
+            let role = message["role"]?.stringValue
+            let content = renderPromptContent(message["content"])
+            guard !content.isEmpty else { return nil }
+            return role.map { "\($0): \(content)" } ?? content
+        }.joined(separator: "\n\n")
+    }
 
     /// List resources when the server advertises them. A server without the
     /// capability returns an empty list rather than making the catalog path fail.
@@ -276,6 +344,43 @@ public actor MCPClient {
             cursor = next
         } while cursor != nil
         return tools
+    }
+
+    private func listPrompts() async throws -> [PromptInfo] {
+        var prompts: [PromptInfo] = []
+        var cursor: String?
+        var seenCursors: Set<String> = []
+        var pages = 0
+        repeat {
+            pages += 1
+            guard pages <= maxToolListPages else {
+                throw MCPError.protocolError("prompts/list exceeded \(maxToolListPages) pages")
+            }
+            let params: JSONValue? = cursor.map { .object(["cursor": .string($0)]) }
+            let result = try await request("prompts/list", params: params)
+            for entry in result["prompts"]?.arrayValue ?? [] {
+                guard let name = entry["name"]?.stringValue else { continue }
+                let arguments = entry["arguments"]?.arrayValue?.compactMap { argument -> PromptArgumentInfo? in
+                    guard let argumentName = argument["name"]?.stringValue else { return nil }
+                    return PromptArgumentInfo(
+                        name: argumentName,
+                        description: argument["description"]?.stringValue,
+                        required: argument["required"]?.boolValue ?? false
+                    )
+                } ?? []
+                prompts.append(PromptInfo(
+                    name: name,
+                    description: entry["description"]?.stringValue,
+                    arguments: arguments
+                ))
+            }
+            guard let next = result["nextCursor"]?.stringValue, !next.isEmpty else { break }
+            guard seenCursors.insert(next).inserted else {
+                throw MCPError.protocolError("prompts/list repeated a cursor")
+            }
+            cursor = next
+        } while true
+        return prompts
     }
 
     // MARK: Call
@@ -640,6 +745,9 @@ public actor MCPClient {
         if method == "notifications/tools/list_changed" {
             Task { [weak self] in await self?.refreshTools() }
         }
+        if method == "notifications/prompts/list_changed" {
+            Task { [weak self] in await self?.refreshPrompts() }
+        }
         // progress / message / cancelled and the rest are ignored for a tools-only client.
     }
 
@@ -649,6 +757,13 @@ public actor MCPClient {
         guard handshakeComplete, !closed, let refreshed = try? await listTools() else { return }
         guard refreshed != toolsCache else { return }
         toolsCache = refreshed
+        await onToolsChanged?()
+    }
+
+    private func refreshPrompts() async {
+        guard handshakeComplete, !closed, let refreshed = try? await listPrompts() else { return }
+        guard refreshed != promptsCache else { return }
+        promptsCache = refreshed
         await onToolsChanged?()
     }
 
@@ -681,4 +796,16 @@ public actor MCPClient {
         if path.hasPrefix("/") { return path }
         return workspaceDirectory + "/" + path
     }
+}
+
+private func renderPromptContent(_ content: JSONValue?) -> String {
+    guard let content else { return "" }
+    if let blocks = content.arrayValue {
+        return blocks.map { renderPromptContent($0) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+    }
+    if let text = content["text"]?.stringValue { return text }
+    if let type = content["type"]?.stringValue { return "[\(type) content]" }
+    return (try? content.encodedString()) ?? ""
 }
