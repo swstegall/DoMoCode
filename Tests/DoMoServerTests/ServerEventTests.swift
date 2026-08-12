@@ -125,6 +125,7 @@ struct ServerEventTests {
                 output: "done",
                 depth: 1
             )),
+            .mcpChanged(server: "github"),
         ]
         for event in cases {
             #expect(try roundTrip(event) == event, "did not round-trip: \(event)")

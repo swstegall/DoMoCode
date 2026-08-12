@@ -5,6 +5,7 @@ import DoMoAgent
 import DoMoCore
 import DoMoHarness
 import DoMoLLM
+import DoMoMCP
 import DoMoPermissions
 import Foundation
 import Hummingbird
@@ -46,6 +47,21 @@ public struct CommitMessageResult: Codable, Sendable, Hashable {
     public init(message: String?) { self.message = message }
 }
 
+/// Stable identity and feature advertisement for SDK clients.
+public struct ServerCapabilities: Codable, Sendable, Hashable {
+    public var name: String
+    public var version: String
+    public var protocolVersion: Int
+    public var capabilities: [String]
+
+    public init(name: String, version: String, protocolVersion: Int, capabilities: [String]) {
+        self.name = name
+        self.version = version
+        self.protocolVersion = protocolVersion
+        self.capabilities = capabilities
+    }
+}
+
 private struct CreateBody: Decodable {
     var resume: String?
 }
@@ -59,6 +75,10 @@ private struct PromptBody: Decodable {
 
 private struct DirectToolBody: Decodable {
     var command: String
+}
+
+private struct MCPResourceBody: Decodable {
+    var uri: String
 }
 
 /// `POST /session/{id}/permission` body (Phase 8b). `reply` is "once" / "always" /
@@ -243,6 +263,8 @@ struct TokenAuthMiddleware: RouterMiddleware {
 /// single-client-first, broadcast-capable shape the roadmap fixes: one loopback
 /// bind, one bearer token, and no multi-instance supervision or discovery.
 public struct DoMoServer: Sendable {
+    public static let version = "0.1.0"
+
 
     public struct Options: Sendable {
         public var host: String
@@ -296,6 +318,22 @@ public struct DoMoServer: Sendable {
         let router = Router(context: BasicRequestContext.self)
         router.add(middleware: FailureLoggingMiddleware(logger: logger))
         router.add(middleware: TokenAuthMiddleware(token: options.token))
+
+        router.get("/capabilities") { _, _ in
+            try await self.mapErrors {
+                try Self.json(ServerCapabilities(
+                    name: "domocode",
+                    version: Self.version,
+                    protocolVersion: serverProtocolVersion,
+                    capabilities: [
+                        "session-events",
+                        "client-ledger",
+                        "mcp-admin",
+                        "mcp-changed"
+                    ]
+                ))
+            }
+        }
 
         router.post("/session") { request, context in
             try await self.mapErrors {
@@ -456,6 +494,47 @@ public struct DoMoServer: Sendable {
         router.get("/models") { _, _ in
             try await self.mapErrors {
                 try Self.json(try await self.runtime.refreshModels())
+            }
+        }
+
+        // MCP is a process-scoped admin surface rather than a session tool. It
+        // projects the manager's existing connections and never forwards raw
+        // MCP JSON-RPC over the public HTTP boundary.
+        router.get("/mcp") { _, _ in
+            try await self.mapErrors {
+                try Self.json(await self.runtime.mcpServers())
+            }
+        }
+
+        router.get("/mcp/:server/resources") { _, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                return try Self.json(await self.runtime.mcpResources(server: server))
+            }
+        }
+
+        router.get("/mcp/:server/resource-templates") { _, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                return try Self.json(await self.runtime.mcpResourceTemplates(server: server))
+            }
+        }
+
+        router.post("/mcp/:server/resource") { request, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                let body = try await Self.requiredBody(MCPResourceBody.self, request)
+                return try Self.json(try await self.runtime.mcpReadResource(
+                    server: server,
+                    uri: body.uri
+                ))
+            }
+        }
+
+        router.get("/mcp/:server/health") { _, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                return try Self.json(await self.runtime.mcpHealth(server: server))
             }
         }
 
@@ -1313,6 +1392,10 @@ public struct DoMoServer: Sendable {
                 throw HTTPError(.badRequest, message: message)
             case .toolCommandInvalid(let message):
                 throw HTTPError(.badRequest, message: message)
+            case .mcpUnavailable, .mcpServerNotFound:
+                throw HTTPError(.notFound)
+            case .mcpReadFailed:
+                throw HTTPError(.badGateway, message: "MCP resource read failed.")
             }
         }
     }

@@ -7,6 +7,7 @@ import DoMoHarness
 import DoMoGit
 import DoMoLLM
 import DoMoMemory
+import DoMoMCP
 import DoMoPermissions
 import Foundation
 import Synchronization
@@ -85,6 +86,12 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     /// A direct slash-tool command could not be parsed or resolved against the
     /// session's currently callable tool set.
     case toolCommandInvalid(String)
+    /// The serving runtime was not configured with an MCP manager.
+    case mcpUnavailable
+    /// The requested MCP server is not connected.
+    case mcpServerNotFound
+    /// A connected MCP server rejected a resource read.
+    case mcpReadFailed
 }
 
 /// A reference to a session, returned by create and fork.
@@ -475,6 +482,10 @@ public actor ServerRuntime {
         /// Optional durable client presence, authority, and mirror cursor ledger.
         /// When absent, embedded runtimes retain the legacy single-client API.
         public var sessionClients: SessionClientManager?
+        /// The process-owned MCP connection manager used by the admin routes.
+        /// Embedded runtimes may leave this nil; list routes then return an empty
+        /// catalog and reads report `mcpUnavailable`.
+        public var mcpManager: MCPManager?
 
         /// The process's adaptive response-character-limit controller, or `nil` to
         /// send prompts exactly as they were written.
@@ -544,7 +555,8 @@ public actor ServerRuntime {
             automationRegistry: AutomationRegistry? = nil,
             sessionClients: SessionClientManager? = nil,
             responseLimit: ResponseLimitController? = nil,
-            gatewayContinuation: GatewayContinuationSettings = .default
+            gatewayContinuation: GatewayContinuationSettings = .default,
+            mcpManager: MCPManager? = nil
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -589,6 +601,7 @@ public actor ServerRuntime {
             self.jobManager = jobManager
             self.automationRegistry = automationRegistry
             self.sessionClients = sessionClients
+            self.mcpManager = mcpManager
             self.responseLimit = responseLimit
             self.gatewayContinuation = gatewayContinuation
         }
@@ -786,6 +799,13 @@ public actor ServerRuntime {
             guard let self else { return nil }
             return await self.awaitQuestion(sessionID: sessionID, questions: questions)
         }
+        if let mcpManager = config.mcpManager {
+            Task { [weak self] in
+                await mcpManager.setChangeHandler { [weak self] server in
+                    await self?.broadcastMCPChanged(server: server)
+                }
+            }
+        }
     }
 
     /// The one command registry shared by every client surface. Templates are
@@ -820,6 +840,49 @@ public actor ServerRuntime {
     public func memory() async throws -> [ProjectMemoryRecord] {
         guard let provider = config.projectMemoryProvider else { return [] }
         return try await provider.list()
+    }
+
+    // MARK: MCP admin
+
+    /// The configured MCP server status map. Disabled and failed entries remain
+    /// visible so an operator can distinguish configuration from connectivity.
+    public func mcpServers() async -> [String: MCPServerStatusInfo] {
+        guard let manager = config.mcpManager else { return [:] }
+        return await manager.statuses()
+    }
+
+    public func mcpResources(server: String) async -> [MCPManager.MCPResourceInfo] {
+        guard let manager = config.mcpManager else { return [] }
+        return await manager.resources(server: server)
+    }
+
+    public func mcpResourceTemplates(server: String) async -> [MCPManager.MCPResourceTemplateInfo] {
+        guard let manager = config.mcpManager else { return [] }
+        return await manager.resourceTemplates(server: server)
+    }
+
+    public func mcpReadResource(server: String, uri: String) async throws -> MCPManager.MCPResourceRead {
+        guard let manager = config.mcpManager else {
+            throw ServerRuntimeError.mcpUnavailable
+        }
+        do {
+            return try await manager.readResource(server: server, uri: uri)
+        } catch MCPManager.MCPManagerError.serverNotConnected {
+            throw ServerRuntimeError.mcpServerNotFound
+        } catch {
+            throw ServerRuntimeError.mcpReadFailed
+        }
+    }
+
+    public func mcpHealth(server: String) async -> [MCPManager.MCPServerHealth] {
+        guard let manager = config.mcpManager else { return [] }
+        return await manager.health(server: server)
+    }
+
+    private func broadcastMCPChanged(server: String) {
+        for session in sessions.values {
+            session.sink.broadcast(.mcpChanged(server: server))
+        }
     }
 
     // MARK: Session clients

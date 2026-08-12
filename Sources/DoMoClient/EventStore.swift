@@ -322,6 +322,9 @@ public final class EventStore {
             queuedMessageCount = max(0, count)
             steeringMode = mode
 
+        case .mcpChanged:
+            break   // catalog invalidation is owned by the SDK/client surface
+
         case .notice(let notice):
             // The two doors, and the rule that picks between them: an error the
             // user has to ACT on becomes a persistent transcript row, because a

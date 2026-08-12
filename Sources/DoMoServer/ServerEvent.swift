@@ -174,6 +174,10 @@ public enum ServerEvent: Sendable, Hashable {
     /// rendering delegation as an opaque tool transcript.
     case subagent(SubagentTaskEvent)
 
+    /// A connected MCP server's tool catalog changed. Clients should invalidate
+    /// their admin/catalog snapshots and refetch the affected server.
+    case mcpChanged(server: String)
+
     /// Projects one runtime event onto the wire, or `nil` when the event carries
     /// nothing a client needs (an assembly frame that is neither a text nor a
     /// reasoning delta — a snapshot boundary the client reconstructs from the
@@ -371,6 +375,7 @@ extension ServerEvent: Codable {
         case queueUpdate = "queue_update"
         case notice
         case subagent
+        case mcpChanged = "mcp_changed"
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -398,6 +403,7 @@ extension ServerEvent: Codable {
         case mode
         case notice
         case subagent
+        case server
     }
 
     public init(from decoder: any Decoder) throws {
@@ -475,6 +481,8 @@ extension ServerEvent: Codable {
             self = .notice(try container.decode(ServerNotice.self, forKey: .notice))
         case .subagent:
             self = .subagent(try container.decode(SubagentTaskEvent.self, forKey: .subagent))
+        case .mcpChanged:
+            self = .mcpChanged(server: try container.decode(String.self, forKey: .server))
         }
     }
 
@@ -549,6 +557,9 @@ extension ServerEvent: Codable {
         case .subagent(let event):
             try container.encode(Kind.subagent, forKey: .type)
             try container.encode(event, forKey: .subagent)
+        case .mcpChanged(let server):
+            try container.encode(Kind.mcpChanged, forKey: .type)
+            try container.encode(server, forKey: .server)
         }
     }
 }

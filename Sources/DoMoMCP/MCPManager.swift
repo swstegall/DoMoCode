@@ -13,9 +13,41 @@ import DoMoExec
 import DoMoLLM
 import Foundation
 
+/// The connection state exposed by the MCP admin route.
+public enum MCPServerStatus: String, Sendable, Hashable, Codable {
+    case connected
+    case disabled
+    case failed
+    case needsAuth = "needs_auth"
+    case needsClientRegistration = "needs_client_registration"
+}
+
+/// A safe, non-secret summary of one configured MCP server.
+public struct MCPServerStatusInfo: Sendable, Hashable, Codable {
+    public let status: MCPServerStatus
+    public let transport: MCPTransport
+    public let toolCount: Int
+    public let error: String?
+    public let endpoint: String?
+
+    public init(
+        status: MCPServerStatus,
+        transport: MCPTransport,
+        toolCount: Int = 0,
+        error: String? = nil,
+        endpoint: String? = nil
+    ) {
+        self.status = status
+        self.transport = transport
+        self.toolCount = toolCount
+        self.error = error
+        self.endpoint = endpoint
+    }
+}
+
 /// Connects and owns the run's stdio MCP servers.
 public actor MCPManager {
-    public struct MCPResourceInfo: Sendable, Hashable {
+    public struct MCPResourceInfo: Sendable, Hashable, Codable {
         public let server: String
         public let uri: String
         public let name: String
@@ -37,7 +69,7 @@ public actor MCPManager {
         }
     }
 
-    public struct MCPResourceTemplateInfo: Sendable, Hashable {
+    public struct MCPResourceTemplateInfo: Sendable, Hashable, Codable {
         public let server: String
         public let uriTemplate: String
         public let name: String
@@ -59,7 +91,7 @@ public actor MCPManager {
         }
     }
 
-    public struct MCPResourceRead: Sendable, Hashable {
+    public struct MCPResourceRead: Sendable, Hashable, Codable {
         public let server: String
         public let uri: String
         public let contents: [JSONValue]
@@ -71,7 +103,7 @@ public actor MCPManager {
         }
     }
 
-    public struct MCPServerHealth: Sendable, Hashable {
+    public struct MCPServerHealth: Sendable, Hashable, Codable {
         public let server: String
         public let healthy: Bool
 
@@ -102,6 +134,8 @@ public actor MCPManager {
     private var mcpTools: [any AgentTool] = []
     private var reservedNames: Set<String> = []
     private var nameOverrides: [ServerKey: String] = [:]
+    private var serverStatuses: [String: MCPServerStatusInfo] = [:]
+    private var changeHandler: (@Sendable (String) async -> Void)?
     private var log: (@Sendable (String) -> Void)?
 
     /// The one HTTP-client factory every remote server this manager connects shares, so
@@ -116,6 +150,12 @@ public actor MCPManager {
     ///   every call site that does not pass one.
     public init(proxy: ProxySettings = .disabled) {
         httpClients = ProxiedHTTPClients(settings: proxy)
+    }
+
+    /// Install the server-wide notification sink used by the HTTP runtime to
+    /// broadcast `mcp_changed` on every live session stream.
+    public func setChangeHandler(_ handler: (@Sendable (String) async -> Void)?) {
+        changeHandler = handler
     }
 
     /// What the embedding surface provides for `oauth`-configured servers.
@@ -169,6 +209,14 @@ public actor MCPManager {
     ) async -> [any AgentTool] {
         self.reservedNames = reservedNames
         self.log = log
+        serverStatuses.removeAll(keepingCapacity: true)
+        for (name, config) in servers.sorted(by: { $0.key < $1.key }) {
+            serverStatuses[name] = MCPServerStatusInfo(
+                status: config.enabled == false ? .disabled : .failed,
+                transport: config.effectiveTransport,
+                endpoint: Self.safeEndpoint(config.url)
+            )
+        }
         // One store for every oauth server this call connects; entries are
         // namespaced by cache key so servers never read each other's tokens.
         let oauthStore = oauth.map { OAuthTokenStore(directory: $0.configDirectory + "/mcp-oauth") }
@@ -180,6 +228,11 @@ public actor MCPManager {
             // uncatchable index fault, not a throw the do/catch below could
             // isolate). Remote entries have no command.
             guard config.isRemote || !config.command.isEmpty else {
+                updateStatus(
+                    name,
+                    status: .failed,
+                    error: "MCP server configuration has an empty command."
+                )
                 log?("MCP server '\(name)' has an empty command; skipping.")
                 continue
             }
@@ -192,6 +245,11 @@ public actor MCPManager {
             var tokenProvider: MCPClient.BearerTokenProvider?
             if let oauthConfig = config.oauth, config.isRemote {
                 guard let setup = oauth, let oauthStore else {
+                    updateStatus(
+                        name,
+                        status: .needsAuth,
+                        error: "Interactive OAuth support is unavailable on this surface."
+                    )
                     log?(
                         "MCP server '\(name)' has oauth configured, but this surface "
                             + "provides no OAuth support; skipping."
@@ -201,6 +259,11 @@ public actor MCPManager {
                 guard let serverURL = config.url else {
                     // isRemote can be true via an explicit transport with no
                     // url; that is a config error, not a surface limitation.
+                    updateStatus(
+                        name,
+                        status: .failed,
+                        error: "OAuth configuration is missing a server URL."
+                    )
                     log?("MCP server '\(name)' has oauth configured but no url; skipping.")
                     continue
                 }
@@ -223,6 +286,8 @@ public actor MCPManager {
                 do {
                     _ = try await provider.accessToken(allowInteractive: setup.allowInteractive)
                 } catch {
+                    let outcome = Self.oauthStatus(for: error)
+                    updateStatus(name, status: outcome.status, error: outcome.error)
                     log?(Redaction.diagnostic("MCP server '\(name)' OAuth login failed: \(error)"))
                     continue
                 }
@@ -244,7 +309,7 @@ public actor MCPManager {
                 workspaceDirectory: workspaceDirectory, clientVersion: clientVersion,
                 sensitiveEnvKeys: sensitiveEnvKeys, sandbox: sandbox, log: log,
                 onToolsChanged: { [weak self] in
-                    await self?.rebuildTools()
+                    await self?.rebuildTools(changedServer: name)
                 },
                 bearerToken: tokenProvider == nil ? bearerToken : nil,
                 tokenProvider: tokenProvider,
@@ -286,12 +351,15 @@ public actor MCPManager {
                 )
                 await rebuildTools()
                 let count = mcpTools.filter { $0.definition.name.hasPrefix(McpTool.sanitize(name) + "_") }.count
+                updateStatus(name, status: .connected, toolCount: count, clearError: true)
                 log?("MCP server '\(name)' connected with \(count) tool(s).")
             } else if let connectionError {
                 // Redacted: a spawn failure quotes the command, and a configured
                 // `environment` block is exactly where a user keeps that server's
                 // token. This line goes to stderr, where it would outlive the run.
                 log?(Redaction.diagnostic("MCP server '\(name)' failed to connect: \(connectionError)"))
+                let outcome = Self.connectionStatus(for: connectionError)
+                updateStatus(name, status: outcome.status, error: outcome.error)
                 await client.shutdown()
             }
         }
@@ -327,6 +395,10 @@ public actor MCPManager {
 
     /// The bridged tools connected so far.
     public func tools() -> [any AgentTool] { mcpTools }
+
+    /// The configured MCP servers, including disabled and failed entries. The
+    /// values deliberately omit credentials and full endpoint paths.
+    public func statuses() -> [String: MCPServerStatusInfo] { serverStatuses }
 
     /// The bridged tools belonging to one exact server. The server name is
     /// required so an adapter cannot accidentally route a call to a different
@@ -450,9 +522,10 @@ public actor MCPManager {
     /// `notifications/tools/list_changed`. The current server/tool order is
     /// deterministic, and an existing `(server, raw tool)` keeps its exposed
     /// name across description/schema refreshes and remove/re-add cycles.
-    private func rebuildTools() async {
+    private func rebuildTools(changedServer: String? = nil) async {
         var usedNames = reservedNames
         var rebuilt: [any AgentTool] = []
+        var toolCounts: [String: Int] = [:]
         for server in servers {
             for info in await server.client.tools() {
                 let parameters: JSONSchema
@@ -488,9 +561,16 @@ public actor MCPManager {
                         transport: server.transport
                     )
                 )
+                toolCounts[server.name, default: 0] += 1
             }
         }
         mcpTools = rebuilt
+        for server in servers {
+            updateStatus(server.name, toolCount: toolCounts[server.name] ?? 0)
+        }
+        if let changedServer, let changeHandler {
+            await changeHandler(changedServer)
+        }
     }
 
     /// Tear down every connected server, then the HTTP clients they shared. Ends this
@@ -500,6 +580,7 @@ public actor MCPManager {
         for server in servers { await server.client.shutdown() }
         servers.removeAll()
         mcpTools.removeAll()
+        serverStatuses.removeAll()
         // After the servers, never before: a shut-down client cannot serve the requests
         // a still-connected server would make. Idempotent, because the CLI's error and
         // success paths can both reach here.
@@ -514,6 +595,47 @@ public actor MCPManager {
         var endpoint = "\(scheme)://\(host)"
         if let port = url.port { endpoint += ":\(port)" }
         return endpoint
+    }
+
+    private func updateStatus(
+        _ name: String,
+        status: MCPServerStatus? = nil,
+        toolCount: Int? = nil,
+        error: String? = nil,
+        clearError: Bool = false
+    ) {
+        guard let current = serverStatuses[name] else { return }
+        serverStatuses[name] = MCPServerStatusInfo(
+            status: status ?? current.status,
+            transport: current.transport,
+            toolCount: toolCount ?? current.toolCount,
+            error: clearError ? error : error ?? current.error,
+            endpoint: current.endpoint
+        )
+    }
+
+    private static func connectionStatus(for error: any Error) -> (status: MCPServerStatus, error: String) {
+        if let oauthError = error as? MCPOAuthError {
+            return oauthStatus(for: oauthError)
+        }
+        if case MCPClient.MCPError.unauthorized = error {
+            return (.needsAuth, "MCP server rejected its credential.")
+        }
+        return (.failed, "MCP server failed to connect.")
+    }
+
+    private static func oauthStatus(for error: any Error) -> (status: MCPServerStatus, error: String) {
+        guard let oauthError = error as? MCPOAuthError else {
+            return (.needsAuth, "MCP authorization is required.")
+        }
+        switch oauthError {
+        case .clientRegistrationRequired:
+            return (.needsClientRegistration, "OAuth client registration is required.")
+        case .interactionRequired, .authorizationDenied, .timedOut, .tokenEndpoint:
+            return (.needsAuth, "MCP authorization is required.")
+        case .configuration, .discoveryFailed, .portInUse, .flowFailed:
+            return (.failed, "MCP OAuth configuration or connection failed.")
+        }
     }
 }
 

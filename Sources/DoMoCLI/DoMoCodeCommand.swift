@@ -1423,6 +1423,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             jobManager: jobManager,
             automationRegistry: automationRegistry,
             sessionClients: sessionClients,
+            mcpManager: mcpManager,
             // The default surface's harnesses are built inside the runtime, so
             // this is where the process's one controller has to reach them. Read
             // from ``ProcessHarnessDefaults`` rather than threaded through this
