@@ -86,6 +86,8 @@ public enum ServerRuntimeError: Error, Sendable, Equatable {
     /// A direct slash-tool command could not be parsed or resolved against the
     /// session's currently callable tool set.
     case toolCommandInvalid(String)
+    /// A client-defined tool registration or result was malformed.
+    case clientToolInvalid(String)
     /// The serving runtime was not configured with an MCP manager.
     case mcpUnavailable
     /// The requested MCP server is not connected.
@@ -101,6 +103,29 @@ public struct SessionRef: Sendable, Codable, Hashable {
     public init(id: String, path: String) {
         self.id = id
         self.path = path
+    }
+}
+
+/// A tool definition supplied by the client when creating a session. The
+/// server validates the name and JSON Schema before advertising it to the model.
+public struct ClientToolDefinition: Sendable, Codable, Hashable {
+    public var name: String
+    public var description: String
+    public var inputSchema: JSONValue
+
+    public init(name: String, description: String, inputSchema: JSONValue) {
+        self.name = name
+        self.description = description
+        self.inputSchema = inputSchema
+    }
+}
+
+/// Whether a client-tool result still matched a pending model request.
+public struct ClientToolResolution: Sendable, Codable, Hashable {
+    public var accepted: Bool
+
+    public init(accepted: Bool) {
+        self.accepted = accepted
     }
 }
 
@@ -347,6 +372,232 @@ public struct SkillDescriptor: Codable, Hashable, Sendable {
 /// cancellation. The task is retained so ``abort(sessionID:)`` can reach it, and
 /// cleared when the run settles so the next prompt is admitted.
 ///
+private final class ClientToolBridge: AgentTool, @unchecked Sendable {
+    private struct State {
+        var waiters: [String: CheckedContinuation<AgentToolResult, Never>] = [:]
+        var completed: [String: AgentToolResult] = [:]
+        var resolved: Set<String> = []
+    }
+
+    let sessionID: String
+    let registration: ClientToolDefinition
+    let definition: ToolDefinition
+    private let sink: BroadcastEventSink
+    private let timeout: Duration
+    private let state = Mutex(State())
+
+    init(
+        sessionID: String,
+        registration: ClientToolDefinition,
+        sink: BroadcastEventSink,
+        timeout: Duration
+    ) throws {
+        guard !registration.name.isEmpty,
+              registration.name.count <= 128,
+              registration.name.allSatisfy({ $0.isLetter || $0.isNumber || "._:-".contains($0) })
+        else {
+            throw ServerRuntimeError.clientToolInvalid(
+                "Client tool names must contain only letters, numbers, '.', '_', ':', or '-'."
+            )
+        }
+        guard !registration.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ServerRuntimeError.clientToolInvalid(
+                "Client tool \(registration.name) requires a description."
+            )
+        }
+        let schema: JSONSchema
+        do {
+            schema = try JSONSchema(jsonValue: registration.inputSchema)
+        } catch {
+            throw ServerRuntimeError.clientToolInvalid(
+                "Client tool \(registration.name) has an invalid inputSchema."
+            )
+        }
+        self.sessionID = sessionID
+        self.registration = registration
+        self.definition = ToolDefinition(
+            name: registration.name,
+            description: registration.description,
+            parameters: schema
+        )
+        self.sink = sink
+        self.timeout = timeout
+    }
+
+    var catalogSource: ToolCatalogSource { .adapter }
+
+    var catalogMetadata: [String: JSONValue] {
+        ["clientDefined": .bool(true)]
+    }
+
+    func execute(_ arguments: JSONValue) async throws(DoMoError) -> AgentToolResult {
+        let requestID = UUIDv7.generate().description
+        sink.broadcast(.clientToolRequest(
+            id: requestID,
+            sessionID: sessionID,
+            name: definition.name,
+            arguments: arguments
+        ))
+
+        return await withTaskCancellationHandler(operation: {
+            await withTaskGroup(of: AgentToolResult.self) { group in
+                group.addTask { await self.waitForResult(requestID) }
+                group.addTask {
+                    do {
+                        try await Task.sleep(for: self.timeout)
+                    } catch {
+                        return AgentToolResult(
+                            output: "Client tool \(self.definition.name) was aborted.",
+                            isError: true
+                        )
+                    }
+                    let result = AgentToolResult(
+                        output: "Client tool \(self.definition.name) timed out after \(self.timeout).",
+                        isError: true
+                    )
+                    self.complete(requestID, result: result)
+                    return result
+                }
+                let result = await group.next() ?? AgentToolResult(
+                    output: "Client tool \(self.definition.name) did not return a result.",
+                    isError: true
+                )
+                group.cancelAll()
+                return result
+            }
+        }, onCancel: {
+            self.complete(
+                requestID,
+                result: AgentToolResult(
+                    output: "Client tool \(self.definition.name) was aborted.",
+                    isError: true
+                )
+            )
+        })
+    }
+
+    func resolve(requestID: String, output: String, isError: Bool, images: [ImageBlock]) -> Bool {
+        complete(
+            requestID,
+            result: AgentToolResult(output: output, isError: isError, images: images)
+        )
+    }
+
+    func cancel(reason: String) {
+        let pending = state.withLock { state -> [String] in
+            Array(state.waiters.keys)
+        }
+        for requestID in pending {
+            complete(requestID, result: AgentToolResult(output: reason, isError: true))
+        }
+    }
+
+    private func waitForResult(_ requestID: String) async -> AgentToolResult {
+        await withCheckedContinuation { continuation in
+            let completed = state.withLock { state -> AgentToolResult? in
+                if let result = state.completed.removeValue(forKey: requestID) {
+                    return result
+                }
+                state.waiters[requestID] = continuation
+                return nil
+            }
+            completed.map { continuation.resume(returning: $0) }
+        }
+    }
+
+    @discardableResult
+    private func complete(_ requestID: String, result: AgentToolResult) -> Bool {
+        let outcome = state.withLock { state -> (CheckedContinuation<AgentToolResult, Never>?, Bool) in
+            guard !state.resolved.contains(requestID) else { return (nil, false) }
+            state.resolved.insert(requestID)
+            if let continuation = state.waiters.removeValue(forKey: requestID) {
+                return (continuation, true)
+            }
+            state.completed[requestID] = result
+            return (nil, true)
+        }
+        outcome.0?.resume(returning: result)
+        if outcome.1 {
+            sink.broadcast(.clientToolResolved(
+                id: requestID,
+                name: definition.name,
+                isError: result.isError
+            ))
+            return true
+        }
+        return false
+    }
+}
+
+private final class ClientToolRegistry: @unchecked Sendable {
+    private let state = Mutex<[String: [ClientToolBridge]]>([:])
+
+    func register(
+        sessionID: String,
+        definitions: [ClientToolDefinition],
+        sink: BroadcastEventSink,
+        timeout: Duration,
+        reservedNames: Set<String>
+    ) throws {
+        guard !definitions.isEmpty else { return }
+        var names = Set<String>()
+        var bridges: [ClientToolBridge] = []
+        for definition in definitions {
+            guard names.insert(definition.name).inserted else {
+                throw ServerRuntimeError.clientToolInvalid(
+                    "Client tool \(definition.name) is registered more than once."
+                )
+            }
+            guard !reservedNames.contains(definition.name) else {
+                throw ServerRuntimeError.clientToolInvalid(
+                    "Client tool \(definition.name) conflicts with a server tool."
+                )
+            }
+            bridges.append(try ClientToolBridge(
+                sessionID: sessionID,
+                registration: definition,
+                sink: sink,
+                timeout: timeout
+            ))
+        }
+
+        try state.withLock { state in
+            if let existing = state[sessionID] {
+                guard existing.map(\.registration) == definitions else {
+                    throw ServerRuntimeError.clientToolInvalid(
+                        "Client tool definitions cannot change while a session is live."
+                    )
+                }
+                return
+            }
+            state[sessionID] = bridges
+        }
+    }
+
+    func tools(for sessionID: String) -> [any AgentTool] {
+        state.withLock { $0[sessionID, default: []].map { $0 as any AgentTool } }
+    }
+
+    func resolve(
+        sessionID: String,
+        requestID: String,
+        output: String,
+        isError: Bool,
+        images: [ImageBlock]
+    ) -> Bool {
+        let bridges = state.withLock { $0[sessionID] ?? [] }
+        for bridge in bridges where bridge.resolve(requestID: requestID, output: output, isError: isError, images: images) {
+            return true
+        }
+        return false
+    }
+
+    func cancel(sessionID: String, reason: String) {
+        let bridges = state.withLock { $0[sessionID] ?? [] }
+        for bridge in bridges { bridge.cancel(reason: reason) }
+    }
+}
+
 /// Three limitations are accepted under the single-client-first posture and would be
 /// revisited for multi-client: ``abort(sessionID:)`` cancels whatever run currently
 /// holds the slot, so a stale abort landing in the brief window after one run ends
@@ -520,6 +771,11 @@ public actor ServerRuntime {
         /// catalog and reads report `mcpUnavailable`.
         public var mcpManager: MCPManager?
 
+        /// Maximum time a model may wait for a client-defined tool result.
+        /// Timeout is returned to the model as an ordinary tool error so the
+        /// run can settle instead of parking the session indefinitely.
+        public var clientToolTimeout: Duration
+
         /// The process's adaptive response-character-limit controller, or `nil` to
         /// send prompts exactly as they were written.
         ///
@@ -589,7 +845,8 @@ public actor ServerRuntime {
             sessionClients: SessionClientManager? = nil,
             responseLimit: ResponseLimitController? = nil,
             gatewayContinuation: GatewayContinuationSettings = .default,
-            mcpManager: MCPManager? = nil
+            mcpManager: MCPManager? = nil,
+            clientToolTimeout: Duration = .seconds(60)
         ) {
             self.systemPrompt = systemPrompt
             self.promptWorkspace = promptWorkspace
@@ -635,6 +892,7 @@ public actor ServerRuntime {
             self.automationRegistry = automationRegistry
             self.sessionClients = sessionClients
             self.mcpManager = mcpManager
+            self.clientToolTimeout = clientToolTimeout
             self.responseLimit = responseLimit
             self.gatewayContinuation = gatewayContinuation
         }
@@ -817,6 +1075,7 @@ public actor ServerRuntime {
 
     private let config: Config
     private let terminalService: PTYService
+    private let clientToolRegistry = ClientToolRegistry()
     private var sessions: [String: SessionState] = [:]
     private var discoveredModelOptions: [ModelOption] = []
     private var subagents: [String: SubagentRecord] = [:]
@@ -2246,13 +2505,14 @@ public actor ServerRuntime {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
 
         let model = await session.harness.currentModel
+        let clientTools = clientToolRegistry.tools(for: sessionID)
         let candidates: [any AgentTool]
         if let resolver = config.toolsForSession {
-            candidates = await resolver(sessionID, model)
+            candidates = await resolver(sessionID, model) + clientTools
         } else if let resolver = config.getTools {
-            candidates = await resolver(model)
+            candidates = await resolver(model) + clientTools
         } else {
-            candidates = config.tools
+            candidates = config.tools + clientTools
         }
 
         let mode = session.modeState.get()
@@ -2484,6 +2744,8 @@ public actor ServerRuntime {
             sessionID: sessionID
         )
         let promptWorkspace = promptWorkspaceOverride ?? config.promptWorkspace
+        let clientToolRegistry = self.clientToolRegistry
+        let registeredClientTools = clientToolRegistry.tools(for: sessionID)
         let rulesetForCurrentMode: @Sendable () -> Ruleset = {
             guard let permissions else { return [] }
             let mode = modeState.get()
@@ -2533,9 +2795,13 @@ public actor ServerRuntime {
         }
         let toolsForTurn: (@Sendable (String) async -> [any AgentTool])?
         if let resolver = config.toolsForSession {
-            toolsForTurn = { model in filterTools(await resolver(sessionID, model)) }
+            toolsForTurn = { model in
+                filterTools(await resolver(sessionID, model) + clientToolRegistry.tools(for: sessionID))
+            }
         } else if let resolver = config.getTools {
-            toolsForTurn = { model in filterTools(await resolver(model)) }
+            toolsForTurn = { model in
+                filterTools(await resolver(model) + clientToolRegistry.tools(for: sessionID))
+            }
         } else {
             toolsForTurn = nil
         }
@@ -2553,7 +2819,7 @@ public actor ServerRuntime {
         var configuration = AgentHarness.Configuration(
             systemPrompt: promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
-            tools: filterTools(config.tools),
+            tools: filterTools(config.tools + registeredClientTools),
             getTools: toolsForTurn,
             systemPromptForPromptAndTools: promptForTools,
             model: config.model,
@@ -2707,6 +2973,25 @@ public actor ServerRuntime {
         }
     }
 
+    /// Resolve a client-defined tool request. A late or duplicate result is
+    /// intentionally idempotent and returns `accepted: false`.
+    public func resolveClientTool(
+        sessionID: String,
+        requestID: String,
+        output: String,
+        isError: Bool,
+        images: [ImageBlock]
+    ) throws -> ClientToolResolution {
+        guard sessions[sessionID] != nil else { throw ServerRuntimeError.sessionNotFound }
+        return ClientToolResolution(accepted: clientToolRegistry.resolve(
+            sessionID: sessionID,
+            requestID: requestID,
+            output: output,
+            isError: isError,
+            images: images
+        ))
+    }
+
     private struct DelegationMetadata: Sendable {
         let header: SessionHeader
         let latestEvent: SubagentTaskEvent?
@@ -2768,12 +3053,16 @@ public actor ServerRuntime {
 
     /// Create a fresh session, or open an existing one when `resume` names a
     /// session file path or a session id.
-    public func createSession(resume: String? = nil) async throws -> SessionRef {
+    public func createSession(
+        resume: String? = nil,
+        clientTools: [ClientToolDefinition] = []
+    ) async throws -> SessionRef {
         // The session id must be known BEFORE building the harness config, so the
         // permission hook can be bound to it (a prompt routes its answer by sessionID).
         let harness: AgentHarness
         let steeringBox: SteeringBox
         let modeState: AgentModeState
+        let sink: BroadcastEventSink
         let id: String
         var depth = 0
         var parentSessionID: String?
@@ -2787,6 +3076,13 @@ public actor ServerRuntime {
             // the same file — that would orphan the running task and leave the
             // existing SSE subscribers attached to a sink no run feeds.
             if let existing = sessions[resumedID] {
+                try clientToolRegistry.register(
+                    sessionID: resumedID,
+                    definitions: clientTools,
+                    sink: existing.sink,
+                    timeout: config.clientToolTimeout,
+                    reservedNames: Set(config.tools.map { $0.definition.name })
+                )
                 return SessionRef(id: resumedID, path: await existing.harness.sessionFilePath.string)
             }
             let metadata = try? await Self.loadDelegationMetadata(at: path)
@@ -2802,6 +3098,14 @@ public actor ServerRuntime {
                 }
             }
             steeringBox = makeSteeringBox()
+            sink = BroadcastEventSink()
+            try clientToolRegistry.register(
+                sessionID: resumedID,
+                definitions: clientTools,
+                sink: sink,
+                timeout: config.clientToolTimeout,
+                reservedNames: Set(config.tools.map { $0.definition.name })
+            )
             let profileName = latestEvent?.agent ?? "explore"
             let profile = child ? subagentProfile(named: profileName) : nil
             modeState = AgentModeState(child ? (latestEvent?.mode ?? .plan) : config.agentMode)
@@ -2822,6 +3126,14 @@ public actor ServerRuntime {
         } else {
             id = UUIDv7.generate().description
             steeringBox = makeSteeringBox()
+            sink = BroadcastEventSink()
+            try clientToolRegistry.register(
+                sessionID: id,
+                definitions: clientTools,
+                sink: sink,
+                timeout: config.clientToolTimeout,
+                reservedNames: Set(config.tools.map { $0.definition.name })
+            )
             modeState = AgentModeState(config.agentMode)
             harness = try AgentHarness.start(
                 cwd: config.cwd,
@@ -2841,7 +3153,7 @@ public actor ServerRuntime {
         if sessions[id] != nil { return SessionRef(id: id, path: path.string) }
         sessions[id] = makeState(
             harness: harness,
-            sink: BroadcastEventSink(),
+            sink: sink,
             steeringBox: steeringBox,
             modeState: modeState,
             depth: depth,
@@ -3956,6 +4268,9 @@ public actor ServerRuntime {
     /// Resume every pending prompt on `session` with a reject, and tell subscribers to
     /// dismiss each modal. Idempotent (empties the map).
     private func drainPending(_ session: SessionState, reason: String) {
+        if let sessionID = sessionID(for: session) {
+            clientToolRegistry.cancel(sessionID: sessionID, reason: reason)
+        }
         let approvals = session.pending
         session.pending.removeAll()
         for (id, approval) in approvals {
@@ -3968,6 +4283,10 @@ public actor ServerRuntime {
             question.continuation.resume(returning: nil)
             session.sink.broadcast(.questionResolved(id: id))
         }
+    }
+
+    private func sessionID(for session: SessionState) -> String? {
+        sessions.first(where: { $0.value === session })?.key
     }
 
     /// Whether a turn is currently in flight for `sessionID`.

@@ -328,6 +328,9 @@ public final class EventStore {
         case .oauthRequest, .oauthResolved:
             break   // server-scoped OAuth is owned by the client interaction surface
 
+        case .clientToolRequest, .clientToolResolved:
+            break   // client-tool lifecycle is owned by the remote SDK surface
+
         case .notice(let notice):
             // The two doors, and the rule that picks between them: an error the
             // user has to ACT on becomes a persistent transcript row, because a

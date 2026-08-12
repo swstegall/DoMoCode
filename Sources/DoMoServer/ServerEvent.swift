@@ -185,6 +185,13 @@ public enum ServerEvent: Sendable, Hashable {
     /// Completion of a server-scoped MCP OAuth flow.
     case oauthResolved(id: String, server: String, status: String, error: String?)
 
+    /// A model requested a tool whose implementation belongs to the connected
+    /// client. The client answers over `POST /session/{id}/client-tool`.
+    case clientToolRequest(id: String, sessionID: String, name: String, arguments: JSONValue)
+    /// The client-tool continuation was answered, timed out, or drained by an
+    /// abort/force-clear/shutdown.
+    case clientToolResolved(id: String, name: String, isError: Bool)
+
     /// Projects one runtime event onto the wire, or `nil` when the event carries
     /// nothing a client needs (an assembly frame that is neither a text nor a
     /// reasoning delta — a snapshot boundary the client reconstructs from the
@@ -385,6 +392,8 @@ extension ServerEvent: Codable {
         case mcpChanged = "mcp_changed"
         case oauthRequest = "oauth_request"
         case oauthResolved = "oauth_resolved"
+        case clientToolRequest = "client_tool_request"
+        case clientToolResolved = "client_tool_resolved"
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -510,6 +519,19 @@ extension ServerEvent: Codable {
                 status: try container.decode(String.self, forKey: .status),
                 error: try container.decodeIfPresent(String.self, forKey: .error)
             )
+        case .clientToolRequest:
+            self = .clientToolRequest(
+                id: try container.decode(String.self, forKey: .id),
+                sessionID: try container.decode(String.self, forKey: .sessionID),
+                name: try container.decode(String.self, forKey: .name),
+                arguments: try container.decode(JSONValue.self, forKey: .arguments)
+            )
+        case .clientToolResolved:
+            self = .clientToolResolved(
+                id: try container.decode(String.self, forKey: .id),
+                name: try container.decode(String.self, forKey: .name),
+                isError: try container.decode(Bool.self, forKey: .isError)
+            )
         }
     }
 
@@ -599,6 +621,17 @@ extension ServerEvent: Codable {
             try container.encode(server, forKey: .server)
             try container.encode(status, forKey: .status)
             try container.encodeIfPresent(error, forKey: .error)
+        case .clientToolRequest(let id, let sessionID, let name, let arguments):
+            try container.encode(Kind.clientToolRequest, forKey: .type)
+            try container.encode(id, forKey: .id)
+            try container.encode(sessionID, forKey: .sessionID)
+            try container.encode(name, forKey: .name)
+            try container.encode(arguments, forKey: .arguments)
+        case .clientToolResolved(let id, let name, let isError):
+            try container.encode(Kind.clientToolResolved, forKey: .type)
+            try container.encode(id, forKey: .id)
+            try container.encode(name, forKey: .name)
+            try container.encode(isError, forKey: .isError)
         }
     }
 }

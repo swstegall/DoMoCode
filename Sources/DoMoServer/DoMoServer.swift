@@ -64,6 +64,7 @@ public struct ServerCapabilities: Codable, Sendable, Hashable {
 
 private struct CreateBody: Decodable {
     var resume: String?
+    var clientTools: [ClientToolDefinition]?
 }
 
 /// `POST /session/{id}/prompt` body. `images` reuses ``DoMoLLM/ImageBlock``'s
@@ -100,6 +101,15 @@ private struct PermissionReplyBody: Decodable {
 private struct QuestionReplyBody: Decodable {
     var requestID: String
     var answers: [ServerQuestionAnswer]?
+}
+
+/// `POST /session/{id}/client-tool` body. Images use the same bounded base64
+/// representation as prompt and tool-result messages.
+private struct ClientToolReplyBody: Decodable {
+    var requestID: String
+    var output: String
+    var isError: Bool
+    var images: [ImageBlock]?
 }
 
 private struct ModelBody: Decodable { var modelID: String }
@@ -417,6 +427,7 @@ public struct DoMoServer: Sendable {
                     "mcp-prompts",
                     "skills-route",
                     "oauth-delegation",
+                    "client-tools",
                 ]
                 if !self.options.corsOrigins.isEmpty { capabilities.append("cors") }
                 return try Self.json(ServerCapabilities(
@@ -437,7 +448,10 @@ public struct DoMoServer: Sendable {
         router.post("/session") { request, context in
             try await self.mapErrors {
                 let body = try await Self.optionalBody(CreateBody.self, request)
-                let ref = try await self.runtime.createSession(resume: body?.resume)
+                let ref = try await self.runtime.createSession(
+                    resume: body?.resume,
+                    clientTools: body?.clientTools ?? []
+                )
                 return try Self.json(ref, status: .created)
             }
         }
@@ -1316,6 +1330,24 @@ public struct DoMoServer: Sendable {
             }
         }
 
+        // Answer a model call routed to a client-defined tool. The response is
+        // intentionally `{accepted}` so a slow handler can distinguish a normal
+        // completion from a timeout or an abort that already drained the call.
+        router.post("/session/:id/client-tool") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
+                let body = try await Self.requiredBody(ClientToolReplyBody.self, request)
+                return try Self.json(try await self.runtime.resolveClientTool(
+                    sessionID: id,
+                    requestID: body.requestID,
+                    output: body.output,
+                    isError: body.isError,
+                    images: body.images ?? []
+                ))
+            }
+        }
+
         // The level-triggered companion to the SSE question edge. A reconnecting
         // client uses it to recover an ask that was dropped from the bounded
         // event buffer or arrived while the stream was down.
@@ -1535,6 +1567,8 @@ public struct DoMoServer: Sendable {
             case .sessionClientInvalid(let message):
                 throw HTTPError(.badRequest, message: message)
             case .toolCommandInvalid(let message):
+                throw HTTPError(.badRequest, message: message)
+            case .clientToolInvalid(let message):
                 throw HTTPError(.badRequest, message: message)
             case .mcpUnavailable, .mcpServerNotFound:
                 throw HTTPError(.notFound)
