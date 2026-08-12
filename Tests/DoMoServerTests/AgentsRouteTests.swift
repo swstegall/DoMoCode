@@ -127,7 +127,25 @@ struct AgentsRouteTests {
     func oauthDelegationSurface() async throws {
         let dirs = try Dirs()
         defer { dirs.cleanUp() }
-        let server = makeServer(dirs, workspace: nil)
+        let manager = MCPManager()
+        _ = await manager.connect(
+            servers: ["github": MCPServerConfig(
+                command: [],
+                url: "https://mcp.example.test/mcp",
+                transport: .streamableHTTP,
+                oauth: MCPOAuthConfig(
+                    authorizationEndpoint: "https://auth.example.test/authorize",
+                    tokenEndpoint: "https://auth.example.test/token",
+                    clientId: "public-client"
+                )
+            )],
+            workspaceDirectory: dirs.root.path,
+            oauth: MCPManager.OAuthSetup(
+                configDirectory: dirs.root.path,
+                allowInteractive: false
+            )
+        )
+        let server = makeServer(dirs, workspace: nil, mcpManager: manager)
 
         try await withServer(server) { http, port in
             let capabilities = try await send(http, port, "/capabilities")
@@ -139,6 +157,14 @@ struct AgentsRouteTests {
             let pending = try await send(http, port, "/oauth/pending")
             #expect(pending.status == 200)
             #expect(try JSONDecoder().decode([MCPOAuthPending].self, from: pending.body).isEmpty)
+
+            let config = try await send(http, port, "/mcp/github/oauth/config")
+            #expect(config.status == 200)
+            let oauth = try JSONDecoder().decode(MCPOAuthConfiguration.self, from: config.body)
+            #expect(oauth.serverURL == "https://mcp.example.test/mcp")
+            #expect(oauth.authorizationEndpoint == "https://auth.example.test/authorize")
+            #expect(oauth.tokenEndpoint == "https://auth.example.test/token")
+            #expect(!String(decoding: config.body, as: UTF8.self).contains("accessToken"))
         }
     }
 
@@ -230,7 +256,11 @@ struct AgentsRouteTests {
         let body: Data
     }
 
-    private func makeServer(_ dirs: Dirs, workspace: PromptWorkspace?) -> DoMoServer {
+    private func makeServer(
+        _ dirs: Dirs,
+        workspace: PromptWorkspace?,
+        mcpManager: MCPManager? = nil
+    ) -> DoMoServer {
         let runtime = ServerRuntime(config: .init(
             systemPrompt: "test",
             tools: [],
@@ -240,7 +270,8 @@ struct AgentsRouteTests {
             maxTurns: 1,
             sessionDirectory: FilePath(dirs.sessions.path),
             cwd: dirs.cwd.path,
-            promptWorkspace: workspace
+            promptWorkspace: workspace,
+            mcpManager: mcpManager
         ))
         return DoMoServer(
             runtime: runtime,

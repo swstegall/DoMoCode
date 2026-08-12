@@ -81,6 +81,11 @@ private struct MCPResourceBody: Decodable {
     var uri: String
 }
 
+private struct MCPTokenImportBody: Decodable {
+    var tokens: OAuthTokens
+    var client: OAuthClientRegistration?
+}
+
 /// `POST /session/{id}/permission` body (Phase 8b). `reply` is "once" / "always" /
 /// "reject"; `message` is the optional model-visible reason carried only on reject.
 private struct PermissionReplyBody: Decodable {
@@ -528,6 +533,26 @@ public struct DoMoServer: Sendable {
                 let initiator = Self.clientIdentity(request)?.clientID
                 return try Self.json(await self.runtime.mcpConnect(
                     server: server,
+                    initiator: initiator
+                ))
+            }
+        }
+
+        router.get("/mcp/:server/oauth/config") { _, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                return try Self.json(try await self.runtime.mcpOAuthConfiguration(server: server))
+            }
+        }
+
+        router.post("/mcp/:server/tokens") { request, context in
+            try await self.mapErrors {
+                let server = try context.parameters.require("server")
+                let body = try await Self.requiredBody(MCPTokenImportBody.self, request)
+                let initiator = Self.clientIdentity(request)?.clientID
+                return try Self.json(try await self.runtime.mcpImportOAuthTokens(
+                    server: server,
+                    credential: MCPManager.MCPOAuthTokenImport(tokens: body.tokens, client: body.client),
                     initiator: initiator
                 ))
             }

@@ -253,4 +253,56 @@ struct MCPManagerOAuthWiringTests {
 
         await manager.shutdown()
     }
+
+    @Test("A remote client can inspect OAuth config, import tokens, and reconnect")
+    func remoteTokenImportReconnects() async throws {
+        let scratch = try ScratchDirectory()
+        let authorizations = Recorder<String?>()
+        let server = try await TestHTTPServer.start(
+            router: combinedRouter(mcpAuthorizations: authorizations, issue: "unused-after-import")
+        )
+        defer { server.stop() }
+
+        let serverURL = "\(server.baseURL)/mcp"
+        let manager = MCPManager()
+        let config = MCPServerConfig(
+            command: [],
+            url: serverURL,
+            transport: .streamableHTTP,
+            allowPrivateNetwork: true,
+            oauth: MCPOAuthConfig(
+                authorizationEndpoint: "\(server.baseURL)/authorize",
+                tokenEndpoint: "\(server.baseURL)/token",
+                clientId: "client-remote"
+            )
+        )
+        _ = await manager.connect(
+            servers: ["jira": config],
+            workspaceDirectory: scratch.path,
+            oauth: MCPManager.OAuthSetup(
+                configDirectory: scratch.path,
+                allowInteractive: false,
+                browser: SilentBrowser()
+            )
+        )
+
+        let oauth = try await manager.oauthConfiguration(named: "jira")
+        #expect(oauth.serverURL == serverURL)
+        #expect(oauth.authorizationEndpoint == "\(server.baseURL)/authorize")
+        #expect(oauth.tokenEndpoint == "\(server.baseURL)/token")
+
+        let result = try await manager.importOAuthTokens(
+            named: "jira",
+            credential: MCPManager.MCPOAuthTokenImport(
+                tokens: OAuthTokens(
+                    accessToken: "access-token-imported-000004",
+                    expiresAt: Date().timeIntervalSince1970 + 3600
+                )
+            ),
+            initiator: "remote-sdk"
+        )
+        #expect(result.status == .connected)
+        #expect(authorizations.values.contains("Bearer access-token-imported-000004"))
+        await manager.shutdown()
+    }
 }

@@ -94,6 +94,21 @@ struct OAuthTokenStoreTests {
         #expect(loaded == saved)
     }
 
+    @Test("A remote import uses the same URL-bound atomic store")
+    func importedCredentialRoundTrip() async throws {
+        let scratch = try ScratchDirectory()
+        let serverURL = "https://mcp.example.com/mcp"
+        let saved = makeCredential(serverURL: serverURL, accessToken: "imported-access-token-1234")
+        let store = OAuthTokenStore(directory: scratch.path)
+        _ = try await store.storeCredential(
+            forKey: "jira",
+            serverURL: serverURL,
+            credential: saved
+        )
+        #expect(await store.credential(forKey: "jira", serverURL: serverURL) == saved)
+        #expect(await store.credential(forKey: "jira", serverURL: "https://other.example.com/mcp") == nil)
+    }
+
     @Test("A server-URL change reads as no credential at all")
     func serverURLBinding() async throws {
         let scratch = try ScratchDirectory()

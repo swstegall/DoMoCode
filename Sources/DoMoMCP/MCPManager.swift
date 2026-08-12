@@ -230,6 +230,21 @@ public actor MCPManager {
     public enum MCPManagerError: Error, Sendable, Equatable {
         case serverNotConnected(String)
         case serverNotConfigured(String)
+        case oauthUnavailable(String)
+        case oauthInitiatorMismatch(String)
+    }
+
+    /// The JSON body accepted by the remote OAuth token-import route. The
+    /// server binds the credential to the configured URL and cache key; the
+    /// client-supplied URL is never trusted.
+    public struct MCPOAuthTokenImport: Sendable, Hashable, Codable {
+        public let tokens: OAuthTokens
+        public let client: OAuthClientRegistration?
+
+        public init(tokens: OAuthTokens, client: OAuthClientRegistration? = nil) {
+            self.tokens = tokens
+            self.client = client
+        }
     }
 
     private struct ServerKey: Hashable {
@@ -585,6 +600,79 @@ public actor MCPManager {
                 return flow.pending
             }
             .sorted { $0.id < $1.id }
+    }
+
+    /// Return the configured and discovered non-secret OAuth metadata for one
+    /// remote MCP server. Token and dynamic-client secret material is never
+    /// included in this projection.
+    public func oauthConfiguration(named name: String) async throws -> MCPOAuthConfiguration {
+        guard let config = configuredServers[name] else {
+            throw MCPManagerError.serverNotConfigured(name)
+        }
+        guard let oauthConfig = config.oauth,
+              config.isRemote,
+              let serverURL = config.url,
+              let setup = oauthSetup,
+              let store = oauthStore
+        else {
+            throw MCPManagerError.oauthUnavailable(name)
+        }
+        let provider = oauthProviders[name] ?? MCPOAuthProvider(
+            serverName: name,
+            serverURL: serverURL,
+            config: oauthConfig,
+            dependencies: MCPOAuthDependencies(
+                store: store,
+                browser: setup.browser ?? SystemBrowserLauncher(),
+                clientProvider: { [httpClients] url in httpClients.client(for: url) },
+                log: log,
+                certificateDirectory: setup.configDirectory + "/mcp-oauth",
+                authorizationTimeout: setup.authorizationTimeout
+            )
+        )
+        oauthProviders[name] = provider
+        return await provider.configuration()
+    }
+
+    /// Import a credential acquired by a remote SDK and immediately retry the
+    /// configured MCP connection. A parked server-owned flow may only be
+    /// replaced by the same client that started it.
+    public func importOAuthTokens(
+        named name: String,
+        credential: MCPOAuthTokenImport,
+        initiator: String?
+    ) async throws -> MCPConnectResult {
+        guard let config = configuredServers[name] else {
+            throw MCPManagerError.serverNotConfigured(name)
+        }
+        guard let oauthConfig = config.oauth,
+              config.isRemote,
+              let serverURL = config.url,
+              let store = oauthStore
+        else {
+            throw MCPManagerError.oauthUnavailable(name)
+        }
+        guard !credential.tokens.accessToken.isEmpty else {
+            throw MCPManagerError.oauthUnavailable("OAuth access token is empty.")
+        }
+        if let flow = oauthFlows[name] {
+            guard flow.initiator == initiator else {
+                throw MCPManagerError.oauthInitiatorMismatch(name)
+            }
+            flow.task?.cancel()
+            oauthFlows.removeValue(forKey: name)
+        }
+        let storedCredential = OAuthStoredCredential(
+            serverURL: serverURL,
+            tokens: credential.tokens,
+            client: credential.client
+        )
+        try await store.storeCredential(
+            forKey: oauthConfig.cacheKey ?? name,
+            serverURL: serverURL,
+            credential: storedCredential
+        )
+        return try await connectServer(named: name, initiator: initiator)
     }
 
     /// Start or re-trigger one configured server. Cached/refreshable OAuth is

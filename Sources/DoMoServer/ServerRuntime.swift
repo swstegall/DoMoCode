@@ -963,6 +963,38 @@ public actor ServerRuntime {
         }
     }
 
+    public func mcpOAuthConfiguration(server: String) async throws -> MCPOAuthConfiguration {
+        guard let manager = config.mcpManager else { throw ServerRuntimeError.mcpUnavailable }
+        do {
+            return try await manager.oauthConfiguration(named: server)
+        } catch MCPManager.MCPManagerError.serverNotConfigured {
+            throw ServerRuntimeError.mcpServerNotFound
+        } catch MCPManager.MCPManagerError.oauthUnavailable {
+            throw ServerRuntimeError.mcpUnavailable
+        }
+    }
+
+    public func mcpImportOAuthTokens(
+        server: String,
+        credential: MCPManager.MCPOAuthTokenImport,
+        initiator: String?
+    ) async throws -> MCPConnectResult {
+        guard let manager = config.mcpManager else { throw ServerRuntimeError.mcpUnavailable }
+        do {
+            return try await manager.importOAuthTokens(
+                named: server,
+                credential: credential,
+                initiator: initiator
+            )
+        } catch MCPManager.MCPManagerError.serverNotConfigured {
+            throw ServerRuntimeError.mcpServerNotFound
+        } catch MCPManager.MCPManagerError.oauthInitiatorMismatch {
+            throw ServerRuntimeError.sessionClientDenied
+        } catch MCPManager.MCPManagerError.oauthUnavailable(let message) {
+            throw ServerRuntimeError.sessionClientInvalid(message)
+        }
+    }
+
     public func mcpLogout(server: String) async throws -> MCPLogoutResult {
         guard let manager = config.mcpManager else { throw ServerRuntimeError.mcpUnavailable }
         do {

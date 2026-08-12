@@ -69,6 +69,67 @@ public struct MCPOAuthDependencies: Sendable {
     }
 }
 
+/// The discovered authorization-server metadata that is safe to hand to a
+/// remote SDK. It contains endpoints and capability hints only; no token,
+/// client secret, verifier, or stored client credential crosses this boundary.
+public struct MCPOAuthConfiguration: Sendable, Hashable, Codable {
+    public let serverURL: String
+    public let authorizationEndpoint: String?
+    public let tokenEndpoint: String?
+    public let registrationEndpoint: String?
+    public let issuer: String?
+    public let codeChallengeMethodsSupported: [String]?
+    public let scopesSupported: [String]?
+    public let clientId: String?
+    public let scope: String?
+    public let resource: String?
+    public let redirectURI: String?
+    public let cacheKey: String?
+
+    public init(
+        serverURL: String,
+        authorizationEndpoint: String? = nil,
+        tokenEndpoint: String? = nil,
+        registrationEndpoint: String? = nil,
+        issuer: String? = nil,
+        codeChallengeMethodsSupported: [String]? = nil,
+        scopesSupported: [String]? = nil,
+        clientId: String? = nil,
+        scope: String? = nil,
+        resource: String? = nil,
+        redirectURI: String? = nil,
+        cacheKey: String? = nil
+    ) {
+        self.serverURL = serverURL
+        self.authorizationEndpoint = authorizationEndpoint
+        self.tokenEndpoint = tokenEndpoint
+        self.registrationEndpoint = registrationEndpoint
+        self.issuer = issuer
+        self.codeChallengeMethodsSupported = codeChallengeMethodsSupported
+        self.scopesSupported = scopesSupported
+        self.clientId = clientId
+        self.scope = scope
+        self.resource = resource
+        self.redirectURI = redirectURI
+        self.cacheKey = cacheKey
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case serverURL = "serverUrl"
+        case authorizationEndpoint
+        case tokenEndpoint
+        case registrationEndpoint
+        case issuer
+        case codeChallengeMethodsSupported
+        case scopesSupported
+        case clientId
+        case scope
+        case resource
+        case redirectURI = "redirectUri"
+        case cacheKey
+    }
+}
+
 public actor MCPOAuthProvider {
     /// The loopback default used when no redirect URI is configured — the
     /// RFC 8252 plain-HTTP shape every surveyed client registers.
@@ -143,6 +204,33 @@ public actor MCPOAuthProvider {
             rejectedAccessToken: rejected,
             allowInteractive: allowInteractive,
             wwwAuthenticate: wwwAuthenticate
+        )
+    }
+
+    /// Return the non-secret OAuth configuration needed by a remote SDK to
+    /// complete its own browser flow. Discovery is attempted when explicit
+    /// endpoints are incomplete; a discovery failure still returns the safe
+    /// configured block so callers can report the actionable omission.
+    public func configuration() async -> MCPOAuthConfiguration {
+        let discovered: OAuthServerMetadata?
+        if config.authorizationEndpoint != nil, config.tokenEndpoint != nil {
+            discovered = nil
+        } else {
+            discovered = try? await resolveEndpoints(wwwAuthenticate: nil, allowNetwork: true)
+        }
+        return MCPOAuthConfiguration(
+            serverURL: serverURL,
+            authorizationEndpoint: config.authorizationEndpoint ?? discovered?.authorizationEndpoint,
+            tokenEndpoint: config.tokenEndpoint ?? discovered?.tokenEndpoint,
+            registrationEndpoint: discovered?.registrationEndpoint,
+            issuer: discovered?.issuer,
+            codeChallengeMethodsSupported: discovered?.codeChallengeMethodsSupported,
+            scopesSupported: discovered?.scopesSupported,
+            clientId: config.clientId,
+            scope: config.scope ?? discoveredScopeHint,
+            resource: config.resource,
+            redirectURI: config.redirectUri,
+            cacheKey: cacheKey
         )
     }
 

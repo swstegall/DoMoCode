@@ -149,6 +149,19 @@ public actor OAuthTokenStore {
         }
     }
 
+    /// Import a complete credential supplied by a remote client. The store
+    /// still owns the URL binding, atomic write, and redaction registration;
+    /// callers cannot accidentally persist a credential for a different MCP
+    /// endpoint by copying the value's `serverURL`.
+    @discardableResult
+    public func storeCredential(
+        forKey key: String,
+        serverURL: String,
+        credential: OAuthStoredCredential
+    ) async throws -> OAuthStoredCredential? {
+        try await mutate(forKey: key, serverURL: serverURL) { _ in credential }
+    }
+
     /// Drops the tokens for `key` (keeping any client registration): the
     /// response to `invalid_grant`, where the identity is fine but the grant
     /// is dead.
