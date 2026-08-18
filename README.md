@@ -396,7 +396,7 @@ what still needs a protocol, state, or layout change.
 | LiteLLM model pricing and session cost | [`ModelOverride`](Sources/DoMoLLM/ModelOverride.swift) supplies manual rates, [`Usage`](Sources/DoMoLLM/Message.swift) can calculate per-message cost, and the client reads a gateway response-cost header when one exists. [`ModelCatalog`](Sources/DoMoLLM/ModelCatalog.swift) only decodes model IDs; there is no price snapshot or per-model breakdown for a session. | Fetch and parse LiteLLM model metadata at session start, merge it with explicit overrides, pass the selected model’s rates through every stream—including model switches and compaction—and aggregate per-call usage/cost by the model that answered. |
 | Collapse/resurface the left pane | [`ClientLayout`](Sources/DoMoClient/ClientLayout.swift) always allocates a fixed sidebar and divider; `ClientApp` has no collapsed state or global shortcut. | Add a global, conflict-aware toggle (default `Ctrl+H` or a configured alternative), hide the sidebar and divider from layout/hit testing, preserve focus/selection, and advertise the restored shortcut. |
 | Question text visibility | [`QuestionDialog`](Sources/DoMoClient/Dialog.swift) collapses the header, question, and option descriptions to one line and clips them; its current test intentionally asserts clipping. | Wrap sanitized prose at the dialog body width, grow within the overlay budget, and add vertical scrolling or a readable page model for prompts/options that exceed the available height. |
-| YOLO permissions | `--yolo`/`--dangerously-allow-all` already auto-approves `ask` decisions in headless `-p` mode through [`PermissionSetup`](Sources/DoMoCLI/PermissionSetup.swift). The server-backed interactive path still parks on [`PermissionEngine`](Sources/DoMoPermissions/PermissionEngine.swift) and shows the approval dialog. | Propagate an explicit opt-in to interactive, inline, and server-owned sessions; convert only `ask` to a one-call approval, keep hard denies, read-only mode restrictions, secret-file guards, and sandbox requirements intact, and show a persistent warning. |
+| YOLO permissions | `--yolo`/`--dangerously-allow-all` already auto-approves `ask` decisions in headless `-p` mode through [`PermissionSetup`](Sources/DoMoCLI/PermissionSetup.swift). The server-backed TUI paths—both inline and full-screen—still park on [`PermissionEngine`](Sources/DoMoPermissions/PermissionEngine.swift) and show the approval dialog. | Propagate an explicit opt-in to both TUI surfaces and server-owned sessions; convert only `ask` to a one-call approval, keep hard denies, read-only mode restrictions, secret-file guards, and sandbox requirements intact, and show a persistent warning. |
 
 ### Completed phases
 
@@ -1025,12 +1025,13 @@ classifier and all four insertion rules covered by tests.
   cell-oracle, resize, Unicode-width, multi-question, and PTY coverage. Verify
   that answers and keyboard navigation are unchanged by the extra rows.
 
-#### Phase 40 — Interactive YOLO permission policy — P0 — planned
+#### Phase 40 — TUI and server YOLO permission policy — P0 — planned
 
 - [ ] Extend the existing `--yolo`/`--dangerously-allow-all` opt-in beyond
-  headless `-p` runs to the inline client, full-screen client, and server-owned
-  sessions. For `--url`, the remote server remains authoritative; a client flag
-  must not change a policy it does not own.
+  headless `-p` runs to both TUI surfaces—the inline TUI and the full-screen
+  alternate-screen TUI—as well as server-owned sessions. For `--url`, the
+  remote server remains authoritative; a client flag must not change a policy
+  it does not own.
 - [ ] Implement YOLO as an `ask`-to-`once` decision at the permission boundary,
   not as a blanket rewrite of the ruleset. Hard `deny`, Ask/Plan/Review mode
   restrictions, `.env`/secret-file guards, project tightening, OS sandbox
@@ -1122,9 +1123,9 @@ rules.
 
 `--yolo` is currently a headless-only flag. It makes an otherwise interactive
 permission request fail-open for that one tool call when used with `-p`; it
-does not yet suppress the approval dialog in the inline or full-screen clients.
-Phase 40 extends the opt-in while preserving explicit denials and sandbox
-boundaries.
+does not yet suppress the approval dialog in either TUI surface (inline or
+full-screen). Phase 40 extends the opt-in while preserving explicit denials
+and sandbox boundaries.
 
 ### Remote MCP servers and OAuth
 
