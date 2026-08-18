@@ -175,7 +175,13 @@ public final class EventStore {
 
     /// Replace the session list.
     public func setSessions(_ sessions: [SessionSummary]) {
-        self.sessions = sessions
+        // ISO-8601 header timestamps sort lexically. The sidebar is a navigator,
+        // so its natural reading order is newest activity first; keeping the
+        // invariant here also makes bootstrap and every later refresh agree.
+        self.sessions = sessions.sorted {
+            if $0.timestamp != $1.timestamp { return $0.timestamp > $1.timestamp }
+            return $0.id > $1.id
+        }
         onChange?()
     }
 

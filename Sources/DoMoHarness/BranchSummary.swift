@@ -50,7 +50,7 @@ private func branchMessage(from entry: SessionTreeEntry) -> Message? {
         return message
     case .branchSummary(let branch): return .user(UserMessage(content: [.text(branch.summary)]))
     case .compaction(let compaction): return .user(UserMessage(content: [.text(compaction.summary)]))
-    case .modelChange, .label, .sessionInfo, .sessionStart,
+    case .modelChange, .agentChange, .label, .sessionInfo, .sessionStart,
         .workspaceCheckpoint, .historyAction, .leaf, .subagent, .recovery: return nil
     }
 }

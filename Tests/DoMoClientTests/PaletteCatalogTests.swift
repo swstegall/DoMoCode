@@ -213,6 +213,16 @@ struct PaletteCatalogTests {
         #expect(decodedBare == PaletteSelection.insert(name: "explore", requiresSlash: false))
     }
 
+    @Test("Agent rows select a profile and the base row clears it")
+    func agentSelectionRoundTrip() throws {
+        let selected = PaletteCatalog.encode(.selectAgent("reviewer"))
+        let cleared = PaletteCatalog.encode(.clearAgent)
+        #expect(PaletteCatalog.decode(selected) == .selectAgent("reviewer"))
+        #expect(PaletteCatalog.decode(cleared) == .clearAgent)
+        #expect(PaletteCatalog.decode("agent:") == nil)
+        #expect(PaletteCatalog.decode("agent:base") == .clearAgent)
+    }
+
     @Test("A name containing colons survives the encoding")
     func colonsInNamesSurvive() throws {
         // An MCP server picks its own tool names; `server:tool` is a shape they

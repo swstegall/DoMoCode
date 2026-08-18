@@ -686,7 +686,7 @@ private func compactionMessage(from entry: SessionTreeEntry) -> Message? {
     switch entry.payload {
     case .message(let message): return message
     case .branchSummary(let branch): return .user(UserMessage(content: [.text(branch.summary)]))
-    case .compaction, .modelChange, .label, .sessionInfo, .sessionStart,
+    case .compaction, .modelChange, .agentChange, .label, .sessionInfo, .sessionStart,
         .workspaceCheckpoint, .historyAction, .leaf, .subagent, .recovery: return nil
     }
 }

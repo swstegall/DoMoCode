@@ -43,6 +43,11 @@ public enum HTMLTranscriptExporter {
                     title: "Model change",
                     body: "<code>\(htmlEscape(provider))/\(htmlEscape(modelId))</code>"
                 ))
+            case .agentChange(let name) where options.includeMetadata:
+                sections.append(metadataSection(
+                    title: "Agent change",
+                    body: textHTML(name ?? "base")
+                ))
             case .compaction(let compaction) where options.includeMetadata:
                 sections.append(metadataSection(
                     title: "Compaction",

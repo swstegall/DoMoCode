@@ -437,6 +437,7 @@ public struct LiteLLMClient: Sendable {
         reasoningEffort: ReasoningEffort? = nil,
         toolChoice: WireToolChoice? = nil,
         rates: ModelCostRates? = nil,
+        ratesForModel: (@Sendable (String) -> ModelCostRates?)? = nil,
         onResponse: (@Sendable (ResponseMetadata) -> Void)? = nil
     ) -> AsyncThrowingStream<AssemblyEvent, any Error> {
         let built: (request: HTTPRequest, body: [UInt8])
@@ -461,6 +462,7 @@ public struct LiteLLMClient: Sendable {
                     body: built.body,
                     model: model,
                     rates: rates,
+                    ratesForModel: ratesForModel,
                     onResponse: onResponse,
                     continuation: continuation
                 )
@@ -475,6 +477,7 @@ public struct LiteLLMClient: Sendable {
         body: [UInt8],
         model: String,
         rates: ModelCostRates?,
+        ratesForModel: (@Sendable (String) -> ModelCostRates?)?,
         onResponse: (@Sendable (ResponseMetadata) -> Void)?,
         continuation: AsyncThrowingStream<AssemblyEvent, any Error>.Continuation
     ) async {
@@ -626,6 +629,9 @@ public struct LiteLLMClient: Sendable {
             // A 2xx commits us to a stream: no more retries. A failure now keeps
             // whatever content arrived rather than replaying it.
             let metadata = ResponseMetadata(head: response.head)
+            if let modelID = metadata.modelID, let responseRates = ratesForModel?(modelID) {
+                assembly.setRates(responseRates)
+            }
             // Stamped into the assembler *before* the callback fires, and before
             // a single body byte is read. Two things fall out of that ordering.
             // A turn that dies mid-stream still reports what it was billed,
@@ -774,6 +780,7 @@ public struct LiteLLMClient: Sendable {
         reasoningEffort: ReasoningEffort? = nil,
         toolChoice: WireToolChoice? = nil,
         rates: ModelCostRates? = nil,
+        ratesForModel: (@Sendable (String) -> ModelCostRates?)? = nil,
         onResponse: (@Sendable (ResponseMetadata) -> Void)? = nil,
         onRetry: (@Sendable (RetryNotice) -> Void)? = nil,
         onRecovery: (@Sendable (RecoveryEnvelope) -> Void)? = nil
@@ -926,10 +933,13 @@ public struct LiteLLMClient: Sendable {
             }
             // The billed cost rides on the message's usage rather than only on
             // `onResponse`, so a caller that passed no callback still gets it.
+            let responseRates = metadata.modelID.flatMap { ratesForModel?($0) }
+                ?? decoded.model.flatMap { ratesForModel?($0) }
+                ?? rates
             let message = AssistantMessage(
                 response: decoded,
                 model: model,
-                rates: rates,
+                rates: responseRates,
                 reportedCost: metadata.responseCost
             )
             if let failure = message.failure {
@@ -977,6 +987,48 @@ public struct LiteLLMClient: Sendable {
         } catch {
             throw DoMoError(.malformedResponse, "Could not decode /models response", cause: error)
         }
+    }
+
+    /// Reads the optional LiteLLM pricing snapshot.
+    ///
+    /// Deployments differ on whether the client base URL already ends in
+    /// `/v1`: the documented endpoint is commonly `/model/info`, while some
+    /// gateways expose `/v1/model/info`. A 404/405 on the first candidate is
+    /// therefore followed by the other spelling. Authentication and timeout
+    /// handling are identical to model discovery, and callers intentionally
+    /// treat failure as non-fatal because pricing is an enhancement to a run.
+    @concurrent
+    public func listModelPricing() async throws -> ModelPricingCatalog {
+        var lastError: DoMoError?
+        for url in try modelInfoURLs() {
+            var request = HTTPRequest(method: .get, url: url)
+            applyHeaders(&request, accept: "application/json", contentType: nil)
+            let response = try await transport.execute(
+                request: request,
+                body: nil,
+                timeout: configuration.timeout
+            )
+            let bodyText = await Self.collectBody(response.body, cap: Self.responseBodyByteCap)
+            let status = response.head.status.code
+            if status == 404 || status == 405 {
+                lastError = Self.classify(status: status, head: response.head, body: bodyText)
+                continue
+            }
+            guard (200..<300).contains(status) else {
+                throw Self.classify(status: status, head: response.head, body: bodyText)
+            }
+            do {
+                return ModelPricingCatalog(entries: try ModelInfoResponse(data: Data(bodyText.utf8)).rows)
+            } catch {
+                throw DoMoError(.malformedResponse, "Could not decode /model/info response", cause: error)
+            }
+        }
+        // A gateway that predates `/model/info` is a normal deployment shape,
+        // not an operator error. Treat the two not-found candidates as an empty
+        // catalog so startup does not emit a warning or consume a model turn;
+        // authentication, transport, and malformed responses still throw.
+        if lastError != nil { return .empty }
+        throw DoMoError(.provider(status: nil, isRetryable: false), "LiteLLM pricing endpoint was unavailable")
     }
 
     // MARK: Request building
@@ -1031,6 +1083,35 @@ public struct LiteLLMClient: Sendable {
             )
         }
         return url
+    }
+
+    private func modelInfoURLs() throws -> [URL] {
+        var base = configuration.baseURL
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let baseURL = URL(string: base), var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw DoMoError(
+                .configuration,
+                "Invalid base URL: \(Redaction.diagnostic(configuration.baseURL))"
+            )
+        }
+
+        let basePath = components.path.isEmpty ? "" : components.path
+        var paths: [String]
+        if basePath == "/v1" || basePath.hasSuffix("/v1") {
+            let root = String(basePath.dropLast(3))
+            let rootPath = root.isEmpty ? "" : root
+            paths = [rootPath + "/model/info", basePath + "/model/info"]
+        } else {
+            paths = [basePath + "/model/info", basePath + "/v1/model/info"]
+        }
+
+        var urls: [URL] = []
+        for path in paths {
+            components.path = path.isEmpty ? "/" : path
+            guard let url = components.url, !urls.contains(url) else { continue }
+            urls.append(url)
+        }
+        return urls
     }
 
     private func applyHeaders(_ request: inout HTTPRequest, accept: String, contentType: String?) {

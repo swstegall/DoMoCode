@@ -222,6 +222,9 @@ public struct SessionStatus: Sendable, Codable, Hashable {
     public var mode: String?
     /// The selected inert agent profile, when reported.
     public var agent: String?
+    /// Whether this runtime bypasses `ask` permission prompts. `deny` rules
+    /// still win; `nil` keeps older server payloads compatible.
+    public var yolo: Bool?
 
     /// - Parameter accounting: Defaulted and **last**, so every existing
     ///   construction of this type keeps compiling untouched.
@@ -236,7 +239,8 @@ public struct SessionStatus: Sendable, Codable, Hashable {
         steeringMode: String? = nil,
         pendingQuestionIDs: [String]? = nil,
         mode: String? = nil,
-        agent: String? = nil
+        agent: String? = nil,
+        yolo: Bool? = nil
     ) {
         self.sessionID = sessionID
         self.running = running
@@ -249,6 +253,7 @@ public struct SessionStatus: Sendable, Codable, Hashable {
         self.steeringMode = steeringMode
         self.mode = mode
         self.agent = agent
+        self.yolo = yolo
     }
 }
 
@@ -617,24 +622,41 @@ public actor ServerRuntime {
         public let ruleset: Ruleset
         public let factory: PermissionRequestFactory
         public let persist: @Sendable (Ruleset) async -> Void
+        /// Automatically answers an `ask` decision with `.once`. Explicit deny
+        /// rules are evaluated before this prompt and remain authoritative.
+        public let yolo: Bool
         /// Rebuilds the mode-specific policy for a session's current mode and
         /// exact plan path. The base ruleset remains useful for older embedders.
         public let rulesetForMode: (@Sendable (AgentMode, String) -> Ruleset)?
+        /// Rebuilds the complete policy after a persistent profile selection.
+        /// The resolver owns project tightening, so a selected profile cannot
+        /// widen a project deny or a read-only mode boundary.
+        public let rulesetForProfile: (@Sendable (AgentMode, String, Ruleset) -> Ruleset)?
         /// The deny-only portion inherited by a child session. Allows and
         /// session approvals deliberately do not cross the parent boundary.
         public let inheritedDenyRulesForMode: (@Sendable (AgentMode, String) -> Ruleset)?
+        /// The profile-neutral base ruleset used when a session changes its
+        /// named profile. `ruleset` remains the startup projection for older
+        /// embedders and startup-time tool visibility.
+        public let baseRuleset: Ruleset?
         public init(
             ruleset: Ruleset,
             factory: PermissionRequestFactory,
             persist: @escaping @Sendable (Ruleset) async -> Void,
             rulesetForMode: (@Sendable (AgentMode, String) -> Ruleset)? = nil,
-            inheritedDenyRulesForMode: (@Sendable (AgentMode, String) -> Ruleset)? = nil
+            inheritedDenyRulesForMode: (@Sendable (AgentMode, String) -> Ruleset)? = nil,
+            rulesetForProfile: (@Sendable (AgentMode, String, Ruleset) -> Ruleset)? = nil,
+            baseRuleset: Ruleset? = nil,
+            yolo: Bool = false
         ) {
             self.ruleset = ruleset
             self.factory = factory
             self.persist = persist
+            self.yolo = yolo
             self.rulesetForMode = rulesetForMode
+            self.rulesetForProfile = rulesetForProfile
             self.inheritedDenyRulesForMode = inheritedDenyRulesForMode
+            self.baseRuleset = baseRuleset
         }
     }
 
@@ -656,6 +678,8 @@ public actor ServerRuntime {
         /// Resolves a selected alias to the concrete stream function owned by the
         /// CLI's LLM client.
         public var modelStreamFactory: (@Sendable (String) -> AgentStreamFn)?
+        /// Resolves a profile's model and reasoning settings to its stream.
+        public var agentStreamFactory: (@Sendable (AgentProfile) -> AgentStreamFn)?
         /// Optional one-shot diagnostic resolver. It must use a bounded client,
         /// no mutation-capable tools, and never call the agent loop recursively.
         public var recoveryDiagnostic: RecoveryDiagnosticFn?
@@ -820,6 +844,7 @@ public actor ServerRuntime {
             modelOptions: [ModelOption] = [],
             modelDiscovery: (@Sendable () async throws -> [ModelOption])? = nil,
             modelStreamFactory: (@Sendable (String) -> AgentStreamFn)? = nil,
+            agentStreamFactory: (@Sendable (AgentProfile) -> AgentStreamFn)? = nil,
             recoveryDiagnostic: RecoveryDiagnosticFn? = nil,
             recoveryDiagnosticTools: [any AgentTool] = [],
             modelContextWindow: (@Sendable (String) -> Int?)? = nil,
@@ -855,6 +880,7 @@ public actor ServerRuntime {
             self.modelOptions = modelOptions
             self.modelDiscovery = modelDiscovery
             self.modelStreamFactory = modelStreamFactory
+            self.agentStreamFactory = agentStreamFactory
             self.recoveryDiagnostic = recoveryDiagnostic
             self.recoveryDiagnosticTools = recoveryDiagnosticTools
             self.modelContextWindow = modelContextWindow
@@ -967,6 +993,37 @@ public actor ServerRuntime {
         }
     }
 
+    /// Synchronously readable persistent profile selection. The mode and agent
+    /// are separate levers: selecting a profile may change the next mode, while
+    /// clearing it must return to the base mode without losing the model choice.
+    private final class AgentSelectionState: Sendable {
+        private struct Value: Sendable {
+            var name: String?
+            var recorded: Bool
+        }
+
+        private let value: Mutex<Value>
+
+        init(_ name: String?, recorded: Bool = false) {
+            value = Mutex(Value(name: name, recorded: recorded))
+        }
+
+        func get() -> String? {
+            value.withLock { $0.name }
+        }
+
+        var isRecorded: Bool {
+            value.withLock { $0.recorded }
+        }
+
+        func set(_ name: String?) {
+            value.withLock {
+                $0.name = name
+                $0.recorded = true
+            }
+        }
+    }
+
     /// One live session's mutable state. A reference type held only inside the
     /// actor, so its `runTask` mutation is serialized by the actor, not shared.
     ///
@@ -980,6 +1037,7 @@ public actor ServerRuntime {
         let sink: BroadcastEventSink
         let steeringBox: SteeringBox
         let modeState: AgentModeState
+        let agentSelectionState: AgentSelectionState
         let depth: Int
         let parentSessionID: String?
         let taskID: String?
@@ -1020,6 +1078,7 @@ public actor ServerRuntime {
             sink: BroadcastEventSink,
             steeringBox: SteeringBox,
             modeState: AgentModeState,
+            agentSelectionState: AgentSelectionState,
             depth: Int = 0,
             parentSessionID: String? = nil,
             taskID: String? = nil,
@@ -1031,6 +1090,7 @@ public actor ServerRuntime {
             self.sink = sink
             self.steeringBox = steeringBox
             self.modeState = modeState
+            self.agentSelectionState = agentSelectionState
             self.depth = depth
             self.parentSessionID = parentSessionID
             self.taskID = taskID
@@ -2692,6 +2752,7 @@ public actor ServerRuntime {
         sink: BroadcastEventSink,
         steeringBox: SteeringBox,
         modeState: AgentModeState,
+        agentSelectionState: AgentSelectionState,
         depth: Int = 0,
         parentSessionID: String? = nil,
         taskID: String? = nil,
@@ -2706,6 +2767,7 @@ public actor ServerRuntime {
             sink: sink,
             steeringBox: steeringBox,
             modeState: modeState,
+            agentSelectionState: agentSelectionState,
             depth: depth,
             parentSessionID: parentSessionID,
             taskID: taskID,
@@ -2726,6 +2788,7 @@ public actor ServerRuntime {
         sessionID: String,
         steeringBox: SteeringBox,
         modeState: AgentModeState,
+        agentSelectionState: AgentSelectionState,
         permissionSessionID: String? = nil,
         derivedPermissions: Bool = false,
         profileRules: Ruleset = [],
@@ -2744,28 +2807,45 @@ public actor ServerRuntime {
             sessionID: sessionID
         )
         let promptWorkspace = promptWorkspaceOverride ?? config.promptWorkspace
+        let profileForName: @Sendable (String?) -> AgentProfile? = { name in
+            guard let name else { return nil }
+            return promptWorkspace?.agents.profile(named: name)
+                ?? config.promptWorkspace?.agents.profile(named: name)
+                ?? AgentProfileRegistry.builtIn.profile(named: name)
+        }
         let clientToolRegistry = self.clientToolRegistry
         let registeredClientTools = clientToolRegistry.tools(for: sessionID)
         let rulesetForCurrentMode: @Sendable () -> Ruleset = {
             guard let permissions else { return [] }
             let mode = modeState.get()
+            let selectedRules = profileForName(agentSelectionState.get())?.permissionRules ?? []
+            let baseRules = permissions.rulesetForMode?(mode, planPath)
+                ?? permissions.baseRuleset
+                ?? permissions.ruleset
             if derivedPermissions {
                 let childPolicy = AgentModePolicy.rules(
                     for: mode,
                     planPath: planPath,
-                    additional: AgentModePolicy.denyOnly(profileRules)
+                    additional: AgentModePolicy.denyOnly(profileRules + selectedRules)
                 )
                 let inherited = permissions.inheritedDenyRulesForMode?(mode, planPath)
                     ?? permissions.ruleset.filter { $0.action == .deny }
-                return merge(childPolicy, inherited)
+                return merge(childPolicy, inherited, AgentModePolicy.denyOnly(selectedRules))
             }
-            return permissions.rulesetForMode?(mode, planPath) ?? permissions.ruleset
+            if let resolver = permissions.rulesetForProfile {
+                return resolver(mode, planPath, selectedRules)
+            }
+            return merge(
+                baseRules,
+                selectedRules
+            )
         }
         if let permissions {
             let engine = PermissionEngine(
                 rulesetProvider: rulesetForCurrentMode,
                 prompt: { [weak self] request in
                     guard let self else { return .reject(message: "The server is shutting down.") }
+                    if permissions.yolo { return .once }
                     return await self.awaitPermission(request)
                 },
                 persist: permissions.persist
@@ -2777,7 +2857,15 @@ public actor ServerRuntime {
         var systemPromptForPrompt: (@Sendable (String) -> String)?
         if let workspace = promptWorkspace {
             systemPromptForPrompt = { prompt in
-                let base = workspace.systemPrompt(for: prompt)
+                let selected = profileForName(agentSelectionState.get())
+                let selectedWorkspace = PromptWorkspace(
+                    baseSystemPrompt: workspace.baseSystemPrompt,
+                    commands: workspace.commands,
+                    skills: workspace.skills,
+                    agents: workspace.agents,
+                    activeAgent: selected
+                )
+                let base = selectedWorkspace.systemPrompt(for: prompt)
                 let mode = modeState.get()
                 guard AgentModePolicy.isReadOnly(mode) else { return base }
                 return base + "\n\n" + AgentModePolicy.systemPrompt(mode: mode, planPath: planPath)
@@ -2785,9 +2873,11 @@ public actor ServerRuntime {
         }
         let filterTools: @Sendable ([any AgentTool]) -> [any AgentTool] = { tools in
             let mode = modeState.get()
+            let selectedAllowlist = profileForName(agentSelectionState.get())?.toolAllowlist.map(Set.init)
+                ?? toolAllowlist
             let hidden = disabledTools(tools.map(\.definition.name), rulesetForCurrentMode())
             return tools.filter { tool in
-                (toolAllowlist == nil || toolAllowlist?.contains(tool.definition.name) == true)
+                (selectedAllowlist == nil || selectedAllowlist?.contains(tool.definition.name) == true)
                     && (mode == .plan || tool.definition.name != "plan_exit")
                     && (mode != .build || tool.definition.name != "task")
                     && !hidden.contains(tool.definition.name)
@@ -2808,7 +2898,13 @@ public actor ServerRuntime {
         let promptForTools: (@Sendable (String, [String]) -> String)?
         if let configured = config.systemPromptForPromptAndTools {
             promptForTools = { prompt, names in
-                let base = configured(prompt, names)
+                var base = configured(prompt, names)
+                if let selected = profileForName(agentSelectionState.get()),
+                   !selected.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    base += "\n\n<agent name=\"\(selected.name)\">\n"
+                        + selected.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        + "\n</agent>"
+                }
                 let mode = modeState.get()
                 guard AgentModePolicy.isReadOnly(mode) else { return base }
                 return base + "\n\n" + AgentModePolicy.systemPrompt(mode: mode, planPath: planPath)
@@ -2819,6 +2915,9 @@ public actor ServerRuntime {
         var configuration = AgentHarness.Configuration(
             systemPrompt: promptWorkspace?.baseSystemPrompt ?? config.systemPrompt,
             systemPromptForPrompt: systemPromptForPrompt,
+            defaultAgentName: agentSelectionState.get(),
+            agentProfileForName: { name in profileForName(name) },
+            agentStreamFactory: config.agentStreamFactory,
             tools: filterTools(config.tools + registeredClientTools),
             getTools: toolsForTurn,
             systemPromptForPromptAndTools: promptForTools,
@@ -3029,6 +3128,13 @@ public actor ServerRuntime {
             ?? AgentProfileRegistry.builtIn.profile(named: name)
     }
 
+    /// A built-in mode profile is the base mode, not a persistent named-agent
+    /// selection. Custom profiles retain their name in the status line.
+    private func configuredAgentName() -> String? {
+        guard let name = config.agentProfile?.name else { return nil }
+        return AgentMode(rawValue: name.lowercased()) == nil ? name : nil
+    }
+
     private func subagentWorkspace(named name: String?) -> PromptWorkspace? {
         guard let profile = subagentProfile(named: name) else { return config.promptWorkspace }
         if let workspace = config.promptWorkspace {
@@ -3062,6 +3168,7 @@ public actor ServerRuntime {
         let harness: AgentHarness
         let steeringBox: SteeringBox
         let modeState: AgentModeState
+        let agentSelectionState: AgentSelectionState
         let sink: BroadcastEventSink
         let id: String
         var depth = 0
@@ -3109,12 +3216,17 @@ public actor ServerRuntime {
             let profileName = latestEvent?.agent ?? "explore"
             let profile = child ? subagentProfile(named: profileName) : nil
             modeState = AgentModeState(child ? (latestEvent?.mode ?? .plan) : config.agentMode)
+            agentSelectionState = AgentSelectionState(child ? profileName : configuredAgentName())
+            if !child {
+                agent = configuredAgentName()
+            }
             harness = try await Self.reopen(
                 path: path,
                 configuration: harnessConfiguration(
                     sessionID: resumedID,
                     steeringBox: steeringBox,
                     modeState: modeState,
+                    agentSelectionState: agentSelectionState,
                     permissionSessionID: child ? parentSessionID : nil,
                     derivedPermissions: child,
                     profileRules: profile?.permissionRules ?? [],
@@ -3135,13 +3247,16 @@ public actor ServerRuntime {
                 reservedNames: Set(config.tools.map { $0.definition.name })
             )
             modeState = AgentModeState(config.agentMode)
+            agentSelectionState = AgentSelectionState(configuredAgentName())
+            agent = configuredAgentName()
             harness = try AgentHarness.start(
                 cwd: config.cwd,
                 sessionDirectory: config.sessionDirectory,
                 configuration: harnessConfiguration(
                     sessionID: id,
                     steeringBox: steeringBox,
-                    modeState: modeState
+                    modeState: modeState,
+                    agentSelectionState: agentSelectionState
                 ),
                 sessionID: id
             )
@@ -3151,11 +3266,19 @@ public actor ServerRuntime {
         // check: a concurrent resume of the same id must not replace a live session
         // and strand its run and its subscribers. `harness` is dropped unused.
         if sessions[id] != nil { return SessionRef(id: id, path: path.string) }
+        if await harness.hasAgentSelection {
+            agentSelectionState.set(await harness.currentAgent)
+        }
+        if let selected = await harness.currentAgent,
+           let profile = subagentProfile(named: selected) {
+            modeState.set(profile.mode)
+        }
         sessions[id] = makeState(
             harness: harness,
             sink: sink,
             steeringBox: steeringBox,
             modeState: modeState,
+            agentSelectionState: agentSelectionState,
             depth: depth,
             parentSessionID: parentSessionID,
             taskID: taskID,
@@ -3175,20 +3298,30 @@ public actor ServerRuntime {
         // steering box are both bound to the parent. Re-open the forked file with
         // fresh per-session state even when permissions are disabled.
         let steeringBox = makeSteeringBox()
-        let modeState = AgentModeState(config.agentMode)
+        let inheritedAgent = await session.harness.currentAgent
+        let modeState = AgentModeState(
+            inheritedAgent.flatMap { subagentProfile(named: $0)?.mode } ?? config.agentMode
+        )
+        let agentSelectionState = AgentSelectionState(
+            inheritedAgent,
+            recorded: await session.harness.hasAgentSelection
+        )
         let harness = try await Self.reopen(
             path: path,
             configuration: harnessConfiguration(
                 sessionID: id,
                 steeringBox: steeringBox,
-                modeState: modeState
+                modeState: modeState,
+                agentSelectionState: agentSelectionState
             )
         )
         sessions[id] = makeState(
             harness: harness,
             sink: BroadcastEventSink(),
             steeringBox: steeringBox,
-            modeState: modeState
+            modeState: modeState,
+            agentSelectionState: agentSelectionState,
+            agent: session.agent
         )
         return SessionRef(id: id, path: path.string)
     }
@@ -3340,11 +3473,13 @@ public actor ServerRuntime {
         let childMode = AgentModeState(request.mode ?? profile?.mode ?? .plan)
         let childSteering = makeSteeringBox()
         let childAgent = request.agent ?? profile?.name
+        let childAgentSelection = AgentSelectionState(childAgent)
         let childWorkspace = subagentWorkspace(named: childAgent)
         let childConfiguration = harnessConfiguration(
             sessionID: childID,
             steeringBox: childSteering,
             modeState: childMode,
+            agentSelectionState: childAgentSelection,
             permissionSessionID: request.parentSessionID,
             derivedPermissions: true,
             profileRules: profile?.permissionRules ?? [],
@@ -3366,6 +3501,7 @@ public actor ServerRuntime {
                 sink: childSink,
                 steeringBox: childSteering,
                 modeState: childMode,
+                agentSelectionState: childAgentSelection,
                 depth: childDepth,
                 parentSessionID: request.parentSessionID,
                 taskID: request.taskID,
@@ -4137,7 +4273,8 @@ public actor ServerRuntime {
             configuration: harnessConfiguration(
                 sessionID: sessionID,
                 steeringBox: steeringBox,
-                modeState: session.modeState
+                modeState: session.modeState,
+                agentSelectionState: session.agentSelectionState
             ),
             preferring: liveBranch
         )
@@ -4182,6 +4319,7 @@ public actor ServerRuntime {
             sink: session.sink,
             steeringBox: steeringBox,
             modeState: session.modeState,
+            agentSelectionState: session.agentSelectionState,
             depth: session.depth,
             parentSessionID: session.parentSessionID,
             taskID: session.taskID,
@@ -4254,7 +4392,10 @@ public actor ServerRuntime {
             steeringMode: session.steeringBox.mode.rawValue,
             pendingQuestionIDs: pendingQuestionIDs,
             mode: session.modeState.get().rawValue,
-            agent: session.agent ?? config.agentProfile?.name
+            agent: session.agentSelectionState.isRecorded
+                ? session.agentSelectionState.get()
+                : session.agent,
+            yolo: config.permissions?.yolo
         )
     }
 
@@ -4376,14 +4517,45 @@ public actor ServerRuntime {
     /// Switch the policy/prompt mode for an idle session. The harness stays in
     /// place, so context and the append-only history remain continuous.
     @discardableResult
-    public func changeMode(sessionID: String, mode: AgentMode) throws -> AgentMode {
+    public func changeMode(sessionID: String, mode: AgentMode) async throws -> AgentMode {
         guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
         guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
+        // A mode command explicitly chooses the base agent surface. Clear any
+        // persistent named profile at the same boundary, so a later turn cannot
+        // silently retain a persona after the user returned to a base mode.
+        if session.agentSelectionState.get() != nil || session.agentSelectionState.isRecorded {
+            try await session.harness.selectAgent(nil)
+            session.agentSelectionState.set(nil)
+        }
         session.modeState.set(mode)
         session.sink.broadcast(
             .notice(ServerNotice(level: .info, code: "mode", text: "mode: \(mode.rawValue)", ttlMilliseconds: 2500))
         )
         return mode
+    }
+
+    /// Select a persistent inert agent profile for the next turn. A nil name
+    /// clears the selection and restores the configured base mode. The runtime
+    /// remains the authority for profile prompt, model, reasoning, permissions,
+    /// and tool visibility; clients only send the safe profile name.
+    @discardableResult
+    public func changeAgent(sessionID: String, name: String?) async throws -> String? {
+        guard let session = sessions[sessionID] else { throw ServerRuntimeError.sessionNotFound }
+        guard !session.isBusy else { throw ServerRuntimeError.sessionBusy }
+        let normalized = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedName = normalized?.isEmpty == true ? nil : normalized
+        let profile = selectedName.flatMap { subagentProfile(named: $0) }
+        if selectedName != nil, profile == nil {
+            throw DoMoError(.configuration, "Unknown agent: \(selectedName ?? "")")
+        }
+        try await session.harness.selectAgent(selectedName)
+        session.agentSelectionState.set(selectedName)
+        session.modeState.set(profile?.mode ?? config.agentMode)
+        let label = selectedName.map { "agent - \($0)" } ?? config.agentMode.rawValue
+        session.sink.broadcast(
+            .notice(ServerNotice(level: .info, code: "agent", text: "mode: \(label)", ttlMilliseconds: 2500))
+        )
+        return selectedName
     }
 
     public func renameSession(sessionID: String, name: String?) async throws {

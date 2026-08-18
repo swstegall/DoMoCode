@@ -58,7 +58,6 @@ final class MockGateway: @unchecked Sendable {
     private let chatBodies: [String]
     private let lock = NSLock()
     private let lifecycleLock = NSLock()
-    private var served = 0
     private var recorded: [RecordedRequest] = []
     private var stopped = false
     private var activeClientFDs: Set<Int32> = []
@@ -87,8 +86,8 @@ final class MockGateway: @unchecked Sendable {
     /// must be answered by the same scripted body.
     private var refusalsRemaining: Int?
 
-    /// Index of the next `chatCompletionBodies` entry to serve. Distinct from
-    /// `served`, which counts every request including `GET /models` and refusals.
+    /// Index of the next `chatCompletionBodies` entry to serve. Metadata and
+    /// refused requests do not consume this queue.
     private var bodyIndex = 0
 
     /// - Parameter chatCompletionBodies: the SSE body for each successive
@@ -155,15 +154,24 @@ final class MockGateway: @unchecked Sendable {
     /// The base URL a client should target, including the `/v1` prefix.
     var baseURL: String { "http://127.0.0.1:\(port)/v1" }
 
-    /// How many requests were answered. Read after the client has finished.
+    /// How many model-facing requests were answered. Optional startup metadata
+    /// probes are deliberately excluded so existing turn-count assertions remain
+    /// about completions and model discovery, not an advisory price endpoint.
     var requestCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return served
+        return recorded.filter { !Self.isPricingRequest($0) }.count
     }
 
-    /// The requests the gateway saw, in arrival order.
+    /// The model-facing requests the gateway saw, in arrival order. Use
+    /// `allRequests` when a test is specifically asserting metadata traffic.
     var requests: [RecordedRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded.filter { !Self.isPricingRequest($0) }
+    }
+
+    var allRequests: [RecordedRequest] {
         lock.lock()
         defer { lock.unlock() }
         return recorded
@@ -276,15 +284,15 @@ final class MockGateway: @unchecked Sendable {
         guard let request = readRequest(fd) else { return }
 
         let isModelCatalog = request.method == "GET" && request.path.contains("models")
+        let isPricing = Self.isPricingRequest(request)
 
         lock.lock()
         recorded.append(request)
-        served += 1
         // Decide refuse-vs-serve and claim the body index under the same lock, so
         // two concurrent attempts cannot both be handed the same scripted body.
         var refuseThis = false
         var index = 0
-        if !isModelCatalog {
+        if !isModelCatalog && !isPricing {
             if refusal != nil, (refusalsRemaining ?? 1) > 0 {
                 refuseThis = true
                 if let remaining = refusalsRemaining { refusalsRemaining = remaining - 1 }
@@ -296,7 +304,13 @@ final class MockGateway: @unchecked Sendable {
         lock.unlock()
 
         let response: [UInt8]
-        if isModelCatalog {
+        if isPricing {
+            response = Self.errorResponse(
+                status: 404,
+                reason: "Not Found",
+                body: Array(#"{"error":"model info is not configured in this fixture"}"#.utf8)
+            )
+        } else if isModelCatalog {
             response = Self.httpResponse(
                 contentType: "application/json",
                 body: Array(#"{"object":"list","data":[{"id":"mock-model","object":"model","owned_by":"openai"}]}"#.utf8)
@@ -312,6 +326,10 @@ final class MockGateway: @unchecked Sendable {
             response = Self.sseResponse(callID: "mock-call-\(index)", body: body)
         }
         writeAll(fd, response)
+    }
+
+    private static func isPricingRequest(_ request: RecordedRequest) -> Bool {
+        request.method == "GET" && request.path.contains("model/info")
     }
 
     // MARK: Request reading

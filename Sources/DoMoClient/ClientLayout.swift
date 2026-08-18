@@ -19,6 +19,10 @@
 struct ClientLayout {
     let width: Int
     let height: Int
+    /// Whether the session sidebar is part of this frame. Keeping this in the
+    /// geometry object means the render tree and pointer hit testing cannot
+    /// disagree while the sidebar is collapsed.
+    let sidebarVisible: Bool
     /// The sidebar's content column count. When there is room, the divider is
     /// immediately after this column and the main column starts one cell later.
     let sidebarWidth: Int
@@ -62,10 +66,17 @@ struct ClientLayout {
         height >= minimumFooterHeight ? 1 : 0
     }
 
-    init(width: Int, height: Int, promptRows: Int = 1, footerRows: Int = 0) {
+    init(
+        width: Int,
+        height: Int,
+        promptRows: Int = 1,
+        footerRows: Int = 0,
+        sidebarVisible: Bool = true
+    ) {
         self.width = max(0, width)
         self.height = max(0, height)
-        self.sidebarWidth = min(Self.sidebarWidth(for: self.width), self.width)
+        self.sidebarVisible = sidebarVisible
+        self.sidebarWidth = sidebarVisible ? min(Self.sidebarWidth(for: self.width), self.width) : 0
         self.promptRows = max(1, promptRows)
         self.footerRows = max(0, min(1, footerRows))
     }
@@ -78,21 +89,22 @@ struct ClientLayout {
 
     /// The first column available to the main pane. This is the one geometry
     /// calculation the tree and coordinate-based consumers must share.
-    static func mainColumnStart(for width: Int) -> Int {
+    static func mainColumnStart(for width: Int, sidebarVisible: Bool = true) -> Int {
+        guard sidebarVisible else { return 0 }
         let clampedWidth = max(0, width)
         let sidebar = min(sidebarWidth(for: clampedWidth), clampedWidth)
         return min(clampedWidth, sidebar + (sidebar < clampedWidth ? dividerWidth : 0))
     }
 
     /// The first main-pane column for this layout.
-    var mainColumnStart: Int { Self.mainColumnStart(for: width) }
+    var mainColumnStart: Int { Self.mainColumnStart(for: width, sidebarVisible: sidebarVisible) }
 
     /// The width left for the transcript, footer, and prompt.
     var mainWidth: Int { max(0, width - mainColumnStart) }
 
     /// The divider column, when the terminal is wide enough to show one.
     var dividerColumn: Int? {
-        guard sidebarWidth < width else { return nil }
+        guard sidebarVisible, sidebarWidth < width else { return nil }
         return sidebarWidth
     }
 
@@ -145,7 +157,7 @@ struct ClientLayout {
     /// terminal can report a coordinate one past the edge during a resize, and a
     /// dropped scroll event reads to the user as a dead wheel.
     func pane(atColumn column: Int, row: Int) -> Pane {
-        if column < sidebarWidth { return .sidebar }
+        if sidebarVisible, column < sidebarWidth { return .sidebar }
         if let dividerColumn, column == dividerColumn { return .divider }
         return row < transcriptHeight ? .transcript : .mainFooter
     }
@@ -170,7 +182,10 @@ struct ClientLayout {
     func bounds(of pane: Pane) -> PaneBounds {
         switch pane {
         case .sidebar:
-            return PaneBounds(columns: 0..<min(sidebarWidth, width), rows: 0..<height)
+            return PaneBounds(
+                columns: 0..<(sidebarVisible ? min(sidebarWidth, width) : 0),
+                rows: 0..<height
+            )
         case .divider:
             guard let dividerColumn else { return PaneBounds(columns: width..<width, rows: 0..<height) }
             return PaneBounds(columns: dividerColumn..<(dividerColumn + Self.dividerWidth), rows: 0..<height)

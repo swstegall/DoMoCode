@@ -73,7 +73,7 @@ public struct ResponseLimitSettings: Sendable, Hashable, Codable {
 
     /// The shipped sentence. Kept as a named constant because both the renderer
     /// and the idempotence scan have to agree on it exactly.
-    public static let defaultTemplate = "Respond in less than {limit} characters or less."
+    public static let defaultTemplate = "Respond in {limit} characters or less."
 
     public init(
         enabled: Bool = true,

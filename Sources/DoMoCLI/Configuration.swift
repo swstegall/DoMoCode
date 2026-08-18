@@ -1006,17 +1006,22 @@ public struct ModelRuntime: Sendable, Hashable {
     public var rates: ModelCostRates?
     /// `nil` = genuinely unknown. See the type's note.
     public var contextWindow: Int?
+    /// The immutable startup pricing snapshot, used to re-price a response
+    /// when LiteLLM reports a concrete fallback model different from the alias.
+    public var pricing: ModelPricingCatalog?
 
     public init(
         model: String,
         reasoningEffort: ReasoningEffort? = nil,
         rates: ModelCostRates? = nil,
-        contextWindow: Int? = nil
+        contextWindow: Int? = nil,
+        pricing: ModelPricingCatalog? = nil
     ) {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.rates = rates
         self.contextWindow = contextWindow
+        self.pricing = pricing
     }
 }
 
@@ -1284,12 +1289,20 @@ public struct ResolvedConfiguration: Sendable {
     /// this file would be a number that could drift from the one the harness
     /// actually compacts against.
     public func modelRuntime(for alias: String) -> ModelRuntime {
+        modelRuntime(for: alias, pricing: nil)
+    }
+
+    /// Resolves an alias with an optional LiteLLM startup snapshot. Explicit
+    /// settings remain authoritative; discovered prices only fill a missing
+    /// override price.
+    public func modelRuntime(for alias: String, pricing: ModelPricingCatalog?) -> ModelRuntime {
         let specific = override(for: alias)
         return ModelRuntime(
             model: alias,
             reasoningEffort: specific?.reasoningEffort ?? reasoningEffort,
-            rates: specific?.rates,
-            contextWindow: specific?.contextWindow ?? contextWindow
+            rates: specific?.rates ?? pricing?.rates(for: alias),
+            contextWindow: specific?.contextWindow ?? pricing?.contextWindow(for: alias) ?? contextWindow,
+            pricing: pricing
         )
     }
 

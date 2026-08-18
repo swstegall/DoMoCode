@@ -69,6 +69,8 @@ public enum TranscriptFormatter {
                 sections.append(contentsOf: messageSections(message, options: options))
             case .modelChange(let provider, let modelId) where options.includeMetadata:
                 sections.append("## Model change\n\n`\(markdownCode(provider))/\(markdownCode(modelId))`")
+            case .agentChange(let name) where options.includeMetadata:
+                sections.append("## Agent change\n\n`\(name.map(markdownCode) ?? "base")`")
             case .compaction(let compaction) where options.includeMetadata:
                 var body = "## Compaction\n\n\(compaction.summary)"
                 body += "\n\n_Tokens before compaction: \(compaction.tokensBefore)._"

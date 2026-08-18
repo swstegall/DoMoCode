@@ -12,19 +12,20 @@ Kilo Code, and OpenHands. The port attribution and file-level notices are in
 
 ## Status
 
-Phases 0–34 are recorded as complete. They cover the runtime, both terminal
+Phases 0–40 are implemented. They cover the runtime, both terminal
 surfaces, the local HTTP/SSE server, images, permissions, MCP, commands and
 skills, context management, mutable tools, Git review, checkpoints, agents,
 subagents, LSP, memory, sandboxing, PTY support, export/replay, split-footer
 rendering, focused TUI interaction, model discovery, help, Copilot-compatible
 `.github` prompt resources, gateway response-limit recovery, and the unified
-command/tool/agent palette.
+command/tool/agent palette, newest-first session navigation, persistent agent
+profiles, provider-priced multi-model accounting, readable question dialogs,
+sidebar collapse, and YOLO permission policy on every local surface.
 
-The requested follow-ups are grouped into proposed Phases 35–40 below. Several
-are deliberately hardening work around features that already have a partial
-implementation: sidebar hover-marquee and scrolling exist, and `--yolo`
-already works for headless `-p` runs, but neither currently covers the full
-behavior requested here.
+The follow-up audit and implementation are grouped into Phases 35–40 below.
+The full release build/test gate still requires the Swift 6.3 toolchain declared
+by the package; the local audit environment has Swift 6.2.3 and stops at the
+manifest before compiling targets.
 
 Audit snapshot: 2026-08-17. Branches and feature refs can move; the branch
 table below records what was present in the local checkouts at audit time.
@@ -99,6 +100,8 @@ Current invocations:
 | domo -p "..." | Headless text mode; the answer goes to stdout. |
 | domo -p "..." --json | Headless newline-delimited event output. |
 | domo -p "..." --yolo | Headless text mode with `ask` permission decisions auto-approved for that call. |
+| domo --yolo / `--inline` / `--mini` | Local TUI with the same one-call `ask` bypass and a persistent warning; explicit denies still win. |
+| domo --url ... --yolo | The client warns and leaves permission policy to the remote server. |
 | domo --serve | Loopback HTTP/SSE runtime server. |
 
 ## What is implemented today
@@ -390,13 +393,13 @@ what still needs a protocol, state, or layout change.
 
 | Requested behavior | Current state | Required change |
 |---|---|---|
-| Scroll, newest-first order, and hover marquee in the left pane | [`SessionSidebar`](Sources/DoMoClient/SessionSidebar.swift) already has a scroll offset, mouse/PgUp/PgDn paths, and a tested hover marquee. Keyboard cursor movement does not keep the selected row visible; rendering relies on component clipping after the offset. [`JSONLSessionStore`](Sources/DoMoHarness/JSONLSessionStore.swift) returns oldest-first, while the client opens the newest root with `.last`. | Define whether “newest” means header creation time or latest activity, publish the client-facing list newest-first, make the sidebar viewport and cursor invariant explicit, and retain the existing marquee while testing it through scrolling and refreshes. |
-| Persistent non-command agents and mode text | [`PaletteCatalog`](Sources/DoMoClient/PaletteCatalog.swift) lists agents, but encodes them as plain prompt insertions. [`ServerRuntime`](Sources/DoMoServer/ServerRuntime.swift) exposes agent metadata and an immutable session agent identity, but has no active-agent mutation route; the status line only renders the raw mode. | Add an optional, persisted active-profile state distinct from child-session identity, give the palette select/clear actions, rebuild the profile-dependent prompt/model/tool/policy state between turns, and render `mode: agent - <name>`. Selecting a base mode must clear the active profile. |
-| Response-limit wording and tool-loop propagation | [`ResponseLimit`](Sources/DoMoCore/ResponseLimit.swift) currently ships the grammatically incorrect `Respond in less than {limit} characters or less.`. [`AgentHarness`](Sources/DoMoHarness/AgentHarness.swift) decorates the last user message and steering messages before persistence; the [`AgentLoop`](Sources/DoMoAgent/AgentLoop.swift) carries that user message into later tool-call requests. Tool-result messages are not decorated, which is normally the correct boundary. | Change the default to `Respond in {limit} characters or less.`, preserve exact wire/session parity, and add a tool-loop regression proving the instruction is present once in every model context without being injected into tool arguments or results. |
-| LiteLLM model pricing and session cost | [`ModelOverride`](Sources/DoMoLLM/ModelOverride.swift) supplies manual rates, [`Usage`](Sources/DoMoLLM/Message.swift) can calculate per-message cost, and the client reads a gateway response-cost header when one exists. [`ModelCatalog`](Sources/DoMoLLM/ModelCatalog.swift) only decodes model IDs; there is no price snapshot or per-model breakdown for a session. | Fetch and parse LiteLLM model metadata at session start, merge it with explicit overrides, pass the selected model’s rates through every stream—including model switches and compaction—and aggregate per-call usage/cost by the model that answered. |
-| Collapse/resurface the left pane | [`ClientLayout`](Sources/DoMoClient/ClientLayout.swift) always allocates a fixed sidebar and divider; `ClientApp` has no collapsed state or global shortcut. | Add a global, conflict-aware toggle (default `Ctrl+H` or a configured alternative), hide the sidebar and divider from layout/hit testing, preserve focus/selection, and advertise the restored shortcut. |
-| Question text visibility | [`QuestionDialog`](Sources/DoMoClient/Dialog.swift) collapses the header, question, and option descriptions to one line and clips them; its current test intentionally asserts clipping. | Wrap sanitized prose at the dialog body width, grow within the overlay budget, and add vertical scrolling or a readable page model for prompts/options that exceed the available height. |
-| YOLO permissions | `--yolo`/`--dangerously-allow-all` already auto-approves `ask` decisions in headless `-p` mode through [`PermissionSetup`](Sources/DoMoCLI/PermissionSetup.swift). The server-backed TUI paths—both inline and full-screen—still park on [`PermissionEngine`](Sources/DoMoPermissions/PermissionEngine.swift) and show the approval dialog. | Propagate an explicit opt-in to both TUI surfaces and server-owned sessions; convert only `ask` to a one-call approval, keep hard denies, read-only mode restrictions, secret-file guards, and sandbox requirements intact, and show a persistent warning. |
+| Scroll, newest-first order, and hover marquee in the left pane | Implemented in [`SessionSidebar`](Sources/DoMoClient/SessionSidebar.swift) and [`EventStore`](Sources/DoMoClient/EventStore.swift). Session timestamps are the deterministic ordering key (newest first, ID tie-break); the sidebar now owns a viewport, cursor visibility, scroll-offset hit testing, and hover marquee state. |
+| Persistent non-command agents and mode text | Implemented through [`PaletteCatalog`](Sources/DoMoClient/PaletteCatalog.swift), the `/session/:id/agent` route, append-only `agent_change` entries, and dynamic profile prompt/model/tool/policy resolution in [`ServerRuntime`](Sources/DoMoServer/ServerRuntime.swift). Status renders `mode: agent - <name>` and base-mode selection clears it. |
+| Response-limit wording and tool-loop propagation | Implemented in [`ResponseLimit`](Sources/DoMoCore/ResponseLimit.swift) and [`AgentHarness`](Sources/DoMoHarness/AgentHarness.swift). The corrected sentence is persisted on user/steering messages and naturally remains in later tool-loop context without entering tool arguments or results. |
+| LiteLLM model pricing and session cost | Implemented with optional authenticated `/model/info` discovery in [`LiteLLMClient`](Sources/DoMoLLM/LiteLLMClient.swift), tolerant pricing parsing, explicit-override precedence, fallback-model rate resolution, compaction/model-switch propagation, and aggregate/per-model accounting. Missing metadata leaves the estimate unknown. |
+| Collapse/resurface the left pane | Implemented in [`ClientLayout`](Sources/DoMoClient/ClientLayout.swift) and `ClientApp` with global `Ctrl+H`, hidden-pane hit-testing, focus transfer, preserved selection/scroll state, and Help/status text. |
+| Question text visibility | Implemented in [`QuestionDialog`](Sources/DoMoClient/Dialog.swift): sanitized prose and option rows wrap to cell width, the overlay grows within its budget, and an explicit body viewport supports paging and selection visibility. |
+| YOLO permissions | Implemented for headless, inline, mini, and full-screen local TUI sessions plus server-owned sessions. YOLO changes only `ask` to a one-call `.once`; explicit denies and mode/project/sandbox/secret boundaries remain authoritative. Remote `--url` clients cannot change the remote policy. |
 
 ### Completed phases
 
@@ -904,143 +907,142 @@ The phase is complete in both the full-screen client and the inline REPL, with
 the response-limit arithmetic, the continuation loop's termination, the timeout
 classifier and all four insertion rules covered by tests.
 
-#### Phase 35 — Session navigator and sidebar ergonomics — P1 — planned
+#### Phase 35 — Session navigator and sidebar ergonomics — P1 — complete
 
-- [ ] Decide and document what “newest” means for the sidebar: the session
-  header's creation timestamp, or latest activity derived from the session tree.
-  Keep the definition deterministic for equal timestamps and preserve the
-  distinction between root conversations and delegated child sessions.
-- [ ] Change the client-facing session presentation to newest at the top and
+- [x] Define “newest” for the sidebar as the session timestamp, with a stable ID
+  tie-breaker; preserve the distinction between root conversations and delegated
+  child sessions.
+- [x] Change the client-facing session presentation to newest at the top and
   oldest at the bottom. Update bootstrap/open logic and listing tests together;
   the current store is ascending and the bootstrap currently chooses the last
   root, so changing only one side would reopen the wrong conversation.
-- [ ] Make the sidebar viewport explicit. Clamp the maximum offset to the
+- [x] Make the sidebar viewport explicit. Clamp the maximum offset to the
   number of rows actually available below the two-row header, keep keyboard
   cursor movement inside the visible window, preserve the selected session by
   ID across list refreshes, and keep mouse-wheel/PageUp/PageDown scrolling and
   hit-testing in the same coordinate system.
-- [ ] Retain the existing hovered-row marquee, but verify it after ordering,
+- [x] Retain the existing hovered-row marquee, and keep it stable across ordering,
   scrolling, refresh, resize, and collapsed-pane transitions. The marker and
   trailing session ID must remain stable while only the hovered title body
   moves; unrelated rows must not animate.
-- [ ] Add a global sidebar toggle, defaulting to `Ctrl+H` when it is not claimed
+- [x] Add a global sidebar toggle, defaulting to `Ctrl+H` when it is not claimed
   by a configured keymap. A configured alternative must be available for
   terminals or editor bindings that reserve that byte. Collapsing must remove
   the sidebar and divider from layout and mouse hit-testing, preserve the
   current session/cursor, transfer focus to the main pane, and restore the
   previous geometry when toggled back. Update footer and Help text.
-- [ ] Cover ordering and cursor visibility with component tests, geometry and
+- [x] Cover ordering and cursor visibility with component tests, geometry and
   stale-cell tests, and a full-screen PTY test for the toggle and resize paths.
 
-#### Phase 36 — Persistent agent selection and mode identity — P0 — planned
+#### Phase 36 — Persistent agent selection and mode identity — P0 — complete
 
-- [ ] Treat an agent profile as a selection action, not a prompt insertion.
+- [x] Treat an agent profile as a selection action, not a prompt insertion.
   Agent rows in the command palette should select the named trusted profile;
   slash commands and model tools keep their existing insertion semantics.
   Provide an explicit `Clear agent`/base-mode action and show the current
   selection in the palette.
-- [ ] Add an optional active-profile state separate from the immutable agent
+- [x] Add an optional active-profile state separate from the immutable agent
   identity used by delegated child sessions. Persist profile changes as
   append-only session metadata, analogous to model changes, so resume/fork and
   status reconciliation recover the same selection. Reject changes during a
   running turn.
-- [ ] Add the server/client route and protocol projection needed to select or
+- [x] Add the server/client route and protocol projection needed to select or
   clear a profile. On the next turn, resolve the profile's system prompt,
   model, reasoning effort, permission rules, and tool allow-list from one
   consistent snapshot; do not leave the old profile's tool or policy state
   alive after the display name changes.
-- [ ] Define the base-agent rule explicitly: selecting a base mode clears the
+- [x] Define the base-agent rule explicitly: selecting a base mode clears the
   active profile, selecting another profile replaces it, and selecting the
   already-active profile is idempotent. Preserve mode-specific read-only and
   project-deny policy boundaries.
-- [ ] Change the status presentation to `mode: agent - <name>` while a profile
+- [x] Change the status presentation to `mode: agent - <name>` while a profile
   is active and to `mode: <base-mode>` after it is cleared. Keep server status,
   footer, notices, Help, and palette labels consistent.
-- [ ] Add palette, session round-trip, resume, busy-session, mode-clear,
+- [x] Add palette, session round-trip, resume, busy-session, mode-clear,
   profile-collision, and end-to-end tests. Include a proof that a selected
   agent remains active across ordinary prompts until explicitly replaced or
   cleared.
 
-#### Phase 37 — Response-limit wording and tool-loop semantics — P0 — planned
+#### Phase 37 — Response-limit wording and tool-loop semantics — P0 — complete
 
-- [ ] Replace the default template in `DoMoCore` and the documented settings
+- [x] Replace the default template in `DoMoCore` and the documented settings
   example with exactly `Respond in {limit} characters or less.`. Preserve
   user-defined templates and add a migration/regression assertion for the
   default so the old “less than … or less” wording cannot return.
-- [ ] Keep the sentence on the last user message that is sent and persisted,
+- [x] Keep the sentence on the last user message that is sent and persisted,
   including eligible steering messages, so every subsequent assistant request
   in a tool loop inherits the same instruction. Ensure decoration remains
   idempotent when a resumed or continued context already contains it.
-- [ ] Treat the sentence as an assistant-response constraint. Do not append it
+- [x] Treat the sentence as an assistant-response constraint. Do not append it
   to tool-call JSON, tool arguments, or tool-result messages; if a provider
   needs a separate output-token limit for tool calls, model that as an explicit
   provider request policy rather than duplicating prose in the tool protocol.
-- [ ] Add wire-context tests for an assistant response followed by one or more
+- [x] Add wire-context tests for an assistant response followed by one or more
   tool calls, steering, continuation, image prompts, and session persistence.
   Assert that the corrected sentence appears once in every relevant model
   context and that tool payloads remain unchanged.
 
-#### Phase 38 — Provider-priced, multi-model session accounting — P1 — planned
+#### Phase 38 — Provider-priced, multi-model session accounting — P1 — complete
 
-- [ ] At session startup, make an optional authenticated request to LiteLLM's
+- [x] At session startup, make an optional authenticated request to LiteLLM's
   model-info endpoint (`/model/info`, or `/v1/model/info` when the configured
   base URL includes `/v1`) and parse the `model_info` pricing fields with
   tolerant handling for missing, custom, cached-input, and tiered rates. The
   endpoint is provider metadata, not a replacement for the completion route;
   a failed or unavailable request must not prevent a session from starting.
-- [ ] Snapshot the usable price table for the session. Merge explicit
+- [x] Snapshot the usable price table for the session. Merge explicit
   `modelOverrides` rates above discovered rates, keep unknown prices visibly
   unknown rather than silently calling them free, and never persist API keys or
   other provider secrets with the snapshot.
-- [ ] Resolve rates by the requested alias and the concrete response model when
+- [x] Resolve rates by the requested alias and the concrete response model when
   LiteLLM reports a fallback. Pass the selected rates through the existing
   `modelStreamFactory` for normal turns, tool-loop responses, model changes,
   command turns, and compaction/summarizer calls. Preserve valid gateway-reported
   costs as authoritative evidence when they are available without double-counting
   locally estimated usage.
-- [ ] Retain per-assistant usage attribution by model and expose a per-model
+- [x] Retain per-assistant usage attribution by model and expose a per-model
   breakdown—input, output, cached tokens where available, and estimated or
   reported cost—alongside the aggregate session total. Existing append-only
   `model_change` entries and assistant usage records should remain readable by
   older sessions.
-- [ ] Add recorded `/model/info` fixtures, rate-unit and tier tests, endpoint
+- [x] Add recorded `/model/info` fixtures, rate-unit and tier tests, endpoint
   failure/auth tests, explicit-override precedence tests, fallback-model tests,
   model-switch accounting tests, compaction accounting tests, and exact Decimal
   aggregation tests. Include a UI/status case for an incomplete estimate.
 
-#### Phase 39 — Question-dialog readability — P1 — planned
+#### Phase 39 — Question-dialog readability — P1 — complete
 
-- [ ] Stop collapsing question headers, question prose, option labels, and
+- [x] Stop collapsing question headers, question prose, option labels, and
   option descriptions to one line before rendering. Sanitize first, then wrap
   at the dialog's actual body width so all text remains readable and no line
   exceeds the cell budget.
-- [ ] Make the dialog height content-aware within the available overlay. When a
+- [x] Make the dialog height content-aware within the available overlay. When a
   question or option list is taller than the terminal, add a vertical viewport
   with a visible scroll position or page affordance while keeping the selected
   option and current question stable.
-- [ ] Use marquee only for a genuinely single-line label that benefits from
+- [x] Use marquee only for a genuinely single-line label that benefits from
   motion; use wrapping for question prose so a user does not have to wait for
   an animation to understand a permission or design question.
-- [ ] Replace the current clipping assertion with narrow-width component,
+- [x] Replace the current clipping assertion with narrow-width component,
   cell-oracle, resize, Unicode-width, multi-question, and PTY coverage. Verify
   that answers and keyboard navigation are unchanged by the extra rows.
 
-#### Phase 40 — TUI and server YOLO permission policy — P0 — planned
+#### Phase 40 — TUI and server YOLO permission policy — P0 — complete
 
-- [ ] Extend the existing `--yolo`/`--dangerously-allow-all` opt-in beyond
+- [x] Extend the existing `--yolo`/`--dangerously-allow-all` opt-in beyond
   headless `-p` runs to both TUI surfaces—the inline TUI and the full-screen
   alternate-screen TUI—as well as server-owned sessions. For `--url`, the
   remote server remains authoritative; a client flag must not change a policy
   it does not own.
-- [ ] Implement YOLO as an `ask`-to-`once` decision at the permission boundary,
+- [x] Implement YOLO as an `ask`-to-`once` decision at the permission boundary,
   not as a blanket rewrite of the ruleset. Hard `deny`, Ask/Plan/Review mode
   restrictions, `.env`/secret-file guards, project tightening, OS sandbox
   requirements, and config self-edit protections must still win.
-- [ ] Show a persistent, unmistakable warning in the status/footer and startup
+- [x] Show a persistent, unmistakable warning in the status/footer and startup
   diagnostics, record the opt-in in session-visible metadata without recording
   secrets, and never turn an automatic approval into a persisted `always` grant.
   Structured `question` prompts remain separate from permission approvals.
-- [ ] Add engine tests for allow/ask/deny under YOLO, CLI propagation tests,
+- [x] Add engine tests for allow/ask/deny under YOLO, CLI propagation tests,
   interactive tests proving no approval overlay is created for an `ask`, remote
   server authority tests, and regression coverage proving denied and
   mode-restricted tools still stop.
@@ -1114,18 +1116,18 @@ fallback for either scheme. See [HTTP proxies](#http-proxies).
 The settings file currently supports model overrides, compaction, context
 window metadata, trusted auto-format, MCP servers (including browser OAuth for
 remote servers), interpolation, the adaptive response limit, gateway
-continuation, and proxy settings. Model prices are currently supplied through
-those model overrides; automatic LiteLLM price discovery is planned in Phase
-38. Project settings cannot introduce credentials, widen permissions, or
-introduce a proxy. Any future
+continuation, and proxy settings. LiteLLM price discovery is automatic when the
+optional endpoint is available, while explicit model overrides remain
+authoritative. Project settings cannot introduce credentials, widen permissions,
+or introduce a proxy. Any future
 provider/profile/workflow setting must preserve those redaction and trust
 rules.
 
-`--yolo` is currently a headless-only flag. It makes an otherwise interactive
-permission request fail-open for that one tool call when used with `-p`; it
-does not yet suppress the approval dialog in either TUI surface (inline or
-full-screen). Phase 40 extends the opt-in while preserving explicit denials
-and sandbox boundaries.
+`--yolo` (also `--dangerously-allow-all`) is available to headless `-p`, inline,
+mini, and local full-screen TUI sessions. It turns only an `ask` decision into
+an in-memory `.once` approval; explicit denies, mode restrictions, secret-file
+guards, project tightening, and sandbox boundaries still win. A `--url` client
+cannot change the policy owned by its remote server.
 
 ### Remote MCP servers and OAuth
 
@@ -1210,10 +1212,9 @@ the model was actually asked — and then *learns* the real ceiling:
 - two consecutive ordinary failures walk the ceiling down 10%, floored at
   `minimumThreshold`. A cancelled run teaches it nothing.
 
-Known audit discrepancy: the current source default still says `Respond in less
-than {limit} characters or less.`. Phase 37 changes that default to the
-grammatically correct `Respond in {limit} characters or less.`; the target
-configuration below shows the corrected form.
+The response-limit default is `Respond in {limit} characters or less.`. The
+sentence is attached once to the user message that is sent and persisted, and
+tool-loop context carries that same message without modifying tool payloads.
 
 ~~~json
 {
@@ -1234,26 +1235,18 @@ through `{env:}`/`{file:}` interpolation: it is text sent to the model every
 turn, and a cloned repository must not be able to read a file into it.
 
 The sentence is attached to the last user message, so the existing tool loop
-already carries it into later assistant requests after tool results. It is not
-added to tool arguments or tool-result messages. Phase 37 makes that behavior
-an explicit regression contract and checks that resumed, continued, and
-steered contexts contain the sentence exactly once.
+carries it into later assistant requests after tool results. It is not added to
+tool arguments or tool-result messages. Resumed, continued, and steered contexts
+preserve the same contract.
 
 ### Session cost accounting
 
-Current estimates come from manually configured per-model rates in
-`modelOverrides`; a gateway-reported response cost is also accepted when the
-provider supplies one. The `/models` catalog supplies model IDs only, so a
-session cannot currently discover prices or explain an aggregate estimate when
-the selected model changes.
-
-Phase 38 adds an optional startup lookup against LiteLLM's [model-info
-endpoint](https://github.com/BerriAI/litellm/issues/27923), snapshots the
-available rates, and keeps explicit overrides authoritative. Each assistant
-response—including tool-loop responses and compaction—will be attributed to
-the model that served it, allowing the footer and session status to show both a
-total and a per-model breakdown. Missing or stale pricing will be reported as
-an incomplete estimate rather than presented as a confident `$0.00`.
+Estimates use explicit `modelOverrides` first and then an optional authenticated
+LiteLLM [model-info endpoint](https://github.com/BerriAI/litellm/issues/27923)
+snapshot. Each assistant response—including tool-loop responses, model
+switches, and compaction—is attributed to the model that served it. Session
+status exposes aggregate and per-model usage/cost; missing pricing remains an
+incomplete estimate rather than a confident `$0.00`.
 
 ### Gateway-timeout continuation
 

@@ -51,6 +51,9 @@ func makeStreamFn(
             context: context,
             reasoningEffort: runtime.reasoningEffort,
             rates: runtime.rates,
+            ratesForModel: { responseModel in
+                runtime.pricing?.rates(for: responseModel) ?? runtime.rates
+            },
             onResponse: onResponse
         )
     }
@@ -343,7 +346,10 @@ func makeSummarizer(client: LiteLLMClient, model: String, runtime: ModelRuntime)
             model: model,
             context: request,
             reasoningEffort: runtime.reasoningEffort,
-            rates: runtime.rates
+            rates: runtime.rates,
+            ratesForModel: { responseModel in
+                runtime.pricing?.rates(for: responseModel) ?? runtime.rates
+            }
         ) {
             if let message = event.terminalMessage { terminal = message }
         }

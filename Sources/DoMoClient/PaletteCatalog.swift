@@ -68,6 +68,8 @@ public struct PaletteEntry: Sendable, Hashable {
 public enum PaletteSelection: Sendable, Hashable {
     case action(String)
     case insert(name: String, requiresSlash: Bool)
+    case selectAgent(String)
+    case clearAgent
 }
 
 /// Assembly, encoding and row composition for the unified palette. Pure: no IO,
@@ -79,6 +81,8 @@ public enum PaletteCatalog {
     /// `requiresSlash`, a colon, and then the name — everything after that second
     /// colon, so a name that itself contains a colon round-trips intact.
     public static let insertPrefix = "insert:"
+    public static let agentPrefix = "agent:"
+    public static let clearAgentValue = "agent:base"
 
     // MARK: Assembly
 
@@ -229,6 +233,10 @@ public enum PaletteCatalog {
             return actionPrefix + id
         case .insert(let name, let requiresSlash):
             return insertPrefix + (requiresSlash ? "1" : "0") + ":" + name
+        case .selectAgent(let name):
+            return agentPrefix + name
+        case .clearAgent:
+            return clearAgentValue
         }
     }
 
@@ -241,6 +249,11 @@ public enum PaletteCatalog {
         if value.hasPrefix(actionPrefix) {
             let id = String(value.dropFirst(actionPrefix.count))
             return id.isEmpty ? nil : .action(id)
+        }
+        if value == clearAgentValue { return .clearAgent }
+        if value.hasPrefix(agentPrefix) {
+            let name = String(value.dropFirst(agentPrefix.count))
+            return name.isEmpty || name == "base" ? nil : .selectAgent(name)
         }
         guard value.hasPrefix(insertPrefix) else { return nil }
         var rest = value.dropFirst(insertPrefix.count)
@@ -271,8 +284,11 @@ public enum PaletteCatalog {
         if let description = entry.description, !description.isEmpty {
             rowDescription += " · " + description
         }
+        let selection: PaletteSelection = entry.kind == "agent"
+            ? .selectAgent(entry.name)
+            : .insert(name: entry.name, requiresSlash: entry.requiresSlash)
         return SelectItem(
-            value: encode(.insert(name: entry.name, requiresSlash: entry.requiresSlash)),
+            value: encode(selection),
             label: sanitizeUntrustedText(collapseToOneLine(entry.insertionText)),
             description: sanitizeUntrustedText(collapseToOneLine(rowDescription))
         )

@@ -444,6 +444,7 @@ final class InteractiveCoordinator {
     private let homeDirectory: String?
     private let keybindings: Keybindings
     private let sessionDirectory: FilePath
+    private let yolo: Bool
 
     /// The terminal's inline-image capability and cell pixel size, detected once by
     /// `run` (the REPL owns the tty). A tool result's image blocks render through
@@ -522,7 +523,11 @@ final class InteractiveCoordinator {
     /// run off the main actor, while the main actor bumps it on each keystroke.
     private let completionSeq = Mutex<Int>(0)
 
-    private let idleStatus = "  @ file · / command · enter to send · esc to interrupt"
+    private var idleStatus: String {
+        yolo
+            ? "  YOLO — permissions bypassed · @ file · / command · enter to send"
+            : "  @ file · / command · enter to send · esc to interrupt"
+    }
 
     /// The animation frame for the running/parked status line, advanced by
     /// ``progressTask``. The inline surface previously showed a STATIC "⋯ working"
@@ -581,6 +586,7 @@ final class InteractiveCoordinator {
         memoryStore: (any ProjectMemoryProvider)? = nil,
         fileSystem: SandboxedFileSystem? = nil,
         directToolNames: Set<String> = [],
+        yolo: Bool = false,
         terminalRows: @escaping () -> Int,
         interactiveInputRouter: InteractiveTerminalInputRouter,
         keybindings: Keybindings = Keybindings(),
@@ -597,6 +603,7 @@ final class InteractiveCoordinator {
         self.questionBox = questionBox
         self.memoryStore = memoryStore
         self.fileSystem = fileSystem
+        self.yolo = yolo
         self.interactiveInputRouter = interactiveInputRouter
         self.provider = provider
         self.commandProcessor = commandProcessor
@@ -2631,6 +2638,7 @@ public struct InteractiveMode: Sendable {
         credentialEnvNames: Set<String> = [],
         maxCostPerRun: Decimal? = nil,
         steeringMode: QueueDeliveryMode = .oneAtATime,
+        yolo: Bool = false,
         agentProfile: AgentProfile? = nil,
         agentMode: AgentMode = .build,
         modeRules: Ruleset = [],
@@ -2821,7 +2829,10 @@ public struct InteractiveMode: Sendable {
         let prompterBox = PrompterBox()
         let engine = PermissionEngine(
             ruleset: permission.ruleset,
-            prompt: { await prompterBox.prompt($0) },
+            prompt: { request in
+                if yolo { return .once }
+                return await prompterBox.prompt(request)
+            },
             persist: permission.persist
         )
         let gate = permissionHook(engine: engine, factory: permission.factory, sessionID: "interactive")
@@ -3046,6 +3057,7 @@ public struct InteractiveMode: Sendable {
             memoryStore: memoryStore,
             fileSystem: fileSystem,
             directToolNames: directToolNames,
+            yolo: yolo,
             terminalRows: { target.rows },
             interactiveInputRouter: interactiveInputRouter,
             imageCapabilities: resolvedCapabilities,

@@ -72,6 +72,11 @@ public actor AgentHarness {
     private var activeModel: String
     private var activeStreamFn: AgentStreamFn
     private var activeContextWindow: Int?
+    /// The durable agent profile selected for the next turn, or nil for the
+    /// base profile. Kept separate from the model so changing one does not
+    /// rewrite the other.
+    private var activeAgentName: String?
+    private var agentSelectionRecorded: Bool
 
     /// The latest shadow tree on the active conversation branch. A checkpoint
     /// entry is still written when this id repeats: a conversation-only turn
@@ -99,6 +104,9 @@ public actor AgentHarness {
     /// One accumulator and one only. Two would mean `--serve` and `--inline`
     /// reporting different numbers for the same session the moment either drifted.
     private var accumulatedUsage: Usage
+    /// The same total, grouped by the model that actually answered each
+    /// assistant turn. `responseModel` wins when LiteLLM reports a fallback.
+    private var accumulatedUsageByModel: [String: Usage]
 
     /// Assistant turns recorded in this session file, seeded on open the same way
     /// ``accumulatedUsage`` is.
@@ -112,10 +120,13 @@ public actor AgentHarness {
         self.activeStreamFn = configuration.streamFnForModel?(seed.model ?? configuration.model) ?? configuration.streamFn
         self.activeContextWindow = configuration.contextWindowForModel?(seed.model ?? configuration.model)
             ?? configuration.contextWindow
+        self.activeAgentName = seed.agentSelectionRecorded ? seed.agent : configuration.defaultAgentName
+        self.agentSelectionRecorded = seed.agentSelectionRecorded
         self.workspaceSnapshotID = seed.workspaceSnapshotID
         self.workspaceStatusValue = configuration.workspaceSnapshots == nil ? .snapshotsDisabled : .restored
         self.nextSeq = seed.nextSeq
         self.accumulatedUsage = seed.usage
+        self.accumulatedUsageByModel = seed.usageByModel
         self.recordedTurns = seed.turns
     }
 
@@ -125,16 +136,22 @@ public actor AgentHarness {
     private struct Seed: Sendable {
         var nextSeq: Int
         var usage: Usage
+        var usageByModel: [String: Usage]
         var turns: Int
         var model: String?
+        var agent: String?
+        var agentSelectionRecorded: Bool
         var workspaceSnapshotID: String?
 
         /// A brand-new file: numbering starts at zero and nothing has been spent.
         static let fresh = Seed(
             nextSeq: 0,
             usage: .zero,
+            usageByModel: [:],
             turns: 0,
             model: nil,
+            agent: nil,
+            agentSelectionRecorded: false,
             workspaceSnapshotID: nil
         )
     }
@@ -154,7 +171,7 @@ public actor AgentHarness {
         defaultModel: String,
         leafID: String?
     ) throws -> Seed {
-        let recovered = totals(from: entries)
+        let recovered = totals(from: entries, defaultModel: defaultModel)
         // Model metadata follows the same active context path as a resumed turn.
         // A compacted checkpoint makes the path below it optional: the file may
         // have lost an old ancestor while the checkpoint still contains the
@@ -166,6 +183,15 @@ public actor AgentHarness {
             if case .modelChange(_, let modelID) = entry.payload { return modelID }
             return nil
         }.first ?? defaultModel
+        var agent: String?
+        var agentSelectionRecorded = false
+        for entry in activeEntries.reversed() {
+            if case .agentChange(let name) = entry.payload {
+                agent = name
+                agentSelectionRecorded = true
+                break
+            }
+        }
         let workspaceSnapshotID = activeEntries.reversed().compactMap { entry -> String? in
             if case .workspaceCheckpoint(let snapshot) = entry.payload { return snapshot.id }
             return nil
@@ -173,8 +199,11 @@ public actor AgentHarness {
         return Seed(
             nextSeq: try store.nextSequenceNumber(),
             usage: recovered.usage,
+            usageByModel: recovered.usageByModel,
             turns: recovered.turns,
             model: model,
+            agent: agent,
+            agentSelectionRecorded: agentSelectionRecorded,
             workspaceSnapshotID: workspaceSnapshotID
         )
     }
@@ -187,27 +216,49 @@ public actor AgentHarness {
     /// throws on a structural hole, which would make opening a damaged session
     /// fail where it used to succeed. ``open(path:configuration:preferring:)``
     /// exists precisely because that refusal is unacceptable on the recovery path.
-    private static func totals(from entries: [SessionTreeEntry]) -> (usage: Usage, turns: Int) {
+    private static func totals(
+        from entries: [SessionTreeEntry],
+        defaultModel: String
+    ) -> (usage: Usage, usageByModel: [String: Usage], turns: Int) {
         var usage = Usage.zero
+        var usageByModel: [String: Usage] = [:]
         var turns = 0
+        var activeModel = defaultModel
+
+        func add(_ value: Usage, to model: String) {
+            usageByModel[model, default: .zero] = usageByModel[model, default: .zero] + value
+        }
+
         for entry in entries {
             switch entry.payload {
             case .message(.assistant(let assistant)):
                 usage = usage + assistant.usage
+                add(assistant.usage, to: assistant.responseModel ?? assistant.model)
                 turns += 1
             case .compaction(let compaction):
-                if let compactionUsage = compaction.usage { usage = usage + compactionUsage }
+                if let compactionUsage = compaction.usage {
+                    usage = usage + compactionUsage
+                    add(compactionUsage, to: activeModel)
+                }
             case .branchSummary(let branch):
-                if let branchUsage = branch.usage { usage = usage + branchUsage }
-            case .message, .modelChange, .label, .leaf, .workspaceCheckpoint, .historyAction, .subagent,
+                if let branchUsage = branch.usage {
+                    usage = usage + branchUsage
+                    add(branchUsage, to: activeModel)
+                }
+            case .modelChange(_, let modelID):
+                activeModel = modelID
+            case .message, .agentChange, .label, .leaf, .workspaceCheckpoint, .historyAction, .subagent,
                 .recovery:
                 break
             case .sessionInfo, .sessionStart:
-                if let metadataUsage = entry.metadataUsage { usage = usage + metadataUsage }
+                if let metadataUsage = entry.metadataUsage {
+                    usage = usage + metadataUsage
+                    add(metadataUsage, to: activeModel)
+                }
                 break
             }
         }
-        return (usage, turns)
+        return (usage, usageByModel, turns)
     }
 
     // MARK: - Configuration
@@ -221,11 +272,22 @@ public actor AgentHarness {
     public struct Configuration: Sendable {
         /// The system prompt sent with every request.
         public var systemPrompt: String?
+        /// The profile supplied by the embedding as the session's initial base
+        /// persona. Explicit agent-change metadata always overrides it.
+        public var defaultAgentName: String?
 
         /// Builds a prompt-aware system prompt for each turn. This is the seam
         /// used by keyword-triggered skills; the static `systemPrompt` remains the
         /// fallback for callers that do not load project resources.
         public var systemPromptForPrompt: (@Sendable (String) -> String)?
+
+        /// Resolves the selected inert profile for a turn. The harness owns the
+        /// persisted selection; the serving layer owns the profile registry.
+        public var agentProfileForName: (@Sendable (String?) -> AgentProfile?)?
+
+        /// Builds a stream function with a profile's model/reasoning settings.
+        /// This keeps profile selection from being a prompt-only cosmetic change.
+        public var agentStreamFactory: (@Sendable (AgentProfile) -> AgentStreamFn)?
 
         /// The tools available to a run, already wrapped as ``AgentTool``s. The
         /// harness never imports `DoMoTools`; the caller crosses that seam and
@@ -394,7 +456,10 @@ public actor AgentHarness {
 
         public init(
             systemPrompt: String? = nil,
+            defaultAgentName: String? = nil,
             systemPromptForPrompt: (@Sendable (String) -> String)? = nil,
+            agentProfileForName: (@Sendable (String?) -> AgentProfile?)? = nil,
+            agentStreamFactory: (@Sendable (AgentProfile) -> AgentStreamFn)? = nil,
             tools: [any AgentTool] = [],
             getTools: (@Sendable (String) async -> [any AgentTool])? = nil,
             systemPromptForPromptAndTools: (@Sendable (String, [String]) -> String)? = nil,
@@ -429,7 +494,10 @@ public actor AgentHarness {
             gatewayContinuation: GatewayContinuationSettings = .default
         ) {
             self.systemPrompt = systemPrompt
+            self.defaultAgentName = defaultAgentName
             self.systemPromptForPrompt = systemPromptForPrompt
+            self.agentProfileForName = agentProfileForName
+            self.agentStreamFactory = agentStreamFactory
             self.tools = tools
             self.getTools = getTools
             self.systemPromptForPromptAndTools = systemPromptForPromptAndTools
@@ -544,6 +612,9 @@ public actor AgentHarness {
                 usage: .zero,
                 turns: 0,
                 model: nil,
+                agent: nil,
+                agentSelectionRecorded: false,
+                usageByModel: [:],
                 workspaceSnapshotID: nil
             )
         )
@@ -772,6 +843,14 @@ public actor AgentHarness {
     /// `model_change` entry when a session is reopened.
     public var currentModel: String { activeModel }
 
+    /// The selected persistent agent profile, or nil for the base agent.
+    public var currentAgent: String? { activeAgentName }
+
+    /// Whether the active branch contains an explicit agent selection entry.
+    /// This distinguishes an explicit return to base from an older session that
+    /// predates persistent agent metadata.
+    public var hasAgentSelection: Bool { agentSelectionRecorded }
+
     /// The latest Git HEAD checkpoint on the active session branch, if one was
     /// recorded. Older sessions simply return `nil`.
     public func sessionStartHead() throws -> String? {
@@ -924,7 +1003,10 @@ public actor AgentHarness {
             costTotal: accumulatedUsage.effectiveCostTotal,
             contextTokens: contextTokens,
             contextWindow: activeContextWindow,
-            turns: recordedTurns
+            turns: recordedTurns,
+            byModel: accumulatedUsageByModel.mapValues { usage in
+                SessionModelAccounting(usage: usage)
+            }
         )
     }
 
@@ -948,6 +1030,21 @@ public actor AgentHarness {
         activeContextWindow = contextWindow
             ?? configuration.contextWindowForModel?(modelId)
             ?? configuration.contextWindow
+    }
+
+    /// Persist a profile selection for the next turn. Passing nil returns the
+    /// session to its base agent. The metadata is append-only, so resume/fork
+    /// reconstructs the selection from the active branch.
+    public func selectAgent(_ name: String?) throws {
+        guard !isRunning else {
+            throw DoMoError(.configuration, "Cannot change agents while a turn is running")
+        }
+        let normalized = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selected = normalized?.isEmpty == true ? nil : normalized
+        guard selected != activeAgentName else { return }
+        try appendMetadata(.agentChange(name: selected))
+        activeAgentName = selected
+        agentSelectionRecorded = true
     }
 
     /// Persist a display name. Passing `nil` clears it.
@@ -1096,7 +1193,7 @@ public actor AgentHarness {
             nextSeq += 1
             leafChain.append(summary.id)
             if case .branchSummary(let branch) = summary.payload, let usage = branch.usage {
-                accumulatedUsage = accumulatedUsage + usage
+                recordUsage(usage, model: activeModel)
             }
         }
 
@@ -1112,6 +1209,15 @@ public actor AgentHarness {
         activeModel = model
         activeStreamFn = configuration.streamFnForModel?(model) ?? configuration.streamFn
         activeContextWindow = configuration.contextWindowForModel?(model) ?? configuration.contextWindow
+        activeAgentName = configuration.defaultAgentName
+        agentSelectionRecorded = false
+        for entry in movedPath.reversed() {
+            if case .agentChange(let name) = entry.payload {
+                activeAgentName = name
+                agentSelectionRecorded = true
+                break
+            }
+        }
     }
 
     private func appendMetadata(_ payload: SessionTreeEntry.Payload, usage: Usage? = nil) throws {
@@ -1126,7 +1232,12 @@ public actor AgentHarness {
         try store.appendEntry(entry)
         nextSeq += 1
         leafChain.append(entry.id)
-        if let usage { accumulatedUsage = accumulatedUsage + usage }
+        if let usage { recordUsage(usage, model: activeModel) }
+    }
+
+    private func recordUsage(_ usage: Usage, model: String) {
+        accumulatedUsage = accumulatedUsage + usage
+        accumulatedUsageByModel[model, default: .zero] = accumulatedUsageByModel[model, default: .zero] + usage
     }
 
     private static func cleanGeneratedTitle(_ text: String) -> String {
@@ -1284,7 +1395,9 @@ public actor AgentHarness {
         // what the model was actually asked. Decorating any later would put a
         // sentence on the wire that no reader of the session ever sees, and the
         // two records of one turn would disagree.
-        let prepared = await decorateWithResponseLimit(messages, runOverride: runOverride)
+        let activeProfile = configuration.agentProfileForName?(activeAgentName)
+        let effectiveModel = runOverride?.model ?? activeProfile?.model ?? activeModel
+        let prepared = await decorateWithResponseLimit(messages, model: effectiveModel)
         let promptMessages = prepared.messages
         let responseLimitTicket = prepared.ticket
 
@@ -1326,7 +1439,7 @@ public actor AgentHarness {
         }
         let steeringMessages: (@Sendable () async -> [Message])?
         if let steeringSource, let limitController = configuration.responseLimit {
-            let limitModel = runOverride?.model ?? activeModel
+            let limitModel = effectiveModel
             steeringMessages = { @Sendable in
                 let drained = await steeringSource()
                 guard !drained.isEmpty else { return drained }
@@ -1383,7 +1496,7 @@ public actor AgentHarness {
             systemPromptForTools = nil
         }
         let loopConfig = AgentLoopConfig(
-            model: runOverride?.model ?? activeModel,
+            model: effectiveModel,
             toolExecution: configuration.toolExecution,
             maxTurns: configuration.maxTurns,
             beforeToolCall: configuration.beforeToolCall,
@@ -1403,7 +1516,17 @@ public actor AgentHarness {
             recoveryDiagnosticTools: configuration.recoveryDiagnosticTools
         )
         let errorBox = PersistenceErrorBox()
-        let streamFn = runOverride?.streamFn ?? activeStreamFn
+        let streamFn: AgentStreamFn
+        if let override = runOverride?.streamFn {
+            streamFn = override
+        } else if let activeProfile, let factory = configuration.agentStreamFactory {
+            streamFn = factory(activeProfile)
+        } else if let profileModel = activeProfile?.model,
+                  let resolver = configuration.streamFnForModel {
+            streamFn = resolver(profileModel)
+        } else {
+            streamFn = activeStreamFn
+        }
 
         /// Run the loop against a supplied context. The overflow retry calls
         /// this with no prompts after it has written a compaction checkpoint;
@@ -1604,17 +1727,13 @@ public actor AgentHarness {
     /// run can never teach the ceiling anything.
     private func decorateWithResponseLimit(
         _ messages: [Message],
-        runOverride: RunOverride?
+        model: String
     ) async -> (messages: [Message], ticket: ResponseLimitController.Ticket?) {
         guard let controller = configuration.responseLimit else { return (messages, nil) }
-        // The model that will actually answer, which a per-command override can
-        // change for one turn. The ceiling is learned per alias, so charging a
-        // probe to the session's default model when a different one answered
-        // would teach the wrong row.
         return await Self.applyingResponseLimit(
             to: messages,
             controller: controller,
-            model: runOverride?.model ?? activeModel
+            model: model
         )
     }
 
@@ -1944,7 +2063,7 @@ public actor AgentHarness {
         // one place a compaction entry is appended, so it reaches the same total
         // every assistant turn does.
         if case .compaction(let compaction) = entry.payload, let usage = compaction.usage {
-            accumulatedUsage = accumulatedUsage + usage
+            recordUsage(usage, model: activeModel)
         }
         return true
     }
@@ -1994,13 +2113,28 @@ public actor AgentHarness {
         let activeTree = try SessionTree.load(from: store)
         leafChain = try activeTree.branch(from: entry.id).map(\.id)
         if case .compaction(let compaction) = entry.payload, let usage = compaction.usage {
-            accumulatedUsage = accumulatedUsage + usage
+            recordUsage(usage, model: activeModel)
         }
         return true
     }
 }
 
 // MARK: - Session accounting
+
+/// The billable usage attributed to one requested or fallback model.
+///
+/// The full session total remains on ``SessionAccounting/usage`` for backward
+/// compatibility. This additive view lets a client explain a mixed-model run
+/// without reconstructing every assistant message from the transcript.
+public struct SessionModelAccounting: Sendable, Hashable, Codable {
+    public var usage: Usage
+    public var costTotal: Decimal
+
+    public init(usage: Usage, costTotal: Decimal? = nil) {
+        self.usage = usage
+        self.costTotal = costTotal ?? usage.effectiveCostTotal
+    }
+}
 
 /// What a session has spent, and how much room it has left.
 ///
@@ -2029,12 +2163,24 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
     /// Assistant turns recorded in the session file.
     public var turns: Int
 
-    public init(usage: Usage, costTotal: Decimal, contextTokens: Int, contextWindow: Int?, turns: Int) {
+    /// Usage grouped by the model that answered it. Empty for a fresh session
+    /// and for old payloads that predate this additive field.
+    public var byModel: [String: SessionModelAccounting]
+
+    public init(
+        usage: Usage,
+        costTotal: Decimal,
+        contextTokens: Int,
+        contextWindow: Int?,
+        turns: Int,
+        byModel: [String: SessionModelAccounting] = [:]
+    ) {
         self.usage = usage
         self.costTotal = costTotal
         self.contextTokens = contextTokens
         self.contextWindow = contextWindow
         self.turns = turns
+        self.byModel = byModel
     }
 
     // MARK: - Wire form
@@ -2066,6 +2212,7 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
         case contextTokens
         case contextWindow
         case turns
+        case byModel
     }
 
     public init(from decoder: any Decoder) throws {
@@ -2075,7 +2222,11 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
             costTotal: try Self.decodeDecimal(from: container, forKey: .costTotal),
             contextTokens: try container.decode(Int.self, forKey: .contextTokens),
             contextWindow: try container.decodeIfPresent(Int.self, forKey: .contextWindow),
-            turns: try container.decode(Int.self, forKey: .turns)
+            turns: try container.decode(Int.self, forKey: .turns),
+            byModel: try container.decodeIfPresent(
+                [String: SessionModelAccounting].self,
+                forKey: .byModel
+            ) ?? [:]
         )
     }
 
@@ -2086,6 +2237,9 @@ public struct SessionAccounting: Sendable, Hashable, Codable {
         try container.encode(contextTokens, forKey: .contextTokens)
         try container.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try container.encode(turns, forKey: .turns)
+        if !byModel.isEmpty {
+            try container.encode(byModel, forKey: .byModel)
+        }
     }
 
     /// A decimal written either as a string (what this type now emits) or as a
@@ -2188,7 +2342,7 @@ extension AgentHarness: SessionMessagePersisting {
         nextSeq += 1
         leafChain.append(entry.id)
         if case .assistant(let assistant) = message {
-            accumulatedUsage = accumulatedUsage + assistant.usage
+            recordUsage(assistant.usage, model: assistant.responseModel ?? assistant.model)
             recordedTurns += 1
         }
     }
@@ -2456,5 +2610,14 @@ extension AgentHarness {
         activeModel = model
         activeStreamFn = configuration.streamFnForModel?(model) ?? configuration.streamFn
         activeContextWindow = configuration.contextWindowForModel?(model) ?? configuration.contextWindow
+        activeAgentName = configuration.defaultAgentName
+        agentSelectionRecorded = false
+        for entry in path.reversed() {
+            if case .agentChange(let name) = entry.payload {
+                activeAgentName = name
+                agentSelectionRecorded = true
+                break
+            }
+        }
     }
 }

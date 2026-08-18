@@ -143,7 +143,7 @@ public enum ContextBuilder {
             return [summary] + (compaction.retainedTail ?? [])
         case .branchSummary(let branch) where !branch.summary.isEmpty:
             return [Message.user(branchSummaryPrefix + branch.summary + branchSummarySuffix)]
-        case .branchSummary, .modelChange, .label, .sessionInfo, .sessionStart,
+        case .branchSummary, .modelChange, .agentChange, .label, .sessionInfo, .sessionStart,
             .workspaceCheckpoint, .historyAction, .leaf, .subagent, .recovery:
             return []
         }

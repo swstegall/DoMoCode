@@ -64,6 +64,9 @@ public final class ClientApp {
     private let footerBar = FooterBar()
     private let focus = FocusRing()
     private let quit = QuitSignal()
+    /// Whether the session navigator is hidden. The sidebar object itself is
+    /// retained so its cursor, scroll anchor, and marquee state survive a toggle.
+    private var sidebarCollapsed = false
     /// A separate root for the phase/agent workflow experience. It is deliberately
     /// not an overlay: the workflow owns the full frame until Escape walks back to
     /// the ordinary session view.
@@ -79,6 +82,12 @@ public final class ClientApp {
     /// The level-triggered policy mode of the selected server session. Tab changes
     /// this through the runtime; the local value is only a render cache.
     private var agentMode: AgentMode = .build
+    /// The runtime's persistent profile selection, separate from the base mode.
+    private var activeAgentName: String?
+    /// Whether the selected runtime bypasses approval prompts. This is a render
+    /// cache only; the server remains the authority and explicit deny rules still
+    /// apply.
+    private var yoloMode = false
 
     /// The terminal's inline-image capability and cell pixel size, detected once at
     /// startup (the client owns the tty; the remote runtime has none).
@@ -331,6 +340,7 @@ public final class ClientApp {
         ("^O", "expand or collapse transcript detail"),
         ("F6", "expand or shrink transcript images"),
         ("^V", "paste an image from the clipboard"),
+        ("^H", "hide or show the sessions pane"),
         ("Tab", "move between the prompt and sessions panes"),
         ("Shift+Tab", "cycle the agent mode"),
         ("F8", "release or capture mouse reporting"),
@@ -633,7 +643,7 @@ public final class ClientApp {
         statusBar.text = statusText()
         footerBar.model = footerModel()
 
-        let mainColumnStart = ClientLayout.mainColumnStart(for: width)
+        let mainColumnStart = ClientLayout.mainColumnStart(for: width, sidebarVisible: !sidebarCollapsed)
         // The width the input will ACTUALLY be placed at: `Row` gives the flexible
         // main column `width - mainColumnStart`, and `Column` stretches every child to
         // the full content width. Measuring at any other width wraps differently than
@@ -649,8 +659,13 @@ public final class ClientApp {
             )
             : 1
         let layout = ClientLayout(
-            width: width, height: height, promptRows: promptRows, footerRows: footerRows
+            width: width,
+            height: height,
+            promptRows: promptRows,
+            footerRows: footerRows,
+            sidebarVisible: !sidebarCollapsed
         )
+        sidebar.setViewport(height: layout.height)
         // Built as an array rather than a literal because the footer row is
         // CONDITIONAL. `Fixed.measure` returns its basis unconditionally and the
         // flexible transcript is handed only what is left, so an unconditional
@@ -665,7 +680,10 @@ public final class ClientApp {
             mainChildren.append(Fixed(.absolute(layout.footerRows), footerBar.layout))
         }
         mainChildren.append(Fixed(.absolute(layout.promptRows), promptInput.layout))
-        var rootChildren: [any LayoutNode] = [Fixed(.absolute(layout.sidebarWidth), sidebar.layout)]
+        var rootChildren: [any LayoutNode] = []
+        if layout.sidebarVisible {
+            rootChildren.append(Fixed(.absolute(layout.sidebarWidth), sidebar.layout))
+        }
         if layout.dividerColumn != nil {
             let divider = theme.palette(for: appearance).muted.foreground(trueColor: graphicsCapabilities.trueColor)
             rootChildren.append(Fixed(.absolute(ClientLayout.dividerWidth), VerticalDividerNode(color: divider)))
@@ -741,7 +759,9 @@ public final class ClientApp {
             parts.append("queued \(store.queuedMessageCount)")
         }
         if store.selectedSessionID != nil {
-            parts.append("mode " + agentMode.rawValue)
+            let modeLabel = activeAgentName.map { "agent - \(sanitizeUntrustedText($0))" } ?? agentMode.rawValue
+            parts.append("mode: " + modeLabel)
+            if yoloMode { parts.append("YOLO") }
             parts.append("ws " + workspaceSnapshotStatus.rawValue)
         }
         if transcriptView.hasImages {
@@ -796,7 +816,7 @@ public final class ClientApp {
             // no longer hides controls simply because they were appended after the
             // visible portion of a static status string.
             parts.append(
-                "^P: palette   ^S: sessions   ^L: model   ^T: tree   ^E: edit prompt   "
+                "^P: palette   ^S: sessions   ^H: pane   ^L: model   ^T: tree   ^E: edit prompt   "
                 + "^G: diagnostics   ^O: detail   F6: images   ^V: paste image   "
                 + "Tab: pane   Shift+Tab: mode   Enter: send   Shift+Enter/^J: newline   "
                 + "↑/↓: history/list   PgUp/PgDn: scroll   Esc: abort   ^C: quit   "
@@ -1188,10 +1208,11 @@ public final class ClientApp {
                     width: width,
                     height: height,
                     promptRows: self.promptRows,
-                    footerRows: ClientLayout.footerRows(for: height)
+                    footerRows: ClientLayout.footerRows(for: height),
+                    sidebarVisible: !self.sidebarCollapsed
                 )
                 let marqueeAnimating = self.statusBar.marqueeActive(width: layout.mainWidth)
-                    || self.sidebar.marqueeActive(width: layout.sidebarWidth)
+                    || (layout.sidebarVisible && self.sidebar.marqueeActive(width: layout.sidebarWidth))
                 if animating {
                     self.transcriptView.spinnerFrame &+= 1
                 }
@@ -1260,7 +1281,7 @@ public final class ClientApp {
         }
         guard store.selectedSessionID == id else { return }
         let wasRunning = store.runState == .running
-        adoptAgentMode(status.mode)
+        adoptAgentMode(status.mode, agent: status.agent, yolo: status.yolo)
         store.adopt(status)
         if wasRunning, !status.running {
             // Said out loud, because from the user's side nothing visibly happened:
@@ -1358,7 +1379,8 @@ public final class ClientApp {
             width: columns,
             height: height,
             promptRows: promptRows,
-            footerRows: ClientLayout.footerRows(for: height)
+            footerRows: ClientLayout.footerRows(for: height),
+            sidebarVisible: !sidebarCollapsed
         )
         // A page keeps one row of overlap, so the eye has an anchor across the
         // jump — the same step the Ctrl-wheel already uses.
@@ -1390,7 +1412,8 @@ public final class ClientApp {
             width: target.columns,
             height: target.rows,
             promptRows: promptRows,
-            footerRows: ClientLayout.footerRows(for: target.rows)
+            footerRows: ClientLayout.footerRows(for: target.rows),
+            sidebarVisible: !sidebarCollapsed
         )
 
         if !event.isScroll {
@@ -1599,6 +1622,23 @@ public final class ClientApp {
                 : "mouse released — PgUp/PgDn scrolls now, the wheel went with it",
             seconds: 6
         )
+        surface?.requestRender()
+    }
+
+    /// Toggle the session navigator without destroying it. Keeping the same
+    /// component preserves the selected session, cursor, scroll anchor, and
+    /// marquee phase; rebuilding only the geometry gives the main pane every
+    /// column while hidden.
+    private func toggleSidebar() {
+        sidebarCollapsed.toggle()
+        sidebar.clearHover()
+        if sidebarCollapsed {
+            if focus.current === sidebar { focus.setCurrent(promptInput) }
+            focus.unregister(sidebar)
+        } else {
+            focus.register(sidebar)
+        }
+        post(notice: sidebarCollapsed ? "sessions pane hidden" : "sessions pane shown")
         surface?.requestRender()
     }
 
@@ -1861,16 +1901,14 @@ public final class ClientApp {
             return
         }
         store.setSessions(sessions)
-        // The listing is ascending by header timestamp ("newest last" —
-        // `JSONLSessionStore.list`), so the most recent conversation is `.last`.
-        // `.first` here reopened the OLDEST session in the directory on every
-        // launch, while the comments downstream believed "most recent".
+        // The client normalizes listings newest-first at the store boundary, so
+        // the most recent conversation is `.first` in every refresh path.
         //
         // Roots only: the listing also contains subagent and workflow CHILD
         // sessions, which are created DURING a parent's latest run and so are
         // routinely the newest files in the directory. A launch must resume
         // the user's conversation, never a delegated task's transcript.
-        if let newest = sessions.last(where: { $0.parentSession == nil }) {
+        if let newest = store.sessions.first(where: { $0.parentSession == nil }) {
             await open(newest.id)
         } else {
             await createAndOpen()
@@ -1933,6 +1971,8 @@ public final class ClientApp {
         // render cache while it is in flight so a previous session's plan marker
         // cannot briefly describe the newly selected conversation.
         agentMode = .build
+        activeAgentName = nil
+        yoloMode = false
 
         // Make the session LIVE on the server before touching its live endpoints.
         //
@@ -2075,13 +2115,14 @@ public final class ClientApp {
             return
         }
         guard store.selectedSessionID == id else { return }
-        adoptAgentMode(status.mode)
+        adoptAgentMode(status.mode, agent: status.agent, yolo: status.yolo)
         store.adoptAccounting(status)
     }
 
-    private func adoptAgentMode(_ raw: String?) {
-        guard let raw, let mode = AgentMode(rawValue: raw.lowercased()) else { return }
-        agentMode = mode
+    private func adoptAgentMode(_ raw: String?, agent: String? = nil, yolo: Bool? = nil) {
+        if let raw, let mode = AgentMode(rawValue: raw.lowercased()) { agentMode = mode }
+        activeAgentName = agent
+        if let yolo { yoloMode = yolo }
     }
 
     private func seedWorkspaceStatus(_ id: String) async {
@@ -2400,6 +2441,11 @@ public final class ClientApp {
                 "Switch agent mode (currently \(agentMode.rawValue))",
                 "Shift+Tab cycles build, plan, ask, debug, and review policies"
             ),
+            Self.paletteAction(
+                "agent-base",
+                activeAgentName.map { "Clear agent (currently \($0))" } ?? "Use base agent",
+                "Return to the base agent mode and prompt"
+            ),
             Self.paletteAction("tools", "Browse tool catalog", "Inspect the runtime's live tool projection"),
             Self.paletteAction("tree", "Browse conversation tree", "Search, fold, and branch"),
             Self.paletteAction("timeline", "Show session timeline", "Inspect checkpoints and history moves"),
@@ -2592,6 +2638,10 @@ public final class ClientApp {
             insertPaletteCommand(name, requiresSlash: requiresSlash)
         case .action(let id):
             performPaletteAction(id)
+        case .selectAgent(let name):
+            selectAgent(name)
+        case .clearAgent:
+            selectAgent(nil)
         }
     }
 
@@ -2603,6 +2653,7 @@ public final class ClientApp {
         case "title": autoTitleSession()
         case "model": openModelPicker()
         case "mode": toggleAgentMode()
+        case "agent-base": selectAgent(nil)
         case "tools": openToolCatalog()
         case "tree": openTreePicker()
         case "timeline": showTimeline()
@@ -2802,6 +2853,7 @@ public final class ClientApp {
                 try await self.client.changeMode(sessionID: id, mode: next)
                 guard self.store.selectedSessionID == id else { return }
                 self.agentMode = next
+                self.activeAgentName = nil
                 self.post(notice: "mode: \(next.rawValue)")
                 self.surface?.requestRender()
                 await self.refreshToolCatalog(sessionID: id)
@@ -2814,6 +2866,37 @@ public final class ClientApp {
                 await self.reconcileWithServer(id)
             } catch {
                 self.postError("Could not change mode", error)
+            }
+        }
+        actionTasks.append(task)
+    }
+
+    /// Persist an agent profile selection in the runtime. Agent rows are
+    /// selections, not prompt insertions: the profile remains active until this
+    /// method is called again with another profile or nil.
+    private func selectAgent(_ name: String?) {
+        guard let id = store.selectedSessionID else {
+            post(notice: "no session is open")
+            return
+        }
+        guard store.runState != .running else {
+            refuseAsBusy()
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.changeAgent(sessionID: id, name: name)
+                guard self.store.selectedSessionID == id else { return }
+                self.activeAgentName = name
+                self.post(notice: name.map { "mode: agent - \($0)" } ?? "mode: \(self.agentMode.rawValue)")
+                await self.reconcileWithServer(id)
+                await self.refreshToolCatalog(sessionID: id)
+                await self.refreshPaletteCatalog()
+            } catch ServerClientError.unexpectedStatus(409, _, _) {
+                self.refuseAsBusy()
+            } catch {
+                self.postError("Could not change agent", error)
             }
         }
         actionTasks.append(task)
@@ -3053,6 +3136,10 @@ public final class ClientApp {
                 kind = .metadata
                 label = "model  \(modelId)"
                 description = provider
+            case .agentChange(let name):
+                kind = .metadata
+                label = "agent  \(name ?? "base")"
+                description = entry.id
             case .branchSummary(let summary):
                 kind = .branch
                 label = "branch summary  \(collapseToOneLine(summary.summary))"
@@ -4272,7 +4359,7 @@ public final class ClientApp {
 
     /// How many rows ``diagnosticsRows(width:)`` always produces, so the overlay's
     /// height budget and its content cannot drift apart.
-    private static let diagnosticsRowCount = 9
+    private static let diagnosticsRowCount = 10
 
     /// The panel's body. Every value is read fresh on each render.
     private func diagnosticsRows(width: Int) -> [String] {
@@ -4289,6 +4376,7 @@ public final class ClientApp {
                 row("server prompts", status.pendingPermissionIDs.isEmpty
                     ? "none" : status.pendingPermissionIDs.joined(separator: ", ")),
                 row("server subscribers", String(status.subscribers)),
+                row("server permissions", status.yolo == true ? "YOLO — ask bypassed" : "approval policy"),
             ]
         } else {
             let reason = diagnosticsStatusError ?? "checking…"
@@ -4317,7 +4405,7 @@ public final class ClientApp {
             do {
                 let status = try await self.client.status(sessionID: id)
                 guard self.store.selectedSessionID == id else { return }
-                self.adoptAgentMode(status.mode)
+                self.adoptAgentMode(status.mode, agent: status.agent, yolo: status.yolo)
                 self.diagnosticsStatus = status
             } catch {
                 // Named, not swallowed: "unavailable" and "the token is wrong" are
@@ -4435,8 +4523,9 @@ public final class ClientApp {
             max(30, surface?.target.columns ?? Self.questionOverlayWidth)
         )
         let innerWidth = max(1, width - 4)
-        let naturalHeight = dialog.render(width: innerWidth).count
         let maxHeight = max(1, (surface?.target.rows ?? 24) - 2)
+        dialog.setViewport(height: max(1, maxHeight - 2))
+        let naturalHeight = dialog.render(width: innerWidth).count
         questionOverlaySize = surface.map { ($0.target.columns, $0.target.rows) }
         questionHandle = dialogs?.present(
             Box(dialog, paddingX: 1),
@@ -4463,8 +4552,9 @@ public final class ClientApp {
         dismissQuestionOverlay()
         if let dialog {
             let width = min(Self.questionOverlayWidth, max(30, surface.target.columns))
-            let naturalHeight = dialog.render(width: max(1, width - 4)).count
             let maxHeight = max(1, surface.target.rows - 2)
+            dialog.setViewport(height: max(1, maxHeight - 2))
+            let naturalHeight = dialog.render(width: max(1, width - 4)).count
             questionOverlaySize = (surface.target.columns, surface.target.rows)
             questionHandle = dialogs?.present(
                 Box(dialog, paddingX: 1),
@@ -4804,6 +4894,7 @@ extension ClientApp: TerminalApp {
             surface?.requestRender()
             return
         }
+        if Self.matchesControl(data, "h") { toggleSidebar(); return }
         if matchesKey(data, Key.f6) {
             transcriptView.toggleImageExpansion()
             surface?.requestRender()

@@ -205,6 +205,31 @@ struct SessionEntryTests {
         #expect(json.contains("\"modelId\":\"gpt-4o\""))
     }
 
+    @Test("agent_change entry round-trips a selected and cleared profile")
+    func agentChangeRoundTrips() throws {
+        let selected = SessionTreeEntry(
+            id: "ac",
+            parentId: "mc",
+            timestamp: "2026-07-23T12:06:00.000Z",
+            payload: .agentChange(name: "review")
+        )
+        let cleared = SessionTreeEntry(
+            id: "ac-clear",
+            parentId: "ac",
+            timestamp: "2026-07-23T12:07:00.000Z",
+            payload: .agentChange(name: nil)
+        )
+
+        #expect(try roundTrip(selected) == selected)
+        #expect(try roundTrip(cleared) == cleared)
+        #expect(selected.entryType == .agentChange)
+        let json = String(decoding: try encoder.encode(selected), as: UTF8.self)
+        #expect(json.contains("\"type\":\"agent_change\""))
+        #expect(json.contains("\"agent\":\"review\""))
+        let clearedJSON = String(decoding: try encoder.encode(cleared), as: UTF8.self)
+        #expect(clearedJSON.contains("\"agent\":null"))
+    }
+
     @Test("compaction entry round-trips with retainedTail and usage")
     func compactionRoundTrips() throws {
         let compaction = Compaction(

@@ -352,6 +352,8 @@ public struct SessionTreeEntry: Sendable, Hashable {
         case message(Message)
         /// The user switched models mid-session.
         case modelChange(provider: String, modelId: String)
+        /// The user selected (or cleared) the persistent agent profile.
+        case agentChange(name: String?)
         /// A context-compaction checkpoint.
         case compaction(Compaction)
         /// A summary of an abandoned branch.
@@ -384,6 +386,7 @@ extension SessionTreeEntry {
     public enum EntryType: String, Sendable {
         case message
         case modelChange = "model_change"
+        case agentChange = "agent_change"
         case compaction
         case branchSummary = "branch_summary"
         case label
@@ -400,6 +403,7 @@ extension SessionTreeEntry {
         switch payload {
         case .message: return .message
         case .modelChange: return .modelChange
+        case .agentChange: return .agentChange
         case .compaction: return .compaction
         case .branchSummary: return .branchSummary
         case .label: return .label
@@ -453,6 +457,7 @@ extension SessionTreeEntry: Codable {
         case message
         case provider
         case modelId
+        case agent
         case summary
         case tokensBefore
         case firstKeptEntryId
@@ -510,6 +515,8 @@ extension SessionTreeEntry: Codable {
                 provider: try container.decode(String.self, forKey: .provider),
                 modelId: try container.decode(String.self, forKey: .modelId)
             )
+        case .agentChange:
+            self.payload = .agentChange(name: try container.decodeIfPresent(String.self, forKey: .agent))
         case .compaction:
             self.payload = .compaction(
                 Compaction(
@@ -611,6 +618,8 @@ extension SessionTreeEntry: Codable {
         case .modelChange(let provider, let modelId):
             try container.encode(provider, forKey: .provider)
             try container.encode(modelId, forKey: .modelId)
+        case .agentChange(let name):
+            try container.encodeIfPresent(name, forKey: .agent)
         case .compaction(let compaction):
             try container.encode(compaction.summary, forKey: .summary)
             try container.encode(compaction.tokensBefore, forKey: .tokensBefore)

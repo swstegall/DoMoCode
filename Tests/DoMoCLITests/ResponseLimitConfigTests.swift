@@ -40,7 +40,7 @@ struct ResponseLimitConfigTests {
         #expect(config.responseLimit.probeEvery == 4)
         #expect(config.responseLimit.minimumThreshold == 200)
         #expect(config.responseLimit.maximumThreshold == 200_000)
-        #expect(config.responseLimit.template == "Respond in less than {limit} characters or less.")
+        #expect(config.responseLimit.template == "Respond in {limit} characters or less.")
 
         #expect(config.gatewayContinuation.enabled)
         #expect(config.gatewayContinuation.maxAttempts == 10)

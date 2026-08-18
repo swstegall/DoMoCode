@@ -42,6 +42,18 @@ private func write(_ text: String, to path: FilePath) throws {
 @Suite("Adaptive response limit — the search")
 struct ResponseLimitPolicyTests {
 
+    @Test("the default response-limit sentence is grammatical and exact")
+    func defaultTemplate() {
+        #expect(ResponseLimitSettings.defaultTemplate == "Respond in {limit} characters or less.")
+        #expect(
+            ResponseLimitPolicy.decorated(
+                "hello",
+                limit: 500,
+                template: ResponseLimitSettings.defaultTemplate
+            ) == "hello\n\nRespond in 500 characters or less."
+        )
+    }
+
     /// The exact sequence the user reported from their gateway, asserted turn by
     /// turn. This is the test that fails if any of the numbered rules drifts.
     @Test("the reported walk-through: 500 seeds, 550 sticks, 605 fails, 577 settles")
@@ -464,36 +476,36 @@ struct ResponseLimitDecorationTests {
         let template = ResponseLimitSettings.defaultTemplate
 
         let once = ResponseLimitPolicy.decorated("Explain the parser.", limit: 500, template: template)
-        #expect(once == "Explain the parser.\n\nRespond in less than 500 characters or less.")
+        #expect(once == "Explain the parser.\n\nRespond in 500 characters or less.")
 
         #expect(ResponseLimitPolicy.decorated(once, limit: 500, template: template) == once)
 
         // A different limit from an earlier turn is still recognised as ours.
         #expect(
             ResponseLimitPolicy.decorated(once, limit: 550, template: template)
-                == "Explain the parser.\n\nRespond in less than 550 characters or less."
+                == "Explain the parser.\n\nRespond in 550 characters or less."
         )
 
         // Only the trailing sentence is touched; the body's own blank lines stay.
         #expect(
             ResponseLimitPolicy.decorated("first\n\nsecond", limit: 500, template: template)
-                == "first\n\nsecond\n\nRespond in less than 500 characters or less."
+                == "first\n\nsecond\n\nRespond in 500 characters or less."
         )
 
         // Trailing whitespace around a previous sentence does not hide it.
         #expect(
             ResponseLimitPolicy.decorated(
-                "hello\n\nRespond in less than 500 characters or less.  \n",
+                "hello\n\nRespond in 500 characters or less.  \n",
                 limit: 500,
                 template: template
-            ) == "hello\n\nRespond in less than 500 characters or less."
+            ) == "hello\n\nRespond in 500 characters or less."
         )
     }
 
     @Test("an image-only prompt still carries the sentence, and carries only it")
     func emptyPromptIsStillDecorated() {
         let template = ResponseLimitSettings.defaultTemplate
-        let sentence = "Respond in less than 500 characters or less."
+        let sentence = "Respond in 500 characters or less."
         #expect(ResponseLimitPolicy.decorated("", limit: 500, template: template) == sentence)
         #expect(ResponseLimitPolicy.decorated("   \n\n ", limit: 500, template: template) == sentence)
     }
@@ -512,7 +524,7 @@ struct ResponseLimitDecorationTests {
         let text = "Respond in less than five hundred characters or less."
         #expect(
             ResponseLimitPolicy.decorated(text, limit: 500, template: template)
-                == text + "\n\nRespond in less than 500 characters or less."
+                == text + "\n\nRespond in 500 characters or less."
         )
 
         // The same sentence in the MIDDLE of a prompt is the user's text, not
@@ -520,7 +532,7 @@ struct ResponseLimitDecorationTests {
         let embedded = "Respond in less than 500 characters or less.\nand then explain why"
         #expect(
             ResponseLimitPolicy.decorated(embedded, limit: 500, template: template)
-                == embedded + "\n\nRespond in less than 500 characters or less."
+                == embedded + "\n\nRespond in 500 characters or less."
         )
     }
 
@@ -660,7 +672,7 @@ struct ResponseLimitControllerTests {
         #expect(ticket.model == "alias")
         #expect(ticket.limit == 550)
         #expect(ticket.isProbe)
-        #expect(decorated.text == "Summarise the file.\n\nRespond in less than 550 characters or less.")
+        #expect(decorated.text == "Summarise the file.\n\nRespond in 550 characters or less.")
         // The cadence is persisted before the turn runs, not after it settles.
         #expect(store.load().models["alias"]?.promptsSinceProbe == 0)
 
@@ -669,7 +681,7 @@ struct ResponseLimitControllerTests {
 
         // A resubmitted prompt carries one sentence, at the new limit.
         let again = await controller.decorate(decorated.text, model: "alias")
-        #expect(again.text == "Summarise the file.\n\nRespond in less than 605 characters or less.")
+        #expect(again.text == "Summarise the file.\n\nRespond in 605 characters or less.")
     }
 
     @Test("a disabled controller changes nothing and issues no ticket")

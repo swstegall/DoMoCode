@@ -303,7 +303,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
 
     @Flag(
         name: [.customLong("yolo"), .customLong("dangerously-allow-all")],
-        help: "Headless (-p) only: auto-approve every tool call that would otherwise need interactive approval. Without this, a tool needing approval is refused with a message the model can act on."
+        help: "Auto-approve tool calls that would otherwise need interactive approval. Available to -p, --inline, --mini, and the local full-screen TUI; explicit deny rules still win."
     )
     public var yolo: Bool = false
 
@@ -533,6 +533,23 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         if inline, mini {
             throw DoMoError(.configuration, "--inline and --mini are mutually exclusive.")
         }
+        if yolo {
+            if serverURL != nil {
+                Self.writeStderr("warning: --yolo cannot change permissions on a remote --url server; the remote server controls its own policy.\n")
+            } else {
+                Self.writeStderr("warning: YOLO mode is enabled; permission prompts are bypassed (explicit deny rules still apply).\n")
+            }
+        }
+        // Print and inline own their harnesses, so they take the same optional
+        // startup pricing snapshot as the embedded server. The full-screen local
+        // client gets it inside `buildServerRuntime`; a remote client must never
+        // probe the caller's local LiteLLM endpoint for a price table.
+        let discoveredPricing: ModelPricingCatalog?
+        if !serve && serverURL == nil && (inline || (prompt?.isEmpty == false)) {
+            discoveredPricing = await Self.discoverModelPricing(configuration)
+        } else {
+            discoveredPricing = nil
+        }
 
         // `--serve` runs the headless HTTP/SSE server and does not return until the
         // process is signalled. It manages sessions itself, so it is branched before
@@ -547,7 +564,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 agentProfile: profile,
                 agentMode: selectedMode,
                 sandbox: processSandbox,
-                corsOrigins: corsOrigins
+                corsOrigins: corsOrigins,
+                yolo: yolo
             )
             return
         }
@@ -602,13 +620,18 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     // compacts on — and the REPL's own tests build their own
                     // `InteractiveMode` with arguments of their own, so nothing but a
                     // run of the real binary observes what this line hands it.
-                    modelRuntime: configuration.modelRuntime(for: model),
-                    modelRuntimeFor: { configuration.modelRuntime(for: $0) },
+                    modelRuntime: configuration.modelRuntime(for: model, pricing: discoveredPricing),
+                    modelRuntimeFor: { configuration.modelRuntime(for: $0, pricing: discoveredPricing) },
                     compaction: configuration.compaction,
-                    summarizer: Self.compactionSummarizer(configuration, model: model),
+                    summarizer: Self.compactionSummarizer(
+                        configuration,
+                        model: model,
+                        pricing: discoveredPricing
+                    ),
                     credentialEnvNames: Self.gatewayCredentialEnvNames(configuration),
                     maxCostPerRun: costLimit,
                     steeringMode: deliveryMode,
+                    yolo: yolo,
                     agentProfile: profile,
                     agentMode: selectedMode,
                     modeRules: configuration.agentModes[selectedMode.rawValue] ?? [],
@@ -634,7 +657,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     serverToken: serverToken,
                     agentProfile: profile,
                     agentMode: selectedMode,
-                    sandbox: processSandbox
+                    sandbox: processSandbox,
+                    yolo: yolo
                 )
             }
             return
@@ -650,6 +674,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             includeMCPResourceInspection: !configuration.mcpServers.isEmpty
         )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
+        let discoveredPricing = await Self.discoverModelPricing(configuration, client: client)
 
         // The permission gate (Phase 8). Headless has no human to prompt, so a tool
         // that resolves to `ask` is refused with a model-visible reason unless
@@ -781,17 +806,25 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             mcpTools: visibleMcp,
             mcpToolResolver: mcpToolResolver,
             modelRuntime: {
-                var runtime = configuration.modelRuntime(for: model)
+                var runtime = configuration.modelRuntime(for: model, pricing: discoveredPricing)
                 runtime.reasoningEffort = profile.reasoningEffort ?? runtime.reasoningEffort
                 return runtime
             }(),
             compaction: configuration.compaction,
-            summarizer: Self.compactionSummarizer(configuration, model: model, client: client),
+            summarizer: Self.compactionSummarizer(
+                configuration,
+                model: model,
+                client: client,
+                pricing: discoveredPricing
+            ),
             promptWorkspace: promptWorkspace,
             promptBuilder: promptBuilder,
             commandProcessor: commandProcessor,
             commandRuntimeFactory: { commandModel, effort in
-                var selected = configuration.modelRuntime(for: commandModel ?? model)
+                var selected = configuration.modelRuntime(
+                    for: commandModel ?? model,
+                    pricing: discoveredPricing
+                )
                 selected.reasoningEffort = effort ?? profile.reasoningEffort ?? selected.reasoningEffort
                 return selected
             },
@@ -991,14 +1024,36 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
     static func compactionSummarizer(
         _ configuration: ResolvedConfiguration,
         model: String,
-        client: LiteLLMClient? = nil
+        client: LiteLLMClient? = nil,
+        pricing: ModelPricingCatalog? = nil
     ) -> Summarizer? {
         guard let small = compactionModel(configuration, model: model) else { return nil }
         return makeSummarizer(
             client: client ?? LiteLLMClient(configuration: configuration.clientConfiguration),
             model: small,
-            runtime: configuration.modelRuntime(for: small)
+            runtime: configuration.modelRuntime(for: small, pricing: pricing)
         )
+    }
+
+    /// Pricing is advisory. A gateway without `/model/info`, or one that
+    /// requires credentials this process does not have, must still start and
+    /// run; the footer will mark the resulting cost as unknown instead.
+    static func discoverModelPricing(
+        _ configuration: ResolvedConfiguration,
+        client: LiteLLMClient? = nil
+    ) async -> ModelPricingCatalog? {
+        let source = client ?? LiteLLMClient(configuration: configuration.clientConfiguration)
+        let bounded = source.diagnosticClient(timeout: .seconds(3))
+        do {
+            let catalog = try await bounded.listModelPricing()
+            return catalog.entries.isEmpty ? nil : catalog
+        } catch let error as DoMoError {
+            Self.writeStderr("warning: LiteLLM model pricing unavailable: \(Redaction.diagnostic(error.description))\n")
+            return nil
+        } catch {
+            Self.writeStderr("warning: LiteLLM model pricing unavailable: \(Redaction.diagnostic(String(describing: error)))\n")
+            return nil
+        }
     }
 
     /// Reads each `--image` path into an ``ImageBlock``, sniffing its media type
@@ -1079,7 +1134,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         agentProfile: AgentProfile,
         agentMode: AgentMode,
         sandbox: ProcessSandbox?,
-        corsOrigins: [String]
+        corsOrigins: [String],
+        yolo: Bool
     ) async throws {
         let (runtime, mcpManager, backgroundSessions) = try await Self.buildServerRuntime(
             configuration: configuration,
@@ -1090,7 +1146,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             steeringMode: steeringMode,
             agentProfile: agentProfile,
             agentMode: agentMode,
-            sandbox: sandbox
+            sandbox: sandbox,
+            yolo: yolo
         )
         let token = Self.generateToken()
         let server = DoMoServer(
@@ -1140,7 +1197,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         steeringMode: QueueDeliveryMode,
         agentProfile: AgentProfile,
         agentMode: AgentMode,
-        sandbox: ProcessSandbox? = nil
+        sandbox: ProcessSandbox? = nil,
+        yolo: Bool = false
     ) async throws -> (
         runtime: ServerRuntime,
         mcpManager: MCPManager,
@@ -1165,6 +1223,7 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             includeMCPResourceInspection: !configuration.mcpServers.isEmpty
         )
         let client = LiteLLMClient(configuration: configuration.clientConfiguration)
+        let discoveredPricing = await Self.discoverModelPricing(configuration, client: client)
         // The permission gate (Phase 8b) for the server — the same ruleset/factory/
         // persist the local surfaces use. This gates BOTH `--serve` and the loopback
         // client (both spawn through here); a tool needing approval prompts the client
@@ -1177,7 +1236,14 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             homeDirectory: home,
             profileRules: agentProfile.permissionRules
         )
-        let baseRuleset = permission.ruleset
+        // Keep the profile-neutral policy beside the startup projection. Session
+        // agent changes must be able to remove the old profile's rules rather
+        // than only append the new profile's rules to them.
+        let baseRuleset = PermissionSetup.runtime(
+            workingDirectory: workingDirectory.string,
+            configDirectory: configuration.configDirectory.string,
+            homeDirectory: home
+        ).ruleset
         let configuredModeRules = configuration.agentModes
         let rulesetForMode: @Sendable (AgentMode, String) -> Ruleset = { mode, planPath in
             merge(
@@ -1187,6 +1253,17 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                     planPath: planPath,
                     additional: configuredModeRules[mode.rawValue] ?? []
                 )
+            )
+        }
+        let rulesetForProfile: @Sendable (AgentMode, String, Ruleset) -> Ruleset = { mode, planPath, profileRules in
+            PermissionSetup.resolvedRuleset(
+                workingDirectory: workingDirectory.string,
+                configDirectory: configuration.configDirectory.string,
+                homeDirectory: home,
+                mode: mode,
+                planPath: planPath,
+                profileRules: profileRules,
+                modeRules: configuredModeRules[mode.rawValue] ?? []
             )
         }
         let inheritedDenyRulesForMode: @Sendable (AgentMode, String) -> Ruleset = { mode, _ in
@@ -1325,14 +1402,14 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         // One resolved runtime for the alias — reasoning effort, per-alias rates and
         // the declared context window — built once and shared by the stream function
         // and the accounting the client's footer reads.
-        var modelRuntime = configuration.modelRuntime(for: model)
+        var modelRuntime = configuration.modelRuntime(for: model, pricing: discoveredPricing)
         modelRuntime.reasoningEffort = agentProfile.reasoningEffort ?? modelRuntime.reasoningEffort
         let streamFn = makeStreamFn(client: client, runtime: modelRuntime)
         var modelAliases = Set(configuration.modelOverrides.keys)
         modelAliases.insert(model)
         if let small = configuration.smallModel { modelAliases.insert(small) }
         let modelOptions = modelAliases.sorted().map { alias in
-            let runtime = configuration.modelRuntime(for: alias)
+            let runtime = configuration.modelRuntime(for: alias, pricing: discoveredPricing)
             return ModelOption(id: alias, contextWindow: runtime.contextWindow)
         }
         let workflowStore = try WorkflowStore.create(
@@ -1382,18 +1459,29 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 factory: permission.factory,
                 persist: permission.persist,
                 rulesetForMode: rulesetForMode,
-                inheritedDenyRulesForMode: inheritedDenyRulesForMode
+                rulesetForProfile: rulesetForProfile,
+                inheritedDenyRulesForMode: inheritedDenyRulesForMode,
+                baseRuleset: baseRuleset,
+                yolo: yolo
             ),
             // `nil` when nothing declared a window for this alias. It travels as
             // `nil` all the way to the footer, which renders "?" — never a
             // percentage of a guess.
             contextWindow: modelRuntime.contextWindow,
             compaction: configuration.compaction,
-            summarizer: Self.compactionSummarizer(configuration, model: model, client: client),
+            summarizer: Self.compactionSummarizer(
+                configuration,
+                model: model,
+                client: client,
+                pricing: discoveredPricing
+            ),
             promptWorkspace: promptWorkspace,
             commandProcessor: commandProcessor,
             commandStreamFactory: { commandModel, effort in
-                var selected = configuration.modelRuntime(for: commandModel ?? model)
+                var selected = configuration.modelRuntime(
+                    for: commandModel ?? model,
+                    pricing: discoveredPricing
+                )
                 selected.reasoningEffort = effort
                     ?? agentProfile.reasoningEffort
                     ?? selected.reasoningEffort
@@ -1403,14 +1491,25 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
             modelDiscovery: {
                 let catalog = try await client.listModels()
                 return catalog.models.map { entry in
-                    ModelOption(id: entry.id)
+                    ModelOption(
+                        id: entry.id,
+                        contextWindow: discoveredPricing?.contextWindow(for: entry.id)
+                    )
                 }
             },
             modelStreamFactory: { alias in
-                var selected = configuration.modelRuntime(for: alias)
+                var selected = configuration.modelRuntime(for: alias, pricing: discoveredPricing)
                 if alias == model {
                     selected.reasoningEffort = agentProfile.reasoningEffort ?? selected.reasoningEffort
                 }
+                return makeStreamFn(client: client, runtime: selected)
+            },
+            agentStreamFactory: { profile in
+                var selected = configuration.modelRuntime(
+                    for: profile.model ?? model,
+                    pricing: discoveredPricing
+                )
+                selected.reasoningEffort = profile.reasoningEffort ?? selected.reasoningEffort
                 return makeStreamFn(client: client, runtime: selected)
             },
             recoveryDiagnostic: makeRecoveryDiagnostic(client: client, runtime: modelRuntime),
@@ -1420,7 +1519,9 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 toolContext: toolContext,
                 visibleToolNames: tools.map(\.definition.name)
             ),
-            modelContextWindow: { alias in configuration.modelRuntime(for: alias).contextWindow },
+            modelContextWindow: { alias in
+                configuration.modelRuntime(for: alias, pricing: discoveredPricing).contextWindow
+            },
             steeringMode: steeringMode,
             maxCostPerRun: maxCostPerRun,
             getTools: toolResolver,
@@ -1489,7 +1590,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
         serverToken: String?,
         agentProfile: AgentProfile,
         agentMode: AgentMode,
-        sandbox: ProcessSandbox?
+        sandbox: ProcessSandbox?,
+        yolo: Bool
     ) async throws {
         let baseURL: String
         let token: String
@@ -1516,7 +1618,8 @@ public struct DoMoCodeCommand: AsyncParsableCommand {
                 steeringMode: steeringMode,
                 agentProfile: agentProfile,
                 agentMode: agentMode,
-                sandbox: sandbox
+                sandbox: sandbox,
+                yolo: yolo
             )
             mcpManager = manager
             backgroundSessions = sessions

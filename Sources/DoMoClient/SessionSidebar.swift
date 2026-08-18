@@ -16,8 +16,14 @@ import Foundation
 final class SessionSidebar: @MainActor Focusable {
     var focused = false
 
-    /// The sessions to list; set from `EventStore.sessions` each frame.
-    var sessions: [SessionSummary] = []
+    /// The sessions to list; set from `EventStore.sessions` each frame. The
+    /// setter keeps the UI invariant local as well as at the store boundary, so
+    /// tests and future callers cannot accidentally reintroduce oldest-first
+    /// rows.
+    var sessions: [SessionSummary] {
+        get { sessionItems }
+        set { replaceSessions(newValue) }
+    }
     /// The id of the currently-open session, marked in the list.
     var openID: String?
 
@@ -29,6 +35,11 @@ final class SessionSidebar: @MainActor Focusable {
     var onBack: ((String) -> Void)?
 
     private var cursor = 0
+    private var sessionItems: [SessionSummary] = []
+    /// The last pane height supplied by the layout. `render(width:)` only knows
+    /// its width because it is a component API, so the app records the viewport
+    /// before composing the frame.
+    private var viewportHeight = 0
 
     /// How many session rows are scrolled off the top. The list is clipped to the
     /// pane height by ``ComponentBox``, so without this a long session list simply
@@ -52,10 +63,19 @@ final class SessionSidebar: @MainActor Focusable {
     /// Scroll the list by `delta` rows, clamped to the content. `viewportHeight` is
     /// the pane height the app knows and the component does not.
     func scroll(by delta: Int, viewportHeight: Int) {
+        setViewport(height: viewportHeight)
         let visibleRows = max(1, viewportHeight - Self.headerRows)
         let maxOffset = max(0, sessions.count - visibleRows)
         scrollOffset = min(max(0, scrollOffset + delta), maxOffset)
         hoveredSessionID = nil
+    }
+
+    /// Record the current pane height and clamp stale scroll state. Cursor
+    /// visibility is changed only by cursor movement or a session refresh; a
+    /// render after a manual page scroll must not snap the viewport back.
+    func setViewport(height: Int) {
+        viewportHeight = max(0, height)
+        clampScrollOffset()
     }
 
     /// Update the pointer hover from a screen row. Header rows and empty rows clear
@@ -95,7 +115,10 @@ final class SessionSidebar: @MainActor Focusable {
         let activeID = activeSessionID
         // Clamp here too: `sessions` can shrink between a scroll and a render.
         let offset = min(max(0, scrollOffset), max(0, sessions.count - 1))
-        for (index, session) in sessions.enumerated().dropFirst(offset) {
+        let visibleRows = viewportHeight > 0 ? max(1, viewportHeight - Self.headerRows) : sessions.count
+        let end = min(sessions.count, offset + visibleRows)
+        for index in offset..<end {
+            let session = sessions[index]
             let label = sessionRow(session, width: width, active: session.id == activeID)
             lines.append(index == clampedCursor && focused ? inverse(label) : label)
         }
@@ -110,8 +133,10 @@ final class SessionSidebar: @MainActor Focusable {
         switch data {
         case Self.arrowUp, [0x6b]:                       // up / k
             cursor = max(0, min(cursor, sessions.count - 1) - 1)
+            ensureCursorVisible()
         case Self.arrowDown, [0x6a]:                     // down / j
             cursor = min(sessions.count - 1, cursor + 1)
+            ensureCursorVisible()
         case [0x0d], [0x0a]:                             // Enter
             let index = min(cursor, sessions.count - 1)
             onSelect?(sessions[index].id)
@@ -162,6 +187,50 @@ final class SessionSidebar: @MainActor Focusable {
 
     private func bodyWidth(for width: Int, suffix: String) -> Int {
         max(0, width - 2 - visibleWidth(suffix))
+    }
+
+    private func replaceSessions(_ newValue: [SessionSummary]) {
+        let oldCursorID = sessions.indices.contains(cursor) ? sessions[cursor].id : nil
+        let oldTopID = sessions.indices.contains(scrollOffset) ? sessions[scrollOffset].id : nil
+        let ordered = newValue.sorted(by: Self.newestFirst)
+        sessionItems = ordered
+
+        if let oldCursorID, let index = ordered.firstIndex(where: { $0.id == oldCursorID }) {
+            cursor = index
+        } else {
+            cursor = min(cursor, max(0, ordered.count - 1))
+        }
+        if let oldTopID, let index = ordered.firstIndex(where: { $0.id == oldTopID }) {
+            scrollOffset = index
+        }
+        marqueeStates = marqueeStates.filter { key, _ in ordered.contains { $0.id == key } }
+        clampScrollOffset()
+        ensureCursorVisible()
+    }
+
+    private func clampScrollOffset() {
+        guard viewportHeight > 0 else {
+            scrollOffset = max(0, scrollOffset)
+            return
+        }
+        let visibleRows = max(1, viewportHeight - Self.headerRows)
+        scrollOffset = min(max(0, scrollOffset), max(0, sessions.count - visibleRows))
+    }
+
+    private func ensureCursorVisible() {
+        guard viewportHeight > 0, !sessions.isEmpty else { return }
+        let visibleRows = max(1, viewportHeight - Self.headerRows)
+        if cursor < scrollOffset {
+            scrollOffset = cursor
+        } else if cursor >= scrollOffset + visibleRows {
+            scrollOffset = cursor - visibleRows + 1
+        }
+        clampScrollOffset()
+    }
+
+    private static func newestFirst(_ lhs: SessionSummary, _ rhs: SessionSummary) -> Bool {
+        if lhs.timestamp != rhs.timestamp { return lhs.timestamp > rhs.timestamp }
+        return lhs.id > rhs.id
     }
 
     /// A compact one-line label split so the open marker and trailing id stay at

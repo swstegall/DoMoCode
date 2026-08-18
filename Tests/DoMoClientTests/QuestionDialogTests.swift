@@ -59,4 +59,21 @@ struct QuestionDialogTests {
         #expect(lines.joined().contains("\u{1b}[2J") == false)
         #expect(lines.joined().contains("\u{1b}[31m") == false)
     }
+
+    @Test("long question text wraps and can be paged instead of being discarded")
+    func wrapsAndScrolls() {
+        let dialog = QuestionDialog(questions: [ServerQuestionPrompt(
+            question: "This question contains enough words that its complete body must occupy several rows before the choices.",
+            options: [ServerQuestionOption(label: "Continue")]
+        )])
+        dialog.setViewport(height: 5)
+
+        let first = dialog.render(width: 24)
+        dialog.handleInput([0x1b, 0x5b, 0x36, 0x7e]) // Page Down
+        let second = dialog.render(width: 24)
+
+        #expect(first != second)
+        #expect(second.joined().contains("Continue"))
+        #expect(second.allSatisfy { visibleWidth($0) <= 24 })
+    }
 }

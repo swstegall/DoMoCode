@@ -247,7 +247,7 @@ public final class StreamingAssembly: Sendable {
 
     private struct State {
         let model: String
-        let rates: ModelCostRates?
+        var rates: ModelCostRates?
 
         var responseModel: String?
         var responseID: String?
@@ -342,6 +342,14 @@ public final class StreamingAssembly: Sendable {
     /// header-absent case does.
     public func setReportedCost(_ value: Decimal?) {
         state.withLock { $0.reportedCost = value }
+    }
+
+    /// Replaces the provisional alias price with the concrete response-model
+    /// price when the gateway reports one in the response headers. This runs
+    /// before the first SSE frame is consumed, so every usage frame in the turn
+    /// is costed consistently.
+    public func setRates(_ value: ModelCostRates?) {
+        state.withLock { $0.rates = value }
     }
 
     /// Folds one chunk in and reports what changed.

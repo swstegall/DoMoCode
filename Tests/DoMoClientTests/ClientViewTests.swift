@@ -46,7 +46,10 @@ struct ClientViewTests {
     @Test("Sidebar down-arrow then Enter selects the next session")
     func sidebarNavigatesAndSelects() {
         let sidebar = SessionSidebar()
-        sidebar.sessions = [summary("aaaaaaaa01"), summary("bbbbbbbb02")]
+        sidebar.sessions = [
+            SessionSummary(id: "aaaaaaaa01", path: "/sessions/a", cwd: "/home/a", timestamp: "2026-08-16"),
+            SessionSummary(id: "bbbbbbbb02", path: "/sessions/b", cwd: "/home/b", timestamp: "2026-08-17"),
+        ]
         var selected: String?
         sidebar.onSelect = { selected = $0 }
 
@@ -132,6 +135,40 @@ struct ClientViewTests {
         #expect(moved.contains("123456"))
         #expect(initial != moved)
         #expect(visibleWidth(moved) == 20)
+    }
+
+    @Test("The sidebar orders newest sessions first and keeps the cursor visible")
+    func sidebarOrdersNewestFirst() {
+        func dated(_ id: String, _ timestamp: String) -> SessionSummary {
+            SessionSummary(id: id, path: "/sessions/\(id).jsonl", cwd: "/home/\(id)", timestamp: timestamp)
+        }
+        let sidebar = SessionSidebar()
+        sidebar.focused = true
+        sidebar.setViewport(height: 5)
+        sidebar.sessions = [
+            dated("old", "2026-08-15T00:00:00Z"),
+            dated("new", "2026-08-17T00:00:00Z"),
+            dated("middle", "2026-08-16T00:00:00Z"),
+            dated("tail", "2026-08-14T00:00:00Z"),
+        ]
+
+        #expect(sidebar.render(width: 30)[2].contains("new"))
+        sidebar.handleInput([0x1b, 0x5b, 0x42])
+        sidebar.handleInput([0x1b, 0x5b, 0x42])
+        sidebar.handleInput([0x1b, 0x5b, 0x42])
+        #expect(sidebar.scrollOffset == 1)
+        #expect(sidebar.render(width: 30).contains { $0.contains("tail") && $0.contains("\u{1b}[7m") })
+
+        sidebar.sessions = [
+            dated("old", "2026-08-15T00:00:00Z"),
+            dated("new", "2026-08-17T00:00:00Z"),
+            dated("middle", "2026-08-16T00:00:00Z"),
+            dated("tail", "2026-08-14T00:00:00Z"),
+        ]
+        // The refresh keeps the same cursor id and scroll anchor rather than
+        // snapping back to the newest row.
+        #expect(sidebar.scrollOffset == 1)
+        #expect(sidebar.render(width: 30).contains { $0.contains("tail") && $0.contains("\u{1b}[7m") })
     }
 
     @Test("The full-screen status bar scrolls long controls instead of dropping them")

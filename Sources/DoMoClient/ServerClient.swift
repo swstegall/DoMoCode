@@ -150,6 +150,7 @@ public struct ServerClient: Sendable {
     private struct QuestionReplyBody: Encodable { let requestID: String; let answers: [ServerQuestionAnswer]? }
     private struct ModelBody: Encodable { let modelID: String }
     private struct ModeBody: Encodable { let mode: String }
+    private struct AgentBody: Encodable { let name: String? }
     private struct RenameBody: Encodable { let name: String? }
     private struct LabelBody: Encodable { let targetID: String; let label: String? }
     private struct LeafBody: Encodable { let targetID: String? }
@@ -845,6 +846,14 @@ public struct ServerClient: Sendable {
     public func changeMode(sessionID: String, mode: AgentMode) async throws {
         let path = "/session/\(sessionID)/mode"
         let body = try JSONEncoder().encode(ModeBody(mode: mode.rawValue))
+        let (status, data) = try await send(.post, path, body: body)
+        try expect(status, 200, path, body: data)
+    }
+
+    /// Select or clear the persistent agent profile for an idle session.
+    public func changeAgent(sessionID: String, name: String?) async throws {
+        let path = "/session/\(sessionID)/agent"
+        let body = try JSONEncoder().encode(AgentBody(name: name))
         let (status, data) = try await send(.post, path, body: body)
         try expect(status, 200, path, body: data)
     }

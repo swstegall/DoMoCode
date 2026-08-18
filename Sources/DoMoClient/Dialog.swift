@@ -869,6 +869,10 @@ final class QuestionDialog: Component {
     private var questionIndex = 0
     private var selectedIndex = 0
     private var selectedLabels: [Set<String>]
+    private var viewportHeight: Int?
+    private var scrollOffset = 0
+    private var selectedBodyRange: Range<Int>?
+    private var bodyRows = 1
 
     var onSubmit: (([ServerQuestionAnswer]) -> Void)?
     var onCancel: (() -> Void)?
@@ -879,17 +883,28 @@ final class QuestionDialog: Component {
         self.selectedLabels = questions.map { _ in [] }
     }
 
+    /// The overlay supplies the inner height available after its border. A
+    /// question remains fully recoverable even when wrapping makes it taller
+    /// than the terminal: the body scrolls while the title and hint stay put.
+    func setViewport(height: Int?) {
+        viewportHeight = height.map { max(1, $0) }
+        bodyRows = 1
+        clampScroll()
+    }
+
     func render(width: Int) -> [String] {
         guard width > 0, questions.indices.contains(questionIndex) else { return [] }
         let prompt = questions[questionIndex]
         let ordinal = "Question \(questionIndex + 1) of \(questions.count)"
         let title = prompt.header.map(sanitizeUntrustedText).map(collapseToOneLine) ?? ordinal
-        var lines = [truncateToWidth("\u{1b}[1m\(title)\u{1b}[0m  \(ordinal)", width, ellipsis: "")]
-        lines.append(truncateToWidth(
-            sanitizeUntrustedText(collapseToOneLine(prompt.question)), width, ellipsis: ""
-        ))
-        lines.append("")
+        let titleRows = wrapToWidth("\(title)  \(ordinal)", width: width).map {
+            "\u{1b}[1m" + $0 + sgrReset
+        }
+        var body: [String] = wrapToWidth(sanitizeUntrustedText(prompt.question), width: width)
+        if body.isEmpty { body = [""] }
+        body.append("")
 
+        var optionRange: Range<Int>?
         for (index, option) in prompt.options.enumerated() {
             let isSelected = index == selectedIndex
             let isChecked = selectedLabels[questionIndex].contains(option.label)
@@ -903,14 +918,29 @@ final class QuestionDialog: Component {
             if let description = option.description, !description.isEmpty {
                 text += " — " + sanitizeUntrustedText(collapseToOneLine(description))
             }
-            lines.append(truncateToWidth(text, width, ellipsis: ""))
+            let start = body.count
+            let wrapped = wrapToWidth(text, width: width)
+            body.append(contentsOf: wrapped.isEmpty ? [""] : wrapped)
+            if isSelected { optionRange = start..<body.count }
         }
         let hint = prompt.allowsMultiple
             ? "↑/↓ choose · Space toggle · Enter next · Esc cancel"
             : "↑/↓ choose · Enter confirm · Esc cancel"
-        lines.append("")
-        lines.append(truncateToWidth(dim(hint), width, ellipsis: ""))
-        return lines
+        body.append("")
+        selectedBodyRange = optionRange
+
+        guard let viewportHeight else {
+            return titleRows + body + [truncateToWidth(dim(hint), width, ellipsis: "")]
+        }
+
+        let bodyHeight = max(1, viewportHeight - titleRows.count - 1)
+        bodyRows = bodyHeight
+        lastBodyCount = body.count
+        ensureSelectionVisible()
+        clampScroll(bodyCount: body.count, bodyHeight: bodyHeight)
+        let end = min(body.count, scrollOffset + bodyHeight)
+        let visibleBody = Array(body[scrollOffset..<end])
+        return titleRows + visibleBody + [truncateToWidth(dim(hint), width, ellipsis: "")]
     }
 
     func handleInput(_ data: [UInt8]) {
@@ -923,8 +953,10 @@ final class QuestionDialog: Component {
             onCancel?()
         } else if keybindings.matches(data, .selectUp) {
             selectedIndex = selectedIndex == 0 ? prompt.options.count - 1 : selectedIndex - 1
+            ensureSelectionVisible()
         } else if keybindings.matches(data, .selectDown) {
             selectedIndex = selectedIndex == prompt.options.count - 1 ? 0 : selectedIndex + 1
+            ensureSelectionVisible()
         } else if prompt.allowsMultiple, data == [0x20] {
             let label = prompt.options[selectedIndex].label
             if selectedLabels[questionIndex].contains(label) {
@@ -934,7 +966,45 @@ final class QuestionDialog: Component {
             }
         } else if keybindings.matches(data, .selectConfirm) {
             submitCurrent(prompt)
+        } else if keybindings.matches(data, .selectPageUp) || matchesKey(data, Key.pageUp) {
+            scroll(by: -bodyViewportHeight())
+        } else if keybindings.matches(data, .selectPageDown) || matchesKey(data, Key.pageDown) {
+            scroll(by: bodyViewportHeight())
+        } else if matchesKey(data, Key.home) || data == Array("g".utf8) {
+            scrollOffset = 0
+        } else if matchesKey(data, Key.end) || data == Array("G".utf8) {
+            scrollOffset = max(0, lastBodyCount - bodyViewportHeight())
         }
+    }
+
+    private var lastBodyCount = 0
+
+    private func bodyViewportHeight() -> Int {
+        max(1, bodyRows)
+    }
+
+    private func clampScroll(bodyCount: Int? = nil, bodyHeight: Int? = nil) {
+        let count = bodyCount ?? lastBodyCount
+        let height = bodyHeight ?? bodyViewportHeight()
+        lastBodyCount = count
+        scrollOffset = max(0, min(scrollOffset, max(0, count - height)))
+    }
+
+    private func ensureSelectionVisible() {
+        guard viewportHeight != nil, let selectedBodyRange else { return }
+        let height = bodyViewportHeight()
+        if selectedBodyRange.lowerBound < scrollOffset {
+            scrollOffset = selectedBodyRange.lowerBound
+        } else if selectedBodyRange.upperBound > scrollOffset + height {
+            scrollOffset = selectedBodyRange.upperBound - height
+        }
+        clampScroll()
+    }
+
+    private func scroll(by delta: Int) {
+        guard viewportHeight != nil else { return }
+        scrollOffset += delta
+        clampScroll()
     }
 
     private func submitCurrent(_ prompt: ServerQuestionPrompt) {
@@ -952,6 +1022,8 @@ final class QuestionDialog: Component {
         }
         questionIndex += 1
         selectedIndex = 0
+        scrollOffset = 0
+        selectedBodyRange = nil
     }
 }
 

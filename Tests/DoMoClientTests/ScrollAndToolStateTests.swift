@@ -56,6 +56,17 @@ struct ScrollAndToolStateTests {
         #expect(layout.pane(atColumn: 60, row: 23) == .mainFooter)   // prompt
     }
 
+    @Test("A collapsed sidebar gives the main pane the full width")
+    func collapsedSidebarGeometry() {
+        let layout = ClientLayout(width: 100, height: 24, sidebarVisible: false)
+        #expect(layout.sidebarWidth == 0)
+        #expect(layout.mainColumnStart == 0)
+        #expect(layout.mainWidth == 100)
+        #expect(layout.dividerColumn == nil)
+        #expect(layout.pane(atColumn: 0, row: 0) == .transcript)
+        #expect(layout.bounds(of: .sidebar) == ClientLayout.PaneBounds(columns: 0..<0, rows: 0..<24))
+    }
+
     @Test("The sidebar keeps its minimum and maximum width at extreme sizes")
     func sidebarWidthBounds() {
         #expect(ClientLayout(width: 20, height: 10).sidebarWidth == 16)

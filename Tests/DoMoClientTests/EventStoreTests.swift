@@ -287,7 +287,7 @@ struct EventStoreTests {
             SessionSummary(id: "a", path: "/a", cwd: "/w", timestamp: "t1"),
             SessionSummary(id: "b", path: "/b", cwd: "/w", timestamp: "t2"),
         ])
-        #expect(store.sessions.map(\.id) == ["a", "b"])
+        #expect(store.sessions.map(\.id) == ["b", "a"])
     }
 
     @Test("onChange fires on every mutation")

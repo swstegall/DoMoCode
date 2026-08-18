@@ -114,6 +114,7 @@ private struct ClientToolReplyBody: Decodable {
 
 private struct ModelBody: Decodable { var modelID: String }
 private struct ModeBody: Decodable { var mode: String }
+private struct AgentBody: Decodable { var name: String? }
 private struct RenameBody: Decodable { var name: String? }
 private struct LabelBody: Decodable { var targetID: String; var label: String? }
 private struct LeafBody: Decodable { var targetID: String? }
@@ -1206,6 +1207,16 @@ public struct DoMoServer: Sendable {
                     throw HTTPError(.badRequest)
                 }
                 try await self.runtime.changeMode(sessionID: id, mode: mode)
+                return Response(status: .ok)
+            }
+        }
+
+        router.post("/session/:id/agent") { request, context in
+            try await self.mapErrors {
+                let id = try context.parameters.require("id")
+                try await self.authorizeSessionClient(request, sessionID: id)
+                let body = try await Self.requiredBody(AgentBody.self, request)
+                _ = try await self.runtime.changeAgent(sessionID: id, name: body.name)
                 return Response(status: .ok)
             }
         }
